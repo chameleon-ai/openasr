@@ -555,14 +555,57 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
             probability: probabilities_aligned.then(|| generated_probabilities[index]),
         })
         .collect();
-    seq2seq_word_timestamps_from_token_spans(
+    let words = seq2seq_word_timestamps_from_token_spans(
         &token_spans,
         0.0,
         duration,
         seconds_per_frame,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
-    )
+    )?;
+    Ok(cohere_cap_dtw_word_spans(words, seconds_per_frame))
+}
+
+/// Limit how long a single DTW word span may run.
+///
+/// A word's DTW span runs from the frame the alignment path first enters the
+/// word's first token to the frame it enters the NEXT token. When the token
+/// right after a real speech region points into the next region (its true
+/// peak), the path must spend the entire inter-region silence on the earlier
+/// row, so the last word before a pause inherits the whole gap as its span
+/// (measured up to ~18s on pause-heavy 30s chunks, where the truth's longest
+/// word is under 3s). The start of that word is right; only its end is wrong,
+/// and the next word's start (the gap tail) is where its own attention says
+/// the following speech begins, so it stays. Capping the end at the span cap
+/// therefore removes the phantom tail: the next word's start keeps its DTW
+/// position, so the gap becomes an explicit hole. The cap is generous enough
+/// for a long-drawn word (measured clip word durations: the longest truth
+/// word observed is under 3s; 1.5s is well past a normal word and far under
+/// the runaway-span regime) and is applied on top of the monotone,
+/// non-overlapping timeline the tiling already guarantees.
+fn cohere_cap_dtw_word_spans(
+    mut words: Vec<WordTimestamp>,
+    seconds_per_frame: f32,
+) -> Vec<WordTimestamp> {
+    const MAX_SECONDS: f32 = COHERE_DTW_MAX_WORD_SPAN_SECONDS;
+    let limit = MAX_SECONDS.max(seconds_per_frame);
+    let mut capped = 0usize;
+    let mut largest = f32::NAN;
+    for word in &mut words {
+        let span = word.end - word.start;
+        largest = largest.max(span);
+        if span > limit {
+            word.end = word.start + limit;
+            capped += 1;
+        }
+    }
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        eprintln!(
+            "cohere cross dtw span cap: {capped} of {} words capped at {MAX_SECONDS}s (largest pre-cap {largest:?}s)",
+            words.len()
+        );
+    }
+    words
 }
 
 /// Order-gate fallback for long, pause-heavy windows: place each token at its
@@ -3190,6 +3233,16 @@ const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 20.0;
 /// choice, keeping short-clip behavior unchanged.
 const COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS: f32 = 20.0;
 
+/// Maximum duration, in seconds, a single DTW-tiled word span may keep.
+/// The monotone tiling gives whatever frames lie between a token's entry and
+/// the next token's entry to the earlier token, so the word preceding a real
+/// pause swallows the whole pause as its span (measured up to ~18s on
+/// pause-heavy 30s chunks, where the ground truth's longest word is under
+/// 3s). The cap is set well above any plausible spoken word (longest
+/// legitimate words observed in the test clips are ~1.7s) and far below the
+/// runaway regime; only the span's tail is trimmed, never its start.
+const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
+
 /// The wall-clock length of the window, given the per-row frame count and the
 /// family's seconds-per-frame.
 fn band_duration_seconds(window: &[Vec<f32>], seconds_per_frame: f32) -> f32 {
@@ -5532,6 +5585,87 @@ mod tests {
                 row
             })
             .collect()
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_caps_a_word_span_swallowed_by_a_pause() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let spf = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 250; // 20.0s window
+        let duration = (frames as f32) * spf;
+        // Two content words with a real pause between them: token 0 peaks at
+        // frame 10 (0.8s), token 1 at frame 200 (16.0s). The monotone DTW
+        // path must spend the whole gap on token 0's row, so without the cap
+        // word 0 would run 0.0->16.0s.
+        let peak_frames = [10, 200];
+        let rows: Vec<Vec<f32>> = (0..2)
+            .map(|i| {
+                let mut row = vec![0.01_f32; frames];
+                row[peak_frames[i]] = 0.5;
+                row
+            })
+            .collect();
+        let token_ids = [40u32, 41];
+        let alignments: Vec<(u32, Vec<f32>)> = token_ids
+            .iter()
+            .zip(rows.iter())
+            .map(|(&id, row)| (id, row.to_vec()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        // The raw DTW spans (pre-cap) must include a span wider than the cap:
+        // the monotone path spends the 0.8s->16.0s pause on one of the two
+        // rows regardless of which token "owns" the second peak frame.
+        let band_rows: Vec<Vec<f32>> = rows.iter().map(|row| row.clone()).collect();
+        let (band_start, band_end) =
+            crate::models::seq2seq_dtw_alignment::speech_frame_bounds(&band_rows, &[true; 2])
+                .expect("band");
+        let sliced: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|row| row[band_start..band_end].to_vec())
+            .collect();
+        let spans = dtw_align_token_frames(&sliced).expect("spans");
+        assert!(
+            spans
+                .iter()
+                .any(|span| (span.frame_end - span.frame_start) as f32 * spf
+                    > COHERE_DTW_MAX_WORD_SPAN_SECONDS),
+            "the test pattern must produce a pre-cap span wider than the cap: {spans:?}"
+        );
+        let words = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &[0.99, 0.99],
+            duration,
+            &decode_text,
+        )
+        .expect("dtw words");
+        assert_eq!(words.len(), 2, "two words must be emitted, got {words:?}");
+        // Every emitted word must be within the span cap: whatever token (or
+        // word) the DTW path let the pause run through, its end cannot follow
+        // the pause to the next token's entry frame.
+        for word in &words {
+            assert!(
+                word.end - word.start <= COHERE_DTW_MAX_WORD_SPAN_SECONDS + 1e-6,
+                "swallowed pause must be capped, got {word:?}"
+            );
+        }
+        assert!(
+            words[0].start <= words[1].start + 1e-6
+                && words[0].end - 1e-6 <= words[1].start
+                && words.iter().all(|w| w.end <= duration + 1e-3),
+            "timeline must stay monotone, non-overlapping, and within the clip: {words:?}"
+        );
     }
 
     #[test]
