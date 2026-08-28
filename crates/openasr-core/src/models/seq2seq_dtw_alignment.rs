@@ -11,11 +11,11 @@
 //! `token x frame` cross-attention matrix. The DTW path assigns every token
 //! an ordered, non-overlapping span of frames: token `k` owns the frames from
 //! where the path first enters token `k` until the path first enters token
-//! `k + 1` (the last token runs to the end of the window). Word spans are
-//! then derived from their member tokens' spans (see
-//! `seq2seq_word_timestamps_from_token_spans`), which keeps the timeline
-//! monotone by construction while letting each span follow where its
-//! attention actually sits.
+//! `k + 1` (the last token runs to the end of the window). Word windows are
+//! then derived from their member tokens' entry frames via the shared center
+//! fold (`seq2seq_word_timestamps_from_token_times`), which keeps the
+//! timeline monotone by construction while letting each word land where its
+//! attention actually peaks.
 
 /// Width of the per-frame median filter applied to each token's attention row
 /// before alignment. Matches whisper-timestamped's default of 9.
