@@ -4,6 +4,13 @@ use crate::models::decode_policy_component_registry::{
 };
 use crate::models::text_prefix::common_prefix_len;
 
+/// Boundary at the equidistant midpoint between two word centers
+/// (`prev + 0.5 * (this - prev)`): each word owns the audio up to halfway into
+/// its neighbour.
+pub(crate) const MIDPOINT_BOUNDARY_FRACTION: f32 = 0.5;
+/// No correction applied between a decoded center and the spoken onset.
+pub(crate) const NO_ONSET_LEAD: f32 = 0.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Seq2SeqTokenTime {
     pub token_id: u32,
@@ -123,15 +130,26 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
         span.1,
         postprocess_kind,
         decode_text_token_ids,
+        MIDPOINT_BOUNDARY_FRACTION,
+        NO_ONSET_LEAD,
     )
 }
 
+/// Fold per-token center times into word timestamps.
+///
+/// `boundary_fraction` and `onset_lead` tune how each word's window is cut
+/// around its center (see [`word_centers_to_timestamps`]). The plain
+/// midpoint/no-lead fold (`0.5`, `0.0`) is the default behavior: a word owns
+/// the audio up to halfway into each neighbour, with no correction between
+/// where the model's attention centers the token and when it is spoken.
 pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     token_times: &[Seq2SeqTokenTime],
     segment_start: f32,
     segment_end: f32,
     postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind,
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, E>,
+    boundary_fraction: f32,
+    onset_lead: f32,
 ) -> Result<Vec<WordTimestamp>, E> {
     let (segment_start, segment_end) = sanitize_segment_span(segment_start, segment_end);
 
@@ -223,6 +241,8 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
         words,
         segment_start,
         segment_end,
+        boundary_fraction,
+        onset_lead,
     ))
 }
 
@@ -464,18 +484,42 @@ fn is_han_ideograph(ch: char) -> bool {
     )
 }
 
+/// Split one word's timeline from the centers of itself and its neighbours.
+///
+/// `boundary_fraction` places the boundary between two words at
+/// `prev + fraction * (this - prev)` of the gap. `0.5` is the equidistant
+/// midpoint (a word owns the audio up to halfway into its neighbour); a
+/// smaller fraction moves the boundary closer to this word's own center,
+/// which -- for a center that lags the spoken onset -- pulls every word's start
+/// earlier, toward when its speech actually begins.
+fn boundary(prev_center: f32, this_center: f32, fraction: f32) -> f32 {
+    prev_center + fraction * (this_center - prev_center)
+}
+
 fn word_centers_to_timestamps(
     mut words: Vec<WordCenter>,
     segment_start: f32,
     segment_end: f32,
+    boundary_fraction: f32,
+    onset_lead: f32,
 ) -> Vec<WordTimestamp> {
     if words.is_empty() {
         return Vec::new();
     }
+    // A center that lags the spoken onset (the model's attention concentrates a
+    // token slightly after it starts) leaves every boundary behind the true
+    // word start. `onset_lead` shifts each center earlier by a fixed amount,
+    // the measured late-onset bias, so the boundaries fall where the speech
+    // actually begins. `segment_start` is the floor: the first word's window
+    // still covers from the band start, never from a time before the spoken
+    // audio.
+    let lead = onset_lead.max(0.0);
     let mut last_center = segment_start;
     for word in &mut words {
         if !word.center_seconds.is_finite() {
             word.center_seconds = last_center;
+        } else {
+            word.center_seconds -= lead;
         }
         word.center_seconds = word.center_seconds.clamp(last_center, segment_end);
         last_center = word.center_seconds;
@@ -486,12 +530,20 @@ fn word_centers_to_timestamps(
         let start = if index == 0 {
             segment_start
         } else {
-            midpoint(words[index - 1].center_seconds, word.center_seconds)
+            boundary(
+                words[index - 1].center_seconds,
+                word.center_seconds,
+                boundary_fraction,
+            )
         };
         let end = if index + 1 == words.len() {
             segment_end
         } else {
-            midpoint(word.center_seconds, words[index + 1].center_seconds)
+            boundary(
+                word.center_seconds,
+                words[index + 1].center_seconds,
+                boundary_fraction,
+            )
         };
         let start = start.clamp(segment_start, segment_end);
         let end = end.clamp(start, segment_end);
@@ -517,10 +569,6 @@ fn sanitize_segment_span(start: f32, end: f32) -> (f32, f32) {
         start
     };
     (start, end)
-}
-
-fn midpoint(lhs: f32, rhs: f32) -> f32 {
-    lhs + (rhs - lhs) * 0.5
 }
 
 #[cfg(test)]
@@ -597,6 +645,8 @@ mod tests {
             2.0,
             BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
             &pieces,
+            MIDPOINT_BOUNDARY_FRACTION,
+            NO_ONSET_LEAD,
         )
         .unwrap();
 
