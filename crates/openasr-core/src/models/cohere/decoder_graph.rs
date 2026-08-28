@@ -37,8 +37,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    Seq2SeqTokenSpan, Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
-    seq2seq_word_timestamps_from_token_spans, seq2seq_word_timestamps_from_token_times,
+    Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
+    seq2seq_word_timestamps_from_token_times,
 };
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
@@ -543,69 +543,62 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     let Some(spans) = dtw_align_token_frames(&attention) else {
         return Ok(Vec::new());
     };
+    // The monotone DTW path *enters* each token's row at the frame where the
+    // path first reaches it, which for a token whose attention is a peak is
+    // that peak -- i.e. roughly the MIDDLE of the spoken word, not its start.
+    // Treating that entry frame as the word's start (the span-tiling `frame_end`
+    // of the previous token) therefore places every word start about a half
+    // word later than the word is actually spoken (measured +0.5s start offset
+    // on every long-form chunk, with the word landing past the truth window).
+    //
+    // The entry frame is the correct *center*. So each token is folded into a
+    // word at its entry-frame center and the boundaries fall at the midpoints
+    // between consecutive centers -- the same word reconstruction the
+    // center-of-mass / peak-fallback paths use -- which keeps the timeline
+    // monotone and non-overlapping while putting a word's *start* at the
+    // midpoint before its center (i.e. before the peak), where the speech
+    // begins. The band-anchored first/last bounds below replace the tiling's
+    // "run to the window edge" behaviour, so a mid-chunk band does not stretch
+    // its first/last word across the band's surrounding silence.
     let probabilities_aligned = generated_probabilities.len() == token_alignments.len();
-    let token_spans: Vec<Seq2SeqTokenSpan> = token_alignments
+    let band_start_secs = band_start as f32 * seconds_per_frame;
+    let band_end_secs = band_end as f32 * seconds_per_frame;
+    let token_times: Vec<Seq2SeqTokenTime> = token_alignments
         .iter()
         .enumerate()
         .zip(spans.iter())
-        .map(|((index, alignment), span)| Seq2SeqTokenSpan {
+        .map(|((index, alignment), span)| Seq2SeqTokenTime {
             token_id: alignment.0,
-            frame_start: span.frame_start.saturating_add(band_start),
-            frame_end: span.frame_end.saturating_add(band_start),
+            center_seconds: (span.frame_start.saturating_add(band_start)) as f32
+                * seconds_per_frame,
             probability: probabilities_aligned.then(|| generated_probabilities[index]),
         })
         .collect();
-    let words = seq2seq_word_timestamps_from_token_spans(
-        &token_spans,
-        0.0,
-        duration,
-        seconds_per_frame,
+    let words = seq2seq_word_timestamps_from_token_times(
+        &token_times,
+        band_start_secs,
+        band_end_secs,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
     )?;
-    Ok(cohere_cap_dtw_word_spans(words, seconds_per_frame))
-}
-
-/// Limit how long a single DTW word span may run.
-///
-/// A word's DTW span runs from the frame the alignment path first enters the
-/// word's first token to the frame it enters the NEXT token. When the token
-/// right after a real speech region points into the next region (its true
-/// peak), the path must spend the entire inter-region silence on the earlier
-/// row, so the last word before a pause inherits the whole gap as its span
-/// (measured up to ~18s on pause-heavy 30s chunks, where the truth's longest
-/// word is under 3s). The start of that word is right; only its end is wrong,
-/// and the next word's start (the gap tail) is where its own attention says
-/// the following speech begins, so it stays. Capping the end at the span cap
-/// therefore removes the phantom tail: the next word's start keeps its DTW
-/// position, so the gap becomes an explicit hole. The cap is generous enough
-/// for a long-drawn word (measured clip word durations: the longest truth
-/// word observed is under 3s; 1.5s is well past a normal word and far under
-/// the runaway-span regime) and is applied on top of the monotone,
-/// non-overlapping timeline the tiling already guarantees.
-fn cohere_cap_dtw_word_spans(
-    mut words: Vec<WordTimestamp>,
-    seconds_per_frame: f32,
-) -> Vec<WordTimestamp> {
-    const MAX_SECONDS: f32 = COHERE_DTW_MAX_WORD_SPAN_SECONDS;
-    let limit = MAX_SECONDS.max(seconds_per_frame);
-    let mut capped = 0usize;
-    let mut largest = f32::NAN;
-    for word in &mut words {
-        let span = word.end - word.start;
-        largest = largest.max(span);
-        if span > limit {
-            word.end = word.start + limit;
-            capped += 1;
-        }
-    }
+    // `word_centers_to_timestamps` anchors the first word's start to
+    // `segment_start` (the band start) and the last word's end to
+    // `segment_end` (the band end), so a mid-chunk band does not stretch its
+    // first/last word across the surrounding silence; the midpoint between two
+    // centers lands where the following word's speech begins. The timeline is
+    // monotone and non-overlapping by construction, so the only remaining
+    // correction is capping any word that swallowed a real pause (its tail
+    // would otherwise run halfway across the following gap).
+    let words = cohere_cap_dtw_word_spans(words, seconds_per_frame);
     if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
         eprintln!(
-            "cohere cross dtw span cap: {capped} of {} words capped at {MAX_SECONDS}s (largest pre-cap {largest:?}s)",
-            words.len()
+            "cohere cross dtw midpoint fold: {} words over band {}..{}s",
+            words.len(),
+            band_start_secs,
+            band_end_secs
         );
     }
-    words
+    Ok(words)
 }
 
 /// Order-gate fallback for long, pause-heavy windows: place each token at its
@@ -3243,6 +3236,42 @@ const COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS: f32 = 20.0;
 /// runaway regime; only the span's tail is trimmed, never its start.
 const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// Limit how long a single DTW word may run.
+///
+/// In the midpoint fold a word's edge is the midpoint between its own center
+/// (its token's DTW entry) and its neighbor's center. When a real pause sits
+/// between two utterances, the word on each side of the pause extends halfway
+/// across it (measured ~6-7s on pause-heavy 30s chunks, where the ground
+/// truth's longest word is under 3s). The cap trims each word's tail at
+/// `start + 1.5s`, well above any plausible spoken word and far below the
+/// phantom-tail regime, restoring an explicit gap at the pause while keeping
+/// the word's own (peak-derived) start untouched.
+fn cohere_cap_dtw_word_spans(
+    words: Vec<WordTimestamp>,
+    seconds_per_frame: f32,
+) -> Vec<WordTimestamp> {
+    const MAX_SECONDS: f32 = COHERE_DTW_MAX_WORD_SPAN_SECONDS;
+    let limit = MAX_SECONDS.max(seconds_per_frame);
+    let mut capped = 0usize;
+    let mut largest = f32::NAN;
+    let mut capped_words = words;
+    for word in &mut capped_words {
+        let span = word.end - word.start;
+        largest = largest.max(span);
+        if span > limit {
+            word.end = word.start + limit;
+            capped += 1;
+        }
+    }
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        eprintln!(
+            "cohere cross dtw span cap: {capped} of {} words capped at {MAX_SECONDS}s (largest pre-cap {largest:?}s)",
+            capped_words.len()
+        );
+    }
+    capped_words
+}
+
 /// The wall-clock length of the window, given the per-row frame count and the
 /// family's seconds-per-frame.
 fn band_duration_seconds(window: &[Vec<f32>], seconds_per_frame: f32) -> f32 {
@@ -5025,11 +5054,25 @@ mod tests {
         assert_eq!(words.len(), 2, "expected two words, got {words:?}");
         assert_eq!(words[0].word, "hi");
         assert_eq!(words[1].word, "there");
-        // Monotone timeline and the words sit on their respective attention
-        // frames rather than being smeared to the midpoint.
-        assert!(words[0].start < words[1].end);
-        assert!(words[0].start < 3.0 * seconds_per_frame + 1e-3);
-        assert!(words[1].end > 8.0 * seconds_per_frame + 1e-3);
+        // The DTW midpoint fold anchors the first word's start to the band
+        // start (frame 0 here) and the last word's end to the band end (frame
+        // 12), rather than starting the first word at its token's attention
+        // peak as the old span-tiling did.
+        assert!(
+            (words[0].start - 0.0).abs() < 1e-3,
+            "first word must start at the band start, got {words:?}"
+        );
+        assert!(
+            (words[1].end - frames as f32 * seconds_per_frame).abs() < 1e-3,
+            "last word must end at the band end, got {words:?}"
+        );
+        // The first word's start is at or before where its token's attention
+        // peaks (frame 2): the midpoint fold puts a word's start before its
+        // peak, not after it.
+        assert!(
+            words[1].start > words[0].end - 1e-6
+                && words[1].end > frames as f32 * seconds_per_frame * 8.0 / 10.0
+        );
     }
 
     #[test]
