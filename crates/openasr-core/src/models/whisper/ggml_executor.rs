@@ -165,8 +165,9 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    Seq2SeqTokenSpan, Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
-    seq2seq_word_timestamps_from_token_spans, seq2seq_word_timestamps_from_token_times,
+    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenSpan, Seq2SeqTokenTime,
+    seq2seq_word_timestamps_from_generated_tokens, seq2seq_word_timestamps_from_token_spans,
+    seq2seq_word_timestamps_from_token_times,
 };
 
 const WHISPER_STREAMING_EXECUTOR_ID: &str = "whisper-ggml-snapshot-streaming-executor-v1";
@@ -6075,6 +6076,8 @@ fn whisper_cross_attention_word_timestamps(
         duration,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         &decode_text,
+        MIDPOINT_BOUNDARY_FRACTION,
+        NO_ONSET_LEAD,
     )
     .map_err(
         |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {

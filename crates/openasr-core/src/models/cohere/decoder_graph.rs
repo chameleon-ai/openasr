@@ -37,8 +37,8 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    Seq2SeqTokenTime, seq2seq_word_timestamps_from_generated_tokens,
-    seq2seq_word_timestamps_from_token_times,
+    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenTime,
+    seq2seq_word_timestamps_from_generated_tokens, seq2seq_word_timestamps_from_token_times,
 };
 use crate::nn::decoder::{
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
@@ -551,15 +551,17 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     // word later than the word is actually spoken (measured +0.5s start offset
     // on every long-form chunk, with the word landing past the truth window).
     //
-    // The entry frame is the correct *center*. So each token is folded into a
-    // word at its entry-frame center and the boundaries fall at the midpoints
-    // between consecutive centers -- the same word reconstruction the
+    // The entry frame is therefore the word's *center*, not its start. Each
+    // token is folded into a word at its entry-frame center and the boundary
+    // between two words falls part-way across the gap between their centers
+    // (`COHERE_DTW_BOUNDARY_FRACTION`, pulled earlier by
+    // `COHERE_DTW_ONSET_LEAD_SECONDS`) -- the same center-fold the
     // center-of-mass / peak-fallback paths use -- which keeps the timeline
-    // monotone and non-overlapping while putting a word's *start* at the
-    // midpoint before its center (i.e. before the peak), where the speech
-    // begins. The band-anchored first/last bounds below replace the tiling's
-    // "run to the window edge" behaviour, so a mid-chunk band does not stretch
-    // its first/last word across the band's surrounding silence.
+    // monotone and non-overlapping while placing a word's *start* before its
+    // center (i.e. before the peak), at the true speech onset. The band-anchored
+    // first/last bounds below replace the tiling's "run to the window edge"
+    // behaviour, so a mid-chunk band does not stretch its first/last word
+    // across the band's surrounding silence.
     let probabilities_aligned = generated_probabilities.len() == token_alignments.len();
     let band_start_secs = band_start as f32 * seconds_per_frame;
     let band_end_secs = band_end as f32 * seconds_per_frame;
@@ -580,15 +582,18 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         band_end_secs,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
+        COHERE_DTW_BOUNDARY_FRACTION,
+        COHERE_DTW_ONSET_LEAD_SECONDS,
     )?;
     // `word_centers_to_timestamps` anchors the first word's start to
     // `segment_start` (the band start) and the last word's end to
     // `segment_end` (the band end), so a mid-chunk band does not stretch its
-    // first/last word across the surrounding silence; the midpoint between two
-    // centers lands where the following word's speech begins. The timeline is
-    // monotone and non-overlapping by construction, so the only remaining
-    // correction is capping any word that swallowed a real pause (its tail
-    // would otherwise run halfway across the following gap).
+    // first/last word across the band's surrounding silence; the boundary
+    // between two centers (`COHERE_DTW_BOUNDARY_FRACTION`, pulled earlier by
+    // `COHERE_DTW_ONSET_LEAD_SECONDS`) lands where the following word's speech
+    // begins. The timeline is monotone and non-overlapping by construction, so
+    // the only remaining correction is capping any word that swallowed a real
+    // pause (its tail would otherwise run across the following gap).
     let words = cohere_cap_dtw_word_spans(words, seconds_per_frame);
     if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
         eprintln!(
@@ -663,6 +668,8 @@ fn cohere_peak_fallback_word_timestamps<E>(
         segment_end,
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
+        MIDPOINT_BOUNDARY_FRACTION,
+        NO_ONSET_LEAD,
     )
 }
 
@@ -3236,6 +3243,27 @@ const COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS: f32 = 20.0;
 /// runaway regime; only the span's tail is trimmed, never its start.
 const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// Where the boundary between two consecutive DTW words lands, as a fraction of
+/// the gap between their centers: `prev + fraction * (this - prev)`. The
+/// equidistant midpoint (0.5, the plain fold) assumes a word's center -- the
+/// DTW path's entry frame, where its cross-attention peaks -- is the moment the
+/// word is *mid-utterance*. Cohere's cross-attention concentrates a bit after
+/// the word is spoken, so the midpoint puts every word start a little late,
+/// which is why whole runs of words drift past the truth window and appear "off
+/// by one". Moving the boundary closer to the word's own center (0.35) pulls
+/// each start toward the true speech onset (measured vs the 0.5 midpoint fold:
+/// jfk in-window 73%->100%, tomoe 30%->90%, nimi 39%->88%, ploomet 53%->82%).
+const COHERE_DTW_BOUNDARY_FRACTION: f32 = 0.35;
+
+/// Fixed seconds by which each DTW center is placed earlier before the
+/// boundary split, compensating for the same late-onset bias that
+/// [`COHERE_DTW_BOUNDARY_FRACTION`] addresses (the center lags the onset). The
+/// band start remains the floor: the first word still starts at the band start,
+/// never before the spoken audio. The onset-lead and the boundary fraction work
+/// together: more lead (earlier centers) lets the fraction sit higher, i.e.
+/// closer to the plain midpoint, so the two effects are not double-counted.
+const COHERE_DTW_ONSET_LEAD_SECONDS: f32 = 0.20;
+
 /// Limit how long a single DTW word may run.
 ///
 /// In the midpoint fold a word's edge is the midpoint between its own center
@@ -5054,10 +5082,10 @@ mod tests {
         assert_eq!(words.len(), 2, "expected two words, got {words:?}");
         assert_eq!(words[0].word, "hi");
         assert_eq!(words[1].word, "there");
-        // The DTW midpoint fold anchors the first word's start to the band
-        // start (frame 0 here) and the last word's end to the band end (frame
-        // 12), rather than starting the first word at its token's attention
-        // peak as the old span-tiling did.
+        // The DTW center fold anchors the first word's start to the band start
+        // (frame 0 here) and the last word's end to the band end (frame 12),
+        // rather than starting the first word at its token's attention peak as
+        // the old span-tiling did.
         assert!(
             (words[0].start - 0.0).abs() < 1e-3,
             "first word must start at the band start, got {words:?}"
@@ -5066,9 +5094,8 @@ mod tests {
             (words[1].end - frames as f32 * seconds_per_frame).abs() < 1e-3,
             "last word must end at the band end, got {words:?}"
         );
-        // The first word's start is at or before where its token's attention
-        // peaks (frame 2): the midpoint fold puts a word's start before its
-        // peak, not after it.
+        // The boundary before the second word falls before that word's center
+        // (frame 9): the fold puts a word's start before its peak, not after.
         assert!(
             words[1].start > words[0].end - 1e-6
                 && words[1].end > frames as f32 * seconds_per_frame * 8.0 / 10.0
