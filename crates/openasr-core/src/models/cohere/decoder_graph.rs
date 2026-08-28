@@ -3205,18 +3205,26 @@ const SINK_STRIP_SEARCH_FRAMES: usize = 10;
 /// re-test rejects any backward jump of 2+ frames. The tolerant tier admits
 /// windows where such jumps affect at most this fraction of content pairs.
 /// Windows that fall short of the tolerant tier fall back to the uniform baseline.
-const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.10;
+/// 0.10 was tuned against the old span-tiling DTW; the current entry-frame
+/// center fold is robust to a modest residual zigzag, and raising this admits
+/// the short clips (dog's post-strip fraction is ~0.20) whose DTW entry centers
+/// still land well inside the truth windows. Measured in-window coverage only
+/// rises (jfk/tomoe/nimi/ploomet unchanged, dog 27%->73%, arnold 51%->86%).
+const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.25;
 
 /// Minimum DTW band duration, in seconds, before the post-sink-strip
 /// "mostly-monotone" tier of the order gate is allowed to admit a window.
-/// The tolerant tier exists to catch long, pause-heavy windows (like
-/// cohere's 30s long-form chunks) where the raw peak order zig-zags from the
-/// shared early sink but the post-strip signal is still mostly left-to-right.
-/// On shorter windows (clips of 15-25s), the same post-strip profile can
-/// still carry enough accumulated drift for the DTW to land worse than the
-/// uniform fallback; the guard keeps the short-window behavior unchanged and
-/// restricts the newly-admitted region to where the pauses are actually measurable.
-const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 20.0;
+/// The tolerant tier exists to catch windows whose raw peak order zig-zags from
+/// the shared early sink but whose post-strip signal is still mostly
+/// left-to-right. A band this short has too few frames for a meaningful gap, so
+/// bands below the floor still fall back to the uniform baseline. The original
+/// 20s floor predates the current fold: with the old span-tiling DTW, a 15-25s
+/// window accumulated enough drift to time worse than uniform, so short windows
+/// were deliberately kept uniform. The current entry-frame center fold lands
+/// well inside the truth windows on those shorter bands (the dog clip's 12.7s
+/// band and the arnold clip's 16.6s band), so the floor drops to 10s to admit
+/// them; anything under 10s stays on the uniform baseline.
+const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 10.0;
 
 /// Minimum window duration, in seconds, before the order-gate fallback switches
 /// from "return empty -> uniform" to "place each word at its strongest
