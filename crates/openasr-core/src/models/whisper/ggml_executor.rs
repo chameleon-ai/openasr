@@ -5880,24 +5880,51 @@ fn run_frame_bounds(
 /// the gap between their centers: `prev + fraction * (this - prev)`. With raw
 /// DTW span tiling each word start is the next token's entry frame (where its
 /// attention peaks), which places a word start a full onset past its true
-/// speech beginning (measured +0.1 to +0.8s late on arnold, with the whole run
-/// drifting toward the band end and landing past the truth window). Folding the
-/// entry frames back into word centers and splitting the gap at this fraction
-/// puts the start before the center, at the true onset. Tuned over the test
-/// clips with the raw-span baseline: arnold in-window 54% -> 100%, dog
-/// 82% -> 100%, jfk 100% (unchanged, better absolute error).
+/// speech beginning. Folding the entry frames back into word centers and splitting
+/// the gap at this fraction puts the start before the center, at the true onset.
 const WHISPER_DTW_BOUNDARY_FRACTION: f32 = 0.45;
 
-/// Fixed seconds by which each DTW center is placed earlier before the
-/// boundary split, compensating for the late-onset bias that
-/// [`WHISPER_DTW_BOUNDARY_FRACTION`] addresses. Whisper's DTW biases the path
-/// to start early (the first cost cell is pulled to the global minimum), so its
-/// entry frames center only slightly behind the onset: a small lead (the same
-/// value as one DTW frame at 0.02s/frame would overshoot) is the best trade --
-/// measured over arnold/dog/jfk, lead 0.05 keeps all three at 100% in-window
-/// while 0.10 drops jfk to 95%. The band start remains the floor: the first
-/// word still starts at the band start, never before the spoken audio.
+/// Baseline seconds by which each DTW center is placed earlier before the
+/// boundary split, for a band speaking at or below the density knee. Whisper's
+/// DTW biases the path to start early (the first cost cell is pulled to the
+/// global minimum), so its entry frames center only slightly behind the onset:
+/// a small lead (one DTW frame at 0.02s/frame would overshoot) is the best
+/// trade. Denser bands add lead on top of this baseline via [`whisper_dtw_onset_lead`].
 const WHISPER_DTW_ONSET_LEAD_SECONDS: f32 = 0.05;
+
+/// Words per second of band audio above which the measured late-onset bias
+/// grows and a larger onset lead is warranted.
+const WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
+
+/// Rate (in seconds of added lead per extra word/second above the knee) by
+/// which the onset lead grows with band density. The DTW entry frames --
+/// treated as word centers -- sit later the more tightly the words pack, so a
+/// fixed lead cannot correct both sparse and dense bands.
+const WHISPER_DTW_LEAD_DENSITY_SLOPE: f32 = 0.43;
+
+/// Upper bound on the density-scaled onset lead. Above this the added lead
+/// outruns the true onset on dense bands as quickly as it helps.
+const WHISPER_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.35;
+
+/// The onset lead for one DTW band, scaled by how densely its words pack.
+///
+/// Whisper's measured late-onset bias is density-dependent: on a slow band
+/// (<= [`WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC`] words/s) the baseline
+/// [`WHISPER_DTW_ONSET_LEAD_SECONDS`] suffices, but as the speaking rate
+/// climbs the DTW centers land a growing fixed amount past the true onset, so
+/// the lead grows at [`WHISPER_DTW_LEAD_DENSITY_SLOPE`] per extra word/second
+/// up to [`WHISPER_DTW_ONSET_LEAD_MAX_SECONDS`].
+///
+/// The density is in *words* per second of band audio, not tokens: a band can
+/// be token-dense (many subwords) yet speak at a relaxed pace, in which case
+/// the late bias is small. Token density does not separate them; word density does.
+fn whisper_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
+    let band_seconds = band_seconds.max(0.05);
+    let density = (word_count as f32) / band_seconds;
+    let excess = (density - WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC).max(0.0);
+    (WHISPER_DTW_ONSET_LEAD_SECONDS + WHISPER_DTW_LEAD_DENSITY_SLOPE * excess)
+        .min(WHISPER_DTW_ONSET_LEAD_MAX_SECONDS)
+}
 
 /// Maximum duration, in seconds, a single DTW word may keep. The center fold
 /// gives each word the boundaries on both sides of its center, so a word next
@@ -5997,6 +6024,35 @@ fn whisper_cross_attention_word_timestamps(
             run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution).is_some()
         });
         if bracketed_by_timestamps {
+            // The onset lead is a property of the whole decode window, not of
+            // any single band: a window can hold one dense short band (e.g. a
+            // rapid aside) inside an otherwise relaxed utterance, and applying
+            // the dense band's lead to every word would pull the rest early.
+            // So measure speaking density across the entire window -- all
+            // decoded words over the window's spoken span -- and use it for
+            // every band the window brackets.
+            let window_word_count = decode_text(&token_ids).map_or(0, |text| {
+                text.split_whitespace()
+                    .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+                    .count()
+            });
+            let window_span_frames = runs
+                .iter()
+                .filter_map(|(lo, hi)| {
+                    run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution)
+                })
+                .fold(None, |acc: Option<(usize, usize)>, (s, e)| match acc {
+                    None => Some((s, e)),
+                    Some((ls, le)) => Some((ls.min(s), le.max(e))),
+                });
+            let onset_lead = window_span_frames
+                .map(|(lo, hi)| {
+                    whisper_dtw_onset_lead(
+                        hi.saturating_sub(lo) as f32 * seconds_per_frame,
+                        window_word_count,
+                    )
+                })
+                .unwrap_or(WHISPER_DTW_ONSET_LEAD_SECONDS);
             let mut words = Vec::new();
             for (lo, hi) in &runs {
                 let Some((band_start, band_end)) =
@@ -6049,7 +6105,7 @@ fn whisper_cross_attention_word_timestamps(
                     BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
-                    WHISPER_DTW_ONSET_LEAD_SECONDS,
+                    onset_lead,
                 ) {
                     block_words = whisper_cap_dtw_word_spans(block_words, seconds_per_frame);
                     words.extend(block_words);
@@ -6122,6 +6178,17 @@ fn whisper_cross_attention_word_timestamps(
                         }
                     })
                     .collect();
+                // All content tokens are aligned here, so the decoded word count
+                // is the whole run.
+                let word_count = decode_text(&token_ids).map_or(0, |text| {
+                    text.split_whitespace()
+                        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+                        .count()
+                });
+                let onset_lead = whisper_dtw_onset_lead(
+                    (dtw_frame_end - dtw_frame_start) as f32 * seconds_per_frame,
+                    word_count,
+                );
                 let mut words = seq2seq_word_timestamps_from_token_times(
                     &token_times,
                     band_start_secs,
@@ -6129,7 +6196,7 @@ fn whisper_cross_attention_word_timestamps(
                     BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
-                    WHISPER_DTW_ONSET_LEAD_SECONDS,
+                    onset_lead,
                 )
                 .map_err(|error| {
                     WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
