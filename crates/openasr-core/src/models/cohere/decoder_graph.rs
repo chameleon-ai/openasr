@@ -576,6 +576,10 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
             probability: probabilities_aligned.then(|| generated_probabilities[index]),
         })
         .collect();
+    let onset_lead = cohere_dtw_onset_lead(
+        band_end_secs - band_start_secs,
+        is_content.iter().filter(|flag| **flag).count(),
+    );
     let words = seq2seq_word_timestamps_from_token_times(
         &token_times,
         band_start_secs,
@@ -583,7 +587,7 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
         decode_text,
         COHERE_DTW_BOUNDARY_FRACTION,
-        COHERE_DTW_ONSET_LEAD_SECONDS,
+        onset_lead,
     )?;
     // `word_centers_to_timestamps` anchors the first word's start to
     // `segment_start` (the band start) and the last word's end to
@@ -3263,14 +3267,59 @@ const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 /// jfk in-window 73%->100%, tomoe 30%->90%, nimi 39%->88%, ploomet 53%->82%).
 const COHERE_DTW_BOUNDARY_FRACTION: f32 = 0.35;
 
-/// Fixed seconds by which each DTW center is placed earlier before the
-/// boundary split, compensating for the same late-onset bias that
-/// [`COHERE_DTW_BOUNDARY_FRACTION`] addresses (the center lags the onset). The
-/// band start remains the floor: the first word still starts at the band start,
-/// never before the spoken audio. The onset-lead and the boundary fraction work
-/// together: more lead (earlier centers) lets the fraction sit higher, i.e.
-/// closer to the plain midpoint, so the two effects are not double-counted.
+/// Baseline seconds by which each DTW center is placed earlier before the
+/// boundary split, for a band speaking at or below the density knee
+/// ([`COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC`]). Cohere's cross-attention centers
+/// a token slightly after its speech onset, so the boundary split
+/// ([`COHERE_DTW_BOUNDARY_FRACTION`]) lands a little late and the fold pulls
+/// each center earlier by this baseline. Denser bands add lead on top of this
+/// via [`cohere_dtw_onset_lead`]: the DTW entry frame -- the word's center --
+/// lands a growing fixed amount past the true onset as the speaking rate
+/// climbs, which a fixed lead cannot correct for both sparse and dense bands.
+/// The band start remains the floor: the first word still starts at the band
+/// start, never before the spoken audio. The onset-lead and the boundary
+/// fraction work together: more lead lets the fraction sit closer to the plain
+/// midpoint, so the two effects are not double-counted. A flat 0.20 (the old
+/// behavior) was tuned to mid-density bands and left dense bands -- e.g. a
+/// rapid aside inside a long pause-heavy window -- with every word start a
+/// third of a second late, just past its truth window.
 const COHERE_DTW_ONSET_LEAD_SECONDS: f32 = 0.20;
+
+/// Words per second of band audio above which the measured late-onset bias
+/// grows and a larger onset lead is warranted.
+const COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
+
+/// Rate (in seconds of added lead per extra word/second above the knee) by
+/// which the onset lead grows with band density.
+const COHERE_DTW_LEAD_DENSITY_SLOPE: f32 = 0.10;
+
+/// Upper bound on the density-scaled onset lead. Above this the added lead
+/// outruns the true onset on dense bands as quickly as it helps.
+const COHERE_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.42;
+
+/// The onset lead for one DTW band, scaled by how densely its words pack.
+///
+/// Cohere's measured late-onset bias is density-dependent: on a slow band
+/// (<= [`COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC`] words/s) the baseline
+/// [`COHERE_DTW_ONSET_LEAD_SECONDS`] suffices, but as the speaking rate climbs
+/// the DTW centers land a growing fixed amount past the true onset, so the
+/// lead grows at [`COHERE_DTW_LEAD_DENSITY_SLOPE`] per extra word/second up to
+/// [`COHERE_DTW_ONSET_LEAD_MAX_SECONDS`]. This is the same density-scaled lead
+/// whisper's DTW fold uses (see `whisper_dtw_onset_lead`), which the cohere
+/// path previously lacked -- the reason dense, rapid-aside windows (the
+/// `sleepy` clip) lost in-window coverage while the sparse windows held.
+///
+/// The density is in *content-token* count per second of band audio, matching
+/// the window's own decoded output (whisper counts decoded words; cohere
+/// decodes `<|notimestamps|>` so the content-token count of the band carries
+/// the same signal without re-decoding the whole window).
+fn cohere_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
+    let band_seconds = band_seconds.max(0.05);
+    let density = word_count as f32 / band_seconds;
+    let excess = (density - COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC).max(0.0);
+    (COHERE_DTW_ONSET_LEAD_SECONDS + COHERE_DTW_LEAD_DENSITY_SLOPE * excess)
+        .min(COHERE_DTW_ONSET_LEAD_MAX_SECONDS)
+}
 
 /// Limit how long a single DTW word may run.
 ///
@@ -4675,6 +4724,35 @@ mod tests {
         read_gguf_metadata_from_runtime_source, read_gguf_tensor_index_from_runtime_source,
     };
     use tempfile::{NamedTempFile, TempPath};
+
+    #[test]
+    fn cohere_dtw_onset_lead_is_flat_below_the_density_knee() {
+        // A band speaking at or below the knee gets the baseline lead verbatim;
+        // no density term is added.
+        let slow = cohere_dtw_onset_lead(10.0, 10); // 1.0 word/s < knee 2.4
+        assert!((slow - COHERE_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+        let at_knee = cohere_dtw_onset_lead(10.0, 24); // exactly 2.4 word/s
+        assert!((at_knee - COHERE_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cohere_dtw_onset_lead_grows_with_density_above_the_knee() {
+        // Above the knee the lead rises at the configured slope per extra
+        // word/second. At 4.0 word/s the excess over the 2.4 knee is 1.6, so
+        // lead = 0.20 + 0.10 * 1.6 = 0.36 -- comfortably below the cap.
+        let dense = cohere_dtw_onset_lead(10.0, 40);
+        let expected =
+            COHERE_DTW_ONSET_LEAD_SECONDS + COHERE_DTW_LEAD_DENSITY_SLOPE * 1.6_f32.max(0.0);
+        assert!((dense - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cohere_dtw_onset_lead_caps_at_max_seconds() {
+        // A very dense band (12 word/s) adds more lead than the cap allows; the
+        // result is exactly the cap, not the unbounded density term.
+        let runaway = cohere_dtw_onset_lead(10.0, 120);
+        assert_eq!(runaway, COHERE_DTW_ONSET_LEAD_MAX_SECONDS);
+    }
 
     fn assert_logits_select_same_token(batched: &[f32], serial: &[f32], label: &str) {
         assert_eq!(
