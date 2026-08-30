@@ -5893,7 +5893,8 @@ const WHISPER_DTW_BOUNDARY_FRACTION: f32 = 0.45;
 const WHISPER_DTW_ONSET_LEAD_SECONDS: f32 = 0.05;
 
 /// Words per second of band audio above which the measured late-onset bias
-/// grows and a larger onset lead is warranted.
+/// grows and a larger onset lead is warranted. At or below the knee a band is
+/// led at the baseline; denser bands carry the extra pull.
 const WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
 
 /// Rate (in seconds of added lead per extra word/second above the knee) by
@@ -6024,35 +6025,6 @@ fn whisper_cross_attention_word_timestamps(
             run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution).is_some()
         });
         if bracketed_by_timestamps {
-            // The onset lead is a property of the whole decode window, not of
-            // any single band: a window can hold one dense short band (e.g. a
-            // rapid aside) inside an otherwise relaxed utterance, and applying
-            // the dense band's lead to every word would pull the rest early.
-            // So measure speaking density across the entire window -- all
-            // decoded words over the window's spoken span -- and use it for
-            // every band the window brackets.
-            let window_word_count = decode_text(&token_ids).map_or(0, |text| {
-                text.split_whitespace()
-                    .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
-                    .count()
-            });
-            let window_span_frames = runs
-                .iter()
-                .filter_map(|(lo, hi)| {
-                    run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution)
-                })
-                .fold(None, |acc: Option<(usize, usize)>, (s, e)| match acc {
-                    None => Some((s, e)),
-                    Some((ls, le)) => Some((ls.min(s), le.max(e))),
-                });
-            let onset_lead = window_span_frames
-                .map(|(lo, hi)| {
-                    whisper_dtw_onset_lead(
-                        hi.saturating_sub(lo) as f32 * seconds_per_frame,
-                        window_word_count,
-                    )
-                })
-                .unwrap_or(WHISPER_DTW_ONSET_LEAD_SECONDS);
             let mut words = Vec::new();
             for (lo, hi) in &runs {
                 let Some((band_start, band_end)) =
@@ -6070,6 +6042,23 @@ fn whisper_cross_attention_word_timestamps(
                 let band_width = band_end.saturating_sub(band_start);
                 let band_start_secs = (band_start as f32) * seconds_per_frame;
                 let band_end_secs = (band_end as f32) * seconds_per_frame;
+                // The onset lead is a property of this band's own speaking rate,
+                // not the window's: a window can hold one dense band (e.g. a rapid
+                // aside) inside otherwise relaxed utterances, and the dense band's
+                // extra lead must not be diluted to the window mean -- that left
+                // the rapid band's words a third of a second late. Conversely a
+                // relaxed band must not inherit a dense neighbour's lead. A run is
+                // one timestamp-bracketed segment, so its decoded word count over
+                // its own span is the right density measure.
+                let band_word_count = decode_text(&token_ids[*lo..*hi]).map_or(0, |text| {
+                    text.split_whitespace()
+                        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+                        .count()
+                });
+                let onset_lead = whisper_dtw_onset_lead(
+                    (band_width as f32) * seconds_per_frame,
+                    band_word_count,
+                );
                 let token_times: Vec<Seq2SeqTokenTime> = spans
                     .iter()
                     .enumerate()
