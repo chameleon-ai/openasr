@@ -3686,6 +3686,11 @@ fn apply_longform_safety_policy(
 ) {
     apply_invocation_span_longform_policy(model_architecture, options, provenance);
     apply_conservative_seq2seq_longform_safety_policy(model_architecture, options, provenance);
+    apply_whisper_cross_attention_dtw_longform_no_padding_policy(
+        model_architecture,
+        options,
+        provenance,
+    );
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
 }
 
@@ -3796,6 +3801,34 @@ fn apply_conservative_seq2seq_longform_safety_policy(
             "core.native.longform.policy:conservative-seq2seq-chunk-cap={}",
             CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS
         ));
+    }
+}
+
+/// Drops slice padding for whisper. Whisper's longform profile is `Default`
+/// (not `ConservativeSeq2SeqV1`), so it escapes the padding rule above, yet it
+/// shares the exact hazard that rule exists for: it derives word times from a
+/// cross-attention DTW that places each frame relative to the buffer the
+/// decoder was actually handed, while the longform assembler re-bases those
+/// slice-relative times from `content_start_sample` (see
+/// `TranscriptAssembler::map_segment_time`). With the default 0.25s slice
+/// padding every word in a padded slice lands ~0.25s late -- the same
+/// left-pad bias the `ScopedSlices` and `ConservativeSeq2SeqV1` policies
+/// already zero out. Whisper timestamps words only, never audio (unlike CTC
+/// / forced-alignment families, whose timestamps ride token times or a
+/// separate alignment pass and so are padding-invariant), and its decode is
+/// buffer-absolute, so zeroing the padding is both necessary and safe. Only
+/// ever narrows, so it composes with the invocation-span cap above.
+fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+        return;
+    }
+    if options.padding_seconds > 0.0 {
+        options.padding_seconds = 0.0;
+        provenance.push("core.native.longform.policy:whisper-xattn-dtw-no-padding".to_string());
     }
 }
 
@@ -7427,11 +7460,21 @@ mod tests {
         );
         assert_eq!(resolution.options.chunk_seconds, 30.0);
         assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        // Whisper's cross-attention-DTW word times are buffer-absolute while the
+        // assembler rebases from `content_start_sample`, so the padding rule
+        // (shared with `ScopedSlices` / `ConservativeSeq2SeqV1`) must zero it.
+        assert_eq!(resolution.options.padding_seconds, 0.0);
         assert!(
             resolution
                 .provenance
                 .iter()
                 .any(|entry| entry.contains("invocation-span-cap=30"))
+        );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
 
         let samples = vec![0.05_f32; 61 * 16_000];
@@ -7443,6 +7486,55 @@ mod tests {
                 .iter()
                 .all(|slice| slice.duration_samples() <= 30 * 16_000),
             "padding must shrink inside the semantic invocation cap"
+        );
+    }
+
+    /// The default (auto-triggered, no explicit `LongFormOptions`) longform
+    /// resolution for whisper must carry zero slice padding. The shared window
+    /// (`chunk_seconds`, `max_chunk_seconds`) is unchanged -- only the padding
+    /// the buffer-absolute cross-attention-DTW word times would be biased by is
+    /// dropped. Pinned separately from the explicit-`Fixed` case above (which is
+    /// requested with `padding_seconds: 0.25`) to prove the rule fires on the
+    /// default 0.25 path too, and that a `Default`-profile family it must NOT
+    /// touch (qwen) keeps its padding.
+    #[test]
+    fn whisper_auto_longform_resolves_with_zero_slice_padding() {
+        let defaults = crate::LongFormOptions::default();
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            45.0,
+            crate::WHISPER_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.padding_seconds, 0.0);
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
+        );
+        // Only padding moved; the generic longform window is preserved.
+        assert_eq!(
+            resolution.options.chunk_seconds,
+            defaults.chunk_seconds.min(30.0)
+        );
+        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+
+        let non_whisper = resolve_native_longform_policy_for_backend(
+            None,
+            45.0,
+            crate::QWEN3_ASR_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(
+            non_whisper.options.padding_seconds,
+            defaults.padding_seconds
+        );
+        assert!(
+            non_whisper
+                .provenance
+                .iter()
+                .all(|entry| !entry.contains("whisper-xattn-dtw-no-padding"))
         );
     }
 
