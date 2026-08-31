@@ -2520,6 +2520,21 @@ fn run_native_transcription_impl(
         } else {
             "identity"
         };
+        // The whole-file single-pass shortcut below is only sound when the one
+        // planned slice really *is* the whole recording (the identity
+        // `full_slice` case). A bounded-frontend family (whisper's fixed 30s
+        // window -> `invocation_span: Bounded`) cannot legally be handed more
+        // than its span, so when the Auto/VAD planner elides a silent head/tail
+        // and collapses the plan to a single slice that is a *proper subset* of
+        // the recording, that one slice window (bounded by the family's
+        // `max_chunk_seconds`) has to be decoded through the slice pipeline
+        // instead of the entire file. Decoding the whole file is what let a
+        // 30.27s clip (speech 0.44s..30.06s, elided head/tail, one ~30s slice)
+        // exceed whisper's session envelope.
+        let whole_file_single_slice = plan.slices.len() == 1
+            && !has_processed_audio
+            && plan.slices[0].start_sample == 0
+            && plan.slices[0].end_sample == plan.total_samples;
         if plan.slices.is_empty() {
             return Ok(NativeTranscriptionOutcome {
                 transcription: Transcription {
@@ -2553,7 +2568,7 @@ fn run_native_transcription_impl(
                 progress_segmenter: segmenter_kind,
             });
         }
-        if has_processed_audio || plan.slices.len() > 1 {
+        if has_processed_audio || !whole_file_single_slice {
             let mut assembler =
                 TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default());
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
