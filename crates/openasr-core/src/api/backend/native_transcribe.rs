@@ -3724,6 +3724,21 @@ fn apply_conservative_seq2seq_longform_safety_policy(
         return;
     }
     let mut changed = false;
+    // Every family in this profile decodes `<|notimestamps|>` and derives word
+    // times from its cross-attention DTW, which places frames relative to the
+    // buffer it is actually handed. A slice decode is fed the padded window
+    // `plan_audio.slice(start_sample..end_sample)`, but the longform assembler
+    // re-bases slice-relative times from `content_start_sample` -- so any
+    // non-zero slice padding biases every word in a padded slice by the
+    // left-pad width (measured +0.25s on every non-first 30s chunk, which
+    // cost long clips in-window coverage while the first, clamped-at-clip-start
+    // chunk stayed exact). Drop the padding the same way the `ScopedSlices`
+    // policy does, leaving each slice a clean content window.
+    if options.padding_seconds > 0.0 {
+        options.padding_seconds = 0.0;
+        changed = true;
+        provenance.push("core.native.longform.policy:conservative-seq2seq-no-padding".to_string());
+    }
     if options.chunk_seconds > CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS {
         options.chunk_seconds = CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS;
         changed = true;
