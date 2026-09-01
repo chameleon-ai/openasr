@@ -1612,7 +1612,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openasr-cli"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1639,24 +1639,28 @@ dependencies = [
 
 [[package]]
 name = "openasr-client"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "futures-util",
+ "libc",
  "openasr-core",
  "openasr-server",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "openasr-core"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "cc",
  "ed25519-dalek",
@@ -1682,13 +1686,14 @@ dependencies = [
  "toml",
  "ts-rs",
  "unicode-general-category",
+ "windows",
  "windows-sys 0.61.2",
  "zip",
 ]
 
 [[package]]
 name = "openasr-ffi"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "hound",
  "libc",
@@ -1702,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "openasr-server"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "axum",
@@ -1727,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "openasr-system-audio"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "libloading",
  "objc2",
@@ -1742,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "openasr-xtask"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "clap",

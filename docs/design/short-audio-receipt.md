@@ -15,7 +15,44 @@ capability and does **not** replace pack install sealing
 openasr.short-audio-receipt.v0
 ```
 
-## Field summary
+`openasr.short-audio-receipt.v0` remains the only top-level receipt schema. A
+receipt may carry an optional, versioned `evidence` object with schema
+`openasr.short-audio-receipt.evidence.v1`. Old v0 JSON remains readable, but a
+receipt without this object is explicitly not GPU token-correctness evidence.
+The extension is privacy-safe and bounded: provider, opaque stable device
+label, and placement are short labels; artifact bindings are labels, SHA-256
+hashes, and optional sizes. New writers never retain raw audio/model/output
+paths or `OPENASR_HOME`. Historical v0 documents containing a path remain
+readable, but those legacy values are not valid new qualification output.
+
+The evidence object has one disjoint `evidence_class`:
+
+| Class | Proves | Cannot prove |
+| --- | --- | --- |
+| `build_packaging` | Candidate binary/pack/fixture artifact identity and packaging result | Runtime placement or model token correctness |
+| `placement_resource` | Selected provider/device, resolved placement, and observed resource/compute result | Token or transcript correctness |
+| `token_transcript` | Family host-oracle parity for a declared output plan and fresh/reuse mode | Packaging completeness unless the artifact bindings are separately checked |
+
+`token_transcript` additionally requires `family`, `model_id`, `quant`, concrete
+runtime topology, provider/device/placement, capture and scheduler mode,
+`execution.mode` (`cold` or `reuse`), a resolved output plan, a typed family
+oracle/tie policy, SHA-256 token trace artifact, optional logits artifact, and
+bounded top-k/margin summaries. All evidence classes carry the strict
+`openasr.gpu-correctness-artifact.v1` contract, matrix digest, candidate release
+subject/core commit, binary/plugin/pack/fixture identity, and all three
+inventory/model/backend catalog digests. The validator hashes the supplied
+trace files; a digest written into JSON without matching content is rejected.
+
+## Correctness extension
+
+The release matrix projects every public family/provider lane from the
+architecture inventory, public model catalog, and staged backend catalog. Each
+cell requires separate build/packaging, placement/resource, and token/transcript
+receipts for both cold and same-process reuse where applicable. The matrix is a
+staging requirement document; it must not claim a result for a provider that has
+not produced a bound receipt. The finalizer fails closed on missing, stale,
+wrong-artifact, placement-only, CPU-only, or partial matrices.
+
 
 | Field | Required | Notes |
 | --- | --- | --- |
@@ -25,20 +62,20 @@ openasr.short-audio-receipt.v0
 | `pack.content_sha256` | yes | Lowercase hex sha256 of the exact pack bytes (no `sha256:` prefix). |
 | `pack.size_bytes` | yes | Pack byte length. |
 | `pack.quant` | yes | Quant id (for example `q4_k`). |
-| `audio.path_or_label` | yes | Path or stable label of the short clip. |
+| `audio.path_or_label` | yes | New writers emit `audio-sha256:<digest>` or another stable label, never a local path. Raw paths are legacy-read-only. |
 | `audio.sha256` | yes | Lowercase hex sha256 of the audio file bytes. |
 | `audio.duration_s` | no | Duration in seconds when known. |
 | `run.backend` | yes | `native` or `mock`. |
 | `run.device` | yes | Requested device label (`cpu`, `metal`, `cuda`, `auto`, ...). |
 | `run.os` | yes | `darwin`, `linux`, or `windows`. |
-| `run.command` | yes | Effective argv vector for the receipt command. |
-| `run.env_allowlist` | no | Small allowlisted env snapshot (`OPENASR_HOME`, ...). Never a full env dump. |
+| `run.command` | yes | Privacy-safe semantic argv projection. Ingress/output/model-pack paths are replaced by byte-bound or typed labels; it is not a shell replay script. |
+| `run.env_allowlist` | no | Small non-path allowlisted env snapshot. `OPENASR_HOME` is forbidden. Never a full env dump. |
 | `run.warmup` | yes | `cold` or `warm`. |
 | `run.cache_state` | yes | `empty` or `populated`. |
-| `metrics.rtf_samples` | no | Wall-clock RTF samples; may be empty. |
-| `metrics.rtf_median` | no | Median of `rtf_samples` when samples exist. |
-| `metrics.measurement_method` | no | v0 uses `wall_clock_process_elapsed`. |
-| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional quality/latency values; leave null/absent when not measured. |
+| `metrics.rtf_samples` | no | Finite, non-negative wall-clock RTF samples; may be empty. |
+| `metrics.rtf_median` | no | Finite, non-negative median of `rtf_samples` when present. |
+| `metrics.measurement_method` | conditional | Must be exactly `wall_clock_process_elapsed` whenever RTF samples exist; other methods are rejected on load rather than normalized. |
+| `metrics.wer_or_cer` / `metrics.ttft_s` | no | Optional finite, non-negative quality/latency values; leave null/absent when not measured. |
 | `metrics.peak_rss_before_model_bytes` / `metrics.peak_rss_bytes` | no | Process RSS high-water before model execution and after all runs. Their difference isolates model-created high-water from CLI/audio setup. |
 | `metrics.rss_before_model_bytes` / `metrics.rss_after_model_bytes` | no | Current process RSS immediately before the first model run and after the last run while runtime caches remain warm. |
 | `metrics.phys_footprint_before_model_bytes` / `metrics.phys_footprint_after_model_bytes` | no | Darwin current physical footprint at the same lifecycle boundaries; absent on unsupported platforms. |
@@ -48,8 +85,16 @@ openasr.short-audio-receipt.v0
 | `transcript.text_sha256` | yes | Lowercase hex sha256 of the UTF-8 transcript bytes. |
 | `placement` | yes | Legacy/requested placement label retained for v0 compatibility. It is not proof of where graph compute ran. |
 | `observed_placement` | no | Actual graph-node placement observed during compute: total/compute-node counts by backend, graph compute count, output bytes, and bounded fallback samples. Native Metal acceptance requires selected-device compute and rejects disallowed CPU/alternate-accelerator compute according to the execution placement. |
-| `scope` | yes | Default `short-audio-gate`. |
-| `notes` | no | Free-form annotations. |
+| `evidence` | no | Versioned, class-separated build/placement/token evidence nested in this same v0 receipt. Omission is never GPU token approval. This is not a third top-level JSON or policy channel. |
+| `execution` | no | Additive projection of the existing request/runtime receipts: request and candidate attempts, safe exact lanes/domains, live lease reconciliation, independent live/event completeness, four-phase timings, and typed terminal. No new journal/schema authority is created. |
+| `decode_diagnostics` | yes | Fail-closed projection of the runtime `GgmlDecodeOutputPlan` and reuse mode, including the unique `full_logits` fallback when compact selection is unproven. Dual-output agreement here is not compact-path authorization. |
+| `scope` | yes | Default `short-audio-gate`. Hardware runners may append exactly one `/<32-lower-hex nonce>` segment; absolute, UNC, drive and traversal paths are invalid. |
+| `notes` | no | Diagnostic-only annotations on unbound v0 receipts. Any receipt carrying formal `evidence.v1` must use an empty list; free-form text never enters release qualification evidence. |
+
+Every qualification-consumable object rejects unknown JSON fields. The flattened
+graph-lifecycle event union is checked against its exact per-event field shape
+before deserialization, so an unrecognized local path or policy field cannot be
+silently dropped and then republished as valid evidence.
 
 ## Emitter
 
@@ -69,6 +114,8 @@ Optional flags:
 - `--warmup-runs N` - untimed passes before sampling (marks warm/populated)
 - `--core-commit <40-hex>` - otherwise `OPENASR_BUILD_COMMIT` or `git rev-parse HEAD`
 - `--scope <label>` - default `short-audio-gate`
+- `--trace-out <path>` - native-only strict token/lifecycle diagnostic for one measured request, so it requires `--runs 1`. It is create-new (never replaces an existing path), rejects any final-path alias with `--out` including dangling symlink chains and symlinked parent directories, and fails closed if the trace directory metadata cannot be synced. Both targets pin canonical parent directories before trace publication, so later caller-path symlink swaps cannot redirect the receipt write. A trace artifact retained after that sync failure is not release-valid.
+- `--logits-out <path>` - requires `--trace-out` and writes the complete finite f32 selection row for every measured FullLogits step. Token and logits headers share a cryptographically random request `run_id`, process-random `process_nonce`, and OS `process_id`. Every row carries the runtime-minted graph/compute/output generation plus a bounded `output_index`/`output_count`; the gate verifies that the complete partition matches the actual native readback byte count. Model-family code cannot construct or deserialize this witness.
 - `--backend mock` - plumbing only; not a quality/perf claim
 
 The command is an **explicit tooling surface**. It does not change the default
@@ -78,16 +125,52 @@ The command is an **explicit tooling surface**. It does not change the default
 
 - Fail closed on schema mismatch, empty required strings, non-40-hex
   `core_commit`, or non-64-lowercase-hex digests.
+- Core structural loading remains legacy-compatible, but new construction,
+  `to_pretty_json`, and qualification validation enforce the privacy-safe
+  audio/command/environment/scope projection. Loading an old path-bearing v0
+  document never authorizes rewriting it as new evidence.
 - `transcript.text_sha256` must match `sha256(text UTF-8 bytes)`.
 - `rtf_median` may be absent when `rtf_samples` is empty; when present it must
   match the median of the samples.
 - Mock backend receipts may use an all-zero pack digest only as a plumbing
   placeholder; native receipts must bind real pack bytes.
-- `placement` alone is never accelerator proof. When a native accelerated run
-  executes a ggml graph, `observed_placement` is populated from runtime
-  telemetry and the emitter fails closed if the observed compute violates the
-  resolved FullDevice/Hybrid placement. Older v0 receipts remain readable
-  because this evidence field and all lifecycle memory fields are optional.
+- `evidence.schema` must equal `openasr.short-audio-receipt.evidence.v1`; its
+  class is one of `build_packaging`, `placement_resource`, or
+  `token_transcript`, and the strict artifact contract must be present.
+- `matrix_sha256`, candidate release subject/core commit, catalog digests,
+  binary/plugin/pack/fixture identities, topology, capture/scheduler mode, and
+  model/quant bindings must match the canonical staging matrix.
+- `token_transcript` evidence must carry a family oracle, resolved typed output
+  plan, cold/reuse mode, non-empty token trace artifact, and bounded logits/top-k/
+  margin summary. `placement_resource` requires observed placement. Classes are
+  never interchangeable. The generic bench command may emit strong runtime
+  diagnostics through `--trace-out`/`--logits-out`, but it deliberately leaves
+  `evidence` absent. Only the explicit real-family qualification producer may
+  bind those artifacts to a release subject and matrix as formal evidence.v1.
+- Cold and reuse traces for one exact family/model/quant/provider lane must have
+  different request `run_id` values and the same process-random nonce plus OS
+  process ID. A label supplied by the caller cannot establish same-process
+  execution. Process-local graph IDs are interpreted only after this pairing.
+- Each token/top-k/full-logits step uses the same readback-layer-minted output
+  witness. A scalar output has index 0/count 1. A batched output may reuse one
+  compute only through distinct runtime-minted row witnesses whose count and
+  vocab width exactly reconstruct the native readback byte size. Caller-supplied
+  row numbers, duplicate row witnesses, missing rows, cross-run splicing, or
+  non-contiguous step indexes fail closed.
+- When a native accelerated run executes a ggml graph, `observed_placement` is
+  populated from runtime telemetry and the emitter fails closed if observed
+  compute violates the resolved FullDevice/Hybrid placement. Older v0 receipts
+  remain readable because the evidence field is optional.
+- `execution.live_state_complete` and `execution.event_history_complete` are
+  independent. `event-capacity-exceeded` does not negate a `matched` live
+  owner/broker reconciliation, but it makes the receipt ineligible for every
+  evidence class that requires complete event history. A qualification gate
+  must call the strict qualification-eligibility validator and never
+  reinterpret dropped history as success.
+- The request attempt is distinct from the pause/cancel `transcription_id` and
+  candidate/cache attempt. Warmup and measured passes receive fresh request
+  attempts; they are not reused merely because the process or runtime cache is
+  warm.
 
 ## Relationship to pack preflight
 

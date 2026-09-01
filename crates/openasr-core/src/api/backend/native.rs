@@ -28,7 +28,6 @@ use crate::device::{
         ExecutionHardwareVendor, ExecutionProvider, enumerate_compute_devices_from_ggml,
     },
 };
-use crate::ggml_runtime::RequestBackendPreference;
 use crate::models::ggml_family_adapter::GgmlFamilyAdapterDescriptor;
 use crate::models::runtime_selection_metadata::selection_metadata_from_gguf;
 use crate::realtime::RealtimeBackendCapabilities;
@@ -58,7 +57,9 @@ pub use native_transcribe::{
     describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
     refine_existing_transcription_timeline,
 };
-pub use request_execution_context::RequestExecutionContext;
+pub use request_execution_context::{
+    RequestAttemptId, RequestAttemptIdError, RequestExecutionContext,
+};
 pub(crate) use request_execution_context::{UnstableDecodeTextObserver, WorkProgressObserver};
 pub use transcription_control::{
     GgmlAbortCallbackGuard, SliceBoundaryControl, TranscriptionControl,
@@ -574,8 +575,83 @@ struct NativeStreamingSessionCandidateFactory {
     >,
 }
 
+impl NativeStreamingSessionCandidateFactory {
+    fn resolved_runtime_and_lane(
+        &self,
+        candidate: &ExecutionCandidate,
+    ) -> Result<
+        (
+            crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+            crate::models::native_execution_services::ExecutionLaneKey,
+        ),
+        NativeAsrError,
+    > {
+        let resolved_runtime =
+            crate::models::device_greedy_token::resolved_runtime_for_family_candidate(
+                candidate,
+                self.auto_gpu_policy,
+                self.selected_family.adapter_id,
+                decode_logits_consumers_for_options(
+                    self.selected_family.adapter_id,
+                    &self.request_options,
+                ),
+            );
+        let execution_lane =
+            crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+                candidate,
+                resolved_runtime.backend(),
+            )
+            .map_err(|reason| NativeAsrError::SessionFailed {
+                message: reason.to_string(),
+            })?;
+        Ok((resolved_runtime, execution_lane))
+    }
+
+    fn record_resolved_execution_facts(
+        &self,
+        resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+        execution_lane: &crate::models::native_execution_services::ExecutionLaneKey,
+    ) -> Result<(), NativeAsrError> {
+        crate::models::request_execution_receipt::record_request_execution_facts(
+            crate::models::native_execution_services::current_execution_receipt_collector()
+                .as_ref(),
+            self.verified_pack.as_ref(),
+            &self.selected_family,
+            resolved_runtime,
+            execution_lane,
+        )
+        .map_err(|message| NativeAsrError::SessionFailed { message })
+    }
+}
+
 trait NativeStreamingSessionCandidateBuilder: Send + Sync {
     fn execution_services(&self) -> Arc<NativeExecutionServices>;
+
+    fn activation_reservation_context(&self) -> Option<crate::ActivationReservationContext> {
+        None
+    }
+
+    fn execution_receipt(&self) -> Option<crate::NativeExecutionReceiptCollector> {
+        None
+    }
+
+    fn record_execution_facts(
+        &self,
+        _candidate: &ExecutionCandidate,
+    ) -> Result<(), NativeAsrError> {
+        Ok(())
+    }
+
+    fn activation_pack(&self) -> Option<crate::models::pack_verifier::VerifiedPack> {
+        None
+    }
+
+    fn activation_quote_source(
+        &self,
+    ) -> Option<crate::models::native_execution_services::CandidateActivationQuoteSource> {
+        self.activation_pack()
+            .map(crate::models::native_execution_services::CandidateActivationQuoteSource::Pack)
+    }
 
     fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
         Ok(())
@@ -595,6 +671,23 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
         Arc::clone(&self.execution_services)
     }
 
+    fn activation_reservation_context(&self) -> Option<crate::ActivationReservationContext> {
+        self.session_context.activation_reservation_context()
+    }
+
+    fn execution_receipt(&self) -> Option<crate::NativeExecutionReceiptCollector> {
+        self.session_context.native_execution_receipt()
+    }
+
+    fn record_execution_facts(&self, candidate: &ExecutionCandidate) -> Result<(), NativeAsrError> {
+        let (resolved_runtime, execution_lane) = self.resolved_runtime_and_lane(candidate)?;
+        self.record_resolved_execution_facts(resolved_runtime, &execution_lane)
+    }
+
+    fn activation_pack(&self) -> Option<crate::models::pack_verifier::VerifiedPack> {
+        Some(self.verified_pack.as_ref().clone())
+    }
+
     fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
         if let Some(punctuator) = self.streaming_punctuator.as_ref() {
             punctuator.initialize().map_err(|error| {
@@ -611,12 +704,23 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
         Box<dyn NativeAsrSession>,
         NativeAsrError,
     > {
+        let _activation_reservation =
+            crate::models::native_execution_services::install_activation_reservation_context(
+                self.session_context.activation_reservation_context(),
+            );
+        let receipt = self.session_context.native_execution_receipt();
+        let _receipt_guard =
+            crate::models::native_execution_services::install_execution_receipt_collector(receipt);
+        let _activation_quote = self
+            .activation_quote_source()
+            .map(crate::models::native_execution_services::install_candidate_activation_quote);
         crate::models::native_execution_services::run_execution_candidate_attempt(
             self.execution_services.as_ref(),
             candidate,
             || {
-                let resolved_runtime =
-                    resolved_runtime_for_candidate(candidate, self.auto_gpu_policy);
+                let (resolved_runtime, execution_lane) =
+                    self.resolved_runtime_and_lane(candidate)?;
+                self.record_resolved_execution_facts(resolved_runtime, &execution_lane)?;
                 let planning_input = crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_streaming_session(
                     self.verified_pack.preflight(),
                     &self.request_options,
@@ -641,6 +745,7 @@ impl NativeStreamingSessionCandidateBuilder for NativeStreamingSessionCandidateF
                     configured_diarize: self.configured_diarize,
                     backend_preference: coarse_backend_preference_for_candidate(candidate),
                     resolved_runtime,
+                    execution_lane,
                     final_text_processor: self
                         .streaming_punctuator
                         .as_ref()
@@ -744,16 +849,46 @@ impl PolicyResolvedNativeStreamingSession {
         }
         let candidate = self.candidate().clone();
         let services = self.factory.execution_services();
+        let _activation_reservation =
+            crate::models::native_execution_services::install_activation_reservation_context(
+                self.factory.activation_reservation_context(),
+            );
+        let _receipt =
+            crate::models::native_execution_services::install_execution_receipt_collector(
+                self.factory.execution_receipt(),
+            );
+        let _activation_quote = self
+            .factory
+            .activation_quote_source()
+            .map(crate::models::native_execution_services::install_candidate_activation_quote);
+        let factory = Arc::clone(&self.factory);
         crate::models::native_execution_services::run_execution_candidate_attempt(
             services.as_ref(),
             &candidate,
             || {
+                factory.record_execution_facts(&candidate)?;
                 operation(
                     self.session
                         .as_deref_mut()
                         .expect("a non-terminal policy session owns an active candidate"),
                 )
             },
+        )
+    }
+
+    fn run_control_current<T>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn NativeAsrSession) -> T,
+    ) -> Option<T> {
+        let candidate = self.candidate().clone();
+        let services = self.factory.execution_services();
+        let session = self.session.as_deref_mut()?;
+        Some(
+            crate::models::native_execution_services::run_execution_candidate_control_scope(
+                services.as_ref(),
+                &candidate,
+                || operation(session),
+            ),
         )
     }
 
@@ -831,6 +966,14 @@ impl PolicyResolvedNativeStreamingSession {
         if self.auxiliary_ready {
             return Ok(());
         }
+        let _activation_reservation =
+            crate::models::native_execution_services::install_activation_reservation_context(
+                self.factory.activation_reservation_context(),
+            );
+        let _receipt =
+            crate::models::native_execution_services::install_execution_receipt_collector(
+                self.factory.execution_receipt(),
+            );
         self.factory.initialize_auxiliary_runtimes()?;
         self.auxiliary_ready = true;
         Ok(())
@@ -851,11 +994,7 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
 
     fn set_cancellation_token(&mut self, cancelled: Arc<AtomicBool>) {
         self.cancellation_token = Some(Arc::clone(&cancelled));
-        let attempt = self.run_current(|session| {
-            session.set_cancellation_token(cancelled);
-            Ok::<_, NativeAsrError>(())
-        });
-        let _ = self.finish_current_attempt("set-cancellation-token", attempt);
+        let _ = self.run_control_current(|session| session.set_cancellation_token(cancelled));
     }
 
     fn push_audio(
@@ -931,9 +1070,11 @@ impl NativeAsrSession for PolicyResolvedNativeStreamingSession {
     fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
         // Cancellation is cleanup, never an inference boundary. It must stay
         // allocation-free even when the session was canceled before warmup or
-        // the first audio frame.
-        let attempt = self.run_current(|session| session.cancel());
-        self.finish_current_attempt("cancel", attempt)
+        // the first audio frame. In particular it must not start a fresh
+        // candidate transaction and overwrite the last completed inference
+        // receipt with a cleanup-only row that has no live backend observation.
+        self.run_control_current(|session| session.cancel())
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 }
 
@@ -1294,17 +1435,19 @@ fn coarse_backend_preference_for_candidate(
     }
 }
 
-fn resolved_runtime_for_candidate(
-    candidate: &ExecutionCandidate,
-    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
-) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
-    let preference = match candidate.placement {
-        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
-        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
-            RequestBackendPreference::Exact(candidate.device.route.clone()),
-        ),
-    };
-    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(preference, auto_gpu_policy)
+fn decode_logits_consumers_for_options(
+    adapter_id: &str,
+    options: &crate::GgmlAsrExecutionOptions,
+) -> crate::ggml_runtime::GgmlDecodeLogitsConsumers {
+    crate::models::device_greedy_token::decode_logits_consumers_for_request(
+        adapter_id,
+        options
+            .phrase_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty()),
+        options.word_timestamps,
+        crate::adapter_pack::active_adapter_path(options.adapter_path.as_deref()).is_some(),
+    )
 }
 
 fn native_ggml_streaming_error_to_asr(
@@ -1673,7 +1816,7 @@ mod tests {
         env, fs,
         path::{Path, PathBuf},
         sync::Barrier,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[test]
@@ -3188,6 +3331,9 @@ mod tests {
     struct TestStreamingCandidateBuilder {
         services: Arc<NativeExecutionServices>,
         builds: Arc<Mutex<Vec<ExecutionProvider>>>,
+        receipt: Option<crate::NativeExecutionReceiptCollector>,
+        control_lanes:
+            Arc<Mutex<Vec<Option<crate::models::native_execution_services::ExecutionLaneKey>>>>,
         fail_build_on_accelerated: bool,
         fail_build_on_cpu_untyped: bool,
         fail_warmup_on_accelerated: bool,
@@ -3200,10 +3346,31 @@ mod tests {
             Arc::clone(&self.services)
         }
 
+        fn execution_receipt(&self) -> Option<crate::NativeExecutionReceiptCollector> {
+            self.receipt.clone()
+        }
+
         fn initialize_auxiliary_runtimes(&self) -> Result<(), NativeAsrError> {
             self.auxiliary_initializations
                 .fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn activation_quote_source(
+            &self,
+        ) -> Option<crate::models::native_execution_services::CandidateActivationQuoteSource>
+        {
+            let quote = crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+                "test-streaming-session-candidate",
+                1,
+                1,
+            )
+            .expect("test candidate quote");
+            Some(
+                crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                    quote,
+                ),
+            )
         }
 
         fn build(
@@ -3213,6 +3380,9 @@ mod tests {
             Box<dyn NativeAsrSession>,
             NativeAsrError,
         > {
+            let _quote = self
+                .activation_quote_source()
+                .map(crate::models::native_execution_services::install_candidate_activation_quote);
             crate::models::native_execution_services::run_execution_candidate_attempt(
                 self.services.as_ref(),
                 candidate,
@@ -3238,6 +3408,7 @@ mod tests {
                     }
                     Ok(Box::new(TestPolicyNativeSession {
                         provider,
+                        control_lanes: Arc::clone(&self.control_lanes),
                         fail_warmup_on_accelerated: self.fail_warmup_on_accelerated,
                         fail_push_on_accelerated: self.fail_push_on_accelerated,
                     }) as Box<dyn NativeAsrSession>)
@@ -3248,6 +3419,8 @@ mod tests {
 
     struct TestPolicyNativeSession {
         provider: ExecutionProvider,
+        control_lanes:
+            Arc<Mutex<Vec<Option<crate::models::native_execution_services::ExecutionLaneKey>>>>,
         fail_warmup_on_accelerated: bool,
         fail_push_on_accelerated: bool,
     }
@@ -3255,6 +3428,13 @@ mod tests {
     impl NativeAsrSession for TestPolicyNativeSession {
         fn session_id(&self) -> &str {
             "policy-streaming-test"
+        }
+
+        fn set_cancellation_token(&mut self, _cancelled: Arc<AtomicBool>) {
+            self.control_lanes
+                .lock()
+                .unwrap()
+                .push(crate::models::native_execution_services::current_execution_lane());
         }
 
         fn push_audio(
@@ -3299,6 +3479,10 @@ mod tests {
         }
 
         fn cancel(&mut self) -> Result<Vec<crate::RealtimeEventEnvelope>, NativeAsrError> {
+            self.control_lanes
+                .lock()
+                .unwrap()
+                .push(crate::models::native_execution_services::current_execution_lane());
             Ok(Vec::new())
         }
     }
@@ -3360,6 +3544,8 @@ mod tests {
             Arc::new(TestStreamingCandidateBuilder {
                 services: native_execution_services_for_test(),
                 builds: Arc::clone(&builds),
+                receipt: None,
+                control_lanes: Arc::new(Mutex::new(Vec::new())),
                 fail_build_on_accelerated: fail_build,
                 fail_build_on_cpu_untyped: false,
                 fail_warmup_on_accelerated: fail_warmup,
@@ -3402,6 +3588,49 @@ mod tests {
     }
 
     #[test]
+    fn streaming_control_cleanup_cannot_overwrite_completed_execution_receipt() {
+        let receipt = crate::NativeExecutionReceiptCollector::new();
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let control_lanes = Arc::new(Mutex::new(Vec::new()));
+        let builder: Arc<dyn NativeStreamingSessionCandidateBuilder> =
+            Arc::new(TestStreamingCandidateBuilder {
+                services: native_execution_services_for_test(),
+                builds,
+                receipt: Some(receipt.clone()),
+                control_lanes: Arc::clone(&control_lanes),
+                fail_build_on_accelerated: false,
+                fail_build_on_cpu_untyped: false,
+                fail_warmup_on_accelerated: false,
+                fail_push_on_accelerated: false,
+                auxiliary_initializations: Arc::new(AtomicUsize::new(0)),
+            });
+        let candidate =
+            streaming_policy_candidate(ExecutionProvider::Cpu, ExecutionPlacement::CpuOnly);
+        let expected_lane =
+            crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+                &candidate,
+                crate::ggml_runtime::GgmlCpuGraphBackend::Cpu,
+            )
+            .unwrap();
+        let plan = ExecutionPlan::for_test(ExecutionIntent::CpuOnly, vec![candidate]);
+        let mut session = PolicyResolvedNativeStreamingSession::start(builder, plan).unwrap();
+
+        // Stand in for the already-completed warmup attempt. Control setup and
+        // channel-close cancellation happen after that boundary and must be
+        // observationally invisible to its immutable receipt.
+        receipt.record_token(0, 7, false);
+        let completed = receipt.snapshot();
+        session.set_cancellation_token(Arc::new(AtomicBool::new(false)));
+        assert_eq!(receipt.snapshot(), completed);
+        session.cancel().unwrap();
+        assert_eq!(receipt.snapshot(), completed);
+        assert_eq!(
+            *control_lanes.lock().unwrap(),
+            vec![Some(expected_lane.clone()), Some(expected_lane)]
+        );
+    }
+
+    #[test]
     fn streaming_never_retries_after_first_audio_enters_session() {
         let (builder, builds, _) = streaming_test_builder(false, false, true);
         let mut session =
@@ -3435,6 +3664,8 @@ mod tests {
             Arc::new(TestStreamingCandidateBuilder {
                 services: native_execution_services_for_test(),
                 builds: Arc::clone(&builds),
+                receipt: None,
+                control_lanes: Arc::new(Mutex::new(Vec::new())),
                 fail_build_on_accelerated: false,
                 fail_build_on_cpu_untyped: true,
                 fail_warmup_on_accelerated: true,
@@ -3697,13 +3928,15 @@ mod tests {
             descriptor.model_family,
             runtime_path,
         );
+        let receipt = crate::NativeExecutionReceiptCollector::new();
 
         let mut session = adapter
             .start_streaming_session(
                 native_execution_services_for_test(),
                 &model_pack,
                 NativeAsrHardwareTarget::Cpu,
-                NativeAsrSessionContext::new("rt_native_adapter_ggml_streaming"),
+                NativeAsrSessionContext::new("rt_native_adapter_ggml_streaming")
+                    .with_native_execution_receipt(receipt.clone()),
                 NativeAsrRequestOptions::new()
                     .with_partial_results(true)
                     .with_word_timestamps(true),
@@ -3738,6 +3971,22 @@ mod tests {
                 .any(|event| event.event_type == "transcript.partial"),
             "the runtime-ready Cohere fixture must decode through the registered streaming executor"
         );
+        let snapshot = receipt.snapshot();
+        assert!(
+            snapshot.completed,
+            "streaming candidate receipt must commit"
+        );
+        let facts = snapshot
+            .facts
+            .expect("streaming candidate must record immutable lane facts");
+        assert_eq!(facts.selected_provider, crate::ExecutionProvider::Cpu);
+        assert_eq!(
+            facts.resolved_runtime.output_plan(),
+            crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits,
+            "word timestamps force complete logits on the same streaming planner seam"
+        );
+        assert_eq!(facts.resolved_runtime.evidence_revision(), 2);
+        assert_eq!(facts.topology.adapter_id, descriptor.adapter_id);
     }
 
     #[test]

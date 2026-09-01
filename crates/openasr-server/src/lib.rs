@@ -11,6 +11,7 @@ pub(crate) use routes::history::*;
 pub(crate) use routes::models_api::*;
 pub(crate) use routes::pairing::*;
 pub(crate) use routes::pull_jobs::*;
+pub(crate) use routes::runtime_receipts::*;
 pub(crate) use routes::transcription::*;
 pub(crate) use routes::voice_id::*;
 
@@ -137,13 +138,16 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
     distribution.log_restart_pending_pull_jobs();
     let auth = launch_options.auth.clone();
     let health_identity = ServerHealthIdentity::from_launch_options(launch_options);
+    let start_identity = ServerStartIdentity::new();
     Router::new()
         .route("/health", get(health))
+        .route("/v1/debug/runtime-receipts", get(runtime_receipts))
         .route("/v1/models", get(models))
         .route("/v1/catalog", get(catalog))
         .route("/v1/config", get(get_config).put(put_config))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/devices", get(devices))
+        .route("/v1/runtime/receipts", get(runtime_receipts))
         .route("/v1/history", get(history_list))
         .route("/v1/history/{id}", get(history_get).delete(history_delete))
         .route(
@@ -247,6 +251,7 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         ))
         .layer(Extension(auth))
         .layer(Extension(health_identity))
+        .layer(Extension(start_identity))
         .layer(Extension(distribution))
         .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES))
         .with_state(runtime)
@@ -303,6 +308,30 @@ pub async fn serve_with_launch_options(
         stage_started.elapsed(),
     );
     let stage_started = Instant::now();
+    let home = openasr_home()?;
+    let migration = openasr_core::default_selection::migrate_legacy_to_v2(&home)?;
+    let projection = openasr_core::default_selection::repair_compat_projection(&home)?;
+    if let openasr_core::default_selection::DefaultSelectionCommitOutcome::V2CommittedProjectionFailed {
+        reason,
+    } = &projection
+    {
+        eprintln!(
+            "openasr-server: default V2 is valid but compatibility projection repair is pending: {reason}"
+        );
+    }
+    openasr_core::stage_timing::log_event(
+        "server_boot",
+        format_args!(
+            "stage=default_selection_migration migrated={}",
+            migration.is_some()
+        ),
+    );
+    openasr_core::stage_timing::log_stage(
+        "server_boot",
+        "default_selection_migration",
+        stage_started.elapsed(),
+    );
+    let stage_started = Instant::now();
     let listener = TcpListener::bind(addr).await?;
     // Shadow the requested `addr` (which may be an OS-assigned wildcard like
     // `:0`) with the listener's actual bound address so everything below --
@@ -320,7 +349,10 @@ pub async fn serve_with_launch_options(
     // anything below that could block, so it never gates bind/serve/health.
     // See `spawn_boot_native_warmup`'s doc comment for the dedup story with a
     // concurrent real WS attach.
-    realtime::spawn_boot_native_warmup(runtime.clone());
+    drop(realtime::spawn_boot_native_warmup(
+        runtime.clone(),
+        home.clone(),
+    ));
     // idle_unload: only spawn the reaper when the resolved policy is not
     // `never` (`idle_unload_after` is `None` for `never` and for every
     // existing caller/test that does not set it, so this is a no-op there).
@@ -775,15 +807,29 @@ fn validate_listen_security(
     addr: SocketAddr,
     launch_options: &ServerLaunchOptions,
 ) -> anyhow::Result<()> {
+    validate_listen_security_with_escape(addr, launch_options, insecure_non_loopback_bind_allowed())
+}
+
+fn validate_listen_security_with_escape(
+    addr: SocketAddr,
+    launch_options: &ServerLaunchOptions,
+    allow_insecure_non_loopback: bool,
+) -> anyhow::Result<()> {
     if addr.ip().is_loopback() {
         return Ok(());
+    }
+    if !launch_options.auth.is_enabled() {
+        anyhow::bail!(
+            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
+        );
     }
     if !launch_options.tls.is_enabled() {
         // Opt-in escape hatch for container / trusted-network deployments where an
         // OUTER boundary controls exposure (a Docker port-publish, a reverse proxy
         // terminating TLS, etc.). The default stays fail-closed; the desktop
-        // pairing flow never sets this and always serves TLS.
-        if insecure_non_loopback_bind_allowed() {
+        // pairing flow never sets this and always serves TLS. This escape hatch
+        // only waives TLS; device authentication remains mandatory above.
+        if allow_insecure_non_loopback {
             eprintln!(
                 "openasr-server: WARNING — binding non-loopback {addr} WITHOUT TLS because OPENASR_ALLOW_INSECURE_NON_LOOPBACK is set. Traffic is UNENCRYPTED; only do this behind a trusted boundary (container / reverse proxy)."
             );
@@ -791,11 +837,6 @@ fn validate_listen_security(
         }
         anyhow::bail!(
             "OpenASR HTTP serve is local-only until TLS/WSS remote serving is enabled; bind a loopback address such as 127.0.0.1 instead of {addr} (or, only for a trusted/container deployment, set OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1)"
-        );
-    }
-    if !launch_options.auth.is_enabled() {
-        anyhow::bail!(
-            "OpenASR remote serve requires device authentication before binding a non-loopback address such as {addr}"
         );
     }
     Ok(())
@@ -1222,6 +1263,29 @@ impl ServerHealthIdentity {
     }
 }
 
+/// Non-secret identity for one router/daemon start. This is intentionally
+/// separate from the legacy supervised-daemon instance token: the token is a
+/// readiness-control secret and must never be copied into diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerStartIdentity {
+    pub(crate) pid: u32,
+    pub(crate) nonce: Option<String>,
+    pub(crate) started_at_unix_secs: Option<u64>,
+}
+
+impl ServerStartIdentity {
+    fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            nonce: random_hex(16).ok(),
+            started_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs()),
+        }
+    }
+}
+
 fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
     env::var(SERVER_INSTANCE_TOKEN_ENV)
         .ok()
@@ -1229,73 +1293,343 @@ fn resolve_instance_token(launch_option: Option<String>) -> Option<String> {
         .or_else(|| launch_option.filter(|value| !value.is_empty()))
 }
 
-/// Process-wide bound native pack path shared by every `ServerRuntime` clone.
+/// Process-wide active-runtime publication slot shared by every
+/// [`ServerRuntime`] clone.
 ///
-/// Model bind is in-process state, independent of optional GPU plugin load
-/// (CUDA/HIP/Vulkan via `active.json`). `POST /v1/models/default` rebinds this
-/// without restarting the process. One bound pack at a time.
+/// The requested path and the active binding are deliberately distinct. A
+/// fresh process may discover a durable V2 request, but it is not active until
+/// startup re-verifies and re-attests it. Set-default publishes an attested
+/// identity with one non-fallible pointer exchange only after V2 commits.
 #[derive(Clone)]
-pub struct BoundModelPackPath {
-    inner: Arc<RwLock<Option<PathBuf>>>,
+pub struct ActiveRuntimeSlot {
+    inner: Arc<RwLock<ActiveRuntimeSlotState>>,
+    /// Serializes activation against new session admission. Existing sessions
+    /// are checked after acquiring this gate; new sessions take the same gate
+    /// briefly while obtaining their model permit, closing the durable-commit
+    /// versus live-publication race.
+    activation_barrier: Arc<Mutex<()>>,
+    /// Test-only failpoint honored inside the shipped
+    /// [`crate::realtime::probe_native_activation`]. Production leaves this
+    /// unset so live warmup runs.
+    activation_probe_failpoint: Arc<RwLock<Option<Result<(), String>>>>,
+    activation_failpoint: Arc<RwLock<Option<ModelActivationFailpoint>>>,
 }
 
-impl std::fmt::Debug for BoundModelPackPath {
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelActivationFailpoint {
+    PackVerification,
+    CandidateResolution,
+    QuoteObservation,
+    BrokerReservation,
+    NativeMaterialization,
+    FirstComputeAttestation,
+    Reconciliation,
+    V2StagingWrite,
+    V2StagingSync,
+    AtomicBeforeReplace,
+    AtomicAfterReplace,
+    DurableCommitBeforeLivePublish,
+}
+
+impl ModelActivationFailpoint {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PackVerification => "pack-verification",
+            Self::CandidateResolution => "candidate-resolution",
+            Self::QuoteObservation => "quote-observation",
+            Self::BrokerReservation => "broker-reservation",
+            Self::NativeMaterialization => "native-materialization",
+            Self::FirstComputeAttestation => "first-compute-attestation",
+            Self::Reconciliation => "reconciliation",
+            Self::V2StagingWrite => "v2-staging-write",
+            Self::V2StagingSync => "v2-staging-sync",
+            Self::AtomicBeforeReplace => "atomic-before-replace",
+            Self::AtomicAfterReplace => "atomic-after-replace",
+            Self::DurableCommitBeforeLivePublish => "durable-commit-before-live-publish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeBinding {
+    path: PathBuf,
+    attested_identity: Option<openasr_core::DefaultModelActivationIdentity>,
+}
+
+impl ActiveRuntimeBinding {
+    fn residency_key(&self) -> idle_activity::NativeRuntimeResidencyKey {
+        self.attested_identity.as_ref().map_or_else(
+            || idle_activity::NativeRuntimeResidencyKey::legacy_path(&self.path),
+            |identity| {
+                idle_activity::NativeRuntimeResidencyKey::attested(identity.pack_content_id())
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeSlotState {
+    requested_path: Option<PathBuf>,
+    active: Option<ActiveRuntimeBinding>,
+    /// Monotonic process-local publication generation. A request may inspect
+    /// an active path before doing expensive audio/model preparation, but it
+    /// may only acquire a native session permit if this generation is still
+    /// current while holding `activation_barrier`. This closes the otherwise
+    /// possible stale-path admission race across a model activation.
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRuntimeSnapshot {
+    generation: u64,
+    path: PathBuf,
+    residency_key: idle_activity::NativeRuntimeResidencyKey,
+}
+
+pub(crate) struct AdmittedNativeExecution {
+    permit: ModelSessionPermit,
+    activity: NativeActivityGuard,
+}
+
+impl AdmittedNativeExecution {
+    pub(crate) fn into_parts(self) -> (ModelSessionPermit, NativeActivityGuard) {
+        (self.permit, self.activity)
+    }
+}
+
+impl ActiveRuntimeSnapshot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn residency_key(&self) -> &idle_activity::NativeRuntimeResidencyKey {
+        &self.residency_key
+    }
+}
+
+/// Compatibility name retained for embedders while the implementation is an
+/// active-runtime slot rather than a path authority.
+pub type BoundModelPackPath = ActiveRuntimeSlot;
+
+impl std::fmt::Debug for ActiveRuntimeSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BoundModelPackPath")
-            .field(&self.current())
+        f.debug_struct("ActiveRuntimeSlot")
+            .field("requested", &self.requested_path())
+            .field("active", &self.current())
             .finish()
     }
 }
 
-impl PartialEq for BoundModelPackPath {
+impl PartialEq for ActiveRuntimeSlot {
     fn eq(&self, other: &Self) -> bool {
-        self.current() == other.current()
+        *self.lock_read() == *other.lock_read()
     }
 }
 
-impl Eq for BoundModelPackPath {}
+impl Eq for ActiveRuntimeSlot {}
 
-impl Default for BoundModelPackPath {
+impl Default for ActiveRuntimeSlot {
     fn default() -> Self {
         Self::from(None)
     }
 }
 
-impl From<Option<PathBuf>> for BoundModelPackPath {
+impl From<Option<PathBuf>> for ActiveRuntimeSlot {
     fn from(path: Option<PathBuf>) -> Self {
+        // Existing embedded callers pass an already-bound path. Daemon startup
+        // uses `requested` below so durable intent is never mistaken for live
+        // process memory.
+        let active = path.clone().map(|path| ActiveRuntimeBinding {
+            path,
+            attested_identity: None,
+        });
         Self {
-            inner: Arc::new(RwLock::new(path)),
+            inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
+                requested_path: path,
+                active,
+                generation: 0,
+            })),
+            activation_barrier: Arc::new(Mutex::new(())),
+            activation_probe_failpoint: Arc::new(RwLock::new(None)),
+            activation_failpoint: Arc::new(RwLock::new(None)),
         }
     }
 }
 
-impl BoundModelPackPath {
-    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, Option<PathBuf>> {
+impl ActiveRuntimeSlot {
+    /// Constructs the daemon's startup state from durable requested intent.
+    /// The path is not returned by [`Self::current`] until reactivation passes.
+    pub fn requested(path: Option<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
+                requested_path: path,
+                active: None,
+                generation: 0,
+            })),
+            activation_barrier: Arc::new(Mutex::new(())),
+            activation_probe_failpoint: Arc::new(RwLock::new(None)),
+            activation_failpoint: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveRuntimeSlotState> {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, Option<PathBuf>> {
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, ActiveRuntimeSlotState> {
         self.inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn current(&self) -> Option<PathBuf> {
-        self.lock_read().clone()
+        self.current_snapshot().map(|snapshot| snapshot.path)
+    }
+
+    pub(crate) fn current_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
+        let state = self.lock_read();
+        state.active.as_ref().map(|binding| ActiveRuntimeSnapshot {
+            generation: state.generation,
+            path: binding.path.clone(),
+            residency_key: binding.residency_key(),
+        })
+    }
+
+    fn snapshot_is_current(&self, snapshot: &ActiveRuntimeSnapshot) -> bool {
+        let state = self.lock_read();
+        state.generation == snapshot.generation
+            && state
+                .active
+                .as_ref()
+                .is_some_and(|binding| binding.path == snapshot.path)
+    }
+
+    pub fn requested_path(&self) -> Option<PathBuf> {
+        self.lock_read().requested_path.clone()
     }
 
     pub fn is_some(&self) -> bool {
-        self.lock_read().is_some()
+        self.lock_read().active.is_some()
     }
 
     pub fn is_none(&self) -> bool {
-        self.lock_read().is_none()
+        self.lock_read().active.is_none()
     }
 
-    fn set(&self, path: Option<PathBuf>) {
-        *self.lock_write() = path;
+    #[cfg(test)]
+    fn set_legacy_binding(&self, path: Option<PathBuf>) {
+        let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
+        state.requested_path = path.clone();
+        state.active = path.map(|path| ActiveRuntimeBinding {
+            path,
+            attested_identity: None,
+        });
+    }
+
+    fn publish_attested(&self, identity: openasr_core::DefaultModelActivationIdentity) {
+        let path = identity.path().to_path_buf();
+        let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
+        state.requested_path = Some(path.clone());
+        state.active = Some(ActiveRuntimeBinding {
+            path,
+            attested_identity: Some(identity),
+        });
+    }
+
+    fn clear_active(&self) {
+        let mut state = self.lock_write();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("active runtime generation exhausted");
+        state.requested_path = None;
+        state.active = None;
+    }
+
+    fn active_identity(&self) -> Option<openasr_core::DefaultModelActivationIdentity> {
+        self.lock_read()
+            .active
+            .as_ref()
+            .and_then(|binding| binding.attested_identity.clone())
+    }
+
+    /// Inject a result into the shipped activation probe. Production leaves
+    /// this unset. Tests use it so set-default still enters
+    /// `probe_native_activation` instead of short-circuiting in the caller.
+    pub fn set_activation_probe_failpoint(&self, result: Option<Result<(), String>>) {
+        *self
+            .activation_probe_failpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = result;
+    }
+
+    pub(crate) fn activation_probe_failpoint(&self) -> Option<Result<(), String>> {
+        self.activation_probe_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    #[doc(hidden)]
+    pub fn set_activation_failpoint_for_test(&self, failpoint: Option<ModelActivationFailpoint>) {
+        *self
+            .activation_failpoint
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = failpoint;
+    }
+
+    pub(crate) fn inject_activation_failure(
+        &self,
+        stage: ModelActivationFailpoint,
+    ) -> Result<(), ApiError> {
+        let configured = *self
+            .activation_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if configured == Some(stage) {
+            Err(ApiError::BadRequest(format!(
+                "injected default model activation failure at {}",
+                stage.label()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn selection_write_fault(
+        &self,
+    ) -> Option<openasr_core::default_selection::DefaultSelectionWriteFault> {
+        use openasr_core::default_selection::DefaultSelectionWriteFault;
+        match *self
+            .activation_failpoint
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            Some(ModelActivationFailpoint::V2StagingWrite) => {
+                Some(DefaultSelectionWriteFault::BeforeStagingWrite)
+            }
+            Some(ModelActivationFailpoint::V2StagingSync) => {
+                Some(DefaultSelectionWriteFault::BeforeStagingSync)
+            }
+            Some(ModelActivationFailpoint::AtomicBeforeReplace) => {
+                Some(DefaultSelectionWriteFault::BeforeAtomicReplace)
+            }
+            Some(ModelActivationFailpoint::AtomicAfterReplace) => {
+                Some(DefaultSelectionWriteFault::AfterAtomicReplace)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1335,7 +1669,59 @@ impl ServerRuntime {
     /// does not split the slot: CPU and accelerated/Exact requests for the same
     /// model share one capacity unit. Route identity isolates streaming workers
     /// and thread-local ggml backend handles instead.
+    #[cfg(test)]
     pub(crate) fn acquire_native_execution(
+        &self,
+        verified_model_identity: &str,
+        route: Option<&openasr_core::ResolvedExecutionRoute>,
+    ) -> Result<ModelSessionPermit, ApiError> {
+        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ApiError::Conflict(
+                    "Cannot start a native session while the active model is changing.".to_string(),
+                ));
+            }
+        };
+        self.try_acquire_native_execution(verified_model_identity, route)
+    }
+
+    /// Admits a request only if the active model inspected before preparation
+    /// is still the same publication. Reading `current()` and later acquiring
+    /// a generic permit is insufficient: an activation can commit between the
+    /// two operations and an old adapter would then start after the cutover.
+    pub(crate) fn acquire_native_execution_for_snapshot(
+        &self,
+        snapshot: &ActiveRuntimeSnapshot,
+        verified_model_identity: &str,
+        route: Option<&openasr_core::ResolvedExecutionRoute>,
+    ) -> Result<AdmittedNativeExecution, ApiError> {
+        let _activation_gate = match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ApiError::Conflict(
+                    "Cannot start a native session while the active model is changing.".to_string(),
+                ));
+            }
+        };
+        if !self.model_pack_path.snapshot_is_current(snapshot) {
+            return Err(ApiError::Conflict(
+                "The active model changed while the native session was being prepared; retry the request."
+                    .to_string(),
+            ));
+        }
+        // Enter activity while still holding the activation barrier. The idle
+        // reaper's exclusive unload claim and this enter are serialized, so
+        // runtime/session construction cannot begin in the gap after the
+        // reaper observed zero activity but before it tears owners down.
+        let activity = NativeActivityGuard::enter();
+        let permit = self.try_acquire_native_execution(verified_model_identity, route)?;
+        Ok(AdmittedNativeExecution { permit, activity })
+    }
+
+    fn try_acquire_native_execution(
         &self,
         verified_model_identity: &str,
         route: Option<&openasr_core::ResolvedExecutionRoute>,
@@ -1344,6 +1730,18 @@ impl ServerRuntime {
         self.native_execution
             .try_acquire(identity)
             .map_err(ApiError::ModelSessionCapacity)
+    }
+
+    pub(crate) fn begin_native_activation(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ApiError> {
+        match self.model_pack_path.activation_barrier.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(ApiError::Conflict(
+                "Another native model activation is already running.".to_string(),
+            )),
+        }
     }
 
     /// Validates the runtime is *safe to serve with*, not that a model is
@@ -1389,6 +1787,7 @@ impl ServerRuntime {
     /// in-flight work is not torn down. Unloads idle runtime caches so a
     /// same-id reinstall (path unchanged, file replaced) cannot keep serving
     /// the previous bytes. Mock backends never call this.
+    #[cfg(test)]
     pub(crate) fn rebind_native_model_pack(
         &self,
         new_path: Option<PathBuf>,
@@ -1396,6 +1795,7 @@ impl ServerRuntime {
         if self.backend != BackendKind::Native {
             return Ok(());
         }
+        let _activation_gate = self.begin_native_activation()?;
         if self.native_rebind_blocked() {
             return Err(ApiError::Conflict(
                 "Cannot change the default model while a native transcription or realtime session is running."
@@ -1405,7 +1805,7 @@ impl ServerRuntime {
         if let Some(path) = new_path.as_deref() {
             let _ = validate_native_runtime_pack(path).map_err(ApiError::Backend)?;
         }
-        self.model_pack_path.set(new_path);
+        self.model_pack_path.set_legacy_binding(new_path);
         if !self.native_rebind_blocked() {
             self.native_execution
                 .execution_services()
@@ -1414,6 +1814,49 @@ impl ServerRuntime {
             invalidate_cached_native_realtime_capabilities();
         }
         Ok(())
+    }
+
+    /// Non-fallible live clear after the authoritative V2 `Unset` record has
+    /// committed. The caller holds the activation barrier and completed every
+    /// fallible busy/durable check before entering this pointer exchange.
+    pub(crate) fn clear_active_native_model(&self) {
+        let previous = self.model_pack_path.active_identity();
+        self.model_pack_path.clear_active();
+        if self.backend == BackendKind::Native
+            && let Some(previous) = previous
+        {
+            self.native_execution
+                .execution_services()
+                .evict_prepared_runtime_content_id(previous.pack_content_id());
+        }
+        idle_activity::bump_native_unload_generation();
+        invalidate_cached_native_realtime_capabilities();
+    }
+
+    /// Publishes one already-attested identity after durable V2 commit. All
+    /// fallible checks happen before this call while the activation barrier is
+    /// held, so the live pointer exchange itself cannot return an error.
+    pub(crate) fn publish_attested_native_model(
+        &self,
+        identity: openasr_core::DefaultModelActivationIdentity,
+    ) {
+        let previous = self.model_pack_path.active_identity();
+        self.model_pack_path.publish_attested(identity.clone());
+        if self.backend == BackendKind::Native
+            && let Some(previous) = previous
+            && previous.pack_content_id() != identity.pack_content_id()
+        {
+            self.native_execution
+                .execution_services()
+                .evict_prepared_runtime_content_id(previous.pack_content_id());
+        }
+        // Attestation warmed this identity after advancing the runtime
+        // generation. Do not advance again here: that would invalidate the
+        // candidate worker's TLS and exact resident marker immediately after
+        // the transaction proved them. Old content was evicted explicitly
+        // above, and new-session admission remains behind the activation
+        // barrier until this non-fallible publication returns.
+        invalidate_cached_native_realtime_capabilities();
     }
 
     /// Whether the bound model's runtime is resident right now (surfaced by
@@ -1426,10 +1869,34 @@ impl ServerRuntime {
     /// only after a successful load/decode, and flips back to `false` the
     /// moment the `idle_unload` reaper evicts the cached runtime, without
     /// this method reaching into any per-thread cache itself.
+    pub(crate) fn runtime_receipt_snapshot(
+        &self,
+    ) -> openasr_core::runtime_receipts::RuntimeReceiptSnapshot {
+        self.native_execution
+            .execution_services()
+            .runtime_receipts()
+            .snapshot()
+    }
+
+    pub(crate) fn runtime_receipt_reconciliation(
+        &self,
+    ) -> openasr_core::runtime_receipts::LeaseReceiptShadow {
+        let services = self.native_execution.execution_services();
+        services
+            .runtime_receipts()
+            .reconcile_live_leases(services.memory_broker())
+    }
+
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => idle_activity::native_model_is_resident(),
+            BackendKind::Native => {
+                self.model_pack_path
+                    .current_snapshot()
+                    .is_some_and(|snapshot| {
+                        idle_activity::native_model_is_resident(snapshot.residency_key())
+                    })
+            }
         }
     }
 }
@@ -2296,6 +2763,18 @@ fn invalidate_cached_native_realtime_capabilities() {
 // openasr-core capability leaf types are legitimately re-exported here,
 // alongside their already-committed copy under
 // `crates/openasr-core/generated/realtime-wire/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+#[allow(dead_code)] // rolled-back/fallback are transaction outcomes, not steady-state GET values
+pub(crate) enum DefaultModelActivationState {
+    Committed,
+    RolledBack,
+    Unavailable,
+    Fallback,
+}
+
 #[derive(Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
@@ -2558,7 +3037,9 @@ impl SetDefaultRequest {
 }
 
 #[derive(Serialize)]
-struct DefaultModelResponse {
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export_to = "generated/http-wire/"))]
+pub(crate) struct DefaultModelResponse {
     object: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
@@ -2574,6 +3055,10 @@ struct DefaultModelResponse {
     default_pull: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pack: Option<InstalledPack>,
+    /// Live activation projection. `committed` is returned only when the V2
+    /// durable selection resolves to the same pack currently bound by the
+    /// daemon; every other state is fail-closed as `unavailable`.
+    activation: DefaultModelActivationState,
 }
 
 #[derive(Debug)]
@@ -2587,6 +3072,7 @@ pub(crate) enum ApiError {
     Home(OpenAsrHomeError),
     History(DaemonHistoryStoreError),
     JobStore(String),
+    RequestAttemptIdentity(String),
     MultipartRejection(MultipartRejection),
     Multipart(axum::extract::multipart::MultipartError),
     AudioPreparation(AudioPreparationError),
@@ -2624,6 +3110,15 @@ impl From<openasr_core::default_selection::DefaultSelectionError> for ApiError {
             openasr_core::default_selection::DefaultSelectionError::Catalog(error) => {
                 Self::Catalog(error)
             }
+            openasr_core::default_selection::DefaultSelectionError::NotCommitted { reason } => {
+                Self::BadRequest(format!("default selection was not committed: {reason}"))
+            }
+            openasr_core::default_selection::DefaultSelectionError::Corrupt { path, reason } => {
+                Self::BadRequest(format!(
+                    "active default selection is corrupt at {}: {reason}",
+                    path.display()
+                ))
+            }
         }
     }
 }
@@ -2638,7 +3133,7 @@ impl std::fmt::Display for ApiError {
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
             Self::History(error) => write!(f, "Could not update transcription history: {error}"),
-            Self::JobStore(message) => f.write_str(message),
+            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => f.write_str(message),
             Self::MultipartRejection(error) => write!(f, "Could not read multipart form: {error}"),
             Self::Multipart(error) => write!(f, "{}", multipart_error_message(error)),
             Self::AudioPreparation(error) => {
@@ -2717,7 +3212,9 @@ impl IntoResponse for ApiError {
                     format!("Could not update transcription history: {error}"),
                 )
             }
-            Self::JobStore(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
             Self::MultipartRejection(error) => (
                 StatusCode::BAD_REQUEST,
                 format!("Could not read multipart form: {error}"),

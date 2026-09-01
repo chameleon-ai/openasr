@@ -303,6 +303,7 @@ fn run_dispatch_once_with_progress(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -327,6 +328,7 @@ fn run_dispatch_once_with_progress(
         execution_services,
         verified_pack,
         selected_family,
+        candidate,
         chunk,
         request_options,
         backend_preference,
@@ -342,6 +344,27 @@ fn run_dispatch_once_with_progress(
 struct SliceExecutionFallback {
     failures: Vec<(ExecutionCandidate, ExecutionCandidateFailure)>,
     selected: ExecutionCandidate,
+}
+
+fn candidate_execution_lane(
+    candidate: &ExecutionCandidate,
+) -> Option<crate::models::native_execution_services::ExecutionLaneKey> {
+    let backend = match candidate.device.route.provider {
+        crate::device::execution_route::ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_route::ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        crate::device::execution_route::ExecutionProvider::Cuda
+        | crate::device::execution_route::ExecutionProvider::Hip
+        | crate::device::execution_route::ExecutionProvider::Vulkan => GgmlCpuGraphBackend::Gpu,
+        crate::device::execution_route::ExecutionProvider::Accelerator
+        | crate::device::execution_route::ExecutionProvider::Unknown => return None,
+    };
+    crate::models::native_execution_services::ExecutionLaneKey::from_candidate(candidate, backend)
+        .ok()
+}
+
+fn log_candidate_failure_context(error: &BackendError, candidate: &ExecutionCandidate) {
+    let lane = candidate_execution_lane(candidate);
+    log_failure_context(classify_backend_error_for_failure_log(error), lane.as_ref());
 }
 
 /// Runs one slice through the immutable execution plan. Every attempt covers
@@ -367,6 +390,10 @@ fn run_dispatch_once_with_progress_and_policy(
 ) -> Result<(GgmlAsrExecutionResult, Option<SliceExecutionFallback>), BackendError> {
     let mut failures = Vec::new();
     let candidates = execution_plan.candidates();
+    let _receipt_guard =
+        crate::models::native_execution_services::install_execution_receipt_collector(
+            execution_context.native_execution_receipt(),
+        );
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         let backend_preference = match candidate.placement {
             ExecutionPlacement::CpuOnly => GgmlAsrBackendPreference::CpuOnly,
@@ -374,6 +401,10 @@ fn run_dispatch_once_with_progress_and_policy(
                 GgmlAsrBackendPreference::Accelerated
             }
         };
+        let _activation_pack =
+            crate::models::native_execution_services::install_candidate_activation_pack(
+                verified_pack.clone(),
+            );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services.as_ref(),
             candidate,
@@ -383,10 +414,13 @@ fn run_dispatch_once_with_progress_and_policy(
                     execution_services,
                     verified_pack,
                     selected_family,
+                    candidate,
                     chunk.clone(),
                     request_options.clone(),
                     backend_preference,
-                    request_backend_preference_for_candidate(candidate),
+                    crate::models::device_greedy_token::request_backend_preference_for_candidate(
+                        candidate,
+                    ),
                     auto_gpu_policy,
                     execution_context,
                     decode_progress,
@@ -402,16 +436,20 @@ fn run_dispatch_once_with_progress_and_policy(
                 });
                 return Ok((result, fallback));
             }
-            (Err(error), None) => return Err(error),
+            (Err(error), None) => {
+                log_candidate_failure_context(&error, candidate);
+                return Err(error);
+            }
             (result, Some(failure)) => {
                 let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
                     .unwrap_or_else(|| BackendError::NativeFailClosed {
                         reason: format!(
-                            "execution candidate reported {:?} during '{}' despite returning success",
-                            failure.kind, failure.operation
+                            "execution candidate reported {:?} during '{}' despite returning success: {}",
+                            failure.kind, failure.operation, failure.detail
                         ),
                     });
                 if candidate_index + 1 == candidates.len() {
+                    log_candidate_failure_context(&error, candidate);
                     return Err(error);
                 }
                 crate::stage_timing::log_detail_event(
@@ -433,12 +471,12 @@ fn run_dispatch_once_with_progress_and_policy(
     })
 }
 
-/// Upper bound on concurrent long-audio slice workers. Kept small: the win is
-/// filling encode/decode GPU bubbles (2-4 in-flight slices saturate a single
-/// GPU's execution pipeline, the same admission-concurrency effect the server
-/// path already relies on), not unbounded fan-out, and every extra worker costs
-/// another resident decoder runtime + KV cache.
-const SLICE_PIPELINE_MAX_WIDTH: usize = 4;
+/// Upper bound on concurrent long-audio slice workers. Kept at 2: that still
+/// fills encode/decode GPU bubbles on a single discrete GPU without keeping
+/// four resident decoder runtimes + KV caches, which is what pushed HIP
+/// longform peak RSS above the v0.1.36 packaged host. Extra width remains
+/// available via `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to this max).
+const SLICE_PIPELINE_MAX_WIDTH: usize = 2;
 
 /// Memory head-room the concurrent slice pipeline always leaves free when
 /// deciding how many workers fit, so it never claims the last of available
@@ -477,8 +515,9 @@ fn slice_pipeline_explicit_width() -> Option<usize> {
 /// - Carry `Disabled`: the serial loop threads no cross-slice prompt anyway,
 ///   so the carry-light concurrent path is transcript-equivalent (proven
 ///   byte-identical by `concurrent_slice_pipeline_equivalence`). Default to
-///   [`SLICE_PIPELINE_MAX_WIDTH`] and let the capacity and slice-count gates
-///   in [`effective_slice_pipeline_width`] pick what actually fits.
+///   one worker so peak RSS stays at a single decoder+KV; extra width is
+///   opt-in through `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to
+///   [`SLICE_PIPELINE_MAX_WIDTH`]).
 /// - Carry active (`Text` / `TokenHistory`): the concurrent path would drop
 ///   the carry and change the transcript (the short-audio audit measured
 ///   whole-clause deletions), so the default stays 1 -- the byte-identical
@@ -490,8 +529,9 @@ fn slice_pipeline_requested_width(carry_prompt_mode: LongformPromptCarryMode) ->
         return explicit;
     }
     match carry_prompt_mode {
-        LongformPromptCarryMode::Disabled => SLICE_PIPELINE_MAX_WIDTH,
-        LongformPromptCarryMode::Text | LongformPromptCarryMode::TokenHistory => 1,
+        LongformPromptCarryMode::Disabled
+        | LongformPromptCarryMode::Text
+        | LongformPromptCarryMode::TokenHistory => 1,
     }
 }
 
@@ -746,6 +786,17 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         let decode_positions_ref = &decode_positions;
         let cursor_ref = &cursor;
         let stop_ref = &stop;
+        // Concurrent slices are one request, not independent candidates.
+        // Each worker still opens its own attempt journal, so without a
+        // parent activation cohort they mint distinct exclusive gates and
+        // fail closed with DeviceDomainBusy while a sibling's pack import
+        // or runner-context is still pending. Install the request cohort
+        // before capturing TLS so workers inherit it.
+        let request_activation_cohort = crate::ActivationReservationContext::mint();
+        let _request_activation_cohort =
+            crate::models::native_execution_services::install_activation_reservation_context(Some(
+                request_activation_cohort,
+            ));
         // `thread::scope` does not inherit TLS. Capture the complete request
         // execution context once so every slice worker keeps the same broker,
         // Exact route namespace, telemetry, and transactional observation
@@ -767,6 +818,9 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                 let native_execution_context = native_execution_context.clone();
                 let execution_observation_sink = execution_observation_sink.clone();
                 scope.spawn(move || {
+                    let _request_activation_cohort = crate::models::native_execution_services::install_activation_reservation_context(
+                        Some(request_activation_cohort),
+                    );
                     let _native_execution_context = native_execution_context.map(
                         crate::models::native_execution_services::install_native_execution_context,
                     );
@@ -1016,7 +1070,7 @@ pub(super) fn run_native_transcription_with_intent(
 ) -> Result<Transcription, BackendError> {
     run_native_transcription_fallible(request, &execution_services, execution_intent).inspect_err(
         |error| {
-            log_failure_context(classify_backend_error_for_failure_log(error));
+            log_failure_context(classify_backend_error_for_failure_log(error), None);
         },
     )
 }
@@ -1034,7 +1088,7 @@ pub(super) fn run_native_transcription_with_verified_pack(
         NativeRuntimePackInput::Verified(verified_pack),
     )
     .inspect_err(|error| {
-        log_failure_context(classify_backend_error_for_failure_log(error));
+        log_failure_context(classify_backend_error_for_failure_log(error), None);
     })
 }
 
@@ -1387,6 +1441,9 @@ fn apply_punctuation_stage_with_policy(
         execution_services,
         &execution_plan,
         "firered-punctuation",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_pack.clone(),
+        ),
         |candidate| {
             // Punctuation is an optional accuracy stage: malformed/missing
             // runtime errors keep the ASR output unchanged. Candidate-local
@@ -1715,11 +1772,15 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         execution_services,
         &execution_plan,
         "qwen3-forced-aligner",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_forced_aligner.clone(),
+        ),
         |candidate| {
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
             }
-            let backend = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate).backend();
+            let resolved_runtime = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate);
+            let backend = resolved_runtime.backend();
             let session_load_started = Instant::now();
             let session_plan =
                 forced_aligner_session_plan(candidate.placement, candidate.device.route.provider)
@@ -1732,11 +1793,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let session = match session_plan {
                 ForcedAlignerSessionPlan::Uniform => Qwen3ForcedAlignerSession::load_verified(
                     verified_forced_aligner.clone(),
-                    backend,
+                    resolved_runtime,
                 ),
                 ForcedAlignerSessionPlan::GpuAudioHybrid => {
                     Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(
                         verified_forced_aligner.clone(),
+                        resolved_runtime,
                     )
                 }
             }
@@ -2160,16 +2222,23 @@ fn run_native_transcription_impl(
     progress.report_fraction(1.0);
     progress.complete_stage();
     progress.enter_stage_indeterminate(TranscriptionStage::Prepare);
-    let audio_prep_started = Instant::now();
+    let prepared_sample_attach_started = Instant::now();
     let prepared_audio = resolve_prepared_audio_samples(&request.input_path, prepared_samples)
         .map_err(|error| BackendError::NativeUnsupportedInputFormat {
             reason: error.to_string(),
         })?;
+    let prepared_sample_attach_duration = prepared_sample_attach_started.elapsed();
     crate::stage_timing::log_stage(
         "native_transcribe",
-        "audio_prep",
-        audio_prep_started.elapsed(),
+        "prepared_sample_attach",
+        prepared_sample_attach_duration,
     );
+    if let Some(receipt) = execution_context.native_execution_receipt() {
+        receipt.record_phase_duration(
+            crate::RequestExecutionPhase::PreparedSampleAttach,
+            prepared_sample_attach_duration,
+        );
+    }
     progress.report_fraction(1.0);
     progress.complete_stage();
     // Empty-but-valid PCM must reach the ASR family's established empty-input
@@ -2250,6 +2319,15 @@ fn run_native_transcription_impl(
     }
 
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    // Stream-VAD, ReDimNet, and the segmenter admit through SystemMemoryOwner,
+    // which requires the process-wide broker. Install NES before materialize,
+    // not only around compute_speaker_attribution: 0.1.37 --diarize failed
+    // closed with VadUnavailable because admission ran with no broker.
+    let _voice_id_memory_context = (speaker_plan != SpeakerPlan::Off).then(|| {
+        crate::models::native_execution_services::install_native_execution_services(
+            execution_services.as_ref(),
+        )
+    });
     let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
         None
     } else {
@@ -2292,15 +2370,6 @@ fn run_native_transcription_impl(
     // be attributed onto whichever transcription path runs below.
     let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
     let speaker_turns = if let Some(diarizer) = external_diarizer.as_ref() {
-        // External diarization runs outside the ASR candidate attempt, but its
-        // invocation-local scratch still belongs to this process-wide broker.
-        // Install only the service context for this phase: the scratch owner
-        // below creates and drops its own reservation, while persistent
-        // segmenter/embedder owners keep their independent candidate leases.
-        let _memory_context =
-            crate::models::native_execution_services::install_native_execution_services(
-                execution_services.as_ref(),
-            );
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
@@ -2396,7 +2465,12 @@ fn run_native_transcription_impl(
         .first()
         .expect("execution policy plans are non-empty");
     let resolved_runtime_for_request =
-        resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
+        crate::models::device_greedy_token::resolved_runtime_for_family_candidate(
+            primary_candidate,
+            auto_gpu_policy,
+            selected_family.adapter_id,
+            decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
+        );
     // Actual device class after candidate selection: Auto may land on Metal/GPU
     // even though the intent-only provisional plan used AutoOrCpu weights.
     let resolved_backend_class =
@@ -2442,10 +2516,19 @@ fn run_native_transcription_impl(
             execution_services.as_ref(),
             &request_execution_intent,
         )?;
+        let vad_activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                crate::diarize::vad::FireRedStreamVadModel::system_memory_quote().map_err(
+                    |reason| BackendError::NativeFailClosed {
+                        reason: format!("longform Stream-VAD resident quote failed: {reason}"),
+                    },
+                )?,
+            );
         let (mut plan, vad_engine_label) = run_auxiliary_stage_with_policy(
             execution_services.as_ref(),
             &vad_execution_plan,
             "longform-vad",
+            vad_activation_quote,
             |candidate| {
                 let (vad_provider, vad_engine_label) =
                     resolve_longform_vad_provider(
@@ -4139,6 +4222,24 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
         || reason.contains("aborted by cancel request")
 }
 
+fn capture_request_execution_facts(
+    verified_pack: &VerifiedPack,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    execution_lane: crate::models::native_execution_services::ExecutionLaneKey,
+) -> Result<crate::models::native_execution_services::ExecutionLaneKey, BackendError> {
+    let receipt = crate::models::native_execution_services::current_execution_receipt_collector();
+    crate::models::request_execution_receipt::record_request_execution_facts(
+        receipt.as_ref(),
+        verified_pack,
+        selected_family,
+        resolved_runtime,
+        &execution_lane,
+    )
+    .map_err(|reason| BackendError::NativeFailClosed { reason })?;
+    Ok(execution_lane)
+}
+
 /// Builds the request's resolved runtime from the exact candidate route passed
 /// by the policy loop. Recomputing it per attempt is required because a retry
 /// can change both provider and placement.
@@ -4147,6 +4248,7 @@ fn run_dispatch_once(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -4155,9 +4257,30 @@ fn run_dispatch_once(
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let runtime_preflight = verified_pack.preflight();
-    let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+    let resolved_runtime = resolved_runtime_for_family_preference(
         resolved_preference,
         auto_gpu_policy,
+        selected_family,
+        decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
+    );
+    let execution_lane =
+        crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+            candidate,
+            resolved_runtime.backend(),
+        )
+        .map_err(|reason| BackendError::NativeFailClosed {
+            reason: reason.to_string(),
+        })?;
+    let execution_lane = capture_request_execution_facts(
+        verified_pack,
+        selected_family,
+        resolved_runtime,
+        execution_lane,
+    )?;
+    let request_execution_context = Arc::new(
+        (**execution_context)
+            .clone()
+            .with_native_execution_lane(execution_lane),
     );
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
@@ -4168,7 +4291,7 @@ fn run_dispatch_once(
         request_options,
         backend_preference,
         resolved_runtime,
-        execution_context: Arc::clone(execution_context),
+        execution_context: Arc::clone(&request_execution_context),
     };
     let planning_input =
         crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_view_request(
@@ -4253,10 +4376,14 @@ fn run_auxiliary_stage_with_policy<T>(
     execution_services: &NativeExecutionServices,
     execution_plan: &ExecutionPlan,
     stage: &'static str,
+    activation_quote: crate::models::native_execution_services::CandidateActivationQuoteSource,
     mut operation: impl FnMut(&ExecutionCandidate) -> Result<T, BackendError>,
 ) -> Result<T, PolicyResolvedAuxRuntimeError<BackendError>> {
     let candidates = execution_plan.candidates();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let _quote = crate::models::native_execution_services::install_candidate_activation_quote(
+            activation_quote.clone(),
+        );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services,
             candidate,
@@ -4315,25 +4442,45 @@ fn execution_policy_error_to_backend(error: ExecutionPolicyError) -> BackendErro
     }
 }
 
+fn decode_logits_consumers_for_options(
+    adapter_id: &str,
+    options: &GgmlAsrExecutionOptions,
+) -> crate::ggml_runtime::GgmlDecodeLogitsConsumers {
+    crate::models::device_greedy_token::decode_logits_consumers_for_request(
+        adapter_id,
+        options
+            .phrase_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty()),
+        options.word_timestamps,
+        crate::adapter_pack::active_adapter_path(options.adapter_path.as_deref()).is_some(),
+    )
+}
+
+fn resolved_runtime_for_family_preference(
+    preference: Option<RequestBackendPreference>,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    logits_consumers: crate::ggml_runtime::GgmlDecodeLogitsConsumers,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+        preference,
+        auto_gpu_policy,
+        crate::models::device_greedy_token::decode_output_contract_for_adapter(
+            selected_family.adapter_id,
+        ),
+        logits_consumers,
+    )
+}
+
 fn resolved_runtime_for_candidate(
     candidate: &ExecutionCandidate,
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        request_backend_preference_for_candidate(candidate),
+        crate::models::device_greedy_token::request_backend_preference_for_candidate(candidate),
         auto_gpu_policy,
     )
-}
-
-fn request_backend_preference_for_candidate(
-    candidate: &ExecutionCandidate,
-) -> Option<RequestBackendPreference> {
-    match candidate.placement {
-        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
-        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
-            RequestBackendPreference::Exact(candidate.device.route.clone()),
-        ),
-    }
 }
 
 /// Whole-slice RMS against an absolute dBFS line. The one caller is the
@@ -4958,15 +5105,71 @@ mod tests {
         let services = native_execution_services_for_test();
         let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
             .expect("Auto VAD plan");
-        let error =
-            run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
-                Err::<(), BackendError>(BackendError::TranscriptionCanceled)
-            })
-            .expect_err("canceled long-form VAD must fail the auxiliary stage");
+        let error = run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| Err::<(), BackendError>(BackendError::TranscriptionCanceled),
+        )
+        .expect_err("canceled long-form VAD must fail the auxiliary stage");
         assert!(matches!(
             required_auxiliary_stage_error(error),
             BackendError::TranscriptionCanceled
         ));
+    }
+
+    #[test]
+    fn run_auxiliary_stage_with_policy_installs_quote_and_does_not_capacity_exhaust() {
+        let services = native_execution_services_for_test();
+        let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
+            .expect("Auto VAD plan");
+        let installed = std::sync::atomic::AtomicBool::new(false);
+        run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| {
+                installed.store(
+                    crate::models::native_execution_services::current_candidate_activation_quote()
+                        .is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Ok::<_, BackendError>(())
+            },
+        )
+        .expect("shipped auxiliary stage must install its quote source");
+        assert!(
+            installed.load(std::sync::atomic::Ordering::SeqCst),
+            "run_auxiliary_stage_with_policy must install CandidateActivationQuoteSource before the attempt"
+        );
+    }
+
+    #[test]
+    fn voice_id_installs_nes_before_vad_materialize() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/api/backend/native_transcribe.rs"),
+        )
+        .expect("read native_transcribe.rs");
+        let impl_body = source
+            .split("fn run_native_transcription_impl(")
+            .nth(1)
+            .expect("run_native_transcription_impl")
+            .split("\nfn ")
+            .next()
+            .expect("impl body");
+        let install = impl_body
+            .find("install_native_execution_services")
+            .expect("Voice ID must install NES");
+        let materialize = impl_body
+            .find(".materialize(")
+            .expect("external diarizer materialize");
+        assert!(
+            install < materialize,
+            "Stream-VAD admission requires NES before ExternalDiarizer::materialize, got install@{install} materialize@{materialize}"
+        );
     }
 
     #[test]
@@ -5039,6 +5242,30 @@ mod tests {
 
     fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
         crate::models::native_execution_services::test_native_execution_services()
+    }
+
+    fn longform_vad_activation_quote_for_test()
+    -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::diarize::vad::FireRedStreamVadModel::system_memory_quote()
+                .expect("Stream-VAD declared resident quote"),
+        )
+    }
+
+    fn auxiliary_stage_activation_quote_for_test(
+        stage: &str,
+    ) -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        if stage == "longform-vad" {
+            return longform_vad_activation_quote_for_test();
+        }
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+                format!("aux.{stage}.test.declared-resident"),
+                128 * 1024,
+                96 * 1024,
+            )
+            .expect("test auxiliary declared resident"),
+        )
     }
 
     const ASR_EXACT_SMOKE_PACK_ENV: &str = "OPENASR_ASR_SMOKE_PACK";
@@ -8951,6 +9178,7 @@ mod tests {
                 native_execution_services_for_test().as_ref(),
                 &typed_fallback_test_plan(),
                 stage,
+                auxiliary_stage_activation_quote_for_test(stage),
                 |_| {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     crate::models::native_execution_services::record_current_execution_candidate_failure(
@@ -9106,15 +9334,13 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
         }
-        // Carry disabled: concurrent is transcript-equivalent, so the default
-        // requests the maximum and lets the capacity gate pick K.
+        // Default is serial so longform peak RSS stays at one decoder+KV.
+        // Concurrent width is opt-in via OPENASR_SLICE_PIPELINE_WIDTH.
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
-            "carry-disabled run defaults to the concurrent pipeline"
+            1,
+            "carry-disabled run defaults to serial"
         );
-        // ... which still flows through the capacity gate: plenty of memory
-        // admits the full width, tight memory caps it back to serial.
         assert_eq!(
             slice_pipeline_capped_width(
                 slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
@@ -9123,7 +9349,7 @@ mod tests {
                 1 << 20,
                 0,
             ),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_capped_width(
@@ -9154,7 +9380,7 @@ mod tests {
         // Explicit widths override the carry-gated default in both directions:
         // ">=2" forces the carry-light concurrent path onto a carry-active
         // run, and "0"/"1" pin a carry-disabled run to serial.
-        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 4), ("9", 4)] {
+        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 2), ("9", 2)] {
             // SAFETY: nextest runs each test in its own process, so mutating
             // this process-global env var cannot race another test.
             unsafe {
@@ -9179,7 +9405,7 @@ mod tests {
         }
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::TokenHistory),

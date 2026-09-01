@@ -17,6 +17,27 @@ pub(crate) struct RuntimePathOverrides {
     pub(crate) ffmpeg_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct QualifyFamilyDecodeArgs {
+    #[arg(long, short = 'm')]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub audio: PathBuf,
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
+    #[arg(long)]
+    pub model_pack: Option<PathBuf>,
+    /// JSON `RealFamilyEvidenceBinding` with matrix/catalog/artifact identity.
+    #[arg(long)]
+    pub binding: PathBuf,
+    #[arg(long)]
+    pub out_dir: PathBuf,
+    #[arg(long)]
+    pub core_commit: Option<String>,
+    #[arg(long)]
+    pub ffmpeg_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TranscribeCommandOptions<'a> {
     pub(crate) inputs: &'a [PathBuf],
@@ -243,6 +264,38 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: BackendPluginCommand,
     },
+    /// Qualification-only Windows helper that safely creates real host-memory
+    /// pressure for the ownership/activation evidence harness.
+    #[command(name = "__openasr-memory-pressure-helper", hide = true)]
+    MemoryPressureHelper {
+        /// PID of the qualification parent. The helper exits if it dies.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Exact candidate request whose native observation must cross from
+        /// admissible to rejected. This is not an arbitrary allocation size.
+        #[arg(long)]
+        candidate_required_bytes: u64,
+        /// Absolute available-memory floor. Values below 2 GiB are rejected.
+        #[arg(long, default_value_t = 2 * 1024_u64 * 1024 * 1024)]
+        absolute_floor_bytes: u64,
+        /// Proportional available-memory floor in basis points of physical RAM.
+        #[arg(long, default_value_t = 2_000)]
+        proportional_floor_basis_points: u16,
+        /// Hard lifetime limit. The helper never accepts more than 120 seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
+    /// Validate a complete artifact-bound ownership evidence bundle without
+    /// consulting runtime policy or network state.
+    #[command(name = "__openasr-validate-ownership-evidence", hide = true)]
+    ValidateOwnershipEvidence {
+        /// Directory containing the immutable release evidence artifacts.
+        #[arg(long)]
+        artifact_dir: PathBuf,
+        /// Ownership envelope. Repeat exactly once per required scenario.
+        #[arg(long = "envelope", required = true)]
+        envelopes: Vec<PathBuf>,
+    },
     /// Internal helper for sandboxed GGUF C parser probes.
     #[command(name = "__openasr-gguf-c-parser-probe", hide = true)]
     GgufCParserProbe {
@@ -284,54 +337,68 @@ pub(crate) enum Command {
     /// embedded catalog matches a copied catalog resource.
     #[command(name = "catalog-fingerprint", hide = true)]
     CatalogFingerprint,
-    /// Internal helper: sign a release `backends-manifest.json` (the
-    /// per-release index of downloadable Windows GPU-kernel sidecars) with
-    /// the SAME production signing key and trust root as the model catalog.
-    /// Signing stays local -- run this with
-    /// `OPENASR_CATALOG_SIGNING_KEY_SEED_HEX` set to the real production
-    /// seed, never in CI. See
-    /// `tooling/release-manifest/backends_manifest.py` for generating the
-    /// unsigned manifest this command signs.
-    #[command(name = "__openasr-sign-backends-manifest", hide = true)]
-    SignBackendsManifest {
-        /// backends-manifest.json file to sign.
+    /// Internal helper: sign an inert exact-cell qualification manifest with
+    /// the production catalog key under the qualification-specific signature
+    /// domain. This command never signs a capability or activation policy.
+    #[command(name = "__openasr-sign-qualification-manifest", hide = true)]
+    SignQualificationManifest {
+        /// Exact-cell qualification manifest file to sign.
         manifest: PathBuf,
-        /// Output backends-manifest.signature.json path.
+        /// Output qualification-manifest.signature.json path.
         #[arg(long)]
         out: PathBuf,
-        /// The canonical URL this manifest will be served from, e.g.
-        /// `https://dl.openasr.org/core/v0.1.10/backends-manifest.json`.
+        /// Canonical immutable release URL bound into the signature.
         #[arg(long)]
         manifest_url: String,
-        /// Signature key id. Defaults to the production catalog key id
-        /// (`openasr-catalog-v1`) -- this manifest has no local-dev key.
+        /// Production catalog key id. Qualification has no local-dev key.
         #[arg(long, default_value = "openasr-catalog-v1")]
         key_id: String,
         /// Print the derived public key for the env signing seed and exit.
         #[arg(long)]
         print_public_key: bool,
     },
-    /// Internal helper: read-only verification of an already-signed
-    /// `backends-manifest.json` + `backends-manifest.signature.json` pair
-    /// against the production trust root. Does not sign anything and needs no
-    /// signing seed -- safe to run in CI. Exits non-zero (with a typed error
-    /// message) if the signature file is missing, malformed, bound to a
-    /// different `--manifest-url`, or fails Ed25519 verification. Used as a
-    /// post-release CI probe to catch the LOCAL-only signing step being
-    /// forgotten (see `tooling/release-manifest/README.md`'s "Signing"
-    /// section).
-    #[command(name = "__openasr-verify-backends-manifest", hide = true)]
-    VerifyBackendsManifest {
-        /// backends-manifest.json file to verify.
+    /// Internal read-only verifier for a signed qualification manifest. It
+    /// validates the signature and the inert schema but does not download or
+    /// load any artifact.
+    #[command(name = "__openasr-verify-qualification-manifest", hide = true)]
+    VerifyQualificationManifest {
+        /// Exact-cell qualification manifest file to verify.
         manifest: PathBuf,
-        /// backends-manifest.signature.json sidecar to verify.
+        /// qualification-manifest.signature.json sidecar.
         #[arg(long)]
         signature: PathBuf,
-        /// The canonical URL the signature must be bound to, e.g.
-        /// `https://dl.openasr.org/core/v0.1.20/backends-manifest.json`
-        /// (`openasr_core::backend_manifest::canonical_manifest_url`).
+        /// Canonical immutable release URL the signature must bind.
         #[arg(long)]
         manifest_url: String,
+    },
+    /// Explicit parent runner for inert, signed backend qualification assets.
+    /// It has no plugin-path or activation-mode argument and spawns a fresh
+    /// child using this exact executable.
+    #[command(name = "__openasr-qualify-backend", hide = true)]
+    QualifyBackend {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+    },
+    /// Fresh-process half of `__openasr-qualify-backend`. The expected
+    /// manifest digest binds the child to the bytes the parent prepared.
+    #[command(name = "__openasr-qualification-child", hide = true)]
+    QualificationChild {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        manifest_url: String,
+        #[arg(long)]
+        qualification_home: PathBuf,
+        #[arg(long)]
+        expected_manifest_sha256: String,
     },
     /// Transcribe one or more audio files (or directories of audio).
     #[command(visible_alias = "t")]
@@ -636,13 +703,13 @@ pub(crate) enum BackendPluginCommand {
     Status,
     /// Report conservative download sizes for all target packs of a provider.
     DescribeProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
     /// Discover the live GPU target and install only its signed pack without
     /// changing the activation selector.
     PrepareProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
     /// Download and fully verify a signed-catalog pack without activating it.
@@ -654,22 +721,57 @@ pub(crate) enum BackendPluginCommand {
     /// Discover the current GPU target, install its signed pack, and activate
     /// it after live target proof.
     InstallActivateProvider {
-        #[arg(value_parser = ["cuda", "hip"])]
+        #[arg(value_parser = ["cuda", "hip", "vulkan"])]
         provider: String,
     },
-    /// Remove the optional backend selector; bundled CPU/Vulkan remain.
+    /// Install and live-probe one exact inert candidate for an isolated,
+    /// non-product qualification scope. Never writes `active.json`.
+    #[command(name = "prepare-qualification", hide = true)]
+    PrepareQualification {
+        backend_id: String,
+        /// Exact live capability target. Required for generic Vulkan artifacts;
+        /// CUDA/HIP infer it from their one-target catalog entry.
+        #[arg(long)]
+        device_target: Option<String>,
+        #[arg(long)]
+        scope: String,
+    },
+    /// Delete the selector for one completed qualification scope.
+    #[command(name = "clear-qualification", hide = true)]
+    ClearQualification {
+        #[arg(long)]
+        scope: String,
+    },
+    /// Remove the optional GPU selector; bundled CPU remains.
     Deactivate,
-    /// Reclaim unselected backend-pack generations and shared vendor objects.
-    /// Active and explicitly retained backend ids are never removed.
+    /// Reclaim replaced backend-pack generations and unreferenced vendor objects.
+    /// Installed library packs stay until explicitly uninstalled.
     Gc {
         #[arg(long = "keep-backend-id")]
         keep_backend_ids: Vec<String>,
         #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
         min_age_seconds: u64,
     },
+    /// List installed optional GPU packs (library membership, not the active kernel).
+    List,
+    /// Delete one vendor's installed library pack. Refuses if that pack is in use.
+    Uninstall {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+    },
+    /// Import an official CUDA/HIP pack from a local file or folder. Does not activate.
+    Import {
+        #[arg(value_parser = ["cuda", "hip"])]
+        provider: String,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
+// Clap owns this short-lived parse tree exactly once per process. Boxing an
+// individual option solely to shrink the enum would complicate every command
+// pattern without reducing resident runtime state.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum BenchReceiptCommand {
     /// Run one short-audio transcription and write `openasr.short-audio-receipt.v0` JSON.
     #[command(name = "short-audio")]
@@ -708,6 +810,31 @@ pub(crate) enum BenchReceiptCommand {
         /// Optional ffmpeg binary for non-WAV preparation.
         #[arg(long)]
         ffmpeg_bin: Option<PathBuf>,
+        /// Write the request-scoped native token trace. This strict output is
+        /// unavailable to mock runs and is produced only after a complete
+        /// native candidate records execution facts.
+        #[arg(long)]
+        trace_out: Option<PathBuf>,
+        /// Write the complete per-step f32 logits artifact. Requires
+        /// `--trace-out` and a native FullLogits execution plan.
+        #[arg(long, requires = "trace_out")]
+        logits_out: Option<PathBuf>,
+    },
+    /// Validate one or more receipts with the core-owned release qualification
+    /// predicate. This command does not approve a matrix cell; it only proves
+    /// that the receipt is eligible to be consumed by the existing gate.
+    #[command(name = "validate-qualification", hide = true)]
+    ValidateQualification {
+        /// Receipt JSON to validate. Repeat for every candidate receipt.
+        #[arg(long, required = true)]
+        receipt: Vec<PathBuf>,
+    },
+    /// Bind a native short-audio cold+reuse pair to formal evidence.v1.
+    /// Generic `short-audio` remains evidence-free.
+    #[command(name = "qualify-family", hide = true)]
+    QualifyFamily {
+        #[command(flatten)]
+        args: Box<QualifyFamilyDecodeArgs>,
     },
 }
 
@@ -741,6 +868,9 @@ pub(crate) enum ConfigCommand {
     Set { key: String, value: String },
     /// Remove one saved config value.
     Unset { key: String },
+    /// Preserve a corrupt V2 default record and reset it to a checksummed Unset.
+    #[command(name = "recover-default")]
+    RecoverDefault,
 }
 
 #[derive(Debug, Subcommand)]

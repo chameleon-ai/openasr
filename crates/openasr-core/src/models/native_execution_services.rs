@@ -9,7 +9,11 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
+    ffi::{CStr, c_char, c_void},
     fmt,
+    hash::{Hash, Hasher},
+    rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -19,30 +23,58 @@ use std::{
 use thiserror::Error;
 
 use crate::device::{
-    execution_memory::{DeviceMemoryBrokerSet, DeviceMemoryPolicy, MemoryReservationCohortId},
+    execution_memory::{
+        AllocationLifetime, DeviceMemoryBrokerSet, DeviceMemoryPolicy,
+        DeviceMemoryReservationBatch, DeviceMemorySnapshot, MappingEnvelopeHandle, MemoryDomainKey,
+        MemoryReservationCohortId, PhaseSet, PhysicalDeviceKey, QuoteConfidence,
+    },
     execution_policy::{
         DefaultExecutionPolicyResolver, ExecutionCandidate, ExecutionCandidateFailure,
-        ExecutionPlacement, ExecutionPolicyResolver,
+        ExecutionIntent, ExecutionPlacement, ExecutionPolicyResolver,
     },
-    execution_route::{ExecutionProvider, ExecutionRouteCacheKey, ResolvedExecutionRoute},
+    execution_route::{
+        ExecutionProvider, ExecutionRouteCacheKey, ResolvedExecutionRoute,
+        enumerate_compute_devices_from_ggml,
+    },
 };
+use crate::ggml_runtime::backend_memory::BackendMemoryAbi;
+use crate::ggml_runtime::backend_memory_admission::{
+    NativeMemoryAdmissionPlan, NativeMemoryClaimSemantics, NativeQuotedBackendGroup,
+};
+use crate::ggml_runtime::ffi;
 use crate::ggml_runtime::{
     BackendMemoryBytes, BackendMemoryLifecyclePoint, BackendMemoryStatsSnapshot,
     BackendMemoryUnknownReason, SafeBackendMemoryReceipt,
 };
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector,
-    GgmlExecutionTelemetryGuard, RequestBackendOverrideGuard, RequestBackendPreference,
-    current_execution_telemetry_collector, install_execution_telemetry_collector,
+    GgmlBackend, GgmlBackendKind, GgmlCpuGraphBackend, GgmlDeviceMemory,
+    GgmlExecutionPlacementSummary, GgmlExecutionTelemetryCollector, GgmlExecutionTelemetryGuard,
+    GgmlGraphLifecycleGuard, RequestBackendOverrideGuard, RequestBackendPreference,
+    current_execution_telemetry_collector, ensure_backends_loaded, ggml_available_devices,
+    install_execution_telemetry_collector, install_graph_lifecycle_collector,
     install_request_backend_override, request_backend_override, resolve_request_execution_route,
 };
+use crate::models::pack_verifier::{PackRoute, VerifiedPack};
 
 use super::{
     builtin_execution_dispatch::{
         build_builtin_ggml_execution_dispatch, build_builtin_ggml_streaming_execution_dispatch,
     },
+    candidate_activation_transaction::{
+        ActivationReservation, ActivationStage, AttestationFailure, AttestationOutcome,
+        DefaultModelActivationFacts, DefaultModelActivationIdentity, DefaultModelActivationLane,
+        DefaultModelActivationPlan, DefaultModelResidentComponentPlan,
+        DefaultModelResidentTopologyPlan, ExecutionCandidateAttemptEvidence,
+        ExecutionCandidateAttemptJournalFactory, ExecutionCandidateAttemptOwner,
+        NativeCandidateAttemptFacts, ResolvedExecutionFacts, TypedAttestation,
+    },
     executor_component_registry::BuiltinStatefulExecutorScope,
     ggml_asr_executor::GgmlAsrExecutionDispatch,
+    request_execution_receipt::NativeExecutionReceiptCollector,
+    runtime_receipts::{
+        RuntimeOwnerPlacement, RuntimeReceiptCollector, SafeExecutionLaneProjection,
+    },
+    system_memory_owner::SystemMemoryAllocationQuote,
 };
 
 static NEXT_EXECUTION_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -76,11 +108,22 @@ thread_local! {
     static CURRENT_EXECUTION_MEMORY_BROKER: RefCell<Option<Arc<DeviceMemoryBrokerSet>>> = const {
         RefCell::new(None)
     };
+    /// Explicitly propagated diagnostic collector for one service root. It is
+    /// never consulted by admission or fallback.
+    static CURRENT_EXECUTION_RECEIPTS: RefCell<Option<RuntimeReceiptCollector>> = const {
+        RefCell::new(None)
+    };
     /// Placement selected by the active policy candidate. Graph-runtime
     /// configuration consumes this value to make `FullDevice` and `Hybrid`
     /// executable contracts rather than diagnostic labels.
     static CURRENT_EXECUTION_PLACEMENT: Cell<Option<ExecutionPlacement>> = const {
         Cell::new(None)
+    };
+    /// Exact candidate lane selected before backend initialization. Native
+    /// admission and receipt adapters consume this typed value instead of
+    /// reconstructing provider/device identity from backend labels.
+    static CURRENT_EXECUTION_LANE: RefCell<Option<ExecutionLaneKey>> = const {
+        RefCell::new(None)
     };
     /// Optional request-scoped observation channel used by exact native
     /// runtime audits. It is inert unless an explicit caller installs it, and
@@ -107,6 +150,32 @@ thread_local! {
     static CURRENT_EXECUTION_CACHE_ATTEMPT_ID: Cell<Option<ExecutionCacheAttemptId>> = const {
         Cell::new(None)
     };
+    /// Explicit outer activation cohort shared by every nested reservation
+    /// during staged materialization. It takes precedence over the inner cache
+    /// journal attempt id and propagates through worker contexts.
+    static CURRENT_ACTIVATION_RESERVATION_COHORT: Cell<Option<MemoryReservationCohortId>> = const {
+        Cell::new(None)
+    };
+    /// Strict receipt collection is opt-in and follows the concrete request
+    /// context through policy candidates and worker contexts. It is never
+    /// reconstructed from process state after native execution.
+    static CURRENT_EXECUTION_RECEIPT:
+        RefCell<Option<NativeExecutionReceiptCollector>> = const { RefCell::new(None) };
+    /// Scope-local slot for the admitted embedded Stream-VAD weights. This is
+    /// not a process-global model cache: it is installed from one
+    /// [`NativeExecutionServices`] root and restored when that context exits.
+    static CURRENT_STREAM_VAD_EMBEDDED: RefCell<Option<crate::diarize::vad::StreamVadEmbeddedSlot>> =
+        const { RefCell::new(None) };
+    /// NES-owned loaded-weight owner cache. Production publication of
+    /// `GgmlLoadedWeightContext` goes through this handle, not a process-global
+    /// TLS owner map.
+    static CURRENT_LOADED_WEIGHT_OWNERS: RefCell<Option<crate::ggml_runtime::LoadedWeightOwnerCache>> =
+        const { RefCell::new(None) };
+    /// Quote identity for the current candidate attempt. Nested auxiliary
+    /// attempts must install their own pack or declared resident bytes; they
+    /// must not inherit an outer ASR mapping or another family's blob.
+    static CURRENT_CANDIDATE_ACTIVATION_QUOTE: RefCell<Option<CandidateActivationQuoteSource>> =
+        const { RefCell::new(None) };
 }
 
 /// A backend that was actually constructed for one policy-scoped graph.
@@ -124,6 +193,7 @@ pub(crate) struct ExecutionBackendObservation {
     pub(crate) backend_name: String,
     pub(crate) actual_provider: ExecutionProvider,
     pub(crate) actual_stable_id: String,
+    pub(crate) actual_device: crate::GgmlActualDeviceFacts,
     pub(crate) use_scheduler: bool,
     /// In-process join key only. It is never emitted by the smoke receipt.
     backend_identity: usize,
@@ -361,9 +431,36 @@ impl Drop for ExecutionCacheJournalScope {
 /// `GgmlCpuGraphBackend::Gpu` deliberately is not sufficient: it folds CUDA,
 /// HIP, Vulkan and every visible card together. The route key retains the
 /// provider-local stable id plus PCI identity when ggml exposes it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedDeviceKey {
     route: ExecutionRouteCacheKey,
+    resolved_route: ResolvedExecutionRoute,
+}
+
+impl ResolvedDeviceKey {
+    fn new(resolved_route: ResolvedExecutionRoute) -> Self {
+        Self {
+            route: resolved_route.cache_key(),
+            resolved_route,
+        }
+    }
+}
+
+// Runtime isolation deliberately ignores registry ordinal; the full route is
+// retained only so an immutable lane can reinstall exact backend selection on
+// another worker without enumerating devices again.
+impl PartialEq for ResolvedDeviceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.route == other.route
+    }
+}
+
+impl Eq for ResolvedDeviceKey {}
+
+impl Hash for ResolvedDeviceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.route.hash(state);
+    }
 }
 
 /// Cache key shared by every resident object that owns a ggml backend, device
@@ -375,35 +472,183 @@ pub(crate) struct ExecutionLaneKey {
     backend: GgmlCpuGraphBackend,
 }
 
+/// Live memory observation joined to the same provider + stable device id as
+/// an [`ExecutionLaneKey`]. Consumers may project this fact into telemetry or
+/// batching policy, but must not repeat device-enumeration identity joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionLaneMemorySample {
+    pub(crate) provider: ExecutionProvider,
+    pub(crate) stable_device_id: String,
+    pub(crate) device_kind: GgmlBackendKind,
+    pub(crate) memory: GgmlDeviceMemory,
+}
+
 impl ExecutionLaneKey {
+    #[allow(dead_code)]
+    pub(crate) fn receipt_projection(
+        &self,
+        collector: &RuntimeReceiptCollector,
+    ) -> Option<SafeExecutionLaneProjection> {
+        collector.lane_projection(
+            self.device.route.provider,
+            &self.device.route.stable_id,
+            self.placement,
+            self.backend,
+        )
+    }
+
     pub(crate) fn backend(&self) -> GgmlCpuGraphBackend {
         self.backend
     }
 
-    #[cfg(test)]
-    fn placement(&self) -> ExecutionPlacement {
+    pub(crate) fn provider(&self) -> ExecutionProvider {
+        self.device.route.provider
+    }
+
+    pub(crate) fn stable_device_id(&self) -> &str {
+        &self.device.route.stable_id
+    }
+
+    pub(crate) fn placement(&self) -> ExecutionPlacement {
         self.placement
+    }
+
+    pub(crate) fn request_backend_preference(&self) -> RequestBackendPreference {
+        match self.provider() {
+            ExecutionProvider::Cpu => RequestBackendPreference::CpuOnly,
+            ExecutionProvider::Metal
+            | ExecutionProvider::Cuda
+            | ExecutionProvider::Hip
+            | ExecutionProvider::Vulkan => {
+                RequestBackendPreference::Exact(self.device.resolved_route.clone())
+            }
+            // These providers cannot occur in a production candidate lane;
+            // retain the coarse fallback only for legacy low-level fixtures.
+            ExecutionProvider::Accelerator | ExecutionProvider::Unknown => {
+                RequestBackendPreference::Accelerated
+            }
+        }
+    }
+
+    /// Observe memory for this exact lane. Enumeration order never selects a
+    /// different device: both provider and provider-local stable id must
+    /// match, and a missing observation remains unknown.
+    pub(crate) fn live_memory_sample(&self) -> Option<ExecutionLaneMemorySample> {
+        let devices = ggml_available_devices()
+            .into_iter()
+            .map(|device| (device.name, device.kind, device.memory))
+            .collect::<Vec<_>>();
+        exact_lane_memory_sample_from_device_infos(self, &devices)
+    }
+
+    /// Derive a stage-specific lane from the request's already-resolved exact
+    /// device. This never consults backend preference or route discovery.
+    pub(crate) fn for_stage(
+        &self,
+        backend: GgmlCpuGraphBackend,
+        placement: ExecutionPlacement,
+    ) -> Self {
+        let device = if matches!(backend, GgmlCpuGraphBackend::Cpu)
+            && matches!(placement, ExecutionPlacement::CpuOnly)
+        {
+            ResolvedDeviceKey::new(ResolvedExecutionRoute::cpu())
+        } else {
+            self.device.clone()
+        };
+        Self {
+            device,
+            placement,
+            backend,
+        }
+    }
+
+    /// Construct an exact resident-owner lane from the immutable policy candidate.
+    /// Backend/provider and placement mismatches fail closed; no ambient request
+    /// override or device discovery is consulted.
+    pub(crate) fn from_candidate(
+        candidate: &ExecutionCandidate,
+        backend: GgmlCpuGraphBackend,
+    ) -> Result<Self, &'static str> {
+        let provider = candidate.device.route.provider;
+        let backend_matches = match backend {
+            GgmlCpuGraphBackend::Cpu => provider == ExecutionProvider::Cpu,
+            GgmlCpuGraphBackend::Metal => provider == ExecutionProvider::Metal,
+            GgmlCpuGraphBackend::Gpu => matches!(
+                provider,
+                ExecutionProvider::Cuda | ExecutionProvider::Hip | ExecutionProvider::Vulkan
+            ),
+        };
+        let placement_matches = match candidate.placement {
+            ExecutionPlacement::CpuOnly => provider == ExecutionProvider::Cpu,
+            ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => {
+                provider != ExecutionProvider::Cpu
+            }
+        };
+        if !backend_matches || !placement_matches {
+            return Err("execution candidate lane is incompatible with resolved backend/placement");
+        }
+        Ok(Self {
+            device: ResolvedDeviceKey::new(candidate.device.route.clone()),
+            placement: candidate.placement,
+            backend,
+        })
+    }
+    /// Test/internal fallback for callers outside a request candidate. Native
+    /// production dispatch attaches an exact lane to its request context.
+    #[cfg(test)]
+    pub(crate) fn unscoped_for_backend(backend: GgmlCpuGraphBackend) -> Self {
+        let route = fallback_route_for_unscoped_backend(backend);
+        Self {
+            device: ResolvedDeviceKey::new(route),
+            placement: match backend {
+                GgmlCpuGraphBackend::Cpu => ExecutionPlacement::CpuOnly,
+                GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => {
+                    ExecutionPlacement::FullDevice
+                }
+            },
+            backend,
+        }
     }
 }
 
+fn exact_lane_memory_sample_from_device_infos(
+    lane: &ExecutionLaneKey,
+    devices: &[(String, GgmlBackendKind, Option<GgmlDeviceMemory>)],
+) -> Option<ExecutionLaneMemorySample> {
+    let (stable_device_id, device_kind, memory) = devices.iter().find(|(name, _, _)| {
+        name == lane.stable_device_id()
+            && ExecutionProvider::from_backend_name(name) == lane.provider()
+    })?;
+    Some(ExecutionLaneMemorySample {
+        provider: lane.provider(),
+        stable_device_id: stable_device_id.clone(),
+        device_kind: *device_kind,
+        memory: (*memory)?,
+    })
+}
+
 /// Stable identity of one explicitly constructed execution-service root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct NativeExecutionScopeId(u64);
 
 impl NativeExecutionScopeId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         Self(NEXT_EXECUTION_SCOPE_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
 /// Identity of the outermost transactional cache-publication attempt. Nested
 /// auxiliary candidates inherit it and merge their journals into the parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ExecutionCacheAttemptId(u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct ExecutionCacheAttemptId(u64);
 
 impl ExecutionCacheAttemptId {
     fn next() -> Self {
         Self(NEXT_EXECUTION_CACHE_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub const fn ordinal(self) -> u64 {
+        self.0
     }
 }
 
@@ -426,12 +671,18 @@ impl Drop for NativeExecutionScopeGuard {
 pub(crate) struct NativeExecutionContext {
     scope_id: NativeExecutionScopeId,
     memory_broker: Arc<DeviceMemoryBrokerSet>,
+    runtime_receipts: RuntimeReceiptCollector,
+    stream_vad_embedded: crate::diarize::vad::StreamVadEmbeddedSlot,
+    loaded_weight_owners: crate::ggml_runtime::LoadedWeightOwnerCache,
     backend_preference: Option<RequestBackendPreference>,
     placement: Option<ExecutionPlacement>,
+    execution_lane: Option<ExecutionLaneKey>,
     observation_sink: Option<ExecutionObservationSink>,
     failure_sink: Option<ExecutionCandidateFailureSink>,
     cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: Option<GgmlExecutionTelemetryCollector>,
+    receipt: Option<NativeExecutionReceiptCollector>,
 }
 
 impl NativeExecutionContext {
@@ -446,8 +697,15 @@ impl NativeExecutionContext {
             && Arc::ptr_eq(&self.memory_broker, &other.memory_broker)
             && self.backend_preference == other.backend_preference
             && self.placement == other.placement
+            && self.execution_lane == other.execution_lane
+            && self.activation_reservation_cohort == other.activation_reservation_cohort
             && match (&self.observation_sink, &other.observation_sink) {
                 (Some(left), Some(right)) => Arc::ptr_eq(&left.observations, &right.observations),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.receipt, &other.receipt) {
+                (Some(_), Some(_)) => false,
                 (None, None) => true,
                 _ => false,
             }
@@ -491,12 +749,18 @@ impl NativeExecutionContext {
         Ok(Some(Self {
             scope_id: first.scope_id,
             memory_broker: Arc::clone(&first.memory_broker),
+            runtime_receipts: first.runtime_receipts.clone(),
+            stream_vad_embedded: Arc::clone(&first.stream_vad_embedded),
+            loaded_weight_owners: first.loaded_weight_owners,
             backend_preference: first.backend_preference.clone(),
             placement: first.placement,
+            execution_lane: first.execution_lane.clone(),
             observation_sink: first.observation_sink.clone(),
             failure_sink,
             cache_attempt_id,
+            activation_reservation_cohort: first.activation_reservation_cohort,
             execution_telemetry,
+            receipt: first.receipt.clone(),
         }))
     }
 }
@@ -513,11 +777,18 @@ pub(crate) enum NativeExecutionContextError {
 pub(crate) struct NativeExecutionContextGuard {
     scope: NativeExecutionScopeGuard,
     previous_memory_broker: Option<Arc<DeviceMemoryBrokerSet>>,
+    previous_receipts: Option<RuntimeReceiptCollector>,
+    previous_stream_vad_embedded: Option<crate::diarize::vad::StreamVadEmbeddedSlot>,
+    previous_loaded_weight_owners: Option<crate::ggml_runtime::LoadedWeightOwnerCache>,
     previous_placement: Option<ExecutionPlacement>,
+    previous_execution_lane: Option<ExecutionLaneKey>,
     previous_observation_sink: Option<ExecutionObservationSink>,
     previous_failure_sink: Option<ExecutionCandidateFailureSink>,
     previous_cache_attempt_id: Option<ExecutionCacheAttemptId>,
+    previous_activation_reservation_cohort: Option<MemoryReservationCohortId>,
     execution_telemetry: GgmlExecutionTelemetryGuard,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
+    previous_receipt: Option<NativeExecutionReceiptCollector>,
     backend: RequestBackendOverrideGuard,
 }
 
@@ -526,7 +797,19 @@ impl Drop for NativeExecutionContextGuard {
         CURRENT_EXECUTION_MEMORY_BROKER.with(|current| {
             *current.borrow_mut() = self.previous_memory_broker.take();
         });
+        CURRENT_EXECUTION_RECEIPTS.with(|current| {
+            *current.borrow_mut() = self.previous_receipts.take();
+        });
+        CURRENT_STREAM_VAD_EMBEDDED.with(|current| {
+            *current.borrow_mut() = self.previous_stream_vad_embedded.take();
+        });
+        CURRENT_LOADED_WEIGHT_OWNERS.with(|current| {
+            *current.borrow_mut() = self.previous_loaded_weight_owners.take();
+        });
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.set(self.previous_placement));
+        CURRENT_EXECUTION_LANE.with(|current| {
+            *current.borrow_mut() = self.previous_execution_lane.take();
+        });
         CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| {
             *current.borrow_mut() = self.previous_observation_sink.take();
         });
@@ -535,6 +818,11 @@ impl Drop for NativeExecutionContextGuard {
         });
         CURRENT_EXECUTION_CACHE_ATTEMPT_ID
             .with(|current| current.set(self.previous_cache_attempt_id.take()));
+        CURRENT_ACTIVATION_RESERVATION_COHORT
+            .with(|current| current.set(self.previous_activation_reservation_cohort.take()));
+        CURRENT_EXECUTION_RECEIPT.with(|current| {
+            *current.borrow_mut() = self.previous_receipt.take();
+        });
         // `scope` restores itself after this `Drop` returns.
         let _ = &self.scope;
         // `backend` restores itself after this `Drop` returns.
@@ -636,15 +924,22 @@ pub(crate) fn current_native_execution_scope_id() -> Option<NativeExecutionScope
 pub(crate) fn current_native_execution_context() -> Option<NativeExecutionContext> {
     let scope_id = current_native_execution_scope_id()?;
     let memory_broker = current_native_execution_memory_broker()?;
+    let runtime_receipts = current_runtime_receipts()?;
     Some(NativeExecutionContext {
         scope_id,
         memory_broker,
+        runtime_receipts,
+        stream_vad_embedded: current_stream_vad_embedded_slot()?,
+        loaded_weight_owners: current_loaded_weight_owners()?,
         backend_preference: request_backend_override(),
         placement: current_execution_placement(),
+        execution_lane: current_execution_lane(),
         observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
 }
 
@@ -655,12 +950,112 @@ pub(crate) fn current_native_execution_memory_broker() -> Option<Arc<DeviceMemor
     CURRENT_EXECUTION_MEMORY_BROKER.with(|current| current.borrow().clone())
 }
 
+/// Returns the explicitly propagated owner-receipt collector, if native code is
+/// executing under a service root.
+pub(crate) fn current_runtime_receipts() -> Option<RuntimeReceiptCollector> {
+    CURRENT_EXECUTION_RECEIPTS.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn current_stream_vad_embedded_slot()
+-> Option<crate::diarize::vad::StreamVadEmbeddedSlot> {
+    CURRENT_STREAM_VAD_EMBEDDED.with(|current| current.borrow().clone())
+}
+
+/// NES-owned loaded-weight owner cache for the active request. Absent outside
+/// an installed service root; production loaders then skip coalescing rather
+/// than writing a process-global TLS owner table.
+pub(crate) fn current_loaded_weight_owners() -> Option<crate::ggml_runtime::LoadedWeightOwnerCache>
+{
+    CURRENT_LOADED_WEIGHT_OWNERS.with(|current| *current.borrow())
+}
+
 pub(crate) fn current_execution_placement() -> Option<ExecutionPlacement> {
     CURRENT_EXECUTION_PLACEMENT.with(Cell::get)
 }
 
+pub(crate) fn current_execution_lane() -> Option<ExecutionLaneKey> {
+    CURRENT_EXECUTION_LANE.with(|current| current.borrow().clone())
+}
+
+/// Install one already-resolved lane as the sole backend/placement authority.
+/// The full route travels with the lane, so worker handoff never enumerates a
+/// first/best device again. Other native execution services remain untouched.
+pub(crate) struct ResolvedExecutionLaneGuard {
+    previous_placement: Option<ExecutionPlacement>,
+    previous_execution_lane: Option<ExecutionLaneKey>,
+    backend: RequestBackendOverrideGuard,
+}
+
+impl Drop for ResolvedExecutionLaneGuard {
+    fn drop(&mut self) {
+        CURRENT_EXECUTION_PLACEMENT.with(|current| current.set(self.previous_placement));
+        CURRENT_EXECUTION_LANE.with(|current| {
+            *current.borrow_mut() = self.previous_execution_lane.take();
+        });
+        // `backend` restores itself after this `Drop` returns.
+        let _ = &self.backend;
+    }
+}
+
+#[must_use = "the resolved execution lane is uninstalled when the guard drops"]
+pub(crate) fn install_resolved_execution_lane(
+    lane: ExecutionLaneKey,
+) -> ResolvedExecutionLaneGuard {
+    let backend = install_request_backend_override(Some(lane.request_backend_preference()));
+    let previous_placement =
+        CURRENT_EXECUTION_PLACEMENT.with(|current| current.replace(Some(lane.placement())));
+    let previous_execution_lane =
+        CURRENT_EXECUTION_LANE.with(|current| current.replace(Some(lane)));
+    ResolvedExecutionLaneGuard {
+        previous_placement,
+        previous_execution_lane,
+        backend,
+    }
+}
+
 pub(crate) fn current_execution_observation_sink() -> Option<ExecutionObservationSink> {
     CURRENT_EXECUTION_OBSERVATION_SINK.with(|current| current.borrow().clone())
+}
+
+/// Returns the explicit request-local receipt collector, when a strict native
+/// evidence producer installed one. Normal inference never creates it.
+pub(crate) fn current_execution_receipt_collector() -> Option<NativeExecutionReceiptCollector> {
+    CURRENT_EXECUTION_RECEIPT.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn current_request_attempt_id() -> Option<crate::RequestAttemptId> {
+    current_execution_receipt_collector()?.request_attempt_id()
+}
+
+pub(crate) struct ExecutionReceiptCollectorGuard {
+    previous: Option<NativeExecutionReceiptCollector>,
+    _graph_lifecycle: GgmlGraphLifecycleGuard,
+}
+
+impl Drop for ExecutionReceiptCollectorGuard {
+    fn drop(&mut self) {
+        CURRENT_EXECUTION_RECEIPT.with(|current| {
+            *current.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install the receipt authority carried by a concrete request context before
+/// candidate selection. Candidate/worker propagation then uses the existing
+/// `NativeExecutionContext` path.
+pub(crate) fn install_execution_receipt_collector(
+    collector: Option<NativeExecutionReceiptCollector>,
+) -> ExecutionReceiptCollectorGuard {
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        collector
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
+    let previous = CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(collector));
+    ExecutionReceiptCollectorGuard {
+        previous,
+        _graph_lifecycle: graph_lifecycle,
+    }
 }
 
 /// Records a runner-backed observation only while an explicitly instrumented
@@ -673,8 +1068,18 @@ pub(crate) fn record_current_execution_backend_observation(
     backend_name: &str,
     actual_provider: ExecutionProvider,
     actual_stable_id: &str,
+    actual_device: &crate::GgmlActualDeviceFacts,
     use_scheduler: bool,
 ) {
+    if let Some(receipt) = current_execution_receipt_collector() {
+        receipt.record_backend_observation(
+            backend_identity,
+            actual_provider,
+            actual_stable_id,
+            actual_device,
+            use_scheduler,
+        );
+    }
     let Some(sink) = current_execution_observation_sink() else {
         return;
     };
@@ -693,6 +1098,7 @@ pub(crate) fn record_current_execution_backend_observation(
         backend_name: backend_name.to_string(),
         actual_provider,
         actual_stable_id: actual_stable_id.to_string(),
+        actual_device: actual_device.clone(),
         use_scheduler,
         backend_identity,
         memory_receipts: Vec::new(),
@@ -804,7 +1210,32 @@ pub(crate) fn current_execution_cache_attempt_id() -> Option<ExecutionCacheAttem
 /// enter the provisional domain gate held by their own candidate without
 /// weakening exclusion between independent candidates.
 pub(crate) fn current_memory_reservation_cohort_id() -> Option<MemoryReservationCohortId> {
-    current_execution_cache_attempt_id().map(|attempt| MemoryReservationCohortId::new(attempt.0))
+    current_activation_reservation_cohort_id().or_else(|| {
+        current_execution_cache_attempt_id()
+            .map(|attempt| MemoryReservationCohortId::new(attempt.0))
+    })
+}
+
+fn current_activation_reservation_cohort_id() -> Option<MemoryReservationCohortId> {
+    CURRENT_ACTIVATION_RESERVATION_COHORT.with(Cell::get)
+}
+
+pub(crate) struct ActivationReservationContextGuard {
+    previous: Option<MemoryReservationCohortId>,
+}
+
+impl Drop for ActivationReservationContextGuard {
+    fn drop(&mut self) {
+        CURRENT_ACTIVATION_RESERVATION_COHORT.with(|current| current.set(self.previous.take()));
+    }
+}
+
+pub(crate) fn install_activation_reservation_context(
+    context: Option<ActivationReservationContext>,
+) -> ActivationReservationContextGuard {
+    let previous = CURRENT_ACTIVATION_RESERVATION_COHORT
+        .with(|current| current.replace(context.map(|context| context.cohort_id)));
+    ActivationReservationContextGuard { previous }
 }
 
 /// Resolves the complete resident-owner cache lane for the active request.
@@ -818,8 +1249,15 @@ pub(crate) fn current_memory_reservation_cohort_id() -> Option<MemoryReservation
 /// present in that inventory; the synthetic final branch exists only for CPU
 /// unit fixtures that intentionally run without a linked device registry.
 pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> ExecutionLaneKey {
+    if let Some(lane) = current_execution_lane() {
+        let placement = match (lane.placement(), backend) {
+            (ExecutionPlacement::Hybrid, GgmlCpuGraphBackend::Cpu) => ExecutionPlacement::CpuOnly,
+            (placement, _) => placement,
+        };
+        return lane.for_stage(backend, placement);
+    }
     let preference = request_backend_override();
-    let route = match preference.as_ref() {
+    let mut route = match preference.as_ref() {
         Some(RequestBackendPreference::Exact(route)) => route.clone(),
         Some(RequestBackendPreference::CpuOnly) => ResolvedExecutionRoute::cpu(),
         Some(RequestBackendPreference::Accelerated) | None => {
@@ -833,10 +1271,13 @@ pub(crate) fn current_execution_lane_key(backend: GgmlCpuGraphBackend) -> Execut
         GgmlCpuGraphBackend::Cpu => ExecutionPlacement::CpuOnly,
         GgmlCpuGraphBackend::Metal | GgmlCpuGraphBackend::Gpu => ExecutionPlacement::FullDevice,
     });
+    if matches!(backend, GgmlCpuGraphBackend::Cpu)
+        && matches!(placement, ExecutionPlacement::CpuOnly)
+    {
+        route = ResolvedExecutionRoute::cpu();
+    }
     ExecutionLaneKey {
-        device: ResolvedDeviceKey {
-            route: route.cache_key(),
-        },
+        device: ResolvedDeviceKey::new(route),
         placement,
         backend,
     }
@@ -928,24 +1369,49 @@ pub(crate) fn install_native_execution_context(
     let scope = install_native_execution_scope(context.scope_id);
     let previous_memory_broker = CURRENT_EXECUTION_MEMORY_BROKER
         .with(|current| current.replace(Some(context.memory_broker)));
+    let previous_receipts =
+        CURRENT_EXECUTION_RECEIPTS.with(|current| current.replace(Some(context.runtime_receipts)));
+    let previous_stream_vad_embedded = CURRENT_STREAM_VAD_EMBEDDED
+        .with(|current| current.replace(Some(context.stream_vad_embedded)));
+    let previous_loaded_weight_owners = CURRENT_LOADED_WEIGHT_OWNERS
+        .with(|current| current.replace(Some(context.loaded_weight_owners)));
     let previous_placement =
         CURRENT_EXECUTION_PLACEMENT.with(|current| current.replace(context.placement));
+    let previous_execution_lane =
+        CURRENT_EXECUTION_LANE.with(|current| current.replace(context.execution_lane));
     let previous_observation_sink = CURRENT_EXECUTION_OBSERVATION_SINK
         .with(|current| current.replace(context.observation_sink));
     let previous_failure_sink = CURRENT_EXECUTION_CANDIDATE_FAILURE_SINK
         .with(|current| current.replace(context.failure_sink));
     let previous_cache_attempt_id = CURRENT_EXECUTION_CACHE_ATTEMPT_ID
         .with(|current| current.replace(context.cache_attempt_id));
+    let previous_activation_reservation_cohort = CURRENT_ACTIVATION_RESERVATION_COHORT
+        .with(|current| current.replace(context.activation_reservation_cohort));
     let execution_telemetry = install_execution_telemetry_collector(context.execution_telemetry);
+    let graph_lifecycle = install_graph_lifecycle_collector(
+        context
+            .receipt
+            .as_ref()
+            .map(NativeExecutionReceiptCollector::graph_lifecycle_collector),
+    );
+    let previous_receipt =
+        CURRENT_EXECUTION_RECEIPT.with(|current| current.replace(context.receipt));
     let backend = install_request_backend_override(context.backend_preference);
     NativeExecutionContextGuard {
         scope,
         previous_memory_broker,
+        previous_receipts,
+        previous_stream_vad_embedded,
+        previous_loaded_weight_owners,
         previous_placement,
+        previous_execution_lane,
         previous_observation_sink,
         previous_failure_sink,
         previous_cache_attempt_id,
+        previous_activation_reservation_cohort,
         execution_telemetry,
+        _graph_lifecycle: graph_lifecycle,
+        previous_receipt,
         backend,
     }
 }
@@ -957,15 +1423,44 @@ pub(crate) fn install_native_execution_services(
     install_native_execution_context(NativeExecutionContext {
         scope_id: services.scope_id,
         memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
+        stream_vad_embedded: Arc::clone(&services.firered_stream_vad_embedded),
+        loaded_weight_owners: services.loaded_weight_owners,
         // Preserve an enclosing policy attempt. Legacy direct callers have no
         // enclosing values and continue to install `None` for all three.
         backend_preference: request_backend_override(),
         placement: current_execution_placement(),
+        execution_lane: current_execution_lane(),
         observation_sink: current_execution_observation_sink(),
         failure_sink: current_execution_candidate_failure_sink(),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
+}
+
+fn execution_candidate_context_identity(
+    candidate: &ExecutionCandidate,
+) -> (Option<RequestBackendPreference>, Option<ExecutionLaneKey>) {
+    let backend_preference = if candidate.placement == ExecutionPlacement::CpuOnly {
+        Some(RequestBackendPreference::CpuOnly)
+    } else {
+        Some(RequestBackendPreference::Exact(
+            candidate.device.route.clone(),
+        ))
+    };
+    let backend = match candidate.device.route.provider {
+        ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        ExecutionProvider::Cuda
+        | ExecutionProvider::Hip
+        | ExecutionProvider::Vulkan
+        | ExecutionProvider::Accelerator
+        | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
+    };
+    let execution_lane = ExecutionLaneKey::from_candidate(candidate, backend).ok();
+    (backend_preference, execution_lane)
 }
 
 /// Installs one transactional policy candidate around the complete family
@@ -977,23 +1472,55 @@ pub(crate) fn install_execution_candidate_attempt(
     candidate: &ExecutionCandidate,
     failure_sink: ExecutionCandidateFailureSink,
 ) -> NativeExecutionContextGuard {
-    let backend_preference = if candidate.placement == ExecutionPlacement::CpuOnly {
-        Some(RequestBackendPreference::CpuOnly)
-    } else {
-        Some(RequestBackendPreference::Exact(
-            candidate.device.route.clone(),
-        ))
-    };
+    let (backend_preference, execution_lane) = execution_candidate_context_identity(candidate);
     install_native_execution_context(NativeExecutionContext {
         scope_id: services.scope_id,
         memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
+        stream_vad_embedded: Arc::clone(&services.firered_stream_vad_embedded),
+        loaded_weight_owners: services.loaded_weight_owners,
         backend_preference,
         placement: Some(candidate.placement),
+        execution_lane,
         observation_sink: current_execution_observation_sink(),
         failure_sink: Some(failure_sink),
         cache_attempt_id: current_execution_cache_attempt_id(),
+        activation_reservation_cohort: current_activation_reservation_cohort_id(),
         execution_telemetry: current_execution_telemetry_collector(),
+        receipt: current_execution_receipt_collector(),
     })
+}
+
+/// Runs control-only session cleanup in the already-selected candidate lane.
+///
+/// This deliberately installs the service root and exact backend identity but
+/// none of the mutable attempt authorities: no cache journal, activation
+/// reservation, failure/observation sink, placement telemetry, or execution
+/// receipt. Cancellation may release candidate-owned resources, but it cannot
+/// begin a new inference attempt or overwrite the last completed receipt.
+pub(crate) fn run_execution_candidate_control_scope<T>(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let (backend_preference, execution_lane) = execution_candidate_context_identity(candidate);
+    let _control_scope = install_native_execution_context(NativeExecutionContext {
+        scope_id: services.scope_id,
+        memory_broker: Arc::clone(&services.memory_broker),
+        runtime_receipts: services.runtime_receipts.clone(),
+        stream_vad_embedded: Arc::clone(&services.firered_stream_vad_embedded),
+        loaded_weight_owners: services.loaded_weight_owners,
+        backend_preference,
+        placement: Some(candidate.placement),
+        execution_lane,
+        observation_sink: None,
+        failure_sink: None,
+        cache_attempt_id: None,
+        activation_reservation_cohort: None,
+        execution_telemetry: None,
+        receipt: None,
+    });
+    operation()
 }
 
 /// Result of one complete candidate-local operation. The operation's ordinary
@@ -1002,6 +1529,69 @@ pub(crate) fn install_execution_candidate_attempt(
 pub(crate) struct ExecutionCandidateAttemptOutcome<T, E> {
     pub(crate) result: Result<T, E>,
     pub(crate) candidate_failure: Option<ExecutionCandidateFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeCandidateAttemptAttestError;
+
+struct NativeCandidateAttemptAttestation<T, E, F> {
+    identity: NativeCandidateAttemptFacts,
+    candidate: ExecutionCandidate,
+    operation: RefCell<Option<F>>,
+    failure_sink: ExecutionCandidateFailureSink,
+    placement_collector: Option<GgmlExecutionTelemetryCollector>,
+    outcome: Rc<RefCell<Option<ExecutionCandidateAttemptOutcome<T, E>>>>,
+}
+
+impl<T, E, F> TypedAttestation<NativeCandidateAttemptFacts, NativeCandidateAttemptFacts>
+    for NativeCandidateAttemptAttestation<T, E, F>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    type Identity = NativeCandidateAttemptFacts;
+    type Evidence = ExecutionCandidateAttemptEvidence;
+    type Error = NativeCandidateAttemptAttestError;
+
+    fn identity(&self) -> &Self::Identity {
+        &self.identity
+    }
+
+    fn attest(
+        &self,
+        facts: &ResolvedExecutionFacts<
+            NativeCandidateAttemptFacts,
+            NativeCandidateAttemptFacts,
+            Self::Identity,
+        >,
+    ) -> Result<Self::Evidence, AttestationFailure<Self::Error>> {
+        debug_assert_eq!(facts.identity(), &self.identity);
+        let operation = self
+            .operation
+            .borrow_mut()
+            .take()
+            .expect("candidate attempt attestation runs once");
+        let result = operation();
+        let mut candidate_failure = self.failure_sink.failure();
+        if result.is_ok() && candidate_failure.is_none() {
+            candidate_failure = self.placement_collector.as_ref().and_then(|collector| {
+                observed_placement_violation(&self.candidate, &collector.snapshot())
+            });
+        }
+        let committed = result.is_ok() && candidate_failure.is_none();
+        *self.outcome.borrow_mut() = Some(ExecutionCandidateAttemptOutcome {
+            result,
+            candidate_failure,
+        });
+        if committed {
+            Ok(ExecutionCandidateAttemptEvidence::new(
+                self.identity.clone(),
+            ))
+        } else {
+            Err(AttestationFailure::Rejected(
+                NativeCandidateAttemptAttestError,
+            ))
+        }
+    }
 }
 
 /// Extracts an ordinary error from a failed candidate attempt while ensuring
@@ -1106,11 +1696,771 @@ fn observed_placement_violation(
     })
 }
 
+/// Broker-backed reservation for one candidate activation. Quote is obtained
+/// separately; this token is the atomic `try_reserve*` result.
+/// Opaque identity shared by an outer activation reservation and every
+/// nested owner allocation performed while materializing that candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationReservationContext {
+    cohort_id: MemoryReservationCohortId,
+}
+
+impl ActivationReservationContext {
+    /// Mint a request-scoped cohort so concurrent longform slices and nested
+    /// host owners share one exclusive system-memory gate. Independent
+    /// candidate fallbacks still mint their own attempt journals underneath.
+    pub(crate) fn mint() -> Self {
+        Self {
+            cohort_id: MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0),
+        }
+    }
+}
+
+pub struct BrokerActivationReservation {
+    batch: Option<DeviceMemoryReservationBatch>,
+    envelope: Option<MappingEnvelopeHandle>,
+    context: ActivationReservationContext,
+}
+
+impl BrokerActivationReservation {
+    fn from_batch(
+        batch: DeviceMemoryReservationBatch,
+        cohort_id: MemoryReservationCohortId,
+    ) -> Result<Self, String> {
+        if batch.is_empty() {
+            return Err(
+                "candidate activation quote produced no physical-domain reservation".to_string(),
+            );
+        }
+        Ok(Self {
+            batch: Some(batch),
+            envelope: None,
+            context: ActivationReservationContext { cohort_id },
+        })
+    }
+
+    fn from_envelope(
+        envelope: MappingEnvelopeHandle,
+        cohort_id: MemoryReservationCohortId,
+    ) -> Self {
+        Self {
+            batch: None,
+            envelope: Some(envelope),
+            context: ActivationReservationContext { cohort_id },
+        }
+    }
+
+    pub const fn context(&self) -> ActivationReservationContext {
+        self.context
+    }
+}
+
+impl ActivationReservation for BrokerActivationReservation {
+    type Error = String;
+
+    fn release(&mut self) -> Result<(), Self::Error> {
+        drop(self.batch.take());
+        drop(self.envelope.take());
+        Ok(())
+    }
+
+    fn quarantine(&mut self) -> Result<(), Self::Error> {
+        if let Some(mut batch) = self.batch.take() {
+            batch.quarantine();
+        }
+        drop(self.envelope.take());
+        Ok(())
+    }
+}
+
+/// Quote identity for one candidate activation. A nested auxiliary attempt
+/// replaces the outer source and restores it on drop.
+#[derive(Clone)]
+pub(crate) enum CandidateActivationQuoteSource {
+    Pack(VerifiedPack),
+    Declared(SystemMemoryAllocationQuote),
+}
+
+pub(crate) struct CandidateActivationQuoteGuard {
+    previous: Option<CandidateActivationQuoteSource>,
+}
+
+impl Drop for CandidateActivationQuoteGuard {
+    fn drop(&mut self) {
+        CURRENT_CANDIDATE_ACTIVATION_QUOTE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub(crate) fn install_candidate_activation_quote(
+    source: CandidateActivationQuoteSource,
+) -> CandidateActivationQuoteGuard {
+    let previous = CURRENT_CANDIDATE_ACTIVATION_QUOTE.with(|slot| slot.replace(Some(source)));
+    CandidateActivationQuoteGuard { previous }
+}
+
+pub(crate) fn install_candidate_activation_pack(
+    pack: VerifiedPack,
+) -> CandidateActivationQuoteGuard {
+    install_candidate_activation_quote(CandidateActivationQuoteSource::Pack(pack))
+}
+
+pub(crate) fn current_candidate_activation_quote() -> Option<CandidateActivationQuoteSource> {
+    CURRENT_CANDIDATE_ACTIVATION_QUOTE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+fn current_candidate_activation_pack() -> Option<VerifiedPack> {
+    match current_candidate_activation_quote() {
+        Some(CandidateActivationQuoteSource::Pack(pack)) => Some(pack),
+        _ => None,
+    }
+}
+
+fn architecture_id_from_pack(pack: &VerifiedPack) -> Result<&str, String> {
+    match pack.route() {
+        PackRoute::Asr {
+            model_architecture, ..
+        } => Ok(*model_architecture),
+        PackRoute::Aux {
+            model_architecture, ..
+        } => Ok(model_architecture.as_str()),
+    }
+}
+
+/// Resolves the first policy candidate for the pack being activated. This is
+/// the live lane, not a dummy CPU route.
+pub fn resolve_candidate_activation_lane(
+    services: &NativeExecutionServices,
+    pack: &VerifiedPack,
+    intent: ExecutionIntent,
+) -> Result<ExecutionCandidate, String> {
+    let architecture_id = architecture_id_from_pack(pack)?;
+    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(architecture_id)
+        .ok_or_else(|| {
+            format!("candidate activation has no architecture descriptor for {architecture_id}")
+        })?;
+    let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
+    let plan = services
+        .policy_resolver()
+        .resolve(
+            intent,
+            crate::arch::family_auto_gpu_policy_for_model_architecture(architecture_id),
+            descriptor.execution_contract.execution_capabilities,
+            &inventory,
+        )
+        .map_err(|error| error.to_string())?;
+    plan.candidates()
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("execution policy produced no candidate lane for {architecture_id}"))
+}
+
+/// Fully resolved default-model activation facts. The server consumes this
+/// value but cannot independently recombine family policy, provider identity,
+/// output-plan evidence, or reuse evidence.
+#[derive(Debug, Clone)]
+pub struct ResolvedDefaultModelActivation {
+    verified_pack: VerifiedPack,
+    facts: DefaultModelActivationFacts,
+}
+
+impl ResolvedDefaultModelActivation {
+    pub const fn facts(&self) -> &DefaultModelActivationFacts {
+        &self.facts
+    }
+
+    pub fn quote(&self) -> Result<DefaultModelActivationQuote, String> {
+        let (_backends, _mapping, mapping) = quote_candidate_activation_plan(
+            &self.verified_pack,
+            self.facts.plan().resident_topology(),
+        )?;
+        Ok(DefaultModelActivationQuote {
+            mapping,
+            content_id: self.verified_pack.content_id().to_string(),
+        })
+    }
+
+    pub fn quote_and_reserve(
+        &self,
+        services: &NativeExecutionServices,
+    ) -> Result<BrokerActivationReservation, String> {
+        self.quote()?.reserve(services)
+    }
+}
+
+/// Opaque, observation-bound activation quote. The server can place a fault
+/// or audit checkpoint between quote/stat observation and broker mutation, but
+/// cannot inspect or rewrite physical-domain rows.
+pub struct DefaultModelActivationQuote {
+    mapping: PackMappingQuote,
+    content_id: String,
+}
+
+impl DefaultModelActivationQuote {
+    pub fn reserve(
+        self,
+        services: &NativeExecutionServices,
+    ) -> Result<BrokerActivationReservation, String> {
+        reserve_pack_mapping(services, &self.mapping, Some(&self.content_id))
+    }
+}
+
+/// Observation-bound host-import of one already-open pack mapping.
+///
+/// This is not a broker reservation batch. Activation opens a mapping
+/// envelope; GPU `pack-weight-buffer` reserves separately.
+struct PackMappingQuote {
+    snapshot: DeviceMemorySnapshot,
+    bytes: u64,
+    resource_id: String,
+    quote_confidence: QuoteConfidence,
+}
+
+fn resolve_resident_topology_plan(
+    descriptor: crate::arch::OpenAsrArchitectureDescriptor,
+    pack: &VerifiedPack,
+    candidate: &ExecutionCandidate,
+    intent: &ExecutionIntent,
+    allow_unified_runtime: bool,
+) -> Result<DefaultModelResidentTopologyPlan, String> {
+    let session = crate::arch::runtime_footprint::ResidentSessionEnvelope::activation_prepare();
+    let topology = descriptor
+        .build_resident_topology(pack, candidate, intent, &session, allow_unified_runtime)
+        .map_err(|error| format!("candidate activation resident topology failed: {error:?}"))?;
+    Ok(DefaultModelResidentTopologyPlan {
+        architecture: topology.architecture(),
+        components: topology
+            .components()
+            .iter()
+            .map(|component| {
+                let verified = component.verified();
+                let spec = verified.spec();
+                DefaultModelResidentComponentPlan {
+                    component: spec.component(),
+                    variant: spec.variant(),
+                    phase: spec.phase(),
+                    lifetime: spec.lifetime(),
+                    dependencies: spec.dependencies().to_vec(),
+                    representations: spec.representations().to_vec(),
+                    checkout: spec.checkout(),
+                    placement: verified.resolved_variant().placement(),
+                }
+            })
+            .collect(),
+        dependency_order: topology.dependency_order().to_vec(),
+    })
+}
+
+/// Resolve the verified pack, exact candidate lane, output plan, reuse mode,
+/// and activation identity exactly once before owner acquisition.
+pub fn resolve_default_model_activation(
+    services: &NativeExecutionServices,
+    pack: &VerifiedPack,
+    intent: ExecutionIntent,
+    pull: String,
+    path: std::path::PathBuf,
+) -> Result<ResolvedDefaultModelActivation, String> {
+    if pack.preflight().runtime_source().path() != path {
+        return Err("default-model activation path does not match the verified source".to_string());
+    }
+    let architecture_id = architecture_id_from_pack(pack)?;
+    let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(architecture_id)
+        .ok_or_else(|| {
+            format!("candidate activation has no architecture descriptor for {architecture_id}")
+        })?;
+    let candidate = resolve_candidate_activation_lane(services, pack, intent.clone())?;
+    let resident_topology =
+        resolve_resident_topology_plan(descriptor, pack, &candidate, &intent, true)?;
+    let logits_consumers = super::device_greedy_token::decode_logits_consumers_for_request(
+        descriptor.identity.adapter_id,
+        false,
+        false,
+        false,
+    );
+    let resolved_runtime = super::device_greedy_token::resolved_runtime_for_family_candidate(
+        &candidate,
+        crate::arch::family_auto_gpu_policy_for_model_architecture(architecture_id),
+        descriptor.identity.adapter_id,
+        logits_consumers,
+    );
+    let pack_content_id = pack.content_id().to_string();
+    let plan = DefaultModelActivationPlan::new(
+        path.clone(),
+        pack_content_id.clone(),
+        architecture_id.to_string(),
+        intent.clone(),
+        resolved_runtime,
+        resident_topology.clone(),
+    );
+    let lane = DefaultModelActivationLane::new(candidate.clone());
+    let identity = DefaultModelActivationIdentity::new(
+        pull,
+        path,
+        pack_content_id,
+        architecture_id.to_string(),
+        intent,
+        candidate.clone(),
+        plan.output_plan(),
+        plan.reuse_mode(),
+        resident_topology,
+    );
+    Ok(ResolvedDefaultModelActivation {
+        verified_pack: pack.clone(),
+        facts: ResolvedExecutionFacts::new(plan, lane, identity),
+    })
+}
+
+fn cstr_ptr_lossy(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn ggml_backend_physical_identity(
+    backend: ffi::GgmlBackendRaw,
+) -> Result<PhysicalDeviceKey, String> {
+    if backend.is_null() {
+        return Err("candidate activation quote received a null ggml backend".to_string());
+    }
+    let device = unsafe { ffi::ggml_backend_get_device(backend) };
+    ggml_device_physical_identity(device)
+}
+
+fn ggml_device_physical_identity(
+    device: ffi::GgmlBackendDevRaw,
+) -> Result<PhysicalDeviceKey, String> {
+    if device.is_null() {
+        return Err("candidate activation backend has no device for physical identity".to_string());
+    }
+    let mut props = ffi::GgmlBackendDevProps {
+        name: std::ptr::null(),
+        description: std::ptr::null(),
+        memory_free: 0,
+        memory_total: 0,
+        type_: 0,
+        device_id: std::ptr::null(),
+        caps: ffi::GgmlBackendDevCaps::default(),
+    };
+    unsafe { ffi::ggml_backend_dev_get_props(device, &mut props) };
+    let name = cstr_ptr_lossy(props.name);
+    let provider = ExecutionProvider::from_backend_name(&name);
+    let stable_id = if props.device_id.is_null() {
+        name
+    } else {
+        let value = cstr_ptr_lossy(props.device_id);
+        if value.trim().is_empty() { name } else { value }
+    };
+    PhysicalDeviceKey::new(format!("{}:{stable_id}", provider.as_str()))
+        .map_err(|error| error.to_string())
+}
+
+fn host_backend_for_activation() -> Result<GgmlBackend, String> {
+    ensure_backends_loaded();
+    GgmlBackend::cpu().map_err(|error| error.to_string())
+}
+
+fn quote_activation_group(
+    group_id: &str,
+    identity: PhysicalDeviceKey,
+    abi: BackendMemoryAbi,
+    request: ffi::GgmlBackendMemoryRequestV1,
+) -> Result<NativeQuotedBackendGroup, String> {
+    let semantics = NativeMemoryClaimSemantics {
+        resource_id: group_id.to_owned(),
+        lifetime: AllocationLifetime::PackShared,
+        phases: PhaseSet::ALL,
+    };
+    NativeQuotedBackendGroup::quote(
+        group_id,
+        identity,
+        abi,
+        vec![request],
+        BTreeMap::from([(request.request_id, semantics.clone())]),
+        semantics,
+    )
+    .map_err(|error| format!("candidate activation ggml quote: {error}"))
+}
+
+fn quote_host_activation_group(
+    group_id: &str,
+    host: &GgmlBackend,
+    request: ffi::GgmlBackendMemoryRequestV1,
+) -> Result<NativeQuotedBackendGroup, String> {
+    let abi = unsafe { BackendMemoryAbi::from_backend(host.as_ptr()) }
+        .map_err(|error| format!("candidate activation ABI: {error}"))?;
+    quote_activation_group(
+        group_id,
+        ggml_backend_physical_identity(host.as_ptr())?,
+        abi,
+        request,
+    )
+}
+
+fn quote_candidate_activation_plan(
+    pack: &VerifiedPack,
+    resident_topology: &DefaultModelResidentTopologyPlan,
+) -> Result<
+    (
+        Vec<GgmlBackend>,
+        std::sync::Arc<memmap2::Mmap>,
+        PackMappingQuote,
+    ),
+    String,
+> {
+    let prepared_components = resident_topology
+        .components
+        .iter()
+        .filter(|component| {
+            matches!(
+                component.phase,
+                crate::arch::runtime_footprint::ResidentPhase::Prepare
+                    | crate::arch::runtime_footprint::ResidentPhase::Load
+            )
+        })
+        .map(|component| component.component)
+        .collect::<Vec<_>>();
+    if prepared_components.is_empty() {
+        return Err(
+            "architecture resident topology has no Prepare/Load component to reserve".to_string(),
+        );
+    }
+    let topology_resource = format!(
+        "{}:{}",
+        resident_topology.architecture,
+        prepared_components.join(",")
+    );
+    quote_pack_activation_plan(pack, &topology_resource)
+}
+
+/// Quote the already-open pack mapping as host-import for one activation
+/// resource. Discrete GPU VRAM is reserved later at `pack-weight-buffer`
+/// allocation, never as a mmap-sized device-copy forecast of this mapping.
+fn quote_pack_activation_plan(
+    pack: &VerifiedPack,
+    activation_resource: &str,
+) -> Result<
+    (
+        Vec<GgmlBackend>,
+        std::sync::Arc<memmap2::Mmap>,
+        PackMappingQuote,
+    ),
+    String,
+> {
+    let mmap = pack.preflight().runtime_source().backing_mmap();
+    let requested_bytes = pack.preflight().runtime_source().byte_len();
+    if requested_bytes == 0 || mmap.is_empty() {
+        return Err("verified pack mapping is empty and cannot be reserved as zero".to_string());
+    }
+    let host = host_backend_for_activation()?;
+    let host_import = ffi::GgmlBackendMemoryRequestV1 {
+        kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
+        usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+        request_id: 1,
+        backend: host.as_ptr(),
+        host_ptr: mmap.as_ptr().cast::<c_void>(),
+        requested_bytes,
+        currently_allocated_bytes: 0,
+        ..Default::default()
+    };
+    let host_group_id = format!("candidate-activation-host-import:{activation_resource}");
+    let host_group = quote_host_activation_group(&host_group_id, &host, host_import)?;
+    let plan = admission_plan_from_quoted_groups(vec![host_group])?;
+    let request = match plan.reservation_requests() {
+        [request] if request.domain == MemoryDomainKey::SystemMemory && request.peak_bytes > 0 => {
+            request
+        }
+        _ => {
+            return Err(
+                "candidate activation host-import must quote one SystemMemory mapping".to_string(),
+            );
+        }
+    };
+    Ok((
+        vec![host],
+        mmap,
+        PackMappingQuote {
+            snapshot: request.snapshot,
+            bytes: requested_bytes,
+            resource_id: request.resource_id.clone(),
+            quote_confidence: plan.quote_confidence_for_domain(&MemoryDomainKey::SystemMemory),
+        },
+    ))
+}
+
+fn admission_plan_from_quoted_groups(
+    groups: Vec<NativeQuotedBackendGroup>,
+) -> Result<NativeMemoryAdmissionPlan, String> {
+    let plan = NativeMemoryAdmissionPlan::from_groups(groups)
+        .map_err(|error| format!("candidate activation admission plan: {error}"))?;
+    if plan.reservation_requests().is_empty() {
+        return Err("candidate activation quote produced no physical-domain requests".to_string());
+    }
+    for request in plan.reservation_requests() {
+        if request.peak_bytes == 0 {
+            return Err(format!(
+                "candidate activation quote for {} is unknown and cannot be reserved as zero",
+                request.domain
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+fn quote_cpu_buffer_plan(
+    group_id: &str,
+    requested_bytes: u64,
+) -> Result<(GgmlBackend, NativeMemoryAdmissionPlan), String> {
+    if requested_bytes == 0 {
+        return Err(
+            "declared resident bytes are unknown and cannot be reserved as zero".to_string(),
+        );
+    }
+    let host = host_backend_for_activation()?;
+    let device = unsafe { ffi::ggml_backend_get_device(host.as_ptr()) };
+    if device.is_null() {
+        return Err("host activation backend has no device".to_string());
+    }
+    let buft = unsafe { ffi::ggml_backend_dev_buffer_type(device) };
+    if buft.is_null() {
+        return Err("host activation backend has no buffer type to quote".to_string());
+    }
+    let request = ffi::GgmlBackendMemoryRequestV1 {
+        kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+        usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+        request_id: 1,
+        backend: host.as_ptr(),
+        buft,
+        requested_bytes,
+        currently_allocated_bytes: 0,
+        ..Default::default()
+    };
+    let group = quote_host_activation_group(group_id, &host, request)?;
+    let plan = admission_plan_from_quoted_groups(vec![group])?;
+    Ok((host, plan))
+}
+
+fn reserve_pack_mapping(
+    services: &NativeExecutionServices,
+    mapping: &PackMappingQuote,
+    content_id: Option<&str>,
+) -> Result<BrokerActivationReservation, String> {
+    let cohort_id = current_memory_reservation_cohort_id()
+        .unwrap_or_else(|| MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0));
+    let collector = services.runtime_receipts();
+    let handle = services
+        .memory_broker()
+        .open_mapping_envelope(
+            mapping.snapshot,
+            mapping.bytes,
+            cohort_id,
+            mapping.resource_id.clone(),
+            Some(services.scope_id),
+            RuntimeOwnerPlacement::HostNeutral,
+        )
+        .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    if collector.is_available()
+        && let Some(owner) = collector.host_neutral_owner_descriptor(
+            "mapping-envelope",
+            content_id,
+            Some(mapping.resource_id.as_str()),
+        )
+        && let Some(resource) = collector.resource_descriptor(
+            &mapping.resource_id,
+            &MemoryDomainKey::SystemMemory,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.bytes,
+            mapping.quote_confidence,
+            Some(mapping.snapshot.confidence),
+        )
+    {
+        services.memory_broker().attach_mapping_envelope_receipt(
+            &handle,
+            collector.clone(),
+            owner,
+            resource,
+        );
+    }
+    Ok(BrokerActivationReservation::from_envelope(
+        handle, cohort_id,
+    ))
+}
+
+fn reserve_activation_plan(
+    services: &NativeExecutionServices,
+    plan: &NativeMemoryAdmissionPlan,
+    candidate: &ExecutionCandidate,
+    content_id: Option<&str>,
+) -> Result<BrokerActivationReservation, String> {
+    let mut requests = plan.reservation_requests().to_vec();
+    let cohort_id = current_memory_reservation_cohort_id()
+        .unwrap_or_else(|| MemoryReservationCohortId::new(ExecutionCacheAttemptId::next().0));
+    for request in &mut requests {
+        request.cohort_id = Some(cohort_id);
+    }
+    let collector = services.runtime_receipts();
+    let backend = match candidate.device.route.provider {
+        ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        ExecutionProvider::Cuda
+        | ExecutionProvider::Hip
+        | ExecutionProvider::Vulkan
+        | ExecutionProvider::Accelerator
+        | ExecutionProvider::Unknown => GgmlCpuGraphBackend::Gpu,
+    };
+    let lane = collector.lane_projection(
+        candidate.device.route.provider,
+        &candidate.device.route.stable_id,
+        candidate.placement,
+        backend,
+    );
+    let owner_placement = lane.map_or(
+        RuntimeOwnerPlacement::Unknown,
+        RuntimeOwnerPlacement::LaneBound,
+    );
+    let mut batch = services
+        .memory_broker()
+        .try_reserve_batch_for_scope_and_placement(
+            requests,
+            Some(services.scope_id),
+            owner_placement,
+        )
+        .map_err(|error| format!("candidate activation reserve: {error}"))?;
+    if let Some(lane) = lane
+        && let Some(owner) = collector.owner_descriptor(
+            "candidate-activation-reservation",
+            content_id,
+            plan.reservation_requests()
+                .first()
+                .map(|request| request.resource_id.as_str()),
+            Some(lane),
+        )
+    {
+        let resources = plan
+            .reservation_requests()
+            .iter()
+            .filter_map(|request| {
+                collector
+                    .resource_descriptor(
+                        &request.resource_id,
+                        &request.domain,
+                        request.peak_bytes,
+                        request.peak_bytes,
+                        request.retained_bytes,
+                        plan.quote_confidence_for_domain(&request.domain),
+                        Some(request.snapshot.confidence),
+                    )
+                    .map(|descriptor| (request.domain.clone(), descriptor))
+            })
+            .collect();
+        batch.attach_receipt(collector.clone(), owner, resources);
+    }
+    BrokerActivationReservation::from_batch(batch, cohort_id)
+}
+
+fn quote_and_reserve_declared_host_resident(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+    quote: &SystemMemoryAllocationQuote,
+) -> Result<BrokerActivationReservation, String> {
+    let (_backend, plan) = quote_cpu_buffer_plan(
+        &quote.resource_id,
+        quote.peak_bytes.max(quote.retained_bytes),
+    )?;
+    reserve_activation_plan(services, &plan, candidate, None)
+}
+
+fn quote_and_reserve_current_candidate_activation(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+) -> Result<BrokerActivationReservation, String> {
+    match current_candidate_activation_quote() {
+        Some(CandidateActivationQuoteSource::Pack(pack)) => {
+            quote_and_reserve_candidate_activation(services, candidate, &pack)
+        }
+        Some(CandidateActivationQuoteSource::Declared(quote)) => {
+            quote_and_reserve_declared_host_resident(services, candidate, &quote)
+        }
+        None => Err(
+            "candidate activation cannot quote without a verified pack or the current owner's declared resident bytes"
+                .to_string(),
+        ),
+    }
+}
+
+/// Quotes known physical domains for one candidate lane from the architecture
+/// resident footprint and the current execution candidate, then atomically
+/// reserves them. Unknown cost is never treated as zero.
+pub(crate) fn quote_and_reserve_candidate_activation(
+    services: &NativeExecutionServices,
+    candidate: &ExecutionCandidate,
+    pack: &VerifiedPack,
+) -> Result<BrokerActivationReservation, String> {
+    let architecture_id = architecture_id_from_pack(pack)?;
+    let (_backends, _mapping, mapping) = match pack.route() {
+        PackRoute::Asr { .. } => {
+            let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(architecture_id)
+                .ok_or_else(|| {
+                    format!(
+                        "candidate activation has no architecture descriptor for {architecture_id}"
+                    )
+                })?;
+            let intent = ExecutionIntent::Exact(
+                crate::device::execution_route::ExactDeviceSelector::StableId {
+                    provider: Some(candidate.device.route.provider),
+                    stable_id: candidate.device.route.stable_id.clone(),
+                },
+            );
+            let topology =
+                resolve_resident_topology_plan(descriptor, pack, candidate, &intent, true)?;
+            quote_candidate_activation_plan(pack, &topology)?
+        }
+        PackRoute::Aux { .. } => {
+            let policy = super::aux_pack_registry::auxiliary_execution_policy(architecture_id)
+                .ok_or_else(|| {
+                    format!(
+                        "candidate activation has no auxiliary execution descriptor for {architecture_id}"
+                    )
+                })?;
+            let super::aux_pack_registry::AuxiliaryExecutionPolicy::RequestScoped {
+                capabilities,
+                ..
+            } = policy;
+            if !capabilities.supports(candidate.device.route.provider, candidate.placement) {
+                return Err(format!(
+                    "candidate activation lane is not permitted by auxiliary architecture {architecture_id}"
+                ));
+            }
+            let ownership =
+                super::aux_pack_registry::auxiliary_runtime_ownership(architecture_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "candidate activation has no auxiliary ownership descriptor for {architecture_id}"
+                        )
+                    })?;
+            let activation_resource = format!("aux:{architecture_id}:{}", ownership.as_str());
+            quote_pack_activation_plan(pack, &activation_resource)?
+        }
+    };
+    reserve_pack_mapping(services, &mapping, Some(pack.content_id()))
+}
+
 /// Runs a complete allocation/execution operation inside one candidate's
 /// dynamic context and captures its typed failure side channel before the
-/// context is restored. This is shared by offline dispatch and streaming
-/// session construction/warm-up so both surfaces enforce identical retry
-/// semantics.
+/// context is restored. This is the single production runner: it walks
+/// [`super::candidate_activation_transaction::CandidateActivationTransaction`]
+/// internally so offline, streaming, serve-batch, and auxiliary callers share
+/// prepare -> reserve -> materialize -> AttestationPending -> attest -> commit.
+/// Quote is obtained first; reservation is a broker batch, not a Noop.
 pub(crate) fn run_execution_candidate_attempt<T, E>(
     services: &NativeExecutionServices,
     candidate: &ExecutionCandidate,
@@ -1119,36 +2469,121 @@ pub(crate) fn run_execution_candidate_attempt<T, E>(
     let failure_sink = ExecutionCandidateFailureSink::new();
     let placement_collector = (candidate.placement != ExecutionPlacement::CpuOnly)
         .then(GgmlExecutionTelemetryCollector::new);
+    let receipt = current_execution_receipt_collector();
+    // This collector belongs to precisely one candidate attempt. It never
+    // consults the caller's cumulative telemetry when publishing receipt facts.
+    let receipt_collector = receipt
+        .as_ref()
+        .map(|_| GgmlExecutionTelemetryCollector::new());
     let outer_collector = current_execution_telemetry_collector();
     let combined_collector = GgmlExecutionTelemetryCollector::fanout(
-        outer_collector.iter().chain(placement_collector.iter()),
+        outer_collector
+            .iter()
+            .chain(placement_collector.iter())
+            .chain(receipt_collector.iter()),
     );
     // Audit observations follow the same candidate transaction as resident
     // cache publication. A failed FullDevice attempt must not contaminate the
     // evidence for a succeeding Hybrid attempt on the same Exact device.
     let observation_transaction = current_execution_observation_sink()
         .map(|parent| (parent, ExecutionObservationSink::new()));
-    let (result, candidate_failure, committed) = {
+    if let Some(receipt) = &receipt {
+        receipt.begin_candidate_attempt();
+    }
+    let facts = NativeCandidateAttemptFacts::new(candidate.clone());
+    let outcome_slot = Rc::new(RefCell::new(None));
+    let (result, candidate_failure, committed, receipt_placement) = {
         let _observation_guard = observation_transaction
             .as_ref()
             .map(|(_, attempt)| install_execution_observation_sink(attempt.clone()));
         let _telemetry = install_execution_telemetry_collector(combined_collector);
         let _attempt =
             install_execution_candidate_attempt(services, candidate, failure_sink.clone());
-        let journal_scope = ExecutionCacheJournalScope::begin();
-        let result = operation();
-        let mut candidate_failure = failure_sink.failure();
-        if result.is_ok() && candidate_failure.is_none() {
-            candidate_failure = placement_collector.as_ref().and_then(|collector| {
-                observed_placement_violation(candidate, &collector.snapshot())
-            });
+        if receipt.is_some() {
+            services.runtime_receipts.begin_request_event_window();
         }
-        let committed = result.is_ok() && candidate_failure.is_none();
-        journal_scope.finish(committed);
-        (result, candidate_failure, committed)
+        let journal_scope = ExecutionCacheJournalScope::begin();
+        let reservation = match quote_and_reserve_current_candidate_activation(services, candidate)
+        {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                let failure =
+                    ExecutionCandidateFailure::capacity("candidate-activation-reserve", reason);
+                record_current_execution_candidate_failure(failure.clone());
+                let result = operation();
+                let mut candidate_failure = failure_sink.failure().or(Some(failure));
+                if result.is_ok() && candidate_failure.is_none() {
+                    candidate_failure = placement_collector.as_ref().and_then(|collector| {
+                        observed_placement_violation(candidate, &collector.snapshot())
+                    });
+                }
+                journal_scope.finish(false);
+                if let Some(receipt) = &receipt {
+                    receipt.finish_candidate_attempt(false);
+                }
+                return ExecutionCandidateAttemptOutcome {
+                    result,
+                    candidate_failure,
+                };
+            }
+        };
+        let contract = NativeCandidateAttemptAttestation {
+            identity: facts.clone(),
+            candidate: candidate.clone(),
+            operation: RefCell::new(Some(operation)),
+            failure_sink: failure_sink.clone(),
+            placement_collector: placement_collector.clone(),
+            outcome: Rc::clone(&outcome_slot),
+        };
+        let resolved = ResolvedExecutionFacts::new(facts.clone(), facts.clone(), facts.clone());
+        let prepared = ExecutionCandidateAttemptJournalFactory::bind(move |commit| {
+            journal_scope.finish(commit);
+        })
+        .prepare(facts, resolved);
+        debug_assert_eq!(prepared.stage(), ActivationStage::Prepared);
+        let reserved = prepared.reserve(reservation);
+        debug_assert_eq!(reserved.stage(), ActivationStage::Reserved);
+        let materialized = reserved.materialize(std::iter::once(ExecutionCandidateAttemptOwner));
+        debug_assert_eq!(materialized.stage(), ActivationStage::Materialized);
+        let pending = materialized.begin_attestation(contract);
+        debug_assert_eq!(pending.stage(), ActivationStage::AttestationPending);
+        match pending.attest() {
+            AttestationOutcome::Attested(attested) => {
+                debug_assert_eq!(attested.stage(), ActivationStage::Attested);
+                attested
+                    .commit_attempt()
+                    .expect("candidate attempt journal publication cannot fail");
+            }
+            AttestationOutcome::Rejected { transaction, .. } => {
+                let _ = transaction.rollback_attempt();
+            }
+            AttestationOutcome::MustQuarantine { transaction, .. } => {
+                let _ = transaction.quarantine_attempt();
+            }
+        }
+        let outcome = outcome_slot
+            .borrow_mut()
+            .take()
+            .expect("candidate attempt attestation stored an outcome");
+        let committed = outcome.result.is_ok() && outcome.candidate_failure.is_none();
+        let receipt_placement = receipt_collector
+            .as_ref()
+            .map(GgmlExecutionTelemetryCollector::snapshot);
+        (
+            outcome.result,
+            outcome.candidate_failure,
+            committed,
+            receipt_placement,
+        )
     };
     if committed && let Some((parent, attempt)) = observation_transaction {
         parent.append(attempt.observations());
+    }
+    if let Some(receipt) = receipt {
+        receipt.finish_candidate_attempt(committed);
+        if committed {
+            receipt.record_placement(receipt_placement.unwrap_or_default());
+        }
     }
     ExecutionCandidateAttemptOutcome {
         result,
@@ -1181,6 +2616,7 @@ pub struct NativeExecutionServices {
     scope_id: NativeExecutionScopeId,
     policy_resolver: Arc<dyn ExecutionPolicyResolver>,
     memory_broker: Arc<DeviceMemoryBrokerSet>,
+    runtime_receipts: RuntimeReceiptCollector,
     auxiliary_runtime_owners: super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache,
     firered_punc_actors: super::admitted_pinned_runtime_actor_pool::AdmittedPinnedRuntimeActorPool<
         super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
@@ -1206,6 +2642,8 @@ pub struct NativeExecutionServices {
             super::policy_resolved_aux_runtime::AuxiliaryPinnedRuntimeCacheKey,
             crate::diarize::vad::FireRedRealtimeVadRuntime,
         >,
+    firered_stream_vad_embedded: crate::diarize::vad::StreamVadEmbeddedSlot,
+    loaded_weight_owners: crate::ggml_runtime::LoadedWeightOwnerCache,
     dispatches: NativeExecutionDispatches,
 }
 
@@ -1223,6 +2661,18 @@ impl NativeExecutionServices {
     pub(crate) fn new_with_broker(
         policy_resolver: Arc<dyn ExecutionPolicyResolver>,
         memory_broker: Arc<DeviceMemoryBrokerSet>,
+    ) -> Result<Self, NativeExecutionServicesError> {
+        Self::new_with_broker_and_receipt_factory(
+            policy_resolver,
+            memory_broker,
+            RuntimeReceiptCollector::new,
+        )
+    }
+
+    fn new_with_broker_and_receipt_factory(
+        policy_resolver: Arc<dyn ExecutionPolicyResolver>,
+        memory_broker: Arc<DeviceMemoryBrokerSet>,
+        receipt_factory: impl FnOnce(NativeExecutionScopeId) -> RuntimeReceiptCollector,
     ) -> Result<Self, NativeExecutionServicesError> {
         let executor_scope = BuiltinStatefulExecutorScope::new().map_err(|error| {
             NativeExecutionServicesError::DispatchBuild {
@@ -1244,10 +2694,12 @@ impl NativeExecutionServices {
                 }
             })?;
 
+        let scope_id = NativeExecutionScopeId::next();
         Ok(Self {
-            scope_id: NativeExecutionScopeId::next(),
+            scope_id,
             policy_resolver,
-            memory_broker,
+            memory_broker: Arc::clone(&memory_broker),
+            runtime_receipts: receipt_factory(scope_id),
             auxiliary_runtime_owners:
                 super::policy_resolved_aux_runtime::AuxiliaryRuntimeOwnerCache::default(),
             firered_punc_actors:
@@ -1292,6 +2744,8 @@ impl NativeExecutionServices {
                         4,
                     ),
                 ),
+            firered_stream_vad_embedded: Arc::new(Mutex::new(None)),
+            loaded_weight_owners: crate::ggml_runtime::LoadedWeightOwnerCache::new(scope_id),
             dispatches: NativeExecutionDispatches { offline, streaming },
         })
     }
@@ -1306,6 +2760,10 @@ impl NativeExecutionServices {
 
     pub fn memory_broker(&self) -> &Arc<DeviceMemoryBrokerSet> {
         &self.memory_broker
+    }
+
+    pub fn runtime_receipts(&self) -> &RuntimeReceiptCollector {
+        &self.runtime_receipts
     }
 
     pub(crate) fn auxiliary_runtime_owners(
@@ -1378,6 +2836,11 @@ impl NativeExecutionServices {
         self.pyannote_segmenter_actors.clear();
         self.redimnet_runtime_actors.clear();
         self.firered_stream_vad_realtime_actors.clear();
+        *self
+            .firered_stream_vad_embedded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.loaded_weight_owners.clear();
     }
 
     /// Evicts one replaced pack identity from this root's prepared-runtime
@@ -1397,6 +2860,7 @@ impl NativeExecutionServices {
             .evict_where(|key| key.has_content_id(pack_content_id));
         self.redimnet_runtime_actors
             .evict_where(|key| key.has_content_id(pack_content_id));
+        self.loaded_weight_owners.evict_content_id(pack_content_id);
     }
 }
 
@@ -1430,11 +2894,27 @@ pub(crate) fn test_native_execution_services() -> Arc<NativeExecutionServices> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_native_execution_services_with_entropy_failure() -> Arc<NativeExecutionServices>
+{
+    Arc::new(
+        NativeExecutionServices::new_with_broker_and_receipt_factory(
+            Arc::new(DefaultExecutionPolicyResolver),
+            Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy::default())),
+            RuntimeReceiptCollector::new_with_entropy_failure_for_test,
+        )
+        .expect("receipt entropy failure must not block service construction"),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::device::{
+        execution_memory::{
+            DeviceMemorySnapshot, DeviceMemoryUsage, MemoryDomainKey, MemoryObservationConfidence,
+        },
         execution_policy::ExecutionDeviceSnapshot,
         execution_route::{
             DeviceAddressability, ExecutionProvider, PhysicalResourceKey, ResolvedExecutionRoute,
@@ -1442,8 +2922,37 @@ mod tests {
         },
     };
     use crate::ggml_runtime::{
-        GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner,
+        GgmlActualDeviceFacts, GgmlBackendKind, GgmlCpuGraphConfig, GgmlCpuGraphError,
+        GgmlCpuGraphRunner,
     };
+
+    fn test_cuda_device() -> GgmlActualDeviceFacts {
+        GgmlActualDeviceFacts {
+            device_type: "gpu".to_string(),
+            name: "CUDA0".to_string(),
+            description: "test CUDA device".to_string(),
+            provider_device_id: Some("0000:01:00.0".to_string()),
+            pci_vendor_id: Some(0x10de),
+        }
+    }
+
+    fn nes_unit_test_declared_resident() -> SystemMemoryAllocationQuote {
+        SystemMemoryAllocationQuote::new("nes-unit-test.declared-resident", 64 * 1024, 64 * 1024)
+            .expect("nes unit-test declared resident")
+    }
+
+    fn run_execution_candidate_attempt<T, E>(
+        services: &NativeExecutionServices,
+        candidate: &ExecutionCandidate,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> ExecutionCandidateAttemptOutcome<T, E> {
+        let _guard = current_candidate_activation_quote().is_none().then(|| {
+            install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(
+                nes_unit_test_declared_resident(),
+            ))
+        });
+        super::run_execution_candidate_attempt(services, candidate, operation)
+    }
 
     fn cpu_candidate() -> ExecutionCandidate {
         ExecutionCandidate {
@@ -1483,11 +2992,105 @@ mod tests {
                     },
                 },
                 ggml_kind: GgmlBackendKind::Gpu,
-                memory: None,
+                memory: Some(DeviceMemorySnapshot {
+                    free_bytes: 8 * 1024 * 1024 * 1024,
+                    total_bytes: 8 * 1024 * 1024 * 1024,
+                    confidence: MemoryObservationConfidence::DeviceSnapshot,
+                }),
                 buffer_alignment: None,
             },
             placement,
         }
+    }
+
+    #[test]
+    fn candidate_lane_ignores_ambient_override_and_rejects_backend_drift() {
+        let candidate = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA0",
+            "0000:00:02.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let ambient = gpu_candidate(
+            ExecutionProvider::Vulkan,
+            "Vulkan0",
+            "0000:00:03.0",
+            ExecutionPlacement::Hybrid,
+        );
+        let _backend_guard = install_request_backend_override(Some(
+            RequestBackendPreference::Exact(ambient.device.route.clone()),
+        ));
+
+        let lane = ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Gpu)
+            .expect("candidate route must construct the lane");
+        let context = crate::RequestExecutionContext::uncancellable("candidate lane test")
+            .with_native_execution_lane(lane.clone());
+        assert_eq!(lane.provider(), ExecutionProvider::Cuda);
+        assert_eq!(lane.stable_device_id(), "CUDA0");
+        assert_eq!(lane.placement(), ExecutionPlacement::FullDevice);
+        assert_eq!(context.native_execution_lane(), Some(&lane));
+        assert!(
+            ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Metal).is_err(),
+            "a CUDA candidate must not be relabeled as Metal"
+        );
+    }
+
+    #[test]
+    fn resolved_lane_guard_restores_backend_placement_and_lane_as_one_scope() {
+        let outer = ExecutionLaneKey::from_candidate(
+            &gpu_candidate(
+                ExecutionProvider::Vulkan,
+                "Vulkan0",
+                "0000:00:03.0",
+                ExecutionPlacement::Hybrid,
+            ),
+            GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("outer lane");
+        let inner = ExecutionLaneKey::from_candidate(
+            &gpu_candidate(
+                ExecutionProvider::Cuda,
+                "CUDA1",
+                "0000:00:04.0",
+                ExecutionPlacement::FullDevice,
+            ),
+            GgmlCpuGraphBackend::Gpu,
+        )
+        .expect("inner lane");
+        let original_backend = request_backend_override();
+        let original_placement = current_execution_placement();
+        let original_lane = current_execution_lane();
+
+        {
+            let _outer = install_resolved_execution_lane(outer.clone());
+            assert_eq!(
+                request_backend_override(),
+                Some(outer.request_backend_preference())
+            );
+            assert_eq!(current_execution_placement(), Some(outer.placement()));
+            assert_eq!(current_execution_lane(), Some(outer.clone()));
+
+            {
+                let _inner = install_resolved_execution_lane(inner.clone());
+                assert_eq!(
+                    request_backend_override(),
+                    Some(inner.request_backend_preference())
+                );
+                assert_eq!(current_execution_placement(), Some(inner.placement()));
+                assert_eq!(current_execution_lane(), Some(inner));
+            }
+
+            assert_eq!(
+                request_backend_override(),
+                Some(outer.request_backend_preference())
+            );
+            assert_eq!(current_execution_placement(), Some(outer.placement()));
+            assert_eq!(current_execution_lane(), Some(outer));
+        }
+
+        assert_eq!(request_backend_override(), original_backend);
+        assert_eq!(current_execution_placement(), original_placement);
+        assert_eq!(current_execution_lane(), original_lane);
     }
 
     fn record_test_graph_placements(backends: &[&str]) {
@@ -1634,8 +3237,16 @@ mod tests {
         let candidate = cpu_candidate();
         let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
             let context = current_native_execution_context().expect("candidate context");
+            let scope_id = services.scope_id();
             std::thread::spawn(move || {
                 let _guard = install_native_execution_context(context);
+                assert_eq!(
+                    current_runtime_receipts()
+                        .expect("propagated receipt collector")
+                        .snapshot()
+                        .scope_id,
+                    scope_id
+                );
                 record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
                     "worker-allocation",
                     "worker request-local failure",
@@ -1673,6 +3284,7 @@ mod tests {
                     "CUDA0",
                     ExecutionProvider::Cuda,
                     "CUDA0",
+                    &test_cuda_device(),
                     true,
                 );
             })
@@ -1690,6 +3302,7 @@ mod tests {
                 backend_name: "CUDA0".to_string(),
                 actual_provider: ExecutionProvider::Cuda,
                 actual_stable_id: "CUDA0".to_string(),
+                actual_device: test_cuda_device(),
                 use_scheduler: true,
                 backend_identity: 1,
                 memory_receipts: Vec::new(),
@@ -1722,6 +3335,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
@@ -1741,6 +3355,7 @@ mod tests {
                 "CUDA0",
                 ExecutionProvider::Cuda,
                 "CUDA0",
+                &test_cuda_device(),
                 false,
             );
             Ok::<_, &str>(())
@@ -1903,11 +3518,152 @@ mod tests {
     }
 
     #[test]
+    fn nested_candidate_attempts_keep_parent_activation_cohort() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let parent = ActivationReservationContext::mint();
+        let parent_id = parent.cohort_id;
+        let _guard = install_activation_reservation_context(Some(parent));
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            assert_eq!(
+                current_memory_reservation_cohort_id().expect("attempt cohort"),
+                parent_id
+            );
+            let nested = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+                Ok::<_, ()>(current_memory_reservation_cohort_id().expect("nested cohort"))
+            });
+            assert_eq!(nested.result.unwrap(), parent_id);
+            let context = current_native_execution_context().expect("attempt context");
+            let worker = std::thread::spawn(move || {
+                let _guard = install_native_execution_context(context);
+                current_memory_reservation_cohort_id().expect("worker cohort")
+            })
+            .join()
+            .unwrap();
+            assert_eq!(worker, parent_id);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+    }
+
+    #[test]
+    fn native_root_receipts_capture_system_memory_owner_lifecycle() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let cache = super::super::admitted_host_object_cache::AdmittedHostObjectCache::new(
+                super::super::admitted_host_object_cache::AdmittedHostObjectCacheLimits::new(1, 8),
+            );
+            let first = cache
+                .get_or_try_insert_with(
+                    "receipt-system-memory",
+                    || Ok::<_, String>((1, ())),
+                    |()| {
+                        super::super::system_memory_owner::SystemMemoryOwner::try_allocate(
+                            super::super::system_memory_owner::SystemMemoryAllocationQuote::new(
+                                "receipt-system-memory-fixture",
+                                1,
+                                1,
+                            )
+                            .expect("fixture quote"),
+                            || {
+                                Ok(super::super::system_memory_owner::SystemMemoryAllocationOutcome::new(
+                                    vec![0_u8; 1],
+                                    1,
+                                    1,
+                                ))
+                            },
+                        )
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string())
+                    },
+                    || "cache lock poisoned".to_string(),
+                )
+                .expect("one-byte host owner should be admitted");
+            let second = cache
+                .ready(&"receipt-system-memory")
+                .expect("published host owner should be reusable");
+            assert!(Arc::ptr_eq(&first, &second));
+            let live = services.runtime_receipts().summary();
+            // One owner is the candidate-level forecast reservation; the
+            // other is the committed SystemMemory allocation. Both must be
+            // visible while the attempt is active.
+            assert_eq!(live.live_owner_count, 2);
+            assert_eq!(live.live_resource_count, 2);
+            assert!(
+                services
+                    .runtime_receipts()
+                    .snapshot()
+                    .events
+                    .iter()
+                    .any(|event| matches!(
+                        event,
+                        super::super::runtime_receipts::RuntimeReceiptEvent::OwnerReused { .. }
+                    ))
+            );
+            drop(first);
+            drop(second);
+            cache.clear();
+            let released = services.runtime_receipts().summary();
+            assert_eq!(released.live_owner_count, 1);
+            assert_eq!(released.live_resource_count, 1);
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+    }
+    #[test]
+    fn entropy_failure_keeps_service_execution_alive_and_reports_unavailable() {
+        let services = test_native_execution_services_with_entropy_failure();
+        let snapshot = services.runtime_receipts().snapshot();
+        assert!(matches!(
+            snapshot.availability,
+            super::super::runtime_receipts::RuntimeReceiptAvailability::Unavailable {
+                reason: super::super::runtime_receipts::RuntimeReceiptUnavailableReason::EntropyUnavailable,
+            }
+        ));
+        assert!(!snapshot.completeness.complete);
+        assert_eq!(snapshot.live_owners.len(), 0);
+
+        let candidate = cpu_candidate();
+        let outcome = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let owner =
+                super::super::system_memory_owner::SystemMemoryOwner::try_reserve_invocation(
+                    "entropy-failure-execution-fixture",
+                    1,
+                )
+                .map_err(|error| error.to_string())?;
+            assert_eq!(owner.committed_requested_bytes(), 1);
+            drop(owner);
+            Ok::<_, String>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(outcome.candidate_failure.is_none());
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+        assert!(matches!(
+            services.runtime_receipts().summary().completeness.reason,
+            Some(super::super::runtime_receipts::ReceiptCompletenessReason::Unavailable(
+                super::super::runtime_receipts::RuntimeReceiptUnavailableReason::EntropyUnavailable
+            ))
+        ));
+    }
+
+    #[test]
     fn independently_constructed_local_roots_share_the_process_memory_ledger() {
         let first = NativeExecutionServices::for_local_process().unwrap();
         let second = NativeExecutionServices::for_local_process().unwrap();
         assert_ne!(first.scope_id(), second.scope_id());
         assert!(Arc::ptr_eq(first.memory_broker(), second.memory_broker()));
+        assert_eq!(
+            first.runtime_receipts().snapshot().scope_id,
+            first.scope_id()
+        );
+        assert_eq!(
+            second.runtime_receipts().snapshot().scope_id,
+            second.scope_id()
+        );
     }
 
     #[test]
@@ -2056,6 +3812,10 @@ mod tests {
         let lane_for = |candidate: &ExecutionCandidate| {
             let sink = ExecutionCandidateFailureSink::new();
             let _guard = install_execution_candidate_attempt(services.as_ref(), candidate, sink);
+            assert_eq!(
+                current_execution_lane(),
+                ExecutionLaneKey::from_candidate(candidate, GgmlCpuGraphBackend::Gpu).ok()
+            );
             current_execution_lane_key(GgmlCpuGraphBackend::Gpu)
         };
         let cuda0_lane = lane_for(&cuda0);
@@ -2064,6 +3824,68 @@ mod tests {
         assert_ne!(cuda0_lane, lane_for(&hybrid));
         assert_eq!(cuda0_lane.backend(), GgmlCpuGraphBackend::Gpu);
         assert_eq!(cuda0_lane.placement(), ExecutionPlacement::FullDevice);
+        let projection = cuda0_lane
+            .receipt_projection(services.runtime_receipts())
+            .expect("entropy-backed lane projection");
+        assert_eq!(projection.provider, ExecutionProvider::Cuda);
+        assert_eq!(projection.placement, ExecutionPlacement::FullDevice);
+    }
+
+    #[test]
+    fn execution_lane_memory_sample_is_exact_and_enumeration_order_invariant() {
+        let candidate = gpu_candidate(
+            ExecutionProvider::Cuda,
+            "CUDA1",
+            "0000:02:00.0",
+            ExecutionPlacement::FullDevice,
+        );
+        let lane = ExecutionLaneKey::from_candidate(&candidate, GgmlCpuGraphBackend::Gpu)
+            .expect("exact CUDA lane");
+        let vulkan = (
+            "Vulkan0".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 3 * 1024 * 1024,
+                total_bytes: 7 * 1024 * 1024,
+            }),
+        );
+        let cuda0 = (
+            "CUDA0".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 5 * 1024 * 1024,
+                total_bytes: 8 * 1024 * 1024,
+            }),
+        );
+        let cuda1 = (
+            "CUDA1".to_string(),
+            GgmlBackendKind::Gpu,
+            Some(GgmlDeviceMemory {
+                free_bytes: 11 * 1024 * 1024,
+                total_bytes: 16 * 1024 * 1024,
+            }),
+        );
+
+        for devices in [
+            vec![vulkan.clone(), cuda0.clone(), cuda1.clone()],
+            vec![cuda1.clone(), cuda0.clone(), vulkan.clone()],
+        ] {
+            let sample = exact_lane_memory_sample_from_device_infos(&lane, &devices)
+                .expect("exact CUDA1 memory sample");
+            assert_eq!(sample.provider, ExecutionProvider::Cuda);
+            assert_eq!(sample.stable_device_id, "CUDA1");
+            assert_eq!(sample.memory.free_bytes, 11 * 1024 * 1024);
+            assert_eq!(sample.memory.total_bytes, 16 * 1024 * 1024);
+        }
+
+        assert!(
+            exact_lane_memory_sample_from_device_infos(
+                &lane,
+                &[("CUDA1".to_string(), GgmlBackendKind::Gpu, None)],
+            )
+            .is_none()
+        );
+        assert!(exact_lane_memory_sample_from_device_infos(&lane, &[vulkan, cuda0]).is_none());
     }
 
     #[test]
@@ -2125,6 +3947,267 @@ mod tests {
         });
         assert!(success.candidate_failure.is_none());
         assert_eq!(*published.lock().unwrap(), vec!["clean", "rolled-back"]);
+    }
+
+    fn shipped_activation_verified_pack() -> VerifiedPack {
+        static PACK: OnceLock<VerifiedPack> = OnceLock::new();
+        PACK.get_or_init(|| {
+            let directory = Box::leak(Box::new(tempfile::tempdir().expect("activation pack dir")));
+            let path = directory.path().join("activation-quote.gguf");
+            crate::testing::write_tiny_gguf_runtime_source(
+                &path,
+                &crate::testing::TinyGgufFixtureSpec::whisper_oasr_v1_graph_ready_for_tokenizer_fail_closed(
+                    "whisper-tiny",
+                ),
+            )
+            .expect("write activation quote fixture");
+            let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+                .expect("activation quote fixture must pass preflight");
+            assert!(
+                preflight.runtime_source().byte_len() > 4096,
+                "activation quote fixture must exceed a placeholder page, got {}",
+                preflight.runtime_source().byte_len()
+            );
+            crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                preflight,
+                crate::WHISPER_GGML_ARCHITECTURE_ID,
+            )
+        })
+        .clone()
+    }
+
+    fn auxiliary_activation_verified_pack() -> (tempfile::TempDir, VerifiedPack) {
+        let directory = tempfile::tempdir().expect("aux activation pack dir");
+        let path = directory.path().join("redimnet2-activation-quote.oasr");
+        let tensor = crate::ggml_runtime::GgufWriteTensor {
+            name: "fixture.tensor".to_string(),
+            dims: vec![1],
+            tensor_type: crate::ggml_runtime::GgufWriteTensorType::F32,
+            data: 0.0_f32.to_le_bytes().to_vec(),
+        };
+        crate::models::oasr_metadata::OasrPackWriter::write(
+            &path,
+            crate::models::oasr_metadata::PackEnvelope::aux(
+                crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+            ),
+            std::collections::BTreeMap::new(),
+            &[tensor],
+        )
+        .expect("write aux activation quote fixture");
+        let preflight = crate::ggml_runtime::load_runtime_source_metadata_and_tensor_index(&path)
+            .expect("aux activation quote fixture preflight");
+        let pack = VerifiedPack::from_unverified_aux_preflight_for_test(
+            preflight,
+            crate::models::aux_pack_registry::AuxPackKind::Diarization,
+            crate::models::aux_pack_registry::REDIMNET2_GGML_ARCHITECTURE_ID,
+        );
+        (directory, pack)
+    }
+
+    #[test]
+    fn auxiliary_pack_activation_uses_aux_registry_without_asr_descriptor() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let (_directory, pack) = auxiliary_activation_verified_pack();
+        assert!(
+            crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(pack.model_architecture())
+                .is_none(),
+            "the aux pack must not masquerade as an ASR descriptor"
+        );
+        let broker = Arc::clone(services.memory_broker());
+        let before = broker.usage(&MemoryDomainKey::SystemMemory);
+        let reservation =
+            quote_and_reserve_candidate_activation(services.as_ref(), &candidate, &pack)
+                .expect("registered auxiliary pack must receive a physical-domain quote");
+        let during = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert!(
+            during.pending_bytes > before.pending_bytes
+                || during.committed_bytes > before.committed_bytes,
+            "auxiliary activation must reserve nonzero physical bytes"
+        );
+        drop(reservation);
+        assert_eq!(broker.usage(&MemoryDomainKey::SystemMemory), before);
+    }
+
+    #[test]
+    fn shipped_candidate_attempt_reserves_then_releases_on_rollback() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let pack = shipped_activation_verified_pack();
+        let quoted_peak = {
+            let descriptor = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+                .find_by_model_architecture(architecture_id_from_pack(&pack).unwrap())
+                .unwrap();
+            let topology = resolve_resident_topology_plan(
+                descriptor,
+                &pack,
+                &candidate,
+                &ExecutionIntent::CpuOnly,
+                true,
+            )
+            .unwrap();
+            let (_backends, _mapping, mapping) = quote_candidate_activation_plan(&pack, &topology)
+                .expect("activation footprint must be quotable");
+            let peak = mapping.bytes;
+            assert!(
+                peak > 4096,
+                "quoted activation peak must exceed a placeholder page, got {peak}"
+            );
+            peak
+        };
+        let _pack = install_candidate_activation_pack(pack);
+        let broker = Arc::clone(services.memory_broker());
+        let before = broker.usage(&MemoryDomainKey::SystemMemory);
+        let during = run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+            let charged = usage
+                .pending_bytes
+                .saturating_sub(before.pending_bytes)
+                .max(usage.committed_bytes.saturating_sub(before.committed_bytes));
+            assert_eq!(
+                charged, quoted_peak,
+                "broker pending/committed must match the ggml quote, got {usage:?} before {before:?}"
+            );
+            assert!(
+                charged > 4096,
+                "reserved activation peak must exceed a placeholder page, got {charged}"
+            );
+            record_current_execution_candidate_failure(ExecutionCandidateFailure::capacity(
+                "candidate-activation-reserve-test",
+                "force rollback after reservation",
+            ));
+            Ok::<_, ()>(usage)
+        });
+        assert!(during.result.is_ok());
+        assert!(during.candidate_failure.is_some());
+        let after = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert_eq!(
+            after,
+            DeviceMemoryUsage {
+                pending_bytes: before.pending_bytes,
+                committed_bytes: before.committed_bytes,
+                unreclaimable_bytes: before.unreclaimable_bytes,
+                exclusive_pending: before.exclusive_pending,
+                quarantined: before.quarantined,
+            },
+            "rollback must release the candidate reservation"
+        );
+    }
+
+    #[test]
+    fn packless_stream_vad_aux_attempt_reserves_declared_weight_bytes() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        assert!(
+            current_candidate_activation_pack().is_none(),
+            "this path must not inherit an ASR VerifiedPack"
+        );
+        let declared = crate::diarize::vad::FireRedStreamVadModel::system_memory_quote()
+            .expect("Stream-VAD embedded quote");
+        assert!(
+            declared.peak_bytes > 4096 && declared.retained_bytes > 4096,
+            "declared Stream-VAD WEIGHTS quote must exceed a placeholder page, got peak={} retained={}",
+            declared.peak_bytes,
+            declared.retained_bytes
+        );
+        let quoted_peak = {
+            let (_backend, plan) = quote_cpu_buffer_plan(
+                &declared.resource_id,
+                declared.peak_bytes.max(declared.retained_bytes),
+            )
+            .expect("declared Stream-VAD bytes must be ggml-quotable");
+            let peak = plan
+                .reservation_requests()
+                .iter()
+                .map(|request| request.peak_bytes)
+                .sum::<u64>();
+            assert!(
+                peak > 4096,
+                "ggml quote of declared Stream-VAD bytes must exceed a placeholder page, got {peak}"
+            );
+            peak
+        };
+        let _quote = install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(
+            declared.clone(),
+        ));
+        let broker = Arc::clone(services.memory_broker());
+        let before = broker.usage(&MemoryDomainKey::SystemMemory);
+        let outcome = super::run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+            let charged = usage
+                .pending_bytes
+                .saturating_sub(before.pending_bytes)
+                .max(usage.committed_bytes.saturating_sub(before.committed_bytes));
+            assert_eq!(
+                charged, quoted_peak,
+                "packless Stream-VAD reserve must match its declared WEIGHTS ggml quote, got {usage:?} before {before:?}"
+            );
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.candidate_failure.is_none(),
+            "packless Stream-VAD/aux must not capacity-exhaust, got {:?}",
+            outcome.candidate_failure
+        );
+    }
+
+    #[test]
+    fn packless_punc_declared_quote_is_not_stream_vad_blob() {
+        let services = test_native_execution_services();
+        let candidate = cpu_candidate();
+        let vad = crate::diarize::vad::FireRedStreamVadModel::system_memory_quote()
+            .expect("Stream-VAD embedded quote");
+        let punc = SystemMemoryAllocationQuote::new(
+            "aux.firered-punc.test.declared-resident",
+            128 * 1024,
+            96 * 1024,
+        )
+        .expect("punc declared resident");
+        assert_ne!(
+            punc.peak_bytes, vad.peak_bytes,
+            "punc declared peak must not steal the Stream-VAD WEIGHTS blob"
+        );
+        let punc_quoted = {
+            let (_backend, plan) =
+                quote_cpu_buffer_plan(&punc.resource_id, punc.peak_bytes.max(punc.retained_bytes))
+                    .expect("punc declared bytes must be ggml-quotable");
+            plan.reservation_requests()
+                .iter()
+                .map(|request| request.peak_bytes)
+                .sum::<u64>()
+        };
+        let vad_quoted = {
+            let (_backend, plan) =
+                quote_cpu_buffer_plan(&vad.resource_id, vad.peak_bytes.max(vad.retained_bytes))
+                    .expect("vad declared bytes must be ggml-quotable");
+            plan.reservation_requests()
+                .iter()
+                .map(|request| request.peak_bytes)
+                .sum::<u64>()
+        };
+        assert_ne!(punc_quoted, vad_quoted);
+        let _quote =
+            install_candidate_activation_quote(CandidateActivationQuoteSource::Declared(punc));
+        let broker = Arc::clone(services.memory_broker());
+        let before = broker.usage(&MemoryDomainKey::SystemMemory);
+        let outcome = super::run_execution_candidate_attempt(services.as_ref(), &candidate, || {
+            let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+            let charged = usage
+                .pending_bytes
+                .saturating_sub(before.pending_bytes)
+                .max(usage.committed_bytes.saturating_sub(before.committed_bytes));
+            assert_eq!(charged, punc_quoted);
+            assert_ne!(charged, vad_quoted);
+            Ok::<_, ()>(())
+        });
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.candidate_failure.is_none(),
+            "packless punc declared quote must not capacity-exhaust, got {:?}",
+            outcome.candidate_failure
+        );
     }
 
     #[test]

@@ -112,6 +112,7 @@ fn alias_contract_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![
             alias_contract_model(
@@ -2251,7 +2252,7 @@ fn catalog_parser_rejects_disabled_modelscope_mirror() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("ModelScope mirrors are disabled"));
+    assert!(error.contains("mirror URL host is not allowed"));
 }
 
 #[test]
@@ -2279,7 +2280,7 @@ fn catalog_parser_rejects_derived_modelscope_mirror_path() {
         .unwrap_err()
         .to_string();
 
-    assert!(error.contains("ModelScope mirrors are disabled"));
+    assert!(error.contains("mirror URL host is not allowed"));
 }
 
 #[test]
@@ -2287,6 +2288,20 @@ fn catalog_parser_rejects_uppercase_modelscope_owner() {
     let contents = catalog_json_with_first_fp16_mirror(
         "modelscope",
         "https://modelscope.cn/models/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-fp16.oasr",
+    );
+
+    let error = parse_model_catalog(&contents, "fixture")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("mirror URL host is not allowed"));
+}
+
+#[test]
+fn catalog_parser_rejects_modelscope_mirror_source_on_hf_url() {
+    let contents = catalog_json_with_first_fp16_mirror(
+        "modelscope",
+        "https://huggingface.co/OpenASR/moonshine-tiny/resolve/0123456789abcdef0123456789abcdef01234567/moonshine-tiny-fp16.oasr",
     );
 
     let error = parse_model_catalog(&contents, "fixture")
@@ -2420,6 +2435,7 @@ fn catalog_parser_rejects_drifted_pull_strings() {
 
 const BACKEND_SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BACKEND_SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BACKEND_SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 fn catalog_json_with_backends(backends_json: &str) -> String {
     catalog_json().replace(
@@ -2438,7 +2454,7 @@ fn valid_hip_backend_json() -> String {
       "targets": ["gfx1200"],
       "min_cli_version": "0.1.0",
       "host_abi": {{
-        "schema_version": 2,
+        "schema_version": {BACKEND_HOST_ABI_SCHEMA_VERSION},
         "fingerprint": "{BACKEND_SHA_A}",
         "target": "x86_64-pc-windows-msvc",
         "crt": "msvc-md",
@@ -2484,6 +2500,136 @@ fn catalog_parser_accepts_backend_entries() {
         .find(|file| file.role == CatalogBackendFileRole::Archive)
         .expect("archive file");
     assert_eq!(archive.extract_subdir.as_deref(), Some("rocblas/library"));
+}
+
+fn hip_backend_with_activation(activation: &str) -> String {
+    valid_hip_backend_json().replace(
+        "      \"host_abi\": {",
+        &format!("      \"activation\": {activation},\n      \"host_abi\": {{"),
+    )
+}
+
+fn vulkan_backend_with_activation(activation: &str) -> String {
+    valid_hip_backend_json()
+        .replace("\"hip-radeon\"", "\"vulkan-generic\"")
+        .replace("\"vendor\": \"hip\"", "\"vendor\": \"vulkan\"")
+        .replace("AMD ROCm (HIP)", "Vulkan")
+        .replace("\"targets\": [\"gfx1200\"]", "\"targets\": []")
+        .replace("ggml-hip.dll", "ggml-vulkan.dll")
+        .replace(
+            "      \"host_abi\": {",
+            &format!("      \"activation\": {activation},\n      \"host_abi\": {{"),
+        )
+}
+
+#[test]
+fn catalog_backend_activation_state_has_non_overlapping_binding_shapes() {
+    let qualified = format!(
+        r#"{{"state":"qualified","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"gfx1200","qualified_driver_version":"7.2.0"}}"#
+    );
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&qualified)),
+        "fixture",
+    )
+    .expect("hardware-only qualified state");
+
+    let activated = format!(
+        r#"{{"state":"activated","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"gfx1200","qualified_driver_version":"7.2.0","correctness_matrix_sha256":"{BACKEND_SHA_A}","correctness_receipts_sha256":"{BACKEND_SHA_B}"}}"#
+    );
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&activated)),
+        "fixture",
+    )
+    .expect("fully bound activated state");
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(
+            &activated.replace("activated", "revoked"),
+        )),
+        "fixture",
+    )
+    .expect("revocation preserves complete activation bindings for audit");
+    parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(r#"{"state":"revoked"}"#)),
+        "fixture",
+    )
+    .expect("a never-qualified published backend may be revoked without bindings");
+
+    let qualified_with_correctness = activated.replace("activated", "qualified");
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&qualified_with_correctness)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("target, and driver bindings only"),
+        "{error}"
+    );
+
+    let activated_without_receipts = activated.replace(
+        &format!(r#","correctness_receipts_sha256":"{BACKEND_SHA_B}""#),
+        "",
+    );
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&activated_without_receipts)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("activated bindings are incomplete"),
+        "{error}"
+    );
+    let partial_revocation = activated_without_receipts.replace("activated", "revoked");
+    let error = parse_model_catalog(
+        &catalog_json_with_backends(&hip_backend_with_activation(&partial_revocation)),
+        "fixture",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("revoked qualification bindings are partial"),
+        "{error}"
+    );
+}
+
+#[test]
+fn vulkan_activation_uses_a_canonical_reusable_capability_class() {
+    let target = "vk_caps_00001002_0000744c_0123456789abcdef0123456789abcdef";
+    let activated = format!(
+        r#"{{"state":"activated","qualification_source_catalog_sha256":"{BACKEND_SHA_A}","hardware_evidence_sha256":"{BACKEND_SHA_B}","qualified_device_target":"{target}","qualified_driver_version":"305419896","correctness_matrix_sha256":"{BACKEND_SHA_A}","correctness_receipts_sha256":"{BACKEND_SHA_B}"}}"#
+    );
+    let catalog = parse_model_catalog(
+        &catalog_json_with_backends(&vulkan_backend_with_activation(&activated)),
+        "fixture",
+    )
+    .expect("canonical Vulkan capability class");
+    assert_eq!(catalog.backends[0].targets, Vec::<String>::new());
+    assert_eq!(
+        catalog.backends[0]
+            .activation
+            .qualified_device_target
+            .as_deref(),
+        Some(target)
+    );
+
+    for invalid in [
+        "vk_uuid_0123456789abcdef0123456789abcdef",
+        "vk_caps_1002_744c_0123456789abcdef0123456789abcdef",
+        "vk_caps_00001002_0000744c_0123456789ABCDEF0123456789ABCDEF",
+    ] {
+        let invalid_activation = activated.replace(target, invalid);
+        let error = parse_model_catalog(
+            &catalog_json_with_backends(&vulkan_backend_with_activation(&invalid_activation)),
+            "fixture",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("invalid qualified target/driver identity"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -2665,6 +2811,7 @@ fn resolve_catalog_backend_pull_returns_the_matching_pack() {
     assert_eq!(resolved.backend_id, "hip-radeon");
     assert_eq!(resolved.vendor, CatalogBackendVendor::Hip);
     assert_eq!(resolved.version, "0.13.1+643b5659");
+    assert_eq!(resolved.min_cli_version, "0.1.0");
     assert_eq!(resolved.host_abi.fingerprint, BACKEND_SHA_A);
     assert_eq!(resolved.files.len(), 2);
     assert!(
@@ -2673,6 +2820,195 @@ fn resolve_catalog_backend_pull_returns_the_matching_pack() {
             .iter()
             .any(|file| file.role == CatalogBackendFileRole::Plugin)
     );
+}
+
+#[test]
+fn future_backend_min_cli_version_loads_but_cannot_resolve() {
+    let backend = valid_hip_backend_json().replace(
+        r#""min_cli_version": "0.1.0""#,
+        r#""min_cli_version": "999.0.0""#,
+    );
+    let catalog = parse_model_catalog(&catalog_json_with_backends(&backend), "fixture")
+        .expect("future backend entry should remain visible to a capability-aware catalog reader");
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .expect("future backend remains in parsed catalog");
+    assert!(matches!(
+        backend.availability(),
+        BackendAvailability::RequiresUpdate { .. }
+    ));
+
+    assert!(matches!(
+        resolve_catalog_backend_pull(&catalog, "hip-radeon"),
+        Err(BackendResolutionError::BackendRequiresNewerCli { .. })
+    ));
+    assert!(matches!(
+        resolve_compatible_catalog_backend_pull(
+            &catalog,
+            CatalogBackendVendor::Hip,
+            &backend.host_abi,
+            Some("gfx1200"),
+        ),
+        Err(BackendResolutionError::BackendRequiresNewerCli { .. })
+    ));
+}
+
+fn catalog_with_hip_execution_approval(decision: CatalogExecutionApprovalDecision) -> ModelCatalog {
+    let mut catalog = parse_model_catalog(
+        &catalog_json_with_backends(&valid_hip_backend_json()),
+        "fixture",
+    )
+    .unwrap();
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "moonshine-tiny")
+        .unwrap();
+    let quant = model
+        .quants
+        .iter()
+        .find(|quant| quant.quant == "q8_0")
+        .unwrap();
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .unwrap();
+    let plugin_sha256 = backend
+        .files
+        .iter()
+        .find(|file| file.role == CatalogBackendFileRole::Plugin)
+        .unwrap()
+        .sha256
+        .clone();
+    catalog.execution_approvals = Some(CatalogExecutionApprovalSet {
+        schema_version: CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION,
+        release_subject: "openasr-v0.1.36-windows-x86_64.zip".to_string(),
+        core_commit: "1234567890123456789012345678901234567890".to_string(),
+        binary_sha256: BACKEND_SHA_B.to_string(),
+        matrix_sha256: BACKEND_SHA_A.to_string(),
+        capability_epoch: 9,
+        cells: vec![CatalogExecutionApprovalCell {
+            pack_content_sha256: quant.sha256.clone(),
+            family: model.family.clone(),
+            model_id: model.id.clone(),
+            quant: quant.quant.clone(),
+            topology: "moonshine-seq2seq-v1".to_string(),
+            provider: CatalogExecutionProvider::Hip,
+            device_target: "gfx1200".to_string(),
+            approved_target_set_sha256: None,
+            placement: CatalogExecutionPlacement::FullDevice,
+            output_plan: CatalogExecutionOutputPlan::FullLogits,
+            reuse_mode: CatalogExecutionReuseMode::FreshGraph,
+            capture_mode: CatalogExecutionCaptureMode::Enabled,
+            scheduler_mode: CatalogExecutionSchedulerMode::Disabled,
+            evidence_revision: 1,
+            activation_modes: vec![CatalogExecutionActivationMode::Explicit],
+            plugin_sha256,
+            tombstone_sha256: matches!(decision, CatalogExecutionApprovalDecision::Revoked)
+                .then(|| BACKEND_SHA_B.to_string()),
+            decision,
+        }],
+    });
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    parse_model_catalog(&serialized, "fixture").unwrap()
+}
+
+#[test]
+fn signed_catalog_execution_approval_projects_exact_runtime_snapshot() {
+    let catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    let backend = catalog
+        .backends
+        .iter()
+        .find(|backend| backend.id == "hip-radeon")
+        .unwrap();
+    let plugin_sha256 = backend
+        .files
+        .iter()
+        .find(|file| file.role == CatalogBackendFileRole::Plugin)
+        .unwrap()
+        .sha256
+        .clone();
+    let snapshot = catalog
+        .capability_approval_snapshot_for_backend("hip-radeon")
+        .unwrap()
+        .expect("signed approval snapshot");
+    let approvals = catalog.execution_approvals.as_ref().unwrap();
+    let attested = snapshot
+        .attest_runtime(&crate::RuntimeCapabilityArtifactIdentity {
+            release_subject: approvals.release_subject.clone(),
+            core_commit: approvals.core_commit.clone(),
+            host_abi_fingerprint: backend.host_abi.fingerprint.clone(),
+            binary_sha256: approvals.binary_sha256.clone(),
+            plugin_sha256,
+            matrix_sha256: approvals.matrix_sha256.clone(),
+            capability_epoch: approvals.capability_epoch,
+        })
+        .unwrap();
+    let candidate = crate::device::execution_policy::ExecutionCandidate {
+        device: crate::device::execution_policy::ExecutionDeviceSnapshot {
+            route: crate::ResolvedExecutionRoute {
+                provider: crate::ExecutionProvider::Hip,
+                stable_id: "ROCm0".to_string(),
+                registry_ordinal: 0,
+                kind: crate::RouteDeviceKind::Accelerated,
+                addressability: crate::DeviceAddressability::ExactlyAddressable {
+                    physical_key: crate::PhysicalResourceKey::new("0000:03:00.0").unwrap(),
+                },
+            },
+            ggml_kind: crate::ggml_runtime::GgmlBackendKind::Gpu,
+            memory: None,
+            buffer_alignment: None,
+        },
+        placement: crate::device::execution_policy::ExecutionPlacement::FullDevice,
+    };
+    let cell = &approvals.cells[0];
+    let approved = crate::CapabilityApprovalResolver::new(attested)
+        .approve(
+            candidate,
+            crate::CapabilityCellContext {
+                pack_content_sha256: cell.pack_content_sha256.clone(),
+                family: cell.family.clone(),
+                model_id: cell.model_id.clone(),
+                quant: cell.quant.clone(),
+                topology: cell.topology.clone(),
+                device_target: cell.device_target.clone(),
+                approved_target_set_sha256: None,
+                output_plan: crate::ggml_runtime::GgmlDecodeOutputPlan::FullLogits,
+                reuse_mode: crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
+                capture_mode: crate::CapabilityCaptureMode::Enabled,
+                scheduler_mode: crate::CapabilitySchedulerMode::Disabled,
+                evidence_revision: 1,
+                activation_mode: crate::CapabilityActivationMode::Explicit,
+            },
+        )
+        .unwrap();
+    assert_eq!(approved.approval().capability_epoch, 9);
+}
+
+#[test]
+fn qualification_only_cannot_enter_ordinary_signed_catalog_approvals() {
+    let mut catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    catalog.execution_approvals.as_mut().unwrap().cells[0].decision =
+        CatalogExecutionApprovalDecision::QualificationOnly;
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    let error = parse_model_catalog(&serialized, "fixture").unwrap_err();
+    assert!(error.to_string().contains("qualification-only"));
+}
+
+#[test]
+fn signed_catalog_approval_rejects_pack_digest_drift() {
+    let mut catalog =
+        catalog_with_hip_execution_approval(CatalogExecutionApprovalDecision::Activatable);
+    catalog.execution_approvals.as_mut().unwrap().cells[0].pack_content_sha256 =
+        BACKEND_SHA_C.to_string();
+    let serialized = serde_json::to_string(&catalog).unwrap();
+    let error = parse_model_catalog(&serialized, "fixture").unwrap_err();
+    assert!(error.to_string().contains("pack digest"));
 }
 
 #[test]
@@ -2868,6 +3204,26 @@ fn compatible_hip_backend_resolution_ignores_bundled_runtime_driver_floor() {
             "hip-radeon"
         );
     }
+}
+
+#[test]
+fn local_file_catalog_identity_allows_file_backend_urls() {
+    assert!(backend_file_url_is_allowed(
+        "file:///tmp/catalog.json",
+        "file:///tmp/ggml-hip.dll",
+    ));
+    assert!(backend_file_url_is_allowed(
+        "https://catalog.openasr.org/v1/catalog.json",
+        "https://dl.openasr.org/plugin.dll",
+    ));
+    assert!(!backend_file_url_is_allowed(
+        "https://catalog.openasr.org/v1/catalog.json",
+        "file:///tmp/ggml-hip.dll",
+    ));
+    assert!(
+        !backend_file_url_is_allowed(r"E:\openasr\catalog.json", "file:///tmp/ggml-hip.dll"),
+        "cached filesystem path is not the catalog identity; file:// backend URLs follow the signed source URL"
+    );
 }
 
 #[test]

@@ -140,7 +140,6 @@ def compile_bundled_manifest(
     directory: Path,
     host_abi_path: Path,
     out: Path,
-    require_vulkan_loader: bool,
 ) -> None:
     """Bind the neutral host's final, post-signing DLL bytes.
 
@@ -165,25 +164,22 @@ def compile_bundled_manifest(
             provider = "host"
         elif lower.startswith("ggml-cpu"):
             provider = "cpu"
-        elif lower == "ggml-vulkan.dll":
-            provider = "vulkan"
-        elif lower == "vulkan-1.dll":
-            provider = "dependency"
+        elif lower in {"ggml-vulkan.dll", "vulkan-1.dll"}:
+            raise BackendCatalogError(
+                f"optional Vulkan file '{path.name}' leaked into the neutral CPU bundle"
+            )
         if provider is not None:
             if lower in roles:
                 raise BackendCatalogError(f"duplicate bundled DLL name '{path.name}'")
             roles[lower] = provider
             paths[lower] = path
 
-    required = {"ggml.dll", "ggml-base.dll", "ggml-vulkan.dll"}
+    required = {"ggml.dll", "ggml-base.dll"}
     missing = sorted(required - roles.keys())
     if missing:
         raise BackendCatalogError(f"neutral bundle is missing required DLLs: {missing}")
     if not any(name.startswith("ggml-cpu") for name in roles):
         raise BackendCatalogError("neutral bundle has no CPU backend module")
-    if require_vulkan_loader and "vulkan-1.dll" not in roles:
-        raise BackendCatalogError("neutral release bundle has no pinned Vulkan loader")
-
     files: list[dict[str, Any]] = []
     for name in sorted(roles):
         path = paths[name]
@@ -203,14 +199,11 @@ def compile_bundled_manifest(
         )
 
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "host_abi_fingerprint": fingerprint,
         "bundle_contract_sha256": bundle_contract_sha256(fingerprint, files),
         "cpu_contract_sha256": provider_bundle_contract_sha256(
             fingerprint, files, "cpu"
-        ),
-        "vulkan_contract_sha256": provider_bundle_contract_sha256(
-            fingerprint, files, "vulkan"
         ),
         "files": files,
     }
@@ -227,9 +220,39 @@ def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
         relative = f"{extract_subdir}/{relative}" if extract_subdir else relative
         sha256, size = sha256_size(path)
         files.append((relative, size, sha256))
+    return materialized_tree_sha256_rows(files)
+
+
+def materialized_tree_sha256_rows(files: list[tuple[str, int, str]]) -> str:
+    """Hash a materialized backend tree from canonical path/size/digest rows."""
+
     if not files:
         raise BackendCatalogError("vendor runtime tree is empty")
-    files.sort(key=lambda item: item[0])
+    seen: set[str] = set()
+    for relative, size, sha256 in files:
+        _validate_materialized_tree_path(relative)
+        folded = relative.lower()
+        if folded in seen:
+            raise BackendCatalogError(
+                f"materialized tree path is duplicated case-insensitively: {relative!r}"
+            )
+        seen.add(folded)
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > (1 << 64) - 1
+        ):
+            raise BackendCatalogError(f"materialized tree size is invalid: {relative!r}")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise BackendCatalogError(f"materialized tree sha256 is invalid: {relative!r}")
+    for relative, _size, _sha256 in files:
+        parts = relative.split("/")
+        if any("/".join(parts[:index]).lower() in seen for index in range(1, len(parts))):
+            raise BackendCatalogError(
+                f"materialized tree path is nested below another file: {relative!r}"
+            )
+    files = sorted(files, key=lambda item: item[0])
     digest = hashlib.sha256(b"openasr-backend-tree-v1\0")
     for relative, size, sha256 in files:
         encoded = relative.encode("utf-8")
@@ -238,6 +261,40 @@ def materialized_tree_sha256(root: Path, extract_subdir: str) -> str:
         digest.update(struct.pack("<Q", size))
         digest.update(sha256.encode("ascii"))
     return digest.hexdigest()
+
+
+def _validate_materialized_tree_path(relative: str) -> list[str]:
+    if not isinstance(relative, str):
+        raise BackendCatalogError("materialized tree path must be text")
+    parts = relative.split("/")
+    if (
+        not relative
+        or not relative.isascii()
+        or relative.startswith("/")
+        or relative.endswith("/")
+        or "\\" in relative
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise BackendCatalogError(f"materialized tree path is not canonical: {relative!r}")
+    for component in parts:
+        if (
+            component.endswith((".", " "))
+            or ":" in component
+            or any(character in '<>"|?*' for character in component)
+            or any(ord(character) < 32 for character in component)
+        ):
+            raise BackendCatalogError(
+                f"materialized tree path is unsafe on Windows: {relative!r}"
+            )
+        stem = component.split(".", 1)[0].upper()
+        if stem in {"CON", "PRN", "AUX", "NUL"} or (
+            (stem.startswith("COM") or stem.startswith("LPT"))
+            and stem[3:] in {str(number) for number in range(1, 10)}
+        ):
+            raise BackendCatalogError(
+                f"materialized tree path is unsafe on Windows: {relative!r}"
+            )
+    return parts
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -298,8 +355,12 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(host_abi, dict) or len(str(host_abi.get("fingerprint", ""))) != 64:
         raise BackendCatalogError("build manifest has no complete host ABI")
     targets = build.get("backend_targets", {}).get(provider)
-    if not isinstance(targets, list) or not targets or not all(isinstance(v, str) and v for v in targets):
+    if not isinstance(targets, list) or not all(isinstance(v, str) and v for v in targets):
         raise BackendCatalogError(f"build manifest has no '{provider}' targets")
+    if provider in {"cuda", "hip"} and not targets:
+        raise BackendCatalogError(f"build manifest has no '{provider}' targets")
+    if provider == "vulkan" and targets:
+        raise BackendCatalogError("Vulkan artifact must not encode a physical device target")
 
     release_provider = "rocm" if provider == "hip" else provider
     expected_plugin_names = {
@@ -309,7 +370,7 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
     plugin_sha, plugin_size = sha256_size(args.plugin)
     fingerprint = str(host_abi["fingerprint"])
     require_single_target = bool(getattr(args, "require_single_target", False))
-    if require_single_target and len(targets) != 1:
+    if require_single_target and provider in {"cuda", "hip"} and len(targets) != 1:
         raise BackendCatalogError(
             f"{provider} target-scoped pack must declare exactly one target, got {targets!r}"
         )
@@ -320,7 +381,7 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
                 f"{provider} target '{target_label}' is not safe for a release asset name"
             )
     else:
-        target_label = "fat"
+        target_label = "generic" if provider == "vulkan" else "fat"
     target_asset_name = (
         f"openasr-{args.version}-windows-x86_64-{release_provider}-{target_label}-plugin.dll"
     )
@@ -358,7 +419,7 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             }
         )
-    elif provider in {"cuda", "hip"}:
+    elif provider in {"cuda", "hip", "vulkan"}:
         raise BackendCatalogError(f"{provider} pack requires a vendor runtime archive")
 
     return {
@@ -370,6 +431,7 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
         "targets": targets,
         "min_driver_api": args.minimum_driver_api,
         "min_cli_version": args.minimum_cli_version,
+        "activation": {"state": "published-inert"},
         "host_abi": host_abi,
         "files": files,
     }
@@ -406,6 +468,7 @@ def merge_catalog(catalog_path: Path, entry_paths: list[Path], out: Path) -> Non
 
     identities: dict[tuple[str, str, tuple[str, ...]], str] = {}
     for backend_id, entry in by_id.items():
+        entry.setdefault("activation", {"state": "published-inert"})
         key = (
             str(entry.get("vendor")),
             str(entry.get("host_abi", {}).get("fingerprint")),
@@ -442,8 +505,8 @@ def verify_release_assets(
     for entry_path in entry_paths:
         entry = _read_json(entry_path)
         provider = str(entry.get("vendor", ""))
-        if provider not in {"cuda", "hip"}:
-            raise BackendCatalogError("release verification accepts only CUDA and HIP entries")
+        if provider not in {"cuda", "hip", "vulkan"}:
+            raise BackendCatalogError("release verification accepts only GPU provider entries")
         if str(entry.get("version", "")) != expected_version:
             raise BackendCatalogError(
                 f"backend '{provider}' version does not match release {expected_version}"
@@ -452,17 +515,21 @@ def verify_release_assets(
         if len(fingerprint) != 64:
             raise BackendCatalogError(f"backend '{provider}' has no complete host ABI")
         if host_abi is not None and host_abi != fingerprint:
-            raise BackendCatalogError("CUDA and HIP release entries do not share one host ABI")
+            raise BackendCatalogError("GPU release entries do not share one host ABI")
         host_abi = fingerprint
         targets = entry.get("targets")
-        if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+        if not isinstance(targets, list) or (
+            provider in {"cuda", "hip"}
+            and (len(targets) != 1 or not isinstance(targets[0], str))
+        ) or (provider == "vulkan" and targets):
             raise BackendCatalogError(
-                f"backend '{provider}' release entry must declare exactly one target"
+                f"backend '{provider}' release entry has invalid artifact targets"
             )
-        identity = (provider, targets[0])
+        target_identity = targets[0] if targets else "generic"
+        identity = (provider, target_identity)
         if identity in identities:
             raise BackendCatalogError(
-                f"release contains duplicate {provider} target entry '{targets[0]}'"
+                f"release contains duplicate {provider} target entry '{target_identity}'"
             )
         identities.add(identity)
         backend_id = str(entry.get("id", ""))
@@ -528,8 +595,8 @@ def verify_release_assets(
             verified_files += 1
             verified_bytes += actual_size
 
-    if set(providers) != {"cuda", "hip"}:
-        raise BackendCatalogError("release verification requires CUDA and HIP target packs")
+    if set(providers) != {"cuda", "hip", "vulkan"}:
+        raise BackendCatalogError("release verification requires Vulkan, CUDA, and HIP packs")
     return {
         "schema_version": 1,
         "version": expected_version,
@@ -576,6 +643,7 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
             "curl",
             "-sS",
             "-I",
+            "--http1.1",
             "--connect-timeout",
             "5",
             "--max-time",
@@ -616,7 +684,7 @@ def verify_catalog_cdn(
     version: str | None = None,
     head: Callable[[str], tuple[int, int | None]] | None = None,
 ) -> dict[str, object]:
-    """Require signed CUDA/HIP file URLs to be live before catalog deployment."""
+    """Require signed GPU provider file URLs to be live before deployment."""
 
     catalog = _read_json(catalog_path)
     head_fn = head or head_cdn_url
@@ -626,7 +694,7 @@ def verify_catalog_cdn(
         if not isinstance(entry, dict):
             continue
         entry_version = str(entry.get("version", ""))
-        if entry.get("vendor") not in {"cuda", "hip"} or (
+        if entry.get("vendor") not in {"cuda", "hip", "vulkan"} or (
             version is not None and entry_version != version
         ):
             continue
@@ -659,7 +727,7 @@ def verify_catalog_cdn(
     if not seen:
         scope = f"version {version}" if version is not None else "the catalog"
         raise BackendCatalogError(
-            f"catalog has no CUDA/HIP backend files for {scope} to verify on CDN"
+            f"catalog has no GPU backend files for {scope} to verify on CDN"
         )
 
     def probe(item: tuple[str, tuple[str, str, int, str]]) -> str:
@@ -734,22 +802,25 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
     ggml_revisions: set[str] = set()
     for entry in entries:
         provider = str(entry.get("vendor", ""))
-        if provider not in {"cuda", "hip"}:
-            raise BackendCatalogError("update hints accept only CUDA and HIP entries")
+        if provider not in {"cuda", "hip", "vulkan"}:
+            raise BackendCatalogError("update hints accept only GPU provider entries")
         fingerprint = str(entry.get("host_abi", {}).get("fingerprint", ""))
         if len(fingerprint) != 64:
             raise BackendCatalogError(f"backend '{provider}' has no complete host ABI")
         if host_abi is not None and host_abi != fingerprint:
-            raise BackendCatalogError("CUDA and HIP update hints do not share one host ABI")
+            raise BackendCatalogError("GPU update hints do not share one host ABI")
         host_abi = fingerprint
         core_versions.add(str(entry.get("version", "")).split("+", 1)[0])
         ggml_revisions.add(str(entry.get("host_abi", {}).get("ggml_revision", "")))
         targets = entry.get("targets")
-        if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+        if not isinstance(targets, list) or (
+            provider in {"cuda", "hip"}
+            and (len(targets) != 1 or not isinstance(targets[0], str))
+        ) or (provider == "vulkan" and targets):
             raise BackendCatalogError(
-                f"update hint '{provider}' must declare exactly one target"
+                f"update hint '{provider}' has invalid artifact targets"
             )
-        target = targets[0]
+        target = targets[0] if targets else "generic"
         files = entry.get("files")
         archive_files = [file for file in files if isinstance(file, dict) and file.get("role") == "archive"] \
             if isinstance(files, list) else []
@@ -778,8 +849,8 @@ def compile_update_hints(entry_paths: list[Path], out: Path) -> None:
             "size_bytes": sum(int(file.get("size_bytes", 0)) for file in entry.get("files", [])),
             "vendor": vendor_identity,
         }
-    if set(providers) != {"cuda", "hip"}:
-        raise BackendCatalogError("update hints require CUDA and HIP target packs")
+    if set(providers) != {"cuda", "hip", "vulkan"}:
+        raise BackendCatalogError("update hints require Vulkan, CUDA, and HIP packs")
     if len(core_versions) != 1 or "" in core_versions:
         raise BackendCatalogError("update hints do not share one core version")
     if len(ggml_revisions) != 1 or "" in ggml_revisions:
@@ -819,14 +890,16 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     compile_parser = subparsers.add_parser("compile")
     compile_parser.add_argument("--build-manifest", type=Path, required=True)
-    compile_parser.add_argument("--provider", choices=("cuda", "hip"), required=True)
+    compile_parser.add_argument(
+        "--provider", choices=("cuda", "hip", "vulkan"), required=True
+    )
     compile_parser.add_argument("--plugin", type=Path, required=True)
     compile_parser.add_argument("--vendor-archive", type=Path)
     compile_parser.add_argument("--vendor-tree", type=Path)
     compile_parser.add_argument("--vendor-extract-subdir", default="vendor")
     compile_parser.add_argument("--version", required=True)
     compile_parser.add_argument("--minimum-cli-version", required=True)
-    compile_parser.add_argument("--minimum-driver-api", required=True)
+    compile_parser.add_argument("--minimum-driver-api")
     compile_parser.add_argument("--base-url", required=True)
     compile_parser.add_argument("--mirror-base-url")
     compile_parser.add_argument("--backend-id")
@@ -858,7 +931,6 @@ def main() -> int:
     bundle_parser.add_argument("--directory", type=Path, required=True)
     bundle_parser.add_argument("--host-abi", type=Path, required=True)
     bundle_parser.add_argument("--out", type=Path, required=True)
-    bundle_parser.add_argument("--require-vulkan-loader", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "compile":
@@ -889,12 +961,7 @@ def main() -> int:
         elif args.command == "hints":
             compile_update_hints(args.entry, args.out)
         else:
-            compile_bundled_manifest(
-                args.directory,
-                args.host_abi,
-                args.out,
-                args.require_vulkan_loader,
-            )
+            compile_bundled_manifest(args.directory, args.host_abi, args.out)
     except (BackendCatalogError, OSError, json.JSONDecodeError) as error:
         parser.error(str(error))
     return 0

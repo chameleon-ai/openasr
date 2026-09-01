@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
+use super::SharedFireRedStreamVadModel;
 use super::frontend::SAMPLE_RATE_HZ;
 use super::ggml_runtime::FireRedStreamVadGgmlRuntime;
-use super::model::{FRAME_SHIFT_MS, FireRedStreamVadModel};
+use super::model::FRAME_SHIFT_MS;
 use super::streaming::FireRedStreamingVad;
 use super::weights::FireRedStreamVadWeightsError;
 use crate::NativeExecutionServices;
@@ -44,7 +45,7 @@ pub enum FireRedStreamVadError {
 /// Neural VAD provider over the process-wide shared Stream-VAD model. Cheap
 /// to construct (it only borrows the model), so build one per request.
 pub struct FireRedStreamVadProvider {
-    model: &'static FireRedStreamVadModel,
+    model: SharedFireRedStreamVadModel,
     backend: GgmlCpuGraphBackend,
     placement: ExecutionPlacement,
 }
@@ -78,7 +79,7 @@ pub(super) fn offline_chunk_samples_for_backend(backend: GgmlCpuGraphBackend) ->
 
 impl FireRedStreamVadProvider {
     fn from_model(
-        model: &'static FireRedStreamVadModel,
+        model: SharedFireRedStreamVadModel,
         backend: GgmlCpuGraphBackend,
         placement: ExecutionPlacement,
     ) -> Self {
@@ -159,12 +160,17 @@ impl FireRedStreamVadProvider {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        let mut streaming = FireRedStreamingVad::from_model(self.model);
+        let mut streaming =
+            FireRedStreamingVad::from_model(self.model.clone()).map_err(|error| {
+                FireRedStreamVadError::RealtimeRuntime {
+                    reason: error.to_string(),
+                }
+            })?;
         let mut device_runtime = if self.backend == GgmlCpuGraphBackend::Cpu {
             None
         } else {
             Some(
-                FireRedStreamVadGgmlRuntime::new(self.model, self.backend, self.placement)
+                FireRedStreamVadGgmlRuntime::new(&self.model, self.backend, self.placement)
                     .map_err(|error| FireRedStreamVadError::Graph {
                         reason: error.to_string(),
                     })?,
@@ -199,10 +205,11 @@ impl PolicyResolvedFireRedStreamVadProvider {
     pub(crate) fn for_intent(
         execution_services: Arc<NativeExecutionServices>,
         intent: ExecutionIntent,
-    ) -> Result<Option<Self>, FireRedStreamVadError> {
-        let Some(model) = super::shared_model() else {
-            return Ok(None);
-        };
+    ) -> Result<Self, FireRedStreamVadError> {
+        let model = super::shared_model().ok_or_else(|| FireRedStreamVadError::ExecutionPolicy {
+            reason: "Stream-VAD admission failed; vendored weights require an installed native execution broker".to_string(),
+        })?;
+        let model_for_builder = model.clone();
         let inventory = enumerate_compute_devices_from_ggml(&crate::ggml_available_devices());
         let plan = execution_services
             .policy_resolver()
@@ -224,7 +231,7 @@ impl PolicyResolvedFireRedStreamVadProvider {
             .iter()
             .map(|candidate| {
                 let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
-                FireRedStreamVadProvider::from_model(model, backend, candidate.placement)
+                FireRedStreamVadProvider::from_model(model.clone(), backend, candidate.placement)
                     .invocation_scratch_peak_bytes()
             })
             .max()
@@ -233,23 +240,29 @@ impl PolicyResolvedFireRedStreamVadProvider {
             move |candidate: &crate::device::execution_policy::ExecutionCandidate| {
                 let backend = resolved_runtime_for_auxiliary_candidate(candidate).backend();
                 Ok(FireRedStreamVadProvider::from_model(
-                    model,
+                    model_for_builder.clone(),
                     backend,
                     candidate.placement,
                 ))
             },
         );
+        let activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                super::FireRedStreamVadModel::system_memory_quote()
+                    .map_err(|reason| FireRedStreamVadError::ExecutionPolicy { reason })?,
+            );
         let runtime = PolicyResolvedAuxRuntime::try_new(
             execution_services,
             plan,
             POLICY_RESOLVED_OFFLINE_STAGE,
             builder,
+            activation_quote,
         )
         .map_err(map_policy_error)?;
-        Ok(Some(Self {
+        Ok(Self {
             runtime: Mutex::new(runtime),
             invocation_scratch_peak_bytes,
-        }))
+        })
     }
 
     pub(crate) const fn invocation_scratch_peak_bytes(&self) -> u64 {
@@ -420,7 +433,7 @@ mod tests {
     fn offline_chunk_policy_keeps_cpu_responsive_and_batches_accelerators() {
         let model = super::super::shared_model().expect("vendored Stream-VAD model");
         let cpu = FireRedStreamVadProvider {
-            model,
+            model: model.clone(),
             backend: GgmlCpuGraphBackend::Cpu,
             placement: ExecutionPlacement::CpuOnly,
         };
@@ -456,12 +469,14 @@ mod tests {
             NativeExecutionServices::for_local_process()
                 .expect("construct native execution services"),
         );
+        let _nes = crate::models::native_execution_services::install_native_execution_services(
+            services.as_ref(),
+        );
         let provider = PolicyResolvedFireRedStreamVadProvider::for_intent(
-            services,
+            Arc::clone(&services),
             ExecutionIntent::AcceleratedOnly,
         )
-        .expect("resolve explicit accelerated Stream-VAD")
-        .expect("embedded Stream-VAD model");
+        .expect("resolve explicit accelerated Stream-VAD");
         let placement = crate::GgmlExecutionTelemetryCollector::new();
         let _placement_guard = placement.install();
         let actual = provider

@@ -49,7 +49,24 @@ fn exactly_addressable_preference(provider: ExecutionProvider) -> RequestBackend
 }
 
 #[test]
-fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
+fn unified_offline_path_checkouts_combined_owner_instead_of_encoder_only_actor() {
+    assert!(
+        whisper_should_checkout_unified_gpu_owner(false, false, true),
+        "offline unified GPU must skip the encoder-only actor so prelude cannot install a second TLS backend"
+    );
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        true, false, true
+    ));
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        false, true, true
+    ));
+    assert!(!whisper_should_checkout_unified_gpu_owner(
+        false, false, false
+    ));
+}
+
+#[test]
+fn unified_owner_is_limited_to_exact_direct_cuda_hip_vulkan_full_device() {
     let direct_gpu = GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend::Gpu,
         use_scheduler: false,
@@ -78,50 +95,53 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
         None,
     ));
     let cuda = exactly_addressable_preference(ExecutionProvider::Cuda);
-    assert!(!whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        false,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        true,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        large_geometry,
-        false,
-        None,
-        None,
-    ));
-    assert!(whisper_unified_runtime_enabled_with_override(
-        GgmlCpuGraphBackend::Gpu,
-        Some(&cuda),
-        Some(ExecutionPlacement::FullDevice),
-        direct_gpu,
-        direct_gpu,
-        medium_geometry,
-        false,
-        None,
-        Some("1"),
-    ));
+    let hip = exactly_addressable_preference(ExecutionProvider::Hip);
+    for capture_gpu in [&cuda, &hip] {
+        assert!(!whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            false,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            true,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            large_geometry,
+            false,
+            None,
+            None,
+        ));
+        assert!(whisper_unified_runtime_enabled_with_override(
+            GgmlCpuGraphBackend::Gpu,
+            Some(capture_gpu),
+            Some(ExecutionPlacement::FullDevice),
+            direct_gpu,
+            direct_gpu,
+            medium_geometry,
+            false,
+            None,
+            Some("1"),
+        ));
+    }
     assert!(!whisper_unified_runtime_enabled_with_override(
         GgmlCpuGraphBackend::Gpu,
         Some(&vulkan),
@@ -136,7 +156,6 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
     for provider in [
         ExecutionProvider::Cpu,
         ExecutionProvider::Metal,
-        ExecutionProvider::Hip,
         ExecutionProvider::Accelerator,
         ExecutionProvider::Unknown,
     ] {
@@ -171,13 +190,17 @@ fn unified_owner_is_limited_to_exact_direct_cuda_vulkan_full_device() {
 }
 
 #[test]
-fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
+fn gpu_loaded_f16_views_require_exact_direct_cuda_hip_vulkan_full_device() {
     let direct_gpu = GgmlCpuGraphConfig {
         backend: GgmlCpuGraphBackend::Gpu,
         use_scheduler: false,
         ..GgmlCpuGraphConfig::conservative_default()
     };
-    for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    for provider in [
+        ExecutionProvider::Cuda,
+        ExecutionProvider::Hip,
+        ExecutionProvider::Vulkan,
+    ] {
         let preference = exactly_addressable_preference(provider);
         assert_eq!(
             whisper_gpu_loaded_f16_weight_mode_with_override(
@@ -203,7 +226,6 @@ fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
     for provider in [
         ExecutionProvider::Cpu,
         ExecutionProvider::Metal,
-        ExecutionProvider::Hip,
         ExecutionProvider::Accelerator,
         ExecutionProvider::Unknown,
     ] {
@@ -242,6 +264,57 @@ fn gpu_loaded_f16_views_require_exact_direct_cuda_vulkan_full_device() {
             None,
         ),
         WhisperGpuLoadedF16WeightMode::ArenaCopy
+    );
+}
+
+#[test]
+fn same_retained_graph_serves_full_logits_and_native_first_max_plans() {
+    use crate::ggml_runtime::{
+        AutoGpuPolicy, GgmlDecodeOutputContract, GgmlDecodeOutputPlan, RequestBackendPreference,
+        ResolvedFamilyRuntimeInput,
+    };
+    use crate::models::runtime_cache_coordinator::PackContentKey;
+
+    let full = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+        Some(RequestBackendPreference::CpuOnly),
+        AutoGpuPolicy::AllBackends,
+        GgmlDecodeOutputContract::FullLogits,
+    );
+    let compact = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+        Some(RequestBackendPreference::CpuOnly),
+        AutoGpuPolicy::AllBackends,
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+    );
+    assert_eq!(full.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+    assert_eq!(
+        compact.output_plan(),
+        GgmlDecodeOutputPlan::NativeFirstMaxToken
+    );
+
+    let content = PackContentKey::new("sha256:whisper-output-plan-fixture");
+    let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+    let capacity = Seq2SeqResidentCapacity {
+        self_attention_positions: 448,
+        cross_attention_positions: 1500,
+    };
+    let weight_mode = WhisperGpuLoadedF16WeightMode::ArenaCopy;
+    // Production checkout does not take output_plan: the retained decoder
+    // graph always materializes complete logits, so both plans share one owner.
+    let decoder_key = |_plan: GgmlDecodeOutputPlan| -> WhisperDecoderPersistentSessionKey {
+        (content.clone(), lane.clone(), capacity, weight_mode)
+    };
+    let unified_key = |_plan: GgmlDecodeOutputPlan| -> WhisperUnifiedPersistentSessionKey {
+        (content.clone(), lane.clone(), capacity, weight_mode)
+    };
+    assert_eq!(
+        decoder_key(full.output_plan()),
+        decoder_key(compact.output_plan()),
+        "whisper decoder owner must serve FullLogits and NativeFirstMaxToken with one retained graph"
+    );
+    assert_eq!(
+        unified_key(full.output_plan()),
+        unified_key(compact.output_plan()),
+        "whisper unified owner must serve FullLogits and NativeFirstMaxToken with one retained graph"
     );
 }
 
@@ -1706,38 +1779,32 @@ fn whisper_carry_producer_honors_the_effective_carry_switch() {
 }
 
 #[test]
-fn whisper_serve_batch_allows_longform_on_direct_gpu_lane() {
-    let mut direct_gpu = GgmlCpuGraphConfig::conservative_default();
-    direct_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    direct_gpu.use_scheduler = false;
+fn whisper_serve_batch_requires_planner_reusable_graph() {
     let request_options = GgmlAsrExecutionOptions {
         longform: Some(crate::LongFormOptions::default()),
         ..GgmlAsrExecutionOptions::default()
     };
 
+    assert!(!whisper_can_use_serve_batch(
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
+        &request_options,
+        true
+    ));
     assert!(whisper_can_use_serve_batch(
-        direct_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph,
         &request_options,
         true
     ));
 }
 
 #[test]
-fn whisper_serve_batch_rejects_scheduler_and_cpu_lanes() {
+fn whisper_serve_batch_rejects_unproven_reuse() {
     let request_options = GgmlAsrExecutionOptions::default();
-    let mut scheduler_gpu = GgmlCpuGraphConfig::conservative_default();
-    scheduler_gpu.backend = GgmlCpuGraphBackend::Gpu;
-    scheduler_gpu.use_scheduler = true;
-    let mut cpu = GgmlCpuGraphConfig::conservative_default();
-    cpu.backend = GgmlCpuGraphBackend::Cpu;
-    cpu.use_scheduler = false;
-
     assert!(!whisper_can_use_serve_batch(
-        scheduler_gpu,
+        crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph,
         &request_options,
         false
     ));
-    assert!(!whisper_can_use_serve_batch(cpu, &request_options, false));
 }
 
 #[test]

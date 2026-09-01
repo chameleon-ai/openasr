@@ -37,6 +37,12 @@ use super::execution_memory::{
     DeviceMemoryBrokerSet, DeviceMemoryReservationBatch, DeviceMemorySnapshot, MemoryDomainKey,
     MemoryPlanningError, MemoryReservationCohortId,
 };
+use crate::models::native_execution_services::{
+    current_execution_cache_attempt_id, current_native_execution_scope_id, current_runtime_receipts,
+};
+use crate::models::runtime_receipts::{
+    RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeResourceGuard, RuntimeResourceState,
+};
 
 /// Process-local identity of one already-open pack weight mapping.
 ///
@@ -90,6 +96,10 @@ struct PackWeightResidencyInner {
     broker: Arc<DeviceMemoryBrokerSet>,
     key: PackWeightResidencyKey,
     generation: u64,
+    charged_bytes: u64,
+    /// The unique pack-level receipt follows this same Arc as the sole broker
+    /// reservation. It is attached only after native host-import succeeds.
+    receipt: Mutex<Option<(RuntimeResourceGuard, RuntimeOwnerGuard)>>,
     /// Owns the exact mapping whose Arc allocation address forms `key`.
     /// Keeping this clone until the last residency handle drops makes address
     /// reuse impossible while the table can still upgrade `live`.
@@ -111,6 +121,17 @@ pub(crate) struct PackWeightResidencyHandle {
 }
 
 impl PackWeightResidencyHandle {
+    /// Attach the one pack-level receipt after the native host-import has
+    /// succeeded. Concurrent stage/backend contexts share this Arc and only
+    /// the first successful attach creates an owner/resource pair.
+    pub(crate) fn attach_receipt(&self) {
+        self.inner.attach_receipt();
+    }
+
+    pub(crate) fn record_receipt_reuse(&self) {
+        self.inner.record_receipt_reuse();
+    }
+
     #[cfg(test)]
     pub(crate) fn charged_bytes(&self) -> u64 {
         self.charged_bytes
@@ -119,6 +140,59 @@ impl PackWeightResidencyHandle {
     #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.inner.generation
+    }
+}
+
+impl PackWeightResidencyInner {
+    fn attach_receipt(&self) {
+        let Some(collector) =
+            current_runtime_receipts().filter(|collector| collector.is_available())
+        else {
+            return;
+        };
+        let mut receipt = self
+            .receipt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if receipt.is_some() {
+            return;
+        }
+        let Some(descriptor) =
+            collector.host_neutral_owner_descriptor("pack-weight-residency", None, None)
+        else {
+            return;
+        };
+        let owner = collector.start_owner(descriptor, current_execution_cache_attempt_id());
+        let Some(owner_id) = owner.owner_id() else {
+            return;
+        };
+        let Some(descriptor) = collector.resource_descriptor(
+            "pack-weight-residency",
+            &self.key.domain,
+            self.charged_bytes,
+            self.charged_bytes,
+            self.charged_bytes,
+            super::execution_memory::QuoteConfidence::CommittedUpperBound,
+            Some(super::execution_memory::MemoryObservationConfidence::DeviceSnapshot),
+        ) else {
+            return;
+        };
+        let Some(resource) = collector.acquire_resource(owner_id, descriptor) else {
+            return;
+        };
+        // Receipts are attached after the broker lease has already committed.
+        resource.set_state(RuntimeResourceState::Committed);
+        *receipt = Some((resource, owner));
+    }
+
+    fn record_receipt_reuse(&self) {
+        let receipt = self
+            .receipt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((_, owner)) = receipt.as_ref() {
+            owner.record_reuse(current_execution_cache_attempt_id());
+        }
     }
 }
 
@@ -200,6 +274,7 @@ impl DeviceMemoryBrokerSet {
                     domain: key.domain.clone(),
                 });
             }
+            inner.record_receipt_reuse();
             return Ok((
                 PackWeightResidencyHandle {
                     inner,
@@ -227,26 +302,65 @@ impl DeviceMemoryBrokerSet {
         // last Drop cannot observe a half-published generation, and so the
         // stale refund above is atomic with the new charge relative to other
         // acquirers of this key.
-        let mut request = super::execution_memory::DomainReservationRequest {
-            domain: key.domain.clone(),
-            snapshot,
-            peak_bytes: bytes,
-            retained_bytes: bytes,
-            // Already-resident file-backed pages are reclaimable; do not require
-            // live free == pack size. Policy ledger still prevents oversell.
-            observed_peak_bytes: Some(0),
-            requires_reconciliation: false,
-            resource_id: format!(
-                "pack-weight-residency:{}:{:#x}",
-                key.domain,
-                key.mapping_identity.as_raw()
-            ),
-            cohort_id: None,
+        let resource_id = format!(
+            "pack-weight-residency:{}:{:#x}",
+            key.domain,
+            key.mapping_identity.as_raw()
+        );
+        let owner_scope_id = current_native_execution_scope_id();
+        let owner_placement = if owner_scope_id.is_some() {
+            RuntimeOwnerPlacement::HostNeutral
+        } else {
+            RuntimeOwnerPlacement::Unknown
         };
-        request.cohort_id = cohort_id;
-        let mut batch = self.try_reserve_batch(vec![request])?;
-        batch.commit_quoted()?;
+        let mut batch = if key.domain == MemoryDomainKey::SystemMemory {
+            match self.try_consume_mapping_envelope(bytes, cohort_id, resource_id.clone())? {
+                Some(batch) => batch,
+                None => {
+                    let mut request = super::execution_memory::DomainReservationRequest {
+                        domain: key.domain.clone(),
+                        snapshot,
+                        peak_bytes: bytes,
+                        retained_bytes: bytes,
+                        observed_peak_bytes: None,
+                        requires_reconciliation: false,
+                        resource_id: resource_id.clone(),
+                        cohort_id,
+                    }
+                    .already_open_file_backed();
+                    request.cohort_id = cohort_id;
+                    let mut batch = self.try_reserve_batch_for_scope_and_placement(
+                        vec![request],
+                        owner_scope_id,
+                        owner_placement,
+                    )?;
+                    batch.commit_quoted()?;
+                    batch
+                }
+            }
+        } else {
+            let mut request = super::execution_memory::DomainReservationRequest {
+                domain: key.domain.clone(),
+                snapshot,
+                peak_bytes: bytes,
+                retained_bytes: bytes,
+                observed_peak_bytes: None,
+                requires_reconciliation: false,
+                resource_id: resource_id.clone(),
+                cohort_id,
+            }
+            .already_open_file_backed();
+            request.cohort_id = cohort_id;
+            let mut batch = self.try_reserve_batch_for_scope_and_placement(
+                vec![request],
+                owner_scope_id,
+                owner_placement,
+            )?;
+            batch.commit_quoted()?;
+            batch
+        };
 
+        let seeded_receipt = batch.take_receipt_pair();
         let generation = self
             .next_pack_weight_residency_generation
             .fetch_add(1, Ordering::Relaxed);
@@ -254,6 +368,8 @@ impl DeviceMemoryBrokerSet {
             broker: Arc::clone(self),
             key: key.clone(),
             generation,
+            charged_bytes: bytes,
+            receipt: Mutex::new(seeded_receipt),
             mapping_owner,
         });
         table.insert(
@@ -350,7 +466,7 @@ impl DeviceMemoryBrokerSet {
             snapshot,
             peak_bytes: bytes,
             retained_bytes: bytes,
-            observed_peak_bytes: Some(0),
+            observed_peak_bytes: None,
             requires_reconciliation: false,
             resource_id: format!(
                 "pack-weight-residency-dead-inject:{}:{:#x}",
@@ -358,7 +474,8 @@ impl DeviceMemoryBrokerSet {
                 key.mapping_identity.as_raw()
             ),
             cohort_id: None,
-        };
+        }
+        .already_open_file_backed();
         request.cohort_id = None;
         let mut batch = self.try_reserve_batch(vec![request])?;
         batch.commit_quoted()?;
@@ -394,6 +511,7 @@ mod tests {
     use super::*;
     use crate::device::execution_memory::{
         DeviceMemoryPolicy, DeviceMemorySnapshot, MemoryDomainKey, MemoryObservationConfidence,
+        MemoryReservationCohortId,
     };
     use std::sync::Barrier;
     use std::thread;
@@ -450,6 +568,41 @@ mod tests {
             0
         );
         assert_eq!(broker.pack_weight_residency_live_count(), 0);
+    }
+
+    #[test]
+    fn shared_receipt_is_one_owner_until_the_last_mapping_handle_drops() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _scope =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let broker = Arc::clone(services.memory_broker());
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let mapping = key(0xFACE);
+        let (first, charged) = broker
+            .acquire_pack_weight_residency(mapping.clone(), 4 * GIB, snap, None)
+            .expect("first mapping owner");
+        assert_eq!(charged, 4 * GIB);
+        first.attach_receipt();
+        let (second, shared) = broker
+            .acquire_pack_weight_residency(mapping, 4 * GIB, snap, None)
+            .expect("second mapping owner");
+        assert_eq!(shared, 0);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+        assert_eq!(services.runtime_receipts().summary().live_resource_count, 1);
+
+        drop(first);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 1);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            4 * GIB
+        );
+        drop(second);
+        assert_eq!(services.runtime_receipts().summary().live_owner_count, 0);
+        assert_eq!(services.runtime_receipts().summary().live_resource_count, 0);
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            0
+        );
     }
 
     #[test]
@@ -546,6 +699,41 @@ mod tests {
             err,
             MemoryPlanningError::DeviceBudgetExceeded { .. }
         ));
+    }
+
+    #[test]
+    fn residency_joins_same_cohort_host_activation_envelope() {
+        let broker = Arc::new(DeviceMemoryBrokerSet::new(DeviceMemoryPolicy {
+            minimum_headroom_bytes: 0,
+            maximum_owned_basis_points: 10_000,
+        }));
+        let snap = snapshot(16 * GIB, 16 * GIB);
+        let cohort = MemoryReservationCohortId::new(9);
+        let _activation = broker
+            .open_mapping_envelope(
+                snap,
+                4 * GIB,
+                cohort,
+                "candidate-activation-host-import".to_string(),
+                None,
+                RuntimeOwnerPlacement::HostNeutral,
+            )
+            .expect("host activation envelope");
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).pending_bytes,
+            4 * GIB
+        );
+        let (_handle, charged) = broker
+            .acquire_pack_weight_residency(key(1), 4 * GIB, snap, Some(cohort))
+            .expect("residency");
+        assert_eq!(charged, 4 * GIB);
+        let usage = broker.usage(&MemoryDomainKey::SystemMemory);
+        assert_eq!(
+            usage.pending_bytes + usage.committed_bytes,
+            4 * GIB,
+            "one open mapping must not occupy two SystemMemory copies"
+        );
+        assert!(!usage.quarantined);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::mpsc,
     time::Duration,
 };
 
@@ -15,11 +16,19 @@ use crate::{
     catalog_security,
     catalog_series::{CatalogSeriesSpec, catalog_series_spec},
     config::DEFAULT_MODEL_ID,
-    http,
+    http, transport,
 };
 
+mod execution_approvals;
 mod resolution;
 mod validation;
+
+pub use execution_approvals::{
+    CATALOG_EXECUTION_APPROVAL_SCHEMA_VERSION, CatalogExecutionActivationMode,
+    CatalogExecutionApprovalCell, CatalogExecutionApprovalDecision, CatalogExecutionApprovalSet,
+    CatalogExecutionCaptureMode, CatalogExecutionOutputPlan, CatalogExecutionPlacement,
+    CatalogExecutionProvider, CatalogExecutionReuseMode, CatalogExecutionSchedulerMode,
+};
 
 const DEFAULT_CATALOG_URL: &str = "https://catalog.openasr.org/v1/catalog.json";
 const SUPPORTED_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -177,6 +186,10 @@ pub struct ModelCatalog {
     /// drift gates stay green.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<CatalogBackend>,
+    /// Signed exact-cell runtime approvals. Qualification manifests never enter
+    /// this field: absence means no optional provider capability can be minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_approvals: Option<CatalogExecutionApprovalSet>,
     /// Curated display labels for language/dialect recognition codes, keyed by
     /// the exact code a model advertises in `languages` (e.g. `zh-sichuan`).
     /// Carried as signed catalog DATA so app surfaces -- including the web app,
@@ -498,6 +511,21 @@ pub enum ModelAvailability {
     },
 }
 
+/// Whether the running build may resolve and install a catalog backend.
+///
+/// Backend entries are native code, so unlike model listings a future entry is
+/// never returned as an executable candidate. The catalog may still parse for
+/// forward-compatible display and update guidance, but every backend resolver
+/// and the install boundary enforce this floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendAvailability {
+    Available,
+    RequiresUpdate {
+        min_cli_version: String,
+        current_cli_version: String,
+    },
+}
+
 /// The OpenASR version of the running build (`CARGO_PKG_VERSION`), used to gate
 /// catalog models against their `min_cli_version`.
 pub fn current_cli_version() -> &'static str {
@@ -548,6 +576,35 @@ impl CatalogModel {
             },
             None => ModelAvailability::Available,
         }
+    }
+}
+
+fn backend_availability(min_cli_version: &str) -> BackendAvailability {
+    let (Some(current), Some(minimum)) = (
+        parse_semver_triplet(current_cli_version()),
+        parse_semver_triplet(min_cli_version),
+    ) else {
+        // Catalog validation rejects malformed floors. Preserve a total helper
+        // for already-constructed test values without turning malformed data
+        // into an executable authorization.
+        return BackendAvailability::RequiresUpdate {
+            min_cli_version: min_cli_version.to_string(),
+            current_cli_version: current_cli_version().to_string(),
+        };
+    };
+    if current < minimum {
+        BackendAvailability::RequiresUpdate {
+            min_cli_version: min_cli_version.to_string(),
+            current_cli_version: current_cli_version().to_string(),
+        }
+    } else {
+        BackendAvailability::Available
+    }
+}
+
+impl CatalogBackend {
+    pub fn availability(&self) -> BackendAvailability {
+        backend_availability(&self.min_cli_version)
     }
 }
 
@@ -735,10 +792,70 @@ pub struct CatalogBackend {
     #[serde(default, alias = "min_driver")]
     pub min_driver_api: Option<String>,
     pub min_cli_version: String,
+    /// Signed publication/qualification state. Missing on older catalogs is
+    /// fail-closed `published-inert`; installation may prepare those bytes,
+    /// but ordinary Auto/explicit activation may consume only `activated`.
+    #[serde(default)]
+    pub activation: CatalogBackendActivation,
     /// Exact neutral-host ABI this plugin was built against. Backend packs are
     /// never selected by a loose core-version range.
     pub host_abi: BackendHostAbi,
     pub files: Vec<CatalogBackendFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBackendActivation {
+    #[serde(default)]
+    pub state: CatalogBackendActivationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification_source_catalog_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_evidence_sha256: Option<String>,
+    /// Exact live GPU target proven by the hardware qualification receipt.
+    /// CUDA/HIP must equal the entry's compiled target; Vulkan uses a narrow
+    /// vendor/device/pipeline compatibility class with driver bound separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_device_target: Option<String>,
+    /// Exact live driver version used by hardware and correctness evidence.
+    /// A driver change keeps the candidate inert until it is requalified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_driver_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness_matrix_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness_receipts_sha256: Option<String>,
+}
+
+impl Default for CatalogBackendActivation {
+    fn default() -> Self {
+        Self {
+            state: CatalogBackendActivationState::PublishedInert,
+            qualification_source_catalog_sha256: None,
+            hardware_evidence_sha256: None,
+            qualified_device_target: None,
+            qualified_driver_version: None,
+            correctness_matrix_sha256: None,
+            correctness_receipts_sha256: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogBackendActivationState {
+    #[default]
+    PublishedInert,
+    Qualified,
+    Activated,
+    Revoked,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CatalogBackendActivation {
+    pub fn is_activated(&self) -> bool {
+        self.state == CatalogBackendActivationState::Activated
+    }
 }
 
 /// One file in a [`CatalogBackend`] pack: the `ggml-<vendor>` plugin, a runtime
@@ -878,10 +995,18 @@ pub struct ResolvedCatalogBackendPull {
     pub vendor: CatalogBackendVendor,
     pub version: String,
     pub display_name: String,
+    pub min_cli_version: String,
     pub host_abi: BackendHostAbi,
     pub targets: Vec<String>,
     pub min_driver_api: Option<String>,
+    pub activation: CatalogBackendActivation,
     pub files: Vec<CatalogBackendFile>,
+}
+
+impl ResolvedCatalogBackendPull {
+    pub fn availability(&self) -> BackendAvailability {
+        backend_availability(&self.min_cli_version)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -892,6 +1017,14 @@ pub enum BackendResolutionError {
     UnknownBackend {
         reference: String,
         available: String,
+    },
+    #[error(
+        "Backend '{backend_id}' requires OpenASR >= {min_cli_version} (this build is {current_cli_version}). Update OpenASR to use it."
+    )]
+    BackendRequiresNewerCli {
+        backend_id: String,
+        min_cli_version: String,
+        current_cli_version: String,
     },
     #[error(
         "No {vendor} backend pack matches host ABI '{host_fingerprint}' and device target '{device_target}'."
@@ -1206,50 +1339,61 @@ pub fn load_model_catalog(
     let cache_path = default_catalog_cache_path(home);
     let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
 
-    match read_catalog_source(source) {
-        Ok(contents) => match read_and_verify_catalog_manifest(source, home, &contents) {
-            Ok(verified) => {
-                match parse_and_check_production_catalog(source, &contents, &verified.signature) {
-                    Ok(catalog) => {
-                        // This tier (network fetch / explicit catalog_url
-                        // override) always runs the STRICT
-                        // `enforce_catalog_epoch_for_verified` (inside
-                        // `read_and_verify_catalog_manifest` above) -- there is
-                        // no below-floor outcome to reach here, so the floor
-                        // always advances on success.
-                        persist_catalog_cache(
-                            home,
-                            &cache_path,
-                            &contents,
-                            &verified.manifest_contents,
-                            &verified.signature,
-                            true,
-                        );
-                        catalog_security::clear_catalog_degraded(home);
-                        Ok(catalog)
-                    }
-                    // Parse/validate (or the staged-entries check above) failed
-                    // even though the signature verified: fall through to the
-                    // same cache/embedded degrade chain as a transport/signature
-                    // failure, rather than hard-failing the whole load. See
-                    // docs/CATALOG_COMPATIBILITY.md's "fallback chain" section --
-                    // this is the fix for the incident where a signature-valid
-                    // but structurally-wrong cached payload bricked the daemon
-                    // with no fallback attempted.
-                    Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
+    match load_verified_catalog_bytes(source, home) {
+        Ok((contents, verified)) => {
+            match parse_and_check_production_catalog(source, &contents, &verified.signature) {
+                Ok(catalog) => {
+                    // This tier (network fetch / explicit catalog_url
+                    // override) always runs the STRICT
+                    // `enforce_catalog_epoch_for_verified` (inside
+                    // `load_verified_catalog_bytes` above) -- there is
+                    // no below-floor outcome to reach here, so the floor
+                    // always advances on success.
+                    persist_catalog_cache(
+                        home,
+                        &cache_path,
+                        &contents,
+                        &verified.manifest_contents,
+                        &verified.signature,
+                        true,
+                    );
+                    catalog_security::clear_catalog_degraded(home);
+                    Ok(catalog)
                 }
+                // Parse/validate (or the staged-entries check above) failed
+                // even though the signature verified: fall through to the
+                // same cache/embedded degrade chain as a transport/signature
+                // failure, rather than hard-failing the whole load. See
+                // docs/CATALOG_COMPATIBILITY.md's "fallback chain" section --
+                // this is the fix for the incident where a signature-valid
+                // but structurally-wrong cached payload bricked the daemon
+                // with no fallback attempted.
+                Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
             }
-            Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
-        },
+        }
         Err(error) => load_cached_signed_catalog(source, home, &cache_path, error),
     }
+}
+
+fn load_verified_catalog_bytes(
+    source: &str,
+    home: &Path,
+) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
+    if catalog_security::classify_catalog_identity(source)
+        == catalog_security::CatalogSourceKind::Remote
+    {
+        return fetch_verified_remote_catalog(source, home);
+    }
+    let contents = read_catalog_source(source)?;
+    let verified = read_and_verify_catalog_manifest(source, home, &contents)?;
+    Ok((contents, verified))
 }
 
 /// Loads only the already-verified on-disk catalog cache. Runtime backend
 /// enumeration can run inside an async server handler, so it must never create
 /// a blocking HTTP client or perform network I/O. Backend installation already
 /// populated this signed cache; a missing or invalid cache therefore fails the
-/// optional activation transaction while bundled CPU/Vulkan remain available.
+/// optional activation transaction while bundled CPU remains available.
 pub(crate) fn load_model_catalog_from_verified_cache(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,
@@ -1686,7 +1830,7 @@ pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog,
 /// a model whose `kind`, `license_class`, or (for a `capability-pack`)
 /// capability `role` deserialized to the tolerant `Unknown` catch-all (see
 /// each enum's `#[serde(other)]` variant), or a backend pack whose `vendor`
-/// or any file's `role` did the same. `license_class` and capability `role`
+/// activation state or any file's `role` did the same. `license_class` and capability `role`
 /// can gate what a client is allowed to show/download/stage, so "hide" (not
 /// "show with a guessed value") is the only safe degrade.
 ///
@@ -1727,6 +1871,13 @@ fn filter_forward_compatible_catalog(catalog: &mut ModelCatalog) -> Vec<String> 
         if backend.vendor == CatalogBackendVendor::Unknown {
             notes.push(format!(
                 "catalog: hiding backend '{}': unrecognized vendor (needs a newer OpenASR build)",
+                backend.id
+            ));
+            return false;
+        }
+        if backend.activation.state == CatalogBackendActivationState::Unknown {
+            notes.push(format!(
+                "catalog: hiding backend '{}': unrecognized activation state (needs a newer OpenASR build)",
                 backend.id
             ));
             return false;
@@ -1787,6 +1938,7 @@ pub fn resolve_catalog_backend_pull(
                 .collect::<Vec<_>>()
                 .join(", "),
         })?;
+    ensure_catalog_backend_available(backend)?;
     Ok(resolved_catalog_backend_pull(backend))
 }
 
@@ -1812,6 +1964,8 @@ pub fn resolve_catalog_backend_pull_for_host(
             device_target: "post-install-live-probe".to_string(),
         });
     }
+    ensure_matching_backends_available(&matches)?;
+    matches.retain(|backend| matches!(backend.availability(), BackendAvailability::Available));
     if matches.len() > 1 {
         matches.sort_by(|left, right| left.id.cmp(&right.id));
         return Err(BackendResolutionError::AmbiguousCompatibleBackend {
@@ -1891,6 +2045,8 @@ pub fn resolve_compatible_catalog_backend_pull_for_driver(
             device_target,
         });
     }
+    ensure_matching_backends_available(&matches)?;
+    matches.retain(|backend| matches!(backend.availability(), BackendAvailability::Available));
     if matches.len() > 1 {
         matches.sort_by(|left, right| left.id.cmp(&right.id));
         return Err(BackendResolutionError::AmbiguousCompatibleBackend {
@@ -1922,6 +2078,21 @@ pub(crate) fn live_backend_driver_floor(
         CatalogBackendVendor::Hip => None,
         _ => min_driver_api,
     }
+}
+
+pub(crate) fn is_canonical_vulkan_qualification_target(target: &str) -> bool {
+    let Some(rest) = target.strip_prefix("vk_caps_") else {
+        return false;
+    };
+    let parts = rest.split('_').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].len() == 8
+        && parts[1].len() == 8
+        && parts[2].len() == 32
+        && parts.iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn driver_version_at_least(current: &str, minimum: &str) -> bool {
@@ -1959,15 +2130,49 @@ fn backend_vendor_label(vendor: CatalogBackendVendor) -> &'static str {
     }
 }
 
+fn ensure_catalog_backend_available(
+    backend: &CatalogBackend,
+) -> Result<(), BackendResolutionError> {
+    match backend.availability() {
+        BackendAvailability::Available => Ok(()),
+        BackendAvailability::RequiresUpdate {
+            min_cli_version,
+            current_cli_version,
+        } => Err(BackendResolutionError::BackendRequiresNewerCli {
+            backend_id: backend.id.clone(),
+            min_cli_version,
+            current_cli_version,
+        }),
+    }
+}
+
+fn ensure_matching_backends_available(
+    matches: &[&CatalogBackend],
+) -> Result<(), BackendResolutionError> {
+    if matches
+        .iter()
+        .any(|backend| matches!(backend.availability(), BackendAvailability::Available))
+    {
+        return Ok(());
+    }
+    let backend = matches
+        .iter()
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .expect("caller checked non-empty backend matches");
+    ensure_catalog_backend_available(backend)
+}
+
 fn resolved_catalog_backend_pull(backend: &CatalogBackend) -> ResolvedCatalogBackendPull {
     ResolvedCatalogBackendPull {
         backend_id: backend.id.clone(),
         vendor: backend.vendor,
         version: backend.version.clone(),
         display_name: backend.display_name.clone(),
+        min_cli_version: backend.min_cli_version.clone(),
         host_abi: backend.host_abi.clone(),
         targets: backend.targets.clone(),
         min_driver_api: backend.min_driver_api.clone(),
+        activation: backend.activation.clone(),
         files: backend.files.clone(),
     }
 }
@@ -2209,27 +2414,8 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
                 catalog_source: source.to_string(),
                 message: http::error_message(&error),
             })?;
-        // The catalog (and its sibling signature manifest, which also flows
-        // through this function) is served from the OpenASR catalog endpoint
-        // (Cloudflare), never Hugging Face. Only the transport host is rewritten:
-        // `source` stays the canonical, signed catalog_url everywhere it feeds
-        // verification (see `read_and_verify_catalog_manifest`), so a proxy cannot
-        // substitute a tampered catalog. Unlike weight downloads (pull.rs), the
-        // catalog uses a redirect-following client and the endpoint serves bytes
-        // directly, so the per-hop CDN rewrite used by weight downloads is
-        // deliberately NOT applied here.
-        let response = client
-            .get(http::apply_catalog_endpoint(source).as_str())
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| CatalogError::ReadCatalog {
-                catalog_source: source.to_string(),
-                message: http::error_message(&error),
-            })?;
-        return response.text().map_err(|error| CatalogError::ReadCatalog {
-            catalog_source: source.to_string(),
-            message: http::error_message(&error),
-        });
+        let url = http::apply_catalog_endpoint(source);
+        return get_https_text(&client, source, &url);
     }
 
     if let Some(path) = source.strip_prefix("file://") {
@@ -2250,6 +2436,126 @@ fn read_catalog_source(source: &str) -> Result<String, CatalogError> {
         catalog_source: source.to_string(),
         message: error.to_string(),
     })
+}
+
+fn get_https_text(
+    client: &reqwest::blocking::Client,
+    catalog_source: &str,
+    url: &str,
+) -> Result<String, CatalogError> {
+    let response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: catalog_source.to_string(),
+            message: http::error_message(&error),
+        })?;
+    response.text().map_err(|error| CatalogError::ReadCatalog {
+        catalog_source: catalog_source.to_string(),
+        message: http::error_message(&error),
+    })
+}
+
+fn fetch_and_verify_catalog_pair(
+    identity: &str,
+    client: &reqwest::blocking::Client,
+    catalog_url: &str,
+    signature_url: &str,
+) -> Result<(String, String, catalog_security::VerifiedCatalogSignature), CatalogError> {
+    let contents = get_https_text(client, identity, catalog_url)?;
+    let manifest_contents = get_https_text(client, identity, signature_url)?;
+    let signature = verify_catalog_manifest_for_source(identity, &contents, &manifest_contents)
+        .map_err(|error| CatalogError::CatalogSecurity {
+            catalog_source: identity.to_string(),
+            message: error.to_string(),
+        })?;
+    Ok((contents, manifest_contents, signature))
+}
+
+fn fetch_verified_remote_catalog(
+    source: &str,
+    home: &Path,
+) -> Result<(String, VerifiedCatalogManifestContents), CatalogError> {
+    let catalog_urls = transport::catalog_transport_urls(source);
+    let signature_source = catalog_security::catalog_signature_source(source);
+    let signature_urls = transport::catalog_transport_urls(&signature_source);
+    let pairs: Vec<(String, String)> = catalog_urls.into_iter().zip(signature_urls).collect();
+    let client = http::blocking_client(CATALOG_HTTP_CONNECT_TIMEOUT, CATALOG_HTTP_TIMEOUT)
+        .map_err(|error| CatalogError::ReadCatalog {
+            catalog_source: source.to_string(),
+            message: http::error_message(&error),
+        })?;
+    let (contents, manifest_contents, signature) =
+        race_verified_catalog_pairs(source, client, pairs)?;
+    catalog_security::enforce_catalog_epoch_for_verified(home, &signature).map_err(|error| {
+        CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok((
+        contents,
+        VerifiedCatalogManifestContents {
+            manifest_contents,
+            signature,
+        },
+    ))
+}
+
+fn race_verified_catalog_pairs(
+    identity: &str,
+    client: reqwest::blocking::Client,
+    pairs: Vec<(String, String)>,
+) -> Result<(String, String, catalog_security::VerifiedCatalogSignature), CatalogError> {
+    if pairs.is_empty() {
+        return Err(CatalogError::ReadCatalog {
+            catalog_source: identity.to_string(),
+            message: "no catalog transport URL was available".to_string(),
+        });
+    }
+    if pairs.len() == 1 {
+        let (catalog_url, signature_url) = &pairs[0];
+        return fetch_and_verify_catalog_pair(identity, &client, catalog_url, signature_url);
+    }
+    let (tx, rx) = mpsc::channel();
+    let pair_count = pairs.len();
+    for (catalog_url, signature_url) in pairs {
+        let tx = tx.clone();
+        let client = client.clone();
+        let identity_owned = identity.to_string();
+        std::thread::Builder::new()
+            .name("openasr-catalog-race".to_string())
+            .spawn(move || {
+                let _ = tx.send(fetch_and_verify_catalog_pair(
+                    &identity_owned,
+                    &client,
+                    &catalog_url,
+                    &signature_url,
+                ));
+            })
+            .map_err(|error| CatalogError::ReadCatalog {
+                catalog_source: identity.to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    drop(tx);
+    let mut last_error = None;
+    let mut remaining = pair_count;
+    while remaining > 0 {
+        match rx.recv() {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                last_error = Some(error);
+                remaining -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Err(last_error.unwrap_or_else(|| CatalogError::ReadCatalog {
+        catalog_source: identity.to_string(),
+        message: "catalog race produced no result".to_string(),
+    }))
 }
 
 struct VerifiedCatalogManifestContents {
@@ -2385,11 +2691,12 @@ fn load_signed_catalog_from_cache(
             ),
         })?;
     let verified = read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
-    parse_and_check_production_catalog(&cache_path.display().to_string(), &cached, &verified)
-        .map_err(|parse_error| CatalogError::CatalogSecurity {
+    parse_and_check_production_catalog(source, &cached, &verified).map_err(|parse_error| {
+        CatalogError::CatalogSecurity {
             catalog_source: source.to_string(),
             message: format!("{error}; cached catalog rejected: {parse_error}"),
-        })
+        }
+    })
 }
 
 /// Load the signed catalog snapshot embedded in the binary at build time. Used as
@@ -2654,6 +2961,9 @@ fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), Ca
     for backend in &catalog.backends {
         validate_catalog_backend(backend, source)?;
     }
+    if let Some(approvals) = &catalog.execution_approvals {
+        execution_approvals::validate_catalog_execution_approvals(catalog, approvals)?;
+    }
     Ok(())
 }
 
@@ -2665,7 +2975,7 @@ fn validate_model_catalog(catalog: &ModelCatalog, source: &str) -> Result<(), Ca
 /// Production catalogs may only point at https payloads. A local-dev
 /// `file://` catalog identity may also point at `file://` payloads so a
 /// HIP/CUDA candidate pack can be installed offline.
-fn backend_file_url_is_allowed(source: &str, url: &str) -> bool {
+pub(crate) fn backend_file_url_is_allowed(source: &str, url: &str) -> bool {
     url.starts_with("https://") || (source.starts_with("file://") && url.starts_with("file://"))
 }
 
@@ -2693,6 +3003,7 @@ fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<()
             backend.id
         )));
     }
+    validate_catalog_backend_activation(backend)?;
     validate_catalog_backend_targets(backend)?;
     let host_abi = &backend.host_abi;
     if host_abi.schema_version != BACKEND_HOST_ABI_SCHEMA_VERSION {
@@ -2838,6 +3149,131 @@ fn validate_catalog_backend(backend: &CatalogBackend, source: &str) -> Result<()
                     backend.id, file.filename
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_backend_activation(backend: &CatalogBackend) -> Result<(), CatalogError> {
+    let bindings = [
+        (
+            "qualification_source_catalog_sha256",
+            backend
+                .activation
+                .qualification_source_catalog_sha256
+                .as_deref(),
+        ),
+        (
+            "hardware_evidence_sha256",
+            backend.activation.hardware_evidence_sha256.as_deref(),
+        ),
+        (
+            "correctness_matrix_sha256",
+            backend.activation.correctness_matrix_sha256.as_deref(),
+        ),
+        (
+            "correctness_receipts_sha256",
+            backend.activation.correctness_receipts_sha256.as_deref(),
+        ),
+    ];
+    let present = bindings.iter().filter(|(_, value)| value.is_some()).count();
+    let qualified_target = backend.activation.qualified_device_target.as_deref();
+    let qualified_driver = backend.activation.qualified_driver_version.as_deref();
+    let qualifiers_complete = qualified_target.is_some() && qualified_driver.is_some();
+    let qualifiers_absent = qualified_target.is_none() && qualified_driver.is_none();
+    match backend.activation.state {
+        CatalogBackendActivationState::PublishedInert => {
+            if present != 0 || !qualifiers_absent {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' is published-inert but carries qualification bindings",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Qualified => {
+            let hardware_complete = backend
+                .activation
+                .qualification_source_catalog_sha256
+                .is_some()
+                && backend.activation.hardware_evidence_sha256.is_some();
+            let correctness_absent = backend.activation.correctness_matrix_sha256.is_none()
+                && backend.activation.correctness_receipts_sha256.is_none();
+            if !hardware_complete || !qualifiers_complete || !correctness_absent {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' qualified activation must carry source, hardware, target, and driver bindings only",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Activated => {
+            if present != bindings.len() || !qualifiers_complete {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' activated bindings are incomplete",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Revoked => {
+            let preserved_hardware = backend
+                .activation
+                .qualification_source_catalog_sha256
+                .is_some()
+                && backend.activation.hardware_evidence_sha256.is_some()
+                && qualifiers_complete
+                && backend.activation.correctness_matrix_sha256.is_none()
+                && backend.activation.correctness_receipts_sha256.is_none();
+            let preserved_activation = present == bindings.len() && qualifiers_complete;
+            if (present != 0 || !qualifiers_absent) && !preserved_hardware && !preserved_activation
+            {
+                return Err(CatalogError::InvalidCatalog(format!(
+                    "backend '{}' revoked qualification bindings are partial",
+                    backend.id
+                )));
+            }
+        }
+        CatalogBackendActivationState::Unknown => {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' has an unsupported activation state",
+                backend.id
+            )));
+        }
+    }
+    for (field, value) in bindings {
+        if let Some(value) = value
+            && (value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' activation.{field} must be lowercase 64-hex",
+                backend.id
+            )));
+        }
+    }
+    if let (Some(target), Some(driver)) = (qualified_target, qualified_driver) {
+        let safe_target = (3..=128).contains(&target.len())
+            && target.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.' | b':')
+            });
+        let safe_driver = (1..=64).contains(&driver.len())
+            && driver
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        let target_matches_vendor = match backend.vendor {
+            CatalogBackendVendor::Cuda | CatalogBackendVendor::Hip => {
+                backend.targets.as_slice() == [target]
+            }
+            CatalogBackendVendor::Vulkan => is_canonical_vulkan_qualification_target(target),
+            CatalogBackendVendor::Cpu | CatalogBackendVendor::Unknown => false,
+        };
+        if !safe_target || !safe_driver || !target_matches_vendor {
+            return Err(CatalogError::InvalidCatalog(format!(
+                "backend '{}' has invalid qualified target/driver identity",
+                backend.id
+            )));
         }
     }
     Ok(())
@@ -3023,47 +3459,11 @@ fn validate_catalog_mirror_url(
             model.id, quant.quant
         )));
     }
-    let parsed = reqwest::Url::parse(&mirror.url).map_err(|source| {
-        CatalogError::InvalidCatalog(format!(
-            "model '{}' quant '{}' mirror URL is invalid: {source}",
-            model.id, quant.quant
-        ))
-    })?;
-    let host = parsed.host_str().unwrap_or_default();
     if mirror.source == "modelscope" && !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
         return Err(CatalogError::InvalidCatalog(format!(
             "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
             model.id, quant.quant
         )));
-    }
-    if matches!(host, "modelscope.cn" | "www.modelscope.cn") {
-        if !MODELSCOPE_CATALOG_MIRRORS_ENABLED {
-            return Err(CatalogError::InvalidCatalog(format!(
-                "model '{}' quant '{}' ModelScope mirrors are disabled; use Hugging Face with the hf-mirror download source",
-                model.id, quant.quant
-            )));
-        }
-        let segments = parsed
-            .path_segments()
-            .map(|segments| segments.collect::<Vec<_>>())
-            .unwrap_or_default();
-        let (hf_owner, hf_name) = model.hf_repo.split_once('/').unwrap_or_default();
-        let modelscope_owner = hf_owner.to_ascii_lowercase();
-        let revision = segments.get(4).copied().unwrap_or_default();
-        if segments.len() != 6
-            || segments[0] != "models"
-            || segments[1] != modelscope_owner
-            || segments[2] != hf_name
-            || segments[3] != "resolve"
-            || revision.len() != 40
-            || !revision.chars().all(|ch| ch.is_ascii_hexdigit())
-            || segments[5] != quant.filename
-        {
-            return Err(CatalogError::InvalidCatalog(format!(
-                "model '{}' quant '{}' ModelScope mirror URL must use /models/{{lowercase-hf-owner}}/{{hf-repo-name}}/resolve/{{40-hex-revision}}/{{filename}}",
-                model.id, quant.quant
-            )));
-        }
     }
     Ok(())
 }

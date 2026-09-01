@@ -78,6 +78,17 @@ impl VerifiedPack {
         self.preflight.runtime_source().content_id()
     }
 
+    pub fn model_architecture(&self) -> &str {
+        match &self.route {
+            PackRoute::Asr {
+                model_architecture, ..
+            } => model_architecture,
+            PackRoute::Aux {
+                model_architecture, ..
+            } => model_architecture,
+        }
+    }
+
     /// Diagnostic path for the exact open generation represented by this
     /// proof. The path is not an execution capability; consumers retain this
     /// `VerifiedPack` and pass the proof across the next seam.
@@ -123,6 +134,21 @@ impl VerifiedPack {
             route: PackRoute::Asr {
                 model_family,
                 model_architecture,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_unverified_aux_preflight_for_test(
+        preflight: GgufRuntimeSourcePreflight,
+        kind: AuxPackKind,
+        model_architecture: impl Into<String>,
+    ) -> Self {
+        Self {
+            preflight,
+            route: PackRoute::Aux {
+                kind,
+                model_architecture: model_architecture.into(),
             },
         }
     }

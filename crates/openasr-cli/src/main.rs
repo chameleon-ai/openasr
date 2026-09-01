@@ -24,9 +24,10 @@ use openasr_core::{
     convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
     derive_catalog_public_key_hex, discover_batch_inputs, embedded_catalog_fingerprint,
     load_config, models_dir, openasr_home, parse_model_catalog, parse_model_ref,
-    render_backends_manifest_signature, render_batch_summary, render_benchmark,
-    render_catalog_signature_manifest, resolve_registry_model_ref, resolve_runtime_model_ref,
-    runtime_registry, save_config, validate_local_native_model_pack_path,
+    render_batch_summary, render_benchmark, render_catalog_signature_manifest,
+    render_validated_qualification_manifest_signature, resolve_registry_model_ref,
+    resolve_runtime_model_ref, runtime_registry, save_config,
+    validate_local_native_model_pack_path, verify_and_parse_qualification_manifest,
     verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
 };
 
@@ -38,12 +39,16 @@ mod cli_args;
 mod consent;
 mod doctor_cli;
 mod live;
+mod memory_pressure_helper;
 mod model_pack_cli;
 mod native_segment_cli;
+mod ownership_evidence_cli;
 mod panic_hook;
 mod parent_watchdog;
 mod progress;
 mod pull_cli;
+mod qualification_cli;
+mod real_family_cli;
 
 use catalog_cli::*;
 use cli_args::*;
@@ -60,6 +65,9 @@ const UNSET_VALUE: &str = "<unset>";
 /// clap keeps its own `2` for usage/argument errors.
 fn exit_with_error(error: &anyhow::Error) -> ! {
     eprintln!("Error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("Caused by: {cause}");
+    }
     let code = error
         .downcast_ref::<consent::CliExit>()
         .map(|exit| exit.code as i32)
@@ -201,6 +209,85 @@ fn migrate_model_store_once() {
 
 async fn run() -> Result<()> {
     let command = match Cli::parse().command {
+        Command::MemoryPressureHelper {
+            parent_pid,
+            candidate_required_bytes,
+            absolute_floor_bytes,
+            proportional_floor_basis_points,
+            timeout_seconds,
+        } => {
+            return memory_pressure_helper::run(memory_pressure_helper::PressureHelperOptions {
+                parent_pid,
+                candidate_required_bytes,
+                absolute_floor_bytes,
+                proportional_floor_basis_points,
+                timeout_seconds,
+            });
+        }
+        Command::ValidateOwnershipEvidence {
+            artifact_dir,
+            envelopes,
+        } => {
+            return ownership_evidence_cli::validate_bundle(&artifact_dir, &envelopes);
+        }
+        Command::SignQualificationManifest {
+            manifest,
+            out,
+            manifest_url,
+            key_id,
+            print_public_key,
+        } => {
+            return sign_qualification_manifest_command(
+                &manifest,
+                &out,
+                &manifest_url,
+                &key_id,
+                print_public_key,
+            );
+        }
+        Command::VerifyQualificationManifest {
+            manifest,
+            signature,
+            manifest_url,
+        } => {
+            return verify_qualification_manifest_command(&manifest, &signature, &manifest_url);
+        }
+        Command::QualifyBackend {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_parent(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                )
+            })
+            .await
+            .context("qualification parent worker task failed")?;
+        }
+        Command::QualificationChild {
+            manifest,
+            signature,
+            manifest_url,
+            qualification_home,
+            expected_manifest_sha256,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                qualification_cli::run_child(
+                    &manifest,
+                    &signature,
+                    &manifest_url,
+                    &qualification_home,
+                    &expected_manifest_sha256,
+                )
+            })
+            .await
+            .context("qualification child worker task failed")?;
+        }
         Command::BackendPlugin { command } => {
             // Backend-pack installation uses the blocking catalog/download
             // client by design: the same implementation is shared with the
@@ -270,6 +357,12 @@ async fn run() -> Result<()> {
         Command::Show { target } => show_model(&target),
         Command::ModelPack { command } => model_pack_command(command),
         Command::BackendPlugin { .. } => unreachable!("handled before runtime initialization"),
+        Command::MemoryPressureHelper { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
+        Command::ValidateOwnershipEvidence { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::GgufCParserProbe { path } => {
             let output = openasr_core::render_gguf_c_parser_sandbox_child_output(&path)?;
             println!("{output}");
@@ -291,24 +384,12 @@ async fn run() -> Result<()> {
             print_public_key,
         ),
         Command::CatalogFingerprint => catalog_fingerprint_command(),
-        Command::SignBackendsManifest {
-            manifest,
-            out,
-            manifest_url,
-            key_id,
-            print_public_key,
-        } => sign_backends_manifest_command(
-            &manifest,
-            &out,
-            &manifest_url,
-            &key_id,
-            print_public_key,
-        ),
-        Command::VerifyBackendsManifest {
-            manifest,
-            signature,
-            manifest_url,
-        } => verify_backends_manifest_command(&manifest, &signature, &manifest_url),
+        Command::SignQualificationManifest { .. }
+        | Command::VerifyQualificationManifest { .. }
+        | Command::QualifyBackend { .. }
+        | Command::QualificationChild { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         Command::Transcribe {
             inputs,
             formats,
@@ -393,6 +474,8 @@ async fn run() -> Result<()> {
                 core_commit,
                 scope,
                 ffmpeg_bin,
+                trace_out,
+                logits_out,
             } => {
                 let git_cwd = env::current_dir().ok();
                 bench_receipt_cli::bench_receipt_short_audio(
@@ -410,9 +493,27 @@ async fn run() -> Result<()> {
                         scope: &scope,
                         ffmpeg_bin,
                         git_cwd: git_cwd.as_deref(),
+                        trace_out: trace_out.as_deref(),
+                        logits_out: logits_out.as_deref(),
+                        write_outputs: true,
                     },
                 )
+                .map(|_| ())
             }
+            BenchReceiptCommand::ValidateQualification { receipt } => {
+                bench_receipt_cli::validate_qualification_receipts(&receipt)
+            }
+            BenchReceiptCommand::QualifyFamily { args } => real_family_cli::run(
+                &native_execution_services,
+                args.model.as_deref(),
+                &args.audio,
+                &args.device,
+                args.model_pack.as_deref(),
+                &args.binding,
+                &args.out_dir,
+                args.core_commit.as_deref(),
+                args.ffmpeg_bin,
+            ),
         },
         Command::Live {
             source,
@@ -611,31 +712,73 @@ fn show_model(target: &str) -> Result<()> {
 
 fn config_command(command: ConfigCommand) -> Result<()> {
     let home = openasr_home()?;
+    if matches!(&command, ConfigCommand::RecoverDefault) {
+        let outcome = openasr_core::default_selection::recover_corrupt_v2_detailed(&home)
+            .context("Could not recover the corrupt V2 default selection")?;
+        match outcome {
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::Committed {
+                record,
+                ..
+            } => println!(
+                "Recovered default selection to {:?} (generation {}).",
+                record.status, record.selection_generation
+            ),
+            openasr_core::default_selection::DefaultSelectionRecoveryOutcome::ProjectionFailed {
+                record,
+                reason,
+                ..
+            } => {
+                eprintln!(
+                    "Warning: V2 default selection was recovered to {:?} (generation {}), but compatibility projection repair is pending: {reason}",
+                    record.status, record.selection_generation
+                );
+                println!(
+                    "Recovered default selection to {:?} (generation {}).",
+                    record.status, record.selection_generation
+                );
+            }
+        }
+        return Ok(());
+    }
     let mut config = load_config(&home)?;
 
     match command {
-        ConfigCommand::List => print_config(&config),
+        ConfigCommand::List => print_config(&home, &config)?,
         ConfigCommand::Get { key } => {
             let key = ConfigKey::from_str(&key)?;
-            println!(
-                "{}",
-                config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
-            );
+            let value = if key == ConfigKey::DefaultModel {
+                openasr_core::default_selection::current_default_model(&home)?
+            } else {
+                config.get(key)
+            };
+            println!("{}", value.unwrap_or_else(|| UNSET_VALUE.to_string()));
         }
         ConfigCommand::Set { key, value } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             set_config_value(&mut config, key, value)?;
             save_config(&home, &config)?;
             println!("Set {}.", key.as_str());
         }
         ConfigCommand::Unset { key } => {
             let key = ConfigKey::from_str(&key)?;
+            reject_legacy_default_model_mutation(key)?;
             config.unset(key);
             save_config(&home, &config)?;
             println!("Unset {}.", key.as_str());
         }
+        ConfigCommand::RecoverDefault => unreachable!("handled before loading config"),
     }
 
+    Ok(())
+}
+
+fn reject_legacy_default_model_mutation(key: ConfigKey) -> Result<()> {
+    if key == ConfigKey::DefaultModel {
+        bail!(
+            "default_model is managed by the default-selection authority; use the daemon's /v1/models/default endpoint or the desktop default-model activation surface instead."
+        );
+    }
     Ok(())
 }
 
@@ -722,49 +865,39 @@ fn sign_catalog_manifest_command(
     Ok(())
 }
 
-fn sign_backends_manifest_command(
+fn sign_qualification_manifest_command(
     manifest: &Path,
     out: &Path,
     manifest_url: &str,
     key_id: &str,
     print_public_key: bool,
 ) -> Result<()> {
-    // Deliberately the SAME env var (and therefore the SAME signing seed) as
-    // `sign_catalog_manifest_command` -- see backends_manifest_security's
-    // module doc for why this manifest reuses the catalog's key/trust root
-    // instead of minting a second one.
     let signing_key_seed_hex =
         env::var(OPENASR_CATALOG_SIGNING_KEY_SEED_HEX).with_context(|| {
             format!(
                 "{OPENASR_CATALOG_SIGNING_KEY_SEED_HEX} must be set to a 32-byte hex Ed25519 seed"
             )
         })?;
-
     if print_public_key {
         let public_key = derive_catalog_public_key_hex(&signing_key_seed_hex)
-            .context("Could not derive backends-manifest signature public key")?;
+            .context("Could not derive qualification-manifest signature public key")?;
         println!("{public_key}");
         return Ok(());
     }
 
     let manifest_contents = fs::read_to_string(manifest).with_context(|| {
         format!(
-            "Could not read backends-manifest JSON '{}'",
+            "Could not read qualification-manifest JSON '{}'",
             manifest.display()
         )
     })?;
-
-    let signature = render_backends_manifest_signature(
+    let signature = render_validated_qualification_manifest_signature(
         &manifest_contents,
         manifest_url,
         key_id,
         &signing_key_seed_hex,
     )
-    .context("Could not render backends-manifest signature")?;
-    openasr_core::verify_backends_manifest_signature(&manifest_contents, &signature, manifest_url)
-        .context(
-            "Rendered backends-manifest signature did not verify against the production trust root",
-        )?;
+    .context("Could not render qualification-manifest signature")?;
 
     if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
@@ -772,51 +905,55 @@ fn sign_backends_manifest_command(
     }
     atomic_write_text(out, &signature).with_context(|| {
         format!(
-            "Could not write backends-manifest signature '{}'",
+            "Could not write qualification-manifest signature '{}'",
             out.display()
         )
     })?;
-    println!("Wrote backends-manifest signature: {}", out.display());
+    println!("Wrote qualification-manifest signature: {}", out.display());
     Ok(())
 }
 
-/// Read-only counterpart to `sign_backends_manifest_command`: verifies an
-/// already-signed `backends-manifest.json` + `.signature.json` pair against
-/// the production trust root. Needs no signing seed and touches no
-/// filesystem beyond reading the two inputs -- safe to run in CI as a
-/// post-release probe for the LOCAL-only signing step being forgotten.
-fn verify_backends_manifest_command(
+fn verify_qualification_manifest_command(
     manifest: &Path,
     signature: &Path,
     manifest_url: &str,
 ) -> Result<()> {
-    let manifest_contents = fs::read_to_string(manifest).with_context(|| {
+    let manifest_contents = fs::read(manifest).with_context(|| {
         format!(
-            "Could not read backends-manifest JSON '{}'",
+            "Could not read qualification-manifest JSON '{}'",
             manifest.display()
         )
     })?;
-    let signature_contents = fs::read_to_string(signature).with_context(|| {
+    let signature_contents = fs::read(signature).with_context(|| {
         format!(
-            "Could not read backends-manifest signature '{}'",
+            "Could not read qualification-manifest signature '{}'",
             signature.display()
         )
     })?;
-
-    let verified = openasr_core::verify_backends_manifest_signature(
+    let verified = verify_and_parse_qualification_manifest(
         &manifest_contents,
         &signature_contents,
         manifest_url,
     )
-    .context("backends-manifest signature did not verify against the production trust root")?;
-
+    .context("qualification manifest did not verify against the production trust root")?;
+    let body = verified.manifest();
     println!(
         "{}",
         serde_json::json!({
             "verified": true,
             "manifest_url": manifest_url,
-            "manifest_sha256": verified.manifest_sha256,
-            "key_id": verified.key_id,
+            "manifest_sha256": verified.manifest_sha256(),
+            "key_id": verified.signature_key_id(),
+            "release_subject": body.release_subject,
+            "provider": body.provider_target.provider.as_str(),
+            "artifact_target": body.provider_target.target,
+            "host_abi_fingerprint": body.host_abi.fingerprint,
+            "binary_sha256": body.artifacts.binary.sha256,
+            "binary_bundle_sha256": body.artifacts.binary.bundle.sha256,
+            "plugin_sha256": body.artifacts.plugin.as_ref().map(|artifact| artifact.sha256.as_str()),
+            "vendor_sha256": body.artifacts.vendor.iter().map(|artifact| artifact.sha256.as_str()).collect::<Vec<_>>(),
+            "attestation_sha256": body.attestation.bundle.sha256,
+            "source_digest": body.attestation.source_digest,
         })
     );
     Ok(())
@@ -840,19 +977,26 @@ fn catalog_fingerprint_command() -> Result<()> {
     Ok(())
 }
 
-fn print_config(config: &OpenAsrConfig) {
+fn print_config(home: &Path, config: &OpenAsrConfig) -> Result<()> {
+    let current_default = openasr_core::default_selection::current_default_model(home)?;
     for key in [
         ConfigKey::DefaultModel,
         ConfigKey::DefaultBackend,
         ConfigKey::MediaFfmpegBin,
         ConfigKey::DownloadSource,
     ] {
+        let value = if key == ConfigKey::DefaultModel {
+            current_default.clone()
+        } else {
+            config.get(key)
+        };
         println!(
             "{}={}",
             key.as_str(),
-            config.get(key).unwrap_or_else(|| UNSET_VALUE.to_string())
+            value.unwrap_or_else(|| UNSET_VALUE.to_string())
         );
     }
+    Ok(())
 }
 
 fn doctor() -> Result<()> {
@@ -861,7 +1005,8 @@ fn doctor() -> Result<()> {
     let config = load_config(&home)?;
     let catalog = load_cli_model_catalog(&home)?;
     let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
-    let default_model = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL_ID);
+    let current_default = openasr_core::default_selection::current_default_model(&home)?;
+    let default_model = current_default.as_deref().unwrap_or(DEFAULT_MODEL_ID);
     let default_backend = config
         .default_backend
         .as_deref()
@@ -1194,11 +1339,7 @@ fn transcribe(
         && options.model_pack.is_none()
         && let Some(catalog) = offline_language_catalog(&home)
     {
-        let model_ref = options
-            .model
-            .map(str::to_string)
-            .or_else(|| config.default_model.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+        let model_ref = selected_model_ref(options.model, &home)?;
         validate_requested_language(&catalog, &model_ref, language)?;
     }
 
@@ -1432,6 +1573,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_bench_receipt_warmup_and_trace_options() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "bench-receipt",
+            "short-audio",
+            "--audio",
+            "fixture.wav",
+            "--backend",
+            "native",
+            "--out",
+            "receipt.json",
+            "--trace-out",
+            "trace.jsonl",
+            "--warmup-runs",
+            "1",
+            "--runs",
+            "1",
+        ])
+        .expect("bench receipt options parse");
+        let Command::BenchReceipt {
+            command:
+                BenchReceiptCommand::ShortAudio {
+                    runs,
+                    warmup_runs,
+                    trace_out,
+                    logits_out,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected bench receipt short-audio command");
+        };
+        assert_eq!(warmup_runs, 1);
+        assert_eq!(runs, 1);
+        assert_eq!(
+            trace_out.as_deref(),
+            Some(std::path::Path::new("trace.jsonl"))
+        );
+        assert!(logits_out.is_none());
+    }
+
+    #[test]
+    fn parses_bench_receipt_qualification_validator_inputs() {
+        let cli = Cli::try_parse_from([
+            "openasr",
+            "bench-receipt",
+            "validate-qualification",
+            "--receipt",
+            "cold.json",
+            "--receipt",
+            "reuse.json",
+        ])
+        .expect("qualification receipt options parse");
+        let Command::BenchReceipt {
+            command: BenchReceiptCommand::ValidateQualification { receipt },
+        } = cli.command
+        else {
+            panic!("expected bench receipt qualification validator command");
+        };
+        assert_eq!(
+            receipt,
+            vec![
+                std::path::PathBuf::from("cold.json"),
+                std::path::PathBuf::from("reuse.json")
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unknown_backend_value() {
         let error = parse_backend_kind("not-a-backend").unwrap_err();
         assert!(error.contains("Unsupported backend 'not-a-backend'"));
@@ -1448,7 +1658,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let card = resolve_transcribe_model(&cards, None, &config).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let card = resolve_transcribe_model(&cards, None, home.path()).unwrap();
 
         assert_eq!(card.id, "whisper-small");
     }
@@ -1464,8 +1676,10 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
         let card =
-            resolve_transcribe_model(&cards, Some("whisper-large-v3-turbo"), &config).unwrap();
+            resolve_transcribe_model(&cards, Some("whisper-large-v3-turbo"), home.path()).unwrap();
 
         assert_eq!(card.id, "whisper-large-v3-turbo");
     }
@@ -1481,7 +1695,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: whisper-tiny"));
     }
 
@@ -1496,7 +1712,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: whisper-tiny.en"));
     }
 
@@ -1515,7 +1733,9 @@ mod tests {
                 default_model: Some(alias.to_string()),
                 ..OpenAsrConfig::default()
             };
-            let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+            let home = tempfile::tempdir().unwrap();
+            save_config(home.path(), &config).unwrap();
+            let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
             assert!(error.to_string().contains("Unknown model"), "{alias}");
         }
     }
@@ -1531,7 +1751,9 @@ mod tests {
             ..OpenAsrConfig::default()
         };
 
-        let error = resolve_transcribe_model(&cards, None, &config).unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        save_config(home.path(), &config).unwrap();
+        let error = resolve_transcribe_model(&cards, None, home.path()).unwrap_err();
         assert!(error.to_string().contains("Unknown model: not-a-model"));
     }
 
@@ -1586,8 +1808,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_transcribe_model_with_friendly_message() {
-        let error = resolve_transcribe_model(&[], Some("not-a-model"), &OpenAsrConfig::default())
-            .unwrap_err();
+        let home = tempfile::tempdir().unwrap();
+        let error = resolve_transcribe_model(&[], Some("not-a-model"), home.path()).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("Unknown model: not-a-model"));
@@ -1859,8 +2081,9 @@ mod tests {
     fn default_model_ref_matches_documented_constant() {
         // No --model and no saved default resolves to the built-in default,
         // which must stay the documented qwen3-asr-0.6b (guards code/doc drift).
+        let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            selected_model_ref(None, &OpenAsrConfig::default(), &[]),
+            selected_model_ref(None, home.path()).unwrap(),
             "qwen3-asr-0.6b"
         );
         assert_eq!(DEFAULT_MODEL_ID, "qwen3-asr-0.6b");

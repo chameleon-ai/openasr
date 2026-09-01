@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,10 @@ TEMPLATE_PATH = repo_root(SCRIPT_DIR) / "docs" / "model-audits" / "TEMPLATE.md"
 def completed_form_text() -> str:
     """A form derived the way contributors derive one: copy TEMPLATE.md and
     replace every fill marker."""
-    return TEMPLATE_PATH.read_text().replace(audit_form.FILL_SENTINEL, "Supported")
+    return TEMPLATE_PATH.read_text().replace(audit_form.FILL_SENTINEL, "Supported").replace(
+        "| Supported | Supported | Supported | |",
+        "| Supported | Supported | Supported | evidence |",
+    )
 
 
 class AuditFormTemplateTest(unittest.TestCase):
@@ -50,10 +54,11 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
             with self.assertRaisesRegex(audit_form.AuditFormError, "no release audit form"):
                 audit_form.validate_family_audit_form("new-family", audit_dir=Path(temp))
 
-    def test_missing_form_is_tolerated_for_a_pre_audit_family(self) -> None:
+    def test_missing_form_fails_closed_for_a_pre_audit_family(self) -> None:
         self.assertIn("whisper", audit_form.PRE_AUDIT_FAMILIES)
         with tempfile.TemporaryDirectory() as temp:
-            audit_form.validate_family_audit_form("whisper", audit_dir=Path(temp))
+            with self.assertRaisesRegex(audit_form.AuditFormError, "no release audit form"):
+                audit_form.validate_family_audit_form("whisper", audit_dir=Path(temp))
 
     def test_half_filled_form_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -93,9 +98,152 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
     def test_missing_family_value_fails_closed(self) -> None:
         with self.assertRaisesRegex(audit_form.AuditFormError, "family is missing"):
             audit_form.validate_family_audit_form("", audit_dir=Path("/nonexistent"))
+    def advertised_gpu_sources(self, root: Path, family: str = "gpu-family") -> tuple[Path, Path]:
+        inventory = root / "inventory.json"
+        inventory.write_text(
+            json.dumps(
+                {
+                    "schema": "openasr.model-family-inventory.v1",
+                    "families": [
+                        {
+                            "catalog_family_id": family,
+                            "execution": {
+                                "execution_capabilities": {
+                                    "cpu": True,
+                                    "providers": [
+                                        {"provider": "cuda", "full_device": True, "hybrid": False},
+                                        {"provider": "vulkan", "full_device": True, "hybrid": False},
+                                        {"provider": "hip", "full_device": True, "hybrid": False},
+                                    ],
+                                }
+                            },
+                            "optimization": {"auto_gpu_policy": "all-backends"},
+                        }
+                    ],
+                }
+            )
+        )
+        catalog = root / "catalog.json"
+        catalog.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {"id": "gpu", "family": family, "kind": "asr-model", "public": True}
+                    ]
+                }
+            )
+        )
+        return inventory, catalog
 
+    def test_advertised_unproven_backend_cell_fails_closed(self) -> None:
+        cases = (
+            ("Deferred", "unproven or stale status"),
+            ("Untested", "unproven or stale status"),
+            ("Supported (stale)", "unproven or stale status"),
+        )
+        for status, pattern in cases:
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    audit_dir = root / "audits"
+                    audit_dir.mkdir()
+                    text = completed_form_text().replace(
+                        "| CUDA | Supported | Supported | Supported | evidence |",
+                        f"| CUDA | {status} | No | No | not tested; unlock: run the matrix |",
+                    )
+                    (audit_dir / "gpu-family.md").write_text(text)
+                    inventory, catalog = self.advertised_gpu_sources(root)
+                    with self.assertRaisesRegex(audit_form.AuditFormError, pattern):
+                        audit_form.validate_family_audit_form(
+                            "gpu-family",
+                            audit_dir=audit_dir,
+                            inventory_path=inventory,
+                            catalog_path=catalog,
+                        )
 
-class ManifestAuditGateTest(unittest.TestCase):
+    def test_missing_advertised_backend_cell_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit_dir = root / "audits"
+            audit_dir.mkdir()
+            text = "\n".join(
+                line
+                for line in completed_form_text().splitlines()
+                if not line.startswith("| CUDA |")
+            )
+            (audit_dir / "gpu-family.md").write_text(text + "\n")
+            inventory, catalog = self.advertised_gpu_sources(root)
+            with self.assertRaisesRegex(audit_form.AuditFormError, "cuda"):
+                audit_form.validate_family_audit_form(
+                    "gpu-family",
+                    audit_dir=audit_dir,
+                    inventory_path=inventory,
+                    catalog_path=catalog,
+                )
+
+    def test_public_generation_blocks_untested_advertised_gpu_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit_dir = root / "audits"
+            audit_dir.mkdir()
+            text = completed_form_text().replace(
+                "| CUDA | Supported | Supported | Supported | evidence |",
+                "| CUDA | Untested | No | No | not tested; unlock: run the matrix |",
+            ).replace(
+                "| Vulkan | Supported | Supported | Supported | evidence |",
+                "| Vulkan | Untested | No | No | software lavapipe is not physical evidence |",
+            ).replace(
+                "| HIP | Supported | Supported | Supported | evidence |",
+                "| HIP | Deferred | No | No | no HIP host; unlock: run the matrix |",
+            )
+            (audit_dir / "gpu-family.md").write_text(text)
+            inventory, catalog = self.advertised_gpu_sources(root)
+            with self.assertRaises(SystemExit) as error:
+                _manifest.ensure_release_audit_form(
+                    "gpu",
+                    {"registry_id": "gpu", "family": "gpu-family"},
+                    True,
+                    audit_dir=audit_dir,
+                    inventory_path=inventory,
+                    catalog_path=catalog,
+                )
+            message = str(error.exception)
+            self.assertIn("release-audit gate failed", message)
+            self.assertRegex(message, "unproven or stale status|cuda backend cell|vulkan|hip")
+
+    def test_explicit_nonactivation_is_not_an_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit_dir = root / "audits"
+            audit_dir.mkdir()
+            text = completed_form_text().replace(
+                "| CUDA | Supported | Supported | Supported | evidence |",
+                "| CUDA | No | No | No | not shipped; unlock: run the provider matrix |",
+            )
+            (audit_dir / "cpu-family.md").write_text(text)
+            inventory = root / "inventory.json"
+            inventory.write_text(
+                json.dumps(
+                    {
+                        "schema": "openasr.model-family-inventory.v1",
+                        "families": [
+                            {
+                                "catalog_family_id": "cpu-family",
+                                "execution": {"execution_capabilities": {"cpu": True, "providers": []}},
+                                "optimization": {"auto_gpu_policy": "cpu-only"},
+                            }
+                        ],
+                    }
+                )
+            )
+            catalog = root / "catalog.json"
+            catalog.write_text(
+                json.dumps({"models": [{"family": "cpu-family", "kind": "asr-model", "public": True}]})
+            )
+            audit_form.validate_family_audit_form(
+                "cpu-family", audit_dir=audit_dir, inventory_path=inventory, catalog_path=catalog
+            )
+
     def test_public_generation_requires_a_completed_audit_form(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaises(SystemExit) as error:

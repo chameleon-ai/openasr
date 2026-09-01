@@ -16,19 +16,21 @@ pub use native::{
     NativeBackendExecutor, NativeRuntimeModelAdapter, NativeRuntimeModelIdSource,
     NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError, NativeTranscriptionPhase,
     NativeTranscriptionProgress, ProgressBackendClass, ProgressPlan, ProgressPlanInput,
-    ProgressReporter, ProgressSegmenterKind, RequestExecutionContext, SliceBoundaryControl,
-    TranscriptionControl, TranscriptionStage, describe_native_runtime_model_mismatch,
-    duration_weighted_fraction, native_runtime_model_adapter_for_path,
-    native_runtime_model_refs_match, native_runtime_realtime_capabilities_for_path,
+    ProgressReporter, ProgressSegmenterKind, RequestAttemptId, RequestAttemptIdError,
+    RequestExecutionContext, SliceBoundaryControl, TranscriptionControl, TranscriptionStage,
+    describe_native_runtime_model_mismatch, duration_weighted_fraction,
+    native_runtime_model_adapter_for_path, native_runtime_model_refs_match,
+    native_runtime_realtime_capabilities_for_path,
     native_runtime_transcription_capabilities_for_path, native_transcription_progress,
     native_transcription_progress_for_id, refine_existing_transcription_timeline,
     resolve_local_native_runtime_model_identity, validate_local_native_model_pack_path,
     verify_native_runtime_model_pack_path,
 };
 pub(crate) use native::{UnstableDecodeTextObserver, WorkProgressObserver};
+pub(crate) use request_context::log_failure_context;
 pub use request_context::{
-    FailureCategory, RequestSource, format_failure_context_line, format_request_context_line,
-    log_failure_context, log_request_context,
+    FailureCategory, FailureGpuMemoryContext, RequestSource, format_failure_context_line,
+    format_request_context_line, log_request_context,
 };
 
 pub const NATIVE_RUNTIME_MODEL_ID_AUTO: &str = "__openasr_native_runtime_model_id_auto__";

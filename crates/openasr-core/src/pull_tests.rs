@@ -9,6 +9,7 @@ use std::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{
@@ -426,6 +427,7 @@ fn catalog_for_resolved(resolved: &ResolvedCatalogPull) -> ModelCatalog {
         generated_at: "2026-06-08T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: resolved.model_id.clone(),
@@ -599,6 +601,7 @@ fn hf_token_only_attaches_to_the_huggingface_host() {
     assert!(!hf_token_allowed_for_host(Some("cdn-lfs.huggingface.co")));
     assert!(!hf_token_allowed_for_host(Some("hf-mirror.com")));
     assert!(!hf_token_allowed_for_host(Some("modelscope.cn")));
+    assert!(!hf_token_allowed_for_host(Some("www.modelscope.cn")));
     // The weights worker and the Xet CDN it forwards to are always anonymous.
     assert!(!hf_token_allowed_for_host(Some("weights.openasr.org")));
     assert!(!hf_token_allowed_for_host(Some("us.aws.cdn.hf.co")));
@@ -957,6 +960,46 @@ fn pull_falls_back_to_next_source_after_sha_mismatch() {
     let paths = paths_for(temp.path(), &resolved);
     assert!(paths.final_path.exists());
     assert!(!paths.partial_path.exists());
+}
+
+#[test]
+fn china_chain_tries_modelscope_before_direct_hf() {
+    let bytes = tiny_pack_bytes();
+    let resolved = resolved_for(&bytes);
+    let temp = tempfile::tempdir().unwrap();
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: bytes.clone(),
+        },
+    ]);
+
+    let installed = pull_model_pack_with_client_sources_and_cancel(
+        &resolved,
+        temp.path(),
+        &mut client,
+        PullOptions::default(),
+        &[DownloadSource::ModelScope, DownloadSource::Hf],
+        None,
+        None,
+        |_| {},
+        || false,
+        || false,
+    )
+    .unwrap();
+
+    assert_eq!(installed.pull, "moonshine-tiny:q8");
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://www.modelscope.cn/models/openasr/moonshine-tiny/resolve/master/moonshine-tiny-q8_0.oasr".to_string(),
+            resolved.url.clone(),
+        ]
+    );
 }
 
 #[test]
@@ -2778,6 +2821,7 @@ fn installed_pack_alias_catalog() -> ModelCatalog {
         generated_at: "2026-06-04T00:00:00Z".to_string(),
         catalog_url: "fixture".to_string(),
         backends: Vec::new(),
+        execution_approvals: None,
         language_labels: std::collections::BTreeMap::new(),
         models: vec![CatalogModel {
             id: "qwen3-asr-0.6b".to_string(),
@@ -2963,6 +3007,173 @@ fn tensile_zip_bytes() -> Vec<u8> {
     buf
 }
 
+fn backend_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+#[test]
+fn qualification_archive_uses_signed_url_fallback_and_exact_unpacked_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec![
+            "https://primary.example/vendor.zip".to_string(),
+            "https://mirror.example/vendor.zip".to_string(),
+        ],
+    };
+    let mut client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 404,
+            body: Vec::new(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    let prepared = prepare_qualification_archive(
+        &mut client,
+        &artifact,
+        &temp.path().join("objects"),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        client.urls(),
+        vec![
+            "https://primary.example/vendor.zip",
+            "https://mirror.example/vendor.zip"
+        ]
+    );
+    assert_eq!(prepared.materialized_files.len(), 1);
+    assert_eq!(
+        fs::read(prepared.payload_root.join("runtime.dll")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn qualification_archive_repairs_a_content_object_missing_its_attested_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"signed runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some(payload.len() as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let objects_root = temp.path().join("objects");
+    let mut first = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive.clone(),
+    }]);
+    let prepared =
+        prepare_qualification_archive(&mut first, &artifact, &objects_root, &mut |_| {}).unwrap();
+    fs::remove_file(&prepared.source.path).unwrap();
+
+    let mut repair = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+    let repaired =
+        prepare_qualification_archive(&mut repair, &artifact, &objects_root, &mut |_| {}).unwrap();
+    assert!(repaired.source.path.is_file());
+    assert_eq!(repair.urls(), vec!["https://primary.example/vendor.zip"]);
+}
+
+#[test]
+fn qualification_archive_rejects_a_signed_unpacked_size_that_does_not_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"runtime";
+    let archive = backend_zip_bytes(&[("runtime.dll", payload)]);
+    let artifact = QualificationArtifact {
+        file_name: "vendor.zip".to_string(),
+        format: QualificationArtifactFormat::ZipArchive,
+        sha256: sha256_hex(&archive),
+        size_bytes: archive.len() as u64,
+        unpacked_size_bytes: Some((payload.len() - 1) as u64),
+        unpacked_tree_sha256: Some(materialized_tree_sha256(&[
+            InstalledBackendMaterializedFile {
+                relative_path: "runtime.dll".to_string(),
+                sha256: sha256_hex(payload),
+                size_bytes: payload.len() as u64,
+            },
+        ])),
+        urls: vec!["https://primary.example/vendor.zip".to_string()],
+    };
+    let mut client = FakeClient::with_responses(vec![ResponseSpec {
+        status: 200,
+        body: archive,
+    }]);
+
+    assert!(matches!(
+        prepare_qualification_archive(
+            &mut client,
+            &artifact,
+            &temp.path().join("objects"),
+            &mut |_| {},
+        ),
+        Err(PullError::BackendFilePreflight { .. })
+    ));
+}
+
+#[test]
+fn backend_archive_rejects_windows_unsafe_and_case_colliding_entries_before_materializing() {
+    for entries in [
+        vec![("vendor/CON.dll", b"bad".as_slice())],
+        vec![
+            ("vendor/Runtime.dll", b"one".as_slice()),
+            ("vendor/runtime.DLL", b"two".as_slice()),
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = backend_zip_bytes(&entries);
+        let zip_path = temp.path().join("vendor.zip");
+        fs::write(&zip_path, archive).unwrap();
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        assert!(matches!(
+            extract_backend_archive_with_expected_size(&zip_path, &output, "", None),
+            Err(PullError::BackendFilePreflight { .. })
+        ));
+    }
+}
+
 fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPull {
     let extracted_tree_sha256 = materialized_tree_sha256(&[InstalledBackendMaterializedFile {
         relative_path: "rocblas/library/Kernels.so-000-gfx1200.hsaco".to_string(),
@@ -2974,9 +3185,19 @@ fn hip_pack_resolved(plugin: &[u8], archive: &[u8]) -> ResolvedCatalogBackendPul
         vendor: CatalogBackendVendor::Hip,
         version: "0.13.1".to_string(),
         display_name: "AMD ROCm".to_string(),
+        min_cli_version: crate::current_cli_version().to_string(),
         host_abi: crate::backend_distribution::BackendHostAbi::current(),
         targets: vec!["gfx1200".to_string()],
         min_driver_api: Some("7.1.0".to_string()),
+        activation: crate::CatalogBackendActivation {
+            state: crate::CatalogBackendActivationState::Activated,
+            qualification_source_catalog_sha256: Some("1".repeat(64)),
+            hardware_evidence_sha256: Some("2".repeat(64)),
+            qualified_device_target: Some("gfx1200".to_string()),
+            qualified_driver_version: Some("7.1.0".to_string()),
+            correctness_matrix_sha256: Some("3".repeat(64)),
+            correctness_receipts_sha256: Some("4".repeat(64)),
+        },
         files: vec![
             CatalogBackendFile {
                 filename: "ggml-hip.dll".to_string(),
@@ -3056,6 +3277,23 @@ fn install_backend_pack_downloads_verifies_and_extracts() {
     assert_eq!(plan.required_download_bytes, 0);
     assert_eq!(plan.required_plugin_bytes, 0);
     assert_eq!(plan.required_vendor_bytes, 0);
+}
+
+#[test]
+fn install_backend_pack_rechecks_min_cli_version_before_writing_or_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let mut resolved = hip_pack_resolved(&plugin, &archive);
+    resolved.min_cli_version = "999.0.0".to_string();
+    let mut client = FakeClient::with_responses(Vec::new());
+
+    let error =
+        install_backend_pack_with_client(&resolved, home.path(), &mut client, |_| {}).unwrap_err();
+
+    assert!(matches!(error, PullError::BackendRequiresNewerCli { .. }));
+    assert!(client.urls().is_empty());
+    assert!(!home.path().join("backends").exists());
 }
 
 #[cfg(target_os = "windows")]
@@ -3538,17 +3776,210 @@ fn backend_store_gc_retains_requested_pack_and_its_shared_vendor_object() {
         Some(Duration::ZERO),
     )
     .unwrap();
-    assert!(!first_dir.exists());
+    assert!(
+        first_dir.is_dir(),
+        "unselected library packs must survive GC"
+    );
     assert!(second_dir.is_dir());
     assert!(object_dir.is_dir());
-    assert_eq!(report.removed_pack_directories, 1);
+    assert_eq!(report.removed_pack_directories, 0);
     assert_eq!(report.removed_content_objects, 0);
 
     let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
-    assert!(!second_dir.exists());
-    assert!(!object_dir.exists());
+    assert!(first_dir.is_dir());
+    assert!(second_dir.is_dir());
+    assert!(object_dir.is_dir());
+    assert_eq!(report.removed_pack_directories, 0);
+    assert_eq!(report.removed_content_objects, 0);
+}
+
+#[test]
+fn backend_store_gc_reclaims_replaced_generation_of_the_same_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let first = hip_pack_resolved(&plugin, &archive);
+    let mut first_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&first, home.path(), &mut first_client, |_| {}).unwrap();
+
+    let mut second = first.clone();
+    second.version = "0.13.2".to_string();
+    let mut second_plugin = plugin.clone();
+    second_plugin.push(0x11);
+    second.files[0].sha256 = sha256_hex(&second_plugin);
+    second.files[0].size_bytes = second_plugin.len() as u64;
+    let mut second_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: second_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    std::thread::sleep(Duration::from_millis(1100));
+    install_backend_pack_with_client(&second, home.path(), &mut second_client, |_| {}).unwrap();
+
+    let first_dir = backend_pack_install_dir(home.path(), &first).unwrap();
+    let second_dir = backend_pack_install_dir(home.path(), &second).unwrap();
+    let report = gc_backend_store(home.path(), Vec::new(), Some(Duration::ZERO)).unwrap();
+    assert!(!first_dir.exists(), "replaced generation must be reclaimed");
+    assert!(second_dir.is_dir(), "current generation must remain");
     assert_eq!(report.removed_pack_directories, 1);
-    assert_eq!(report.removed_content_objects, 1);
+}
+
+#[test]
+fn uninstall_backend_vendor_leaves_the_other_library_pack() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive.clone(),
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+
+    let mut cuda = hip.clone();
+    cuda.backend_id = "cuda-ampere".to_string();
+    cuda.vendor = CatalogBackendVendor::Cuda;
+    cuda.files[0].filename = "ggml-cuda.dll".to_string();
+    let mut cuda_plugin = plugin.clone();
+    cuda_plugin.push(0x22);
+    cuda.files[0].sha256 = sha256_hex(&cuda_plugin);
+    cuda.files[0].size_bytes = cuda_plugin.len() as u64;
+    let mut cuda_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: cuda_plugin,
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&cuda, home.path(), &mut cuda_client, |_| {}).unwrap();
+
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    let cuda_dir = backend_pack_install_dir(home.path(), &cuda).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Cuda).unwrap();
+    assert!(hip_dir.is_dir());
+    assert!(!cuda_dir.exists());
+    let leftover = list_installed_backend_packs(home.path()).unwrap();
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].vendor, "hip");
+}
+
+#[test]
+fn uninstall_backend_vendor_refuses_while_in_use() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let hip = hip_pack_resolved(&plugin, &archive);
+    let mut hip_client = FakeClient::with_responses(vec![
+        ResponseSpec {
+            status: 200,
+            body: plugin.clone(),
+        },
+        ResponseSpec {
+            status: 200,
+            body: archive,
+        },
+    ]);
+    install_backend_pack_with_client(&hip, home.path(), &mut hip_client, |_| {}).unwrap();
+    let hip_dir = backend_pack_install_dir(home.path(), &hip).unwrap();
+    fs::create_dir_all(home.path().join("backends")).unwrap();
+    let sha = "a".repeat(64);
+    let active = crate::backend_distribution::ActivatedBackendPack {
+        schema_version: crate::backend_distribution::ACTIVATED_BACKEND_SCHEMA_VERSION,
+        backend_id: hip.backend_id.clone(),
+        vendor: CatalogBackendVendor::Hip,
+        version: hip.version.clone(),
+        artifact_fingerprint: "b".repeat(64),
+        host_abi_fingerprint: hip.host_abi.fingerprint.clone(),
+        device_target: "gfx1200".to_string(),
+        driver_version: "7.1.0".to_string(),
+        qualification_source_catalog_sha256: sha.clone(),
+        hardware_evidence_sha256: sha.clone(),
+        correctness_matrix_sha256: sha.clone(),
+        correctness_receipts_sha256: sha,
+        activated_at_unix_seconds: 1,
+    };
+    fs::write(
+        home.path().join("backends").join("active.json"),
+        serde_json::to_string(&active).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap_err();
+    assert!(matches!(
+        error,
+        PullError::BackendPackInUse { vendor } if vendor == "hip"
+    ));
+    assert!(hip_dir.is_dir(), "in-use pack must stay installed");
+
+    crate::backend_distribution::deactivate_backend_pack(home.path()).unwrap();
+    uninstall_backend_packs_for_vendor(home.path(), CatalogBackendVendor::Hip).unwrap();
+    assert!(!hip_dir.exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_does_not_activate() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("ggml-hip.dll"), &plugin).unwrap();
+    fs::write(source.join("rocblas-library.zip"), &archive).unwrap();
+
+    let installed =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap();
+    assert_eq!(installed.backend_id, "hip-radeon");
+    assert!(
+        backend_pack_install_dir(home.path(), &resolved)
+            .unwrap()
+            .join("ggml-hip.dll")
+            .is_file()
+    );
+    assert!(!home.path().join("backends").join("active.json").exists());
+}
+
+#[test]
+fn install_backend_pack_from_local_path_rejects_garbage() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = minimal_pe_bytes();
+    let archive = tensile_zip_bytes();
+    let resolved = hip_pack_resolved(&plugin, &archive);
+    let source = home.path().join("usb");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("readme.txt"), b"not a pack").unwrap();
+    let error =
+        install_backend_pack_from_local_path(&resolved, &source, home.path(), |_| {}).unwrap_err();
+    assert!(matches!(error, PullError::BackendImportRejected { .. }));
+    assert!(
+        list_installed_backend_packs(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3793,7 +4224,7 @@ fn backend_pack_resume_survives_process_boundary_metadata_reload() {
         attempts: 1,
         ranges: Vec::new(),
     };
-    download_backend_file(&mut replacement, file, &dest, &mut |_| {}).unwrap();
+    download_backend_file(&mut replacement, file, &dest, &mut |_| {}, None).unwrap();
     assert_eq!(replacement.ranges(), vec![Some(700)]);
     assert_eq!(fs::read(dest).unwrap(), plugin);
     assert!(!partial.exists());
@@ -5299,5 +5730,108 @@ fn model_store_lifecycle_converts_and_reclaims_a_leaking_store() {
     assert!(
         after < before,
         "the store must shrink (before {before}, after {after})"
+    );
+}
+
+#[test]
+fn retry_transient_io_succeeds_on_the_first_ok() {
+    let mut calls = 0;
+    let value = retry_transient_io(|| {
+        calls += 1;
+        Ok::<_, io::Error>(7)
+    })
+    .unwrap();
+    assert_eq!(value, 7);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn retry_transient_io_does_not_retry_a_non_transient_error() {
+    let mut calls = 0;
+    let error = retry_transient_io(|| {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(1))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.raw_os_error(), Some(1));
+}
+
+#[cfg(windows)]
+#[test]
+fn retry_transient_io_gives_up_after_the_lock_budget() {
+    let mut calls = 0;
+    let error = retry_transient_io(|| {
+        calls += 1;
+        Err::<(), _>(io::Error::from_raw_os_error(32))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 7);
+    assert_eq!(error.raw_os_error(), Some(32));
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_copies_when_rename_stays_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("stale.dll"), b"stale").unwrap();
+
+    promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+    )
+    .expect("locked rename must still promote by copying the readable staging tree");
+
+    assert_eq!(fs::read(dest.join("ggml-cuda.dll")).unwrap(), b"plugin");
+    assert!(!dest.join("stale.dll").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn promote_backend_directory_clears_dest_when_copy_fallback_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("final");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("ggml-cuda.dll"), b"plugin").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("prior.dll"), b"prior").unwrap();
+
+    let error = promote_backend_directory_with(
+        &staging,
+        &dest,
+        "fp",
+        |from, to| {
+            if from.ends_with("staging") {
+                fs::create_dir_all(to.join("ggml-cuda.dll")).unwrap();
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            fs::rename(from, to)
+        },
+        super::fs_remove_dir_all,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("antivirus") && message.contains("Retry the install"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(dest.join("prior.dll")).unwrap(),
+        b"prior",
+        "the previous install must be restored after a failed copy fallback"
     );
 }

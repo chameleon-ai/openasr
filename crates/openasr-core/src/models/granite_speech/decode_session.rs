@@ -48,10 +48,10 @@
 //!
 //! The description above is the CPU / scheduler-on path: it keeps the K/V in
 //! host `Vec<f32>` buffers and rebuilds the 40-layer step graph every token,
-//! re-uploading the whole history each step. On the single-backend GPU path
-//! (`reusable_decode_graph_supported_for_runner`: gpu-class backend + scheduler
-//! off) that host round-trip is the dominant decode cost, so this module also
-//! provides the resident path taken there:
+//! re-uploading the whole history each step. When the immutable planner
+//! authorizes `GgmlDecodeReuseMode::ReusableGraph`, that host round-trip is
+//! the dominant decode cost, so this module also provides the resident path
+//! taken there:
 //!
 //! - The K/V lives in a device-resident fixed-span arena (`resident_kv`,
 //!   `[head_dim, resident_capacity, kv_heads]` f32 per layer). `prefill` seeds
@@ -76,12 +76,11 @@ use std::collections::HashMap;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext, GgmlPersistentGraphSession,
-    GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlDecodeReuseMode, GgmlKvElementType, GgmlLoadedTensor, GgmlLoadedWeightContext,
+    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlSelectionEvidenceRef,
 };
 use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
+    DeviceGreedyStepOutputMode, compute_greedy_step_output_with_evidence, device_top1_token_id,
 };
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingDeviceSpec;
 use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput;
@@ -91,7 +90,7 @@ use crate::models::system_memory_owner::{
 use crate::nn::decoder::{
     LlmKvCacheSpec, LlmResidentKvArena, allocate_zeroed_llm_resident_kv_arena,
     build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits, last_token_hidden_view,
-    reusable_decode_graph_supported_for_runner,
+    reusable_decode_graph_supported,
 };
 
 /// Exact per-invocation KV bound plus the stable session-envelope reservation
@@ -423,10 +422,8 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// `runner`, `weights`/`_loaded`, and the `resident_kv` arena, all declared
     /// below and therefore dropped after it.
     reuse: Option<GraniteReusableDecodeGraph>,
-    /// Device-only first-max support. Declared before `runner` so reusable
-    /// graphs borrowing its reverse-index tensor drop first.
-    greedy_top1: Option<GraniteDeviceGreedyTop1State>,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
     config: GraniteSpeechDecoderConfig,
     runner: GgmlCpuGraphRunner,
     weights: GraniteDecoderWeights,
@@ -470,6 +467,7 @@ pub(crate) struct GraniteSpeechDecodeSession {
     /// request-scoped even when the resident arena/graph survives in the
     /// cross-request cache.
     logical_capacity: usize,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// Build-once/re-run persistent single-token Granite decode graph plus its
@@ -498,11 +496,6 @@ struct GraniteReusableDecodeGraph {
     top1: Option<GgmlCpuTensor<'static>>,
 }
 
-struct GraniteDeviceGreedyTop1State {
-    arena: GgmlStaticTensorArena,
-    reverse_indices: GgmlStaticTensor,
-}
-
 #[derive(Clone, Copy)]
 struct GraniteDeviceTokenEmbedding {
     tensor: GgmlLoadedTensor,
@@ -529,43 +522,11 @@ impl GraniteReusableDecodeInput<'_> {
     }
 }
 
-fn build_device_greedy_top1_state(
-    runner: &GgmlCpuGraphRunner,
-    vocab_size: usize,
-    output_mode: DeviceGreedyStepOutputMode,
-) -> Result<Option<GraniteDeviceGreedyTop1State>, GraniteSpeechDecoderError> {
-    if output_mode == DeviceGreedyStepOutputMode::FullLogits {
-        return Ok(None);
-    }
-    let mut arena = runner
-        .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(1))
-        .map_err(map_ggml("device_top1_arena"))?;
-    let reverse_indices = arena
-        .new_tensor_1d_i32(vocab_size, "granite_argmax_reverse_indices")
-        .map_err(map_ggml("device_top1_reverse_indices_alloc"))?;
-    arena
-        .set_i32_slice(
-            reverse_indices,
-            &first_max_argmax_reverse_indices(vocab_size)
-                .map_err(map_ggml("device_top1_reverse_indices"))?,
-            "granite_argmax_reverse_indices",
-        )
-        .map_err(map_ggml("device_top1_reverse_indices_upload"))?;
-    Ok(Some(GraniteDeviceGreedyTop1State {
-        arena,
-        reverse_indices,
-    }))
-}
-
-fn map_reversed_top1_token(
-    reversed_token_id: i32,
+fn map_device_top1_token(
+    token_id: i32,
     vocab_size: usize,
 ) -> Result<u32, GraniteSpeechDecoderError> {
-    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size)
-        .map_err(map_ggml("device_top1_map_token"))?;
-    u32::try_from(token_id).map_err(|_| GraniteSpeechDecoderError::Shape {
-        reason: format!("granite device top-1 token id {token_id} does not fit u32"),
-    })
+    device_top1_token_id(token_id, vocab_size).map_err(map_ggml("device_top1_map_token"))
 }
 
 impl GraniteSpeechDecodeSession {
@@ -580,19 +541,10 @@ impl GraniteSpeechDecodeSession {
     }
 
     pub(crate) fn quoted_construction_transient_system_memory_bytes(
-        config: &GraniteSpeechDecoderConfig,
-        output_mode: DeviceGreedyStepOutputMode,
+        _config: &GraniteSpeechDecoderConfig,
+        _output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<u64, String> {
-        if output_mode == DeviceGreedyStepOutputMode::FullLogits {
-            return Ok(0);
-        }
-        config
-            .vocab_size
-            .checked_mul(std::mem::size_of::<i32>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                "granite device top-1 reverse-index staging byte count overflowed".to_string()
-            })
+        Ok(0)
     }
 
     pub(crate) fn construction_transient_system_memory_bytes(&self) -> Result<u64, String> {
@@ -617,10 +569,11 @@ impl GraniteSpeechDecodeSession {
         Self::assemble(
             config,
             runner,
-            GraniteDecoderWeights::Arena(weights),
+            GraniteDecoderWeights::Arena(Box::new(weights)),
             None,
             None,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
         )
     }
 
@@ -637,6 +590,7 @@ impl GraniteSpeechDecodeSession {
         token_embedding: Option<MappedTokenEmbeddingDeviceSpec<'_>>,
         backend: GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, GraniteSpeechDecoderError> {
         let graph_config = decoder_graph_config(backend);
         let runner =
@@ -665,11 +619,10 @@ impl GraniteSpeechDecodeSession {
                 })
             })
             .transpose()?;
-        if reusable_decode_graph_supported_for_runner(&runner) && device_token_embedding.is_none() {
+        if reusable_decode_graph_supported(reuse_mode) && device_token_embedding.is_none() {
             return Err(GraniteSpeechDecoderError::Shape {
-                reason:
-                    "direct GPU Granite decode requires a canonical token-major embedding tensor"
-                        .to_string(),
+                reason: "reusable Granite decode requires a canonical token-major embedding tensor"
+                    .to_string(),
             });
         }
         Self::assemble(
@@ -679,6 +632,7 @@ impl GraniteSpeechDecodeSession {
             device_token_embedding,
             Some(loaded),
             greedy_step_output_mode,
+            reuse_mode,
         )
     }
 
@@ -689,21 +643,12 @@ impl GraniteSpeechDecodeSession {
         device_token_embedding: Option<GraniteDeviceTokenEmbedding>,
         loaded: Option<GgmlLoadedWeightContext>,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, GraniteSpeechDecoderError> {
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-            && (runner.backend_kind() != GgmlCpuGraphBackend::Gpu
-                || !reusable_decode_graph_supported_for_runner(&runner))
-        {
-            return Err(GraniteSpeechDecoderError::Shape {
-                reason: "granite device top-1 requires a direct GPU decoder runner".to_string(),
-            });
-        }
-        let greedy_top1 =
-            build_device_greedy_top1_state(&runner, config.vocab_size, greedy_step_output_mode)?;
         Ok(Self {
             reuse: None,
-            greedy_top1,
             greedy_step_output_mode,
+            reuse_mode,
             config,
             runner,
             weights,
@@ -715,14 +660,14 @@ impl GraniteSpeechDecodeSession {
             resident_kv: None,
             resident_capacity: 0,
             logical_capacity: 0,
+            last_step_compute_evidence: None,
         })
     }
 
-    /// Whether this session's runner can run the in-place resident-KV reuse path
-    /// (single-backend GPU, scheduler off). CPU / scheduler-on runners fall back
-    /// to the growing-KV host path, which the bit-exact gate covers.
+    /// Whether the immutable planner authorized in-place resident-KV reuse.
+    /// Unproven lanes, including GPU FullDevice, stay on the growing-KV host path.
     fn reuse_supported(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     /// Reset this decode's request-visible state before the prepared runtime
@@ -738,6 +683,11 @@ impl GraniteSpeechDecodeSession {
         self.seq_len = 0;
         self.prefilled = false;
         self.logical_capacity = 0;
+        self.last_step_compute_evidence = None;
+    }
+
+    pub(crate) fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 
     pub(crate) fn is_prefilled(&self) -> bool {
@@ -796,7 +746,7 @@ impl GraniteSpeechDecodeSession {
             // Metal reuse path: seed the resident KV arena directly from the
             // prefill graph (rows `0..n_tokens` via `set_rows`), no host copy.
             self.ensure_resident_arena(capacity.resident_positions())?;
-            let output = run_prefill_graph_seeding_resident(
+            let (output, evidence) = run_prefill_graph_seeding_resident(
                 &mut self.runner,
                 &self.weights,
                 &self.config,
@@ -806,8 +756,8 @@ impl GraniteSpeechDecodeSession {
                 GraniteResidentPrefillInput::Embeddings(embeddings),
                 n_tokens,
                 DeviceGreedyStepOutputMode::FullLogits,
-                self.greedy_top1.as_ref(),
             )?;
+            self.last_step_compute_evidence = evidence;
             debug_assert!(output.greedy_token_hint.is_none());
             self.seq_len = n_tokens;
             self.prefilled = true;
@@ -825,7 +775,7 @@ impl GraniteSpeechDecodeSession {
             self.config.num_kv_heads,
             self.config.head_dim,
         )?;
-        let last_logits = run_prefill_graph(
+        let (last_logits, evidence) = run_prefill_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -833,6 +783,7 @@ impl GraniteSpeechDecodeSession {
             n_tokens,
             &mut host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.host_kv = Some(host_kv);
         self.seq_len = n_tokens;
         self.prefilled = true;
@@ -895,7 +846,7 @@ impl GraniteSpeechDecodeSession {
             });
         }
         self.ensure_resident_arena(capacity.resident_positions())?;
-        let output = run_prefill_graph_seeding_resident(
+        let (output, evidence) = run_prefill_graph_seeding_resident(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -910,8 +861,8 @@ impl GraniteSpeechDecodeSession {
             },
             n_tokens,
             self.greedy_step_output_mode,
-            self.greedy_top1.as_ref(),
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = n_tokens;
         self.prefilled = true;
         self.logical_capacity = capacity.logical_positions();
@@ -1028,7 +979,7 @@ impl GraniteSpeechDecodeSession {
             .ok_or_else(|| GraniteSpeechDecoderError::Shape {
                 reason: "granite CPU decode path has no admitted host KV owner".to_string(),
             })?;
-        let logits = run_decode_step_graph(
+        let (logits, evidence) = run_decode_step_graph(
             &mut self.runner,
             &self.weights,
             &self.config,
@@ -1036,6 +987,7 @@ impl GraniteSpeechDecodeSession {
             seq_len,
             host_kv,
         )?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len += 1;
         Ok(logits)
     }
@@ -1173,31 +1125,10 @@ impl GraniteSpeechDecodeSession {
                 )
                 .map_err(map_ggml("reuse_upload_mask"))?;
         }
-        let output = match top1 {
-            Some(top1) => {
-                let reversed_token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(map_ggml("reuse_compute_top1"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                        reason: "granite reused device top-1 returned no token id".to_string(),
-                    })?;
-                Seq2SeqGreedyDecodeStepLogitsOutput {
-                    logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
-                        vocab_size,
-                    )?),
-                }
-            }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, vocab_size)
-                    .map_err(map_ggml("reuse_compute"))?,
-                greedy_token_hint: None,
-            },
-        };
+        let (output, evidence) =
+            compute_greedy_step_output_with_evidence(graph, logits, top1, vocab_size)
+                .map_err(map_ggml("reuse_compute"))?;
+        self.last_step_compute_evidence = evidence;
         self.seq_len = position + 1;
         Ok(output)
     }
@@ -1311,10 +1242,10 @@ impl GraniteSpeechDecodeSession {
             // the returned handles are the full `[head_dim, max_positions,
             // kv_heads]` span (with the new row now live) that attention reads.
             let k_full = graph
-                .set_rows(arena_k, pre.k_perm, row_index)
+                .set_kv_rows(arena_k, pre.k_perm, row_index)
                 .map_err(map_ggml("reuse_k_set_rows"))?;
             let v_full = graph
-                .set_rows(arena_v, pre.v_perm, row_index)
+                .set_kv_rows(arena_v, pre.v_perm, row_index)
                 .map_err(map_ggml("reuse_v_set_rows"))?;
             let attended = if use_flash_attention {
                 graph
@@ -1375,18 +1306,9 @@ impl GraniteSpeechDecodeSession {
             .scale(logits_raw, 1.0 / config.logits_scaling)
             .map_err(map_ggml("reuse_logits_scale"))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let state =
-                self.greedy_top1
-                    .as_ref()
-                    .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                        reason: "granite device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        state.arena.graph_tensor(state.reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(map_ggml("reuse_output_top1"))?,
             )
         } else {
@@ -1428,7 +1350,7 @@ fn run_prefill_graph(
     embeddings: &[f32],
     n_tokens: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -1622,10 +1544,10 @@ fn run_prefill_graph(
         destinations.push((*k_tap, &mut k_history[..written_len]));
         destinations.push((*v_tap, &mut v_history[..written_len]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_prefill_compute"))?;
-    Ok(last_logits)
+    Ok((last_logits, evidence))
 }
 
 /// One-shot causal prefill that ALSO seeds the device-resident KV arena
@@ -1665,8 +1587,13 @@ fn run_prefill_graph_seeding_resident(
     input: GraniteResidentPrefillInput<'_>,
     n_tokens: usize,
     output_mode: DeviceGreedyStepOutputMode,
-    greedy_top1: Option<&GraniteDeviceGreedyTop1State>,
-) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, GraniteSpeechDecoderError> {
+) -> Result<
+    (
+        Seq2SeqGreedyDecodeStepLogitsOutput,
+        Option<GgmlSelectionEvidenceRef>,
+    ),
+    GraniteSpeechDecoderError,
+> {
     let head_dim = config.head_dim;
     let hidden_size = config.hidden_size;
     let vocab_size = config.vocab_size;
@@ -1807,13 +1734,13 @@ fn run_prefill_graph_seeding_resident(
             .set_rows(arena_k, pre.k_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_k_set_rows"))?;
         graph
-            .add_side_effect_root(k_seed)
+            .add_kv_write_root(k_seed)
             .map_err(map_ggml("seed_prefill_k_root"))?;
         let v_seed = graph
             .set_rows(arena_v, pre.v_perm, seed_indices)
             .map_err(map_ggml("seed_prefill_v_set_rows"))?;
         graph
-            .add_side_effect_root(v_seed)
+            .add_kv_write_root(v_seed)
             .map_err(map_ggml("seed_prefill_v_root"))?;
 
         let attended = if use_flash_attention {
@@ -1878,15 +1805,9 @@ fn run_prefill_graph_seeding_resident(
         .map_err(map_ggml("seed_prefill_logits_scale"))?;
 
     let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-        let state = greedy_top1.ok_or_else(|| GraniteSpeechDecoderError::Shape {
-            reason: "granite device top-1 reverse indices are unavailable".to_string(),
-        })?;
         Some(
             graph
-                .top1_argmax_first_max_reversed(
-                    logits,
-                    state.arena.graph_tensor(state.reverse_indices),
-                )
+                .top1_argmax_first_max(logits)
                 .map_err(map_ggml("seed_prefill_output_top1"))?,
         )
     } else {
@@ -1959,28 +1880,8 @@ fn run_prefill_graph_seeding_resident(
     graph
         .set_i32_slice(seed_indices, &position_ids, "granite_seed_prefill_rows")
         .map_err(map_ggml("seed_prefill_upload_rows"))?;
-    match top1 {
-        Some(top1) => {
-            let reversed_token_id = graph
-                .compute_output_i32(top1, 1)
-                .map_err(map_ggml("seed_prefill_compute_top1"))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| GraniteSpeechDecoderError::Shape {
-                    reason: "granite prefill device top-1 returned no token id".to_string(),
-                })?;
-            Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: Vec::new(),
-                greedy_token_hint: Some(map_reversed_top1_token(reversed_token_id, vocab_size)?),
-            })
-        }
-        None => Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits: graph
-                .compute_output_f32(logits, vocab_size)
-                .map_err(map_ggml("seed_prefill_compute"))?,
-            greedy_token_hint: None,
-        }),
-    }
+    compute_greedy_step_output_with_evidence(&mut graph, logits, top1, vocab_size)
+        .map_err(map_ggml("seed_prefill_compute"))
 }
 
 /// One incremental single-token step. Each admitted history layer is a
@@ -1997,7 +1898,7 @@ fn run_decode_step_graph(
     embed_row: &[f32],
     seq_len: usize,
     host_kv: &mut GraniteHostKvState,
-) -> Result<Vec<f32>, GraniteSpeechDecoderError> {
+) -> Result<(Vec<f32>, Option<GgmlSelectionEvidenceRef>), GraniteSpeechDecoderError> {
     let head_dim = config.head_dim;
     let kv_heads = config.num_kv_heads;
     let hidden_size = config.hidden_size;
@@ -2245,10 +2146,10 @@ fn run_decode_step_graph(
         destinations.push((*k_tap, &mut k_history[history_len..row_end]));
         destinations.push((*v_tap, &mut v_history[history_len..row_end]));
     }
-    graph
-        .compute_outputs_into_f32(destinations.as_mut_slice())
+    let evidence = graph
+        .compute_outputs_into_f32_with_evidence(destinations.as_mut_slice())
         .map_err(map_ggml("session_step_compute"))?;
-    Ok(logits_row)
+    Ok((logits_row, evidence))
 }
 
 #[cfg(test)]
@@ -2295,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn device_top1_quote_counts_only_reverse_index_construction_staging() {
+    fn device_top1_quote_has_no_reverse_index_construction_staging() {
         let config = tiny_config();
         assert_eq!(
             GraniteSpeechDecodeSession::quoted_construction_transient_system_memory_bytes(
@@ -2311,15 +2212,7 @@ mod tests {
                 DeviceGreedyStepOutputMode::DeviceTop1,
             )
             .expect("device top-1 construction quote"),
-            (config.vocab_size * std::mem::size_of::<i32>()) as u64
-        );
-    }
-
-    #[test]
-    fn device_top1_reverse_mapping_preserves_first_max_token_id() {
-        assert_eq!(
-            map_reversed_top1_token(2, 4).expect("reverse top-1 mapping"),
-            1
+            0
         );
     }
 

@@ -22,8 +22,8 @@ use crate::api::backend::{Segment, Transcription};
 use crate::arch::MIMO_ASR_DECODE_POLICY_ID;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlNativeGqaCapability, RequestBackendPreference,
-    request_backend_override,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlNativeGqaCapability, RequestBackendPreference,
+    ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -43,7 +43,7 @@ use crate::models::incremental_streaming_driver::{
 use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::qwen::{
     Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
-    Qwen3AsrPromptTokenInput, qwen_llm_effective_native_gqa_capability,
+    Qwen3AsrPromptTokenInput,
 };
 use crate::models::runtime_cache_coordinator::PackContentKey;
 use crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight;
@@ -127,23 +127,24 @@ enum MimoAsrExecutorError {
 /// input-local transformer, 36L Qwen2 backbone decoder), their
 /// device-uploaded / arena-resident weights, plus the immutable derived data
 /// read once from the pack. CPU lanes retain scalar-oracle RVQ codebooks and
-/// speech-embedding tables; accelerated lanes bind those native tensors in
-/// the encoder/input-local graphs and deliberately retain no host-f32 copy.
-/// Both retain the mel front-end plan, tokenizer, and the two metadata groups
-/// the per-request path still consults. Before this cache, mimo-asr was the only
-/// family that rebuilt this ENTIRE set on every `execute()` -- three
-/// `Runtime::new()` calls plus a full re-read of the pack's codebooks/tables
-/// -- purely to re-derive state that never changes between requests against
-/// the same pack. Mirrors `firered_llm`'s resident-decoder cache (`FireRedLlm
-/// DecoderRuntime` there is one stage; here the whole prepared pipeline is
-/// resident because all three mimo stages are equally per-request-invariant).
+/// speech-embedding tables; accelerated lanes keep the encoder graph on the
+/// selected backend, read its hidden rows once, and use the same host RVQ
+/// score oracle. Both retain the mel front-end plan, tokenizer, and the two
+/// metadata groups the per-request path still consults. Before this cache,
+/// mimo-asr was the only family that rebuilt this ENTIRE set on every
+/// `execute()` -- three `Runtime::new()` calls plus a full re-read of the pack's
+/// codebooks/tables -- purely to re-derive state that never changes between
+/// requests against the same pack. Mirrors `firered_llm`'s resident-decoder
+/// cache (`FireRedLlm DecoderRuntime` there is one stage; here the whole
+/// prepared pipeline is resident because all three mimo stages are equally
+/// per-request-invariant).
 struct MimoAsrPreparedRuntime {
     encoder_runtime: MimoAudiotokEncoderRuntime,
     inlocal_runtime: MimoInputLocalRuntime,
     decoder: MimoLlmDecoderRuntime,
     tokenizer: MimoAsrTokenizer,
-    /// CPU exact-oracle RVQ tables. Accelerated lanes bind the native GGUF
-    /// tensors in `encoder_runtime` and deliberately retain no host f32 copy.
+    /// CPU exact-oracle RVQ tables. Accelerated lanes retain their host copy
+    /// inside `encoder_runtime` for the same strict-first score oracle.
     codebooks: Option<MimoRvqCodebooks>,
     /// CPU exact-oracle speech tables. Accelerated lanes gather their native
     /// f16 tensors inside `inlocal_runtime` and retain no host f32 copy.
@@ -163,7 +164,12 @@ struct MimoAsrPreparedRuntime {
 /// bytes. Entries are tagged with the idle-unload generation they were built
 /// service root can clear or target-evict every actor directly; each runtime is
 /// destroyed on the same owner thread that constructed its native contexts.
-type MimoAsrPreparedRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, GgmlNativeGqaCapability);
+type MimoAsrPreparedRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    GgmlNativeGqaCapability,
+    GgmlDecodeOutputPlan,
+);
 
 type MimoAsrPreparedRuntimePool =
     AdmittedPinnedRuntimeActorCheckoutPool<MimoAsrPreparedRuntimeCacheKey, MimoAsrPreparedRuntime>;
@@ -286,6 +292,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for MimoAsrGreedyStepExecutor<'_> {
             greedy_token_hint: None,
         })
     }
+
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.decoder.take_compute_evidence()
+    }
 }
 
 impl MimoAsrPreparedRuntime {
@@ -325,27 +335,17 @@ impl MimoAsrPreparedRuntime {
             backend,
         )
         .map_err(capacity_error)?;
-        let (codebook_peak, codebook_retained, speech_embedding_retained) = if backend
-            .is_gpu_class()
-        {
-            (
-                MimoRvqCodebooks::quoted_device_construction_peak_system_memory_bytes(
-                    &audiotok_metadata,
-                )
-                .map_err(capacity_error)?,
-                0,
-                0,
-            )
+        let (codebook_peak, codebook_retained) =
+            MimoRvqCodebooks::quoted_construction_system_memory_bytes(&reader, &audiotok_metadata)
+                .map_err(capacity_error)?;
+        let speech_embedding_retained = if backend.is_gpu_class() {
+            0
         } else {
-            let codebooks =
-                MimoRvqCodebooks::quoted_retained_system_memory_bytes(&audiotok_metadata)
-                    .map_err(capacity_error)?;
-            let speech_embeddings = MimoSpeechEmbeddingTables::quoted_retained_system_memory_bytes(
+            MimoSpeechEmbeddingTables::quoted_retained_system_memory_bytes(
                 inlocal_metadata.d_model,
                 &speech_vocab_sizes,
             )
-            .map_err(capacity_error)?;
-            (codebooks, codebooks, speech_embeddings)
+            .map_err(capacity_error)?
         };
         let inlocal =
             MimoInputLocalRuntime::quoted_retained_system_memory_bytes(&inlocal_metadata, backend)
@@ -413,9 +413,9 @@ impl MimoAsrPreparedRuntime {
     /// exists to pay exactly once per (pack, execution lane).
     fn build(
         preflight: &crate::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, MimoAsrExecutorError> {
+        let backend = resolved_runtime.backend();
         let llm_metadata = parse_mimo_llm_metadata(&preflight.metadata).map_err(|error| {
             MimoAsrExecutorError::RuntimeContractViolation {
                 reason: error.to_string(),
@@ -525,7 +525,7 @@ impl MimoAsrPreparedRuntime {
         })?;
 
         let decoder =
-            MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, backend, native_gqa)
+            MimoLlmDecoderRuntime::new_from_preflight(preflight, llm_metadata, resolved_runtime)
                 .map_err(|error| MimoAsrExecutorError::DecoderFailed {
                     reason: error.to_string(),
                 })?;
@@ -621,13 +621,15 @@ impl MimoAsrGgmlExecutor {
     fn checkout_prepared_runtime(
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
-        backend: GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<MimoAsrPreparedRuntimeActor, MimoAsrExecutorError> {
+        let backend = resolved_runtime.backend();
+        let native_gqa = resolved_runtime.native_gqa_capability();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
             native_gqa,
+            resolved_runtime.output_plan(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -646,7 +648,7 @@ impl MimoAsrGgmlExecutor {
                 Ok((retained_bytes, quote))
             },
             move |quote| match SystemMemoryOwner::try_allocate_transaction(quote, || {
-                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, backend, native_gqa)?;
+                let runtime = MimoAsrPreparedRuntime::build(&build_preflight, resolved_runtime)?;
                 let retained = runtime.retained_system_memory_bytes()?;
                 Ok(SystemMemoryAllocationOutcome::new(
                     runtime, retained, retained,
@@ -694,18 +696,12 @@ impl MimoAsrGgmlExecutor {
             });
         }
 
-        let backend = request.resolved_runtime.backend();
-        let native_gqa = qwen_llm_effective_native_gqa_capability(mimo_native_gqa_candidate(
-            backend,
-            request_backend_override().as_ref(),
-            request.resolved_runtime.native_gqa_capability(),
-        ));
         let kv_capacity = Qwen3AsrKvCacheCapacity::from_decoder_state(
             &request.decoder_state,
             super::capacity::MIMO_ASR_SELF_KV_STATE_ID,
         )
         .map_err(|source| MimoAsrExecutorError::DecoderStateCapacity { source })?;
-        let actor = self.checkout_prepared_runtime(preflight, backend, native_gqa)?;
+        let actor = self.checkout_prepared_runtime(preflight, request.resolved_runtime)?;
         let samples = samples.to_vec();
         let input_rate = request.prepared_audio.sample_rate_hz;
         let control = Arc::clone(&request.execution_context.control);
@@ -822,7 +818,7 @@ impl MimoAsrGgmlExecutor {
                         }
                     })?
                 }
-                MimoAudiotokEncoderOutput::DeviceCodes(codes) => codes,
+                MimoAudiotokEncoderOutput::HostCodes(codes) => codes,
             };
 
         // Truncate to the nearest group_size multiple (drop up to
@@ -1111,6 +1107,26 @@ mod tests {
     }
 
     #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:mimo-asr-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let native_gqa = GgmlNativeGqaCapability::Validated;
+        let full_logits: MimoAsrPreparedRuntimeCacheKey = (
+            content.clone(),
+            lane.clone(),
+            native_gqa,
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact: MimoAsrPreparedRuntimeCacheKey = (
+            content,
+            lane,
+            native_gqa,
+            GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        );
+        assert_ne!(full_logits, compact);
+    }
+
+    #[test]
     fn strip_mimo_language_tags_matches_reference_asr_sft_postprocess() {
         // Leading auto-tag (the common single-utterance case) is removed and
         // the exposed leading space trimmed.
@@ -1357,15 +1373,13 @@ mod tests {
     }
 
     /// Exact bridge gate for the accelerated rewrite: a diagnostic Metal
-    /// encoder emits hidden rows and the original scalar RVQ oracle quantizes
-    /// them; production Metal fuses that same sequential residual quantizer
-    /// into the encoder graph and returns only compact codes. Holding the
-    /// encoder backend fixed isolates the new RVQ math from normal CPU/Metal
-    /// reduction-order drift.
+    /// The encoder graph remains on Metal, but RVQ selection is deliberately
+    /// host-oracle based: compare its compact output with the diagnostic
+    /// hidden-row path while also checking graph placement.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     #[ignore = "host-local: needs OPENASR_MIMO_ASR_PACK and Metal"]
-    fn metal_rvq_fusion_matches_scalar_oracle_on_same_metal_hidden_rows() {
+    fn metal_rvq_host_oracle_matches_scalar_oracle_on_same_metal_hidden_rows() {
         let Some(pack_path) = dev_pack_path() else {
             return;
         };
@@ -1428,8 +1442,8 @@ mod tests {
         metal
             .release_transient_compute_memory()
             .expect("release Metal transient memory");
-        let MimoAudiotokEncoderOutput::DeviceCodes(actual) = output else {
-            panic!("Metal encoder must fuse RVQ and return device codes");
+        let MimoAudiotokEncoderOutput::HostCodes(actual) = output else {
+            panic!("Metal encoder must return host RVQ codes");
         };
         let observed = placement.snapshot();
         let mismatches = actual

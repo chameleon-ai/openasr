@@ -24,13 +24,12 @@ use super::graph_config::{
 };
 use super::greedy_decode::{Qwen3AsrGreedyDecodeError, run_qwen3_greedy_decode_loop};
 use super::kv_cache::{
-    Qwen3AsrHostKvCacheOwner, Qwen3AsrHostKvMode, Qwen3AsrKvCacheCapacity,
-    Qwen3AsrKvCacheCapacityError,
+    Qwen3AsrHostKvCacheOwner, Qwen3AsrKvCacheCapacity, Qwen3AsrKvCacheCapacityError,
 };
 use super::llm_prefill::build_qwen3_llm_prefill_input;
 use super::llm_transformer::{
     Qwen3AsrLlmWholeDecoderGraphExecutor, QwenQkvExecutionMode, QwenWholeDecoderPlan,
-    qwen_llm_effective_native_gqa_capability,
+    qwen_host_kv_mode_for_resolved_runtime, qwen_llm_effective_native_gqa_capability,
 };
 use super::logits_head::{Qwen3AsrLlmLogitsHead, Qwen3AsrLlmLogitsHeadRuntime};
 use super::lora::{qwen_adapter_cache_fingerprint, resolve_qwen_lora_adapter};
@@ -50,10 +49,12 @@ use crate::arch::{
     OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy, QWEN3_ASR_GGML_ARCHITECTURE_ID,
 };
 use crate::device::execution_policy::ExecutionPlacement;
+#[cfg(test)]
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlNativeGqaCapability, RequestBackendPreference,
-    ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy, request_backend_override,
+    GgmlCpuGraphBackend, GgmlCpuGraphError, GgmlDecodeOutputPlan, GgmlNativeGqaCapability,
+    RequestBackendPreference, ResolvedFamilyRuntimeInput, env_toggle_with_raw, env_var_truthy,
+    request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -113,17 +114,20 @@ type Qwen3AsrDecoderRuntimeCacheKey = (
     String,
     GgmlNativeGqaCapability,
     QwenQkvExecutionMode,
+    GgmlDecodeOutputPlan,
 );
 
 /// Immutable identity of one ordinary Qwen model owner. Request-sized KV is
 /// deliberately absent: it is created inside one actor call and dropped before
-/// checkout return, while the pack, physical lane and adapter stay resident.
+/// checkout return, while the pack, physical lane, adapter, and output plan
+/// stay resident.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Qwen3AsrRuntimeOwnerCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
     native_gqa: GgmlNativeGqaCapability,
     qkv_execution_mode: QwenQkvExecutionMode,
+    output_plan: GgmlDecodeOutputPlan,
 }
 
 struct Qwen3AsrAudioEncoderRuntimeActorState {
@@ -253,22 +257,20 @@ impl Qwen3AsrDecoderActorCheckout {
 
 fn qwen_unified_runtime_owner_enabled(
     resolved_runtime: ResolvedFamilyRuntimeInput,
-    native_gqa: GgmlNativeGqaCapability,
+    _native_gqa: GgmlNativeGqaCapability,
     native_logits_runtime: bool,
     backend_preference: Option<&RequestBackendPreference>,
     placement: Option<ExecutionPlacement>,
 ) -> bool {
     let backend = resolved_runtime.backend();
+    // Native GQA is a kernel choice (and fail-closed on HIP). The unified
+    // owner only coalesces encoder+decoder onto one ggml thread so device
+    // weights upload once; it must not require GQA.
     if backend != GgmlCpuGraphBackend::Gpu
-        || !native_gqa.is_validated()
+        || resolved_runtime.reuse_mode() != crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
         || !native_logits_runtime
         || placement != Some(ExecutionPlacement::FullDevice)
-        || !matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        || !crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
     {
         return false;
     }
@@ -283,8 +285,12 @@ fn qwen_unified_runtime_owner_enabled(
 fn qwen_qkv_execution_mode(
     unified_runtime_enabled: bool,
     split_loaded_requested: bool,
+    native_gqa: GgmlNativeGqaCapability,
 ) -> QwenQkvExecutionMode {
-    if unified_runtime_enabled && split_loaded_requested {
+    // Split-loaded QKV is the CUDA/Vulkan fused-GQA packing. HIP's native GQA
+    // broadcast is fail-closed, so a unified HIP owner must keep the unfused
+    // arena path rather than inherit the CUDA packing.
+    if unified_runtime_enabled && split_loaded_requested && native_gqa.is_validated() {
         QwenQkvExecutionMode::SplitLoaded
     } else {
         QwenQkvExecutionMode::FusedArena
@@ -577,6 +583,7 @@ impl Qwen3AsrGgmlExecutor {
             qwen_adapter_cache_fingerprint(adapter.as_ref().map(resolved_lora_adapter)),
             native_gqa,
             qkv_execution_mode,
+            resolved_runtime.output_plan(),
         );
         let preflight = preflight.clone();
         self.decoder_runtimes.checkout_or_try_build_with(
@@ -598,8 +605,7 @@ impl Qwen3AsrGgmlExecutor {
                         prepared_runtime.logits_head.fused_top1_spec(),
                         prepared_runtime.token_embedding_table.device_graph_spec(),
                         adapter.as_ref().map(resolved_lora_adapter),
-                        backend,
-                        native_gqa,
+                        resolved_runtime,
                         qkv_execution_mode,
                     )
                     .map_err(|error| {
@@ -641,6 +647,7 @@ impl Qwen3AsrGgmlExecutor {
             lane: current_execution_lane_key(decoder_backend),
             native_gqa,
             qkv_execution_mode,
+            output_plan: resolved_runtime.output_plan(),
         };
         let preflight = preflight.clone();
         let content_id = preflight.runtime_source.content_id().to_string();
@@ -699,8 +706,7 @@ impl Qwen3AsrGgmlExecutor {
                         prepared_runtime.logits_head.fused_top1_spec(),
                         prepared_runtime.token_embedding_table.device_graph_spec(),
                         None,
-                        backend,
-                        native_gqa,
+                        resolved_runtime,
                         qkv_execution_mode,
                     )
                     .map_err(|error| Qwen3AsrGgmlExecutorError::RuntimeContractViolation {
@@ -901,7 +907,6 @@ impl Qwen3AsrGgmlExecutor {
         // The serve-batch owner loads the pack itself; it needs the path, not
         // the content id.
         let runtime_cache_path = canonical_runtime_cache_path(runtime_source.path());
-        let serve_batch_graph_config = super::graph_config::qwen_runtime_graph_config(backend);
         // Serve-batch remains an independent owner topology in this change.
         // In particular, do not build and retain an otherwise-idle unified
         // decoder merely to run its encoder before handing decode to the batch
@@ -914,8 +919,8 @@ impl Qwen3AsrGgmlExecutor {
         .filter(|_| {
             !skip_serve_batch
                 && !adapter_active
-                && serve_batch_graph_config.backend.is_gpu_class()
-                && !serve_batch_graph_config.use_scheduler
+                && request.resolved_runtime.reuse_mode()
+                    == crate::ggml_runtime::GgmlDecodeReuseMode::ReusableGraph
                 && native_gqa.is_validated()
         });
         let native_logits_runtime = prepared_runtime_owner
@@ -938,6 +943,7 @@ impl Qwen3AsrGgmlExecutor {
                     .ok()
                     .as_deref(),
             ),
+            native_gqa,
         );
         let unified_gpu_runtime = if unified_runtime_enabled {
             Some(self.checkout_unified_gpu_runtime(
@@ -1109,17 +1115,12 @@ impl Qwen3AsrGgmlExecutor {
         qwen_decode_profile_log_opt("decoder_actor_checkout", whole_decoder_started_at);
 
         // The host KV owner is request-scoped, while the whole decoder and its
-        // logits runtime stay resident in the pinned owner actor. This mode is
-        // derived from the same resolved lane policy used by the decoder
-        // constructor, so a resident graph never aliases a materialized host
-        // path (and vice versa).
+        // logits runtime stay resident in the pinned owner actor. Mode must
+        // match `supports_graph_reuse`: ResidentOnly is legal only when the
+        // decoder will actually seed a resident graph. A GPU-class Metal lane
+        // that the planner still marks FreshGraph must materialize host KV.
         let kv_cache_started_at = qwen_decode_profile_start();
-        let decoder_config = qwen_runtime_graph_config(backend);
-        let host_mode = if decoder_config.backend.is_gpu_class() && !decoder_config.use_scheduler {
-            Qwen3AsrHostKvMode::ResidentOnly
-        } else {
-            Qwen3AsrHostKvMode::Materialized
-        };
+        let host_mode = qwen_host_kv_mode_for_resolved_runtime(request.resolved_runtime);
         let kv_cache_spec = super::llm_transformer::resolve_qwen_family_production_kv_cache_policy(
             decoder_backend,
             metadata.llm_head_dim,
@@ -1204,6 +1205,9 @@ impl Qwen3AsrGgmlExecutor {
                 // A failed compute may poison the reusable graph. Always
                 // release session-scoped buffers before the actor goes idle.
                 state.whole_decoder.release_session_scoped_buffers();
+                state
+                    .logits_head_runtime
+                    .release_request_compute_residency();
                 result
             })
             .map_err(|error| Self::map_actor_error("decoder", error))?;
@@ -1692,7 +1696,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor<'
                     reason: error.to_string(),
                 }
             })?;
-        let hidden = self
+        let (hidden, fused_logits) = self
             .run_llm_token_with_kv(token_id, cache_position)
             .map_err(|error| {
                 crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
@@ -1700,18 +1704,27 @@ impl Seq2SeqGreedyDecodeStepExecutor for Qwen3AsrPrefillOnlyGreedyStepExecutor<'
                 }
             })?;
 
-        let logits = self
-            .logits_head_runtime
-            .compute_logits_for_last_hidden(self.logits_head, &hidden)
-            .map_err(|error| {
-                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
-                    reason: error.to_string(),
-                }
-            })?;
+        let logits = if let Some(logits) = fused_logits {
+            logits
+        } else {
+            self.logits_head_runtime
+                .compute_logits_for_last_hidden(self.logits_head, &hidden)
+                .map_err(|error| {
+                    crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeError::DecoderStepFailed {
+                        reason: error.to_string(),
+                    }
+                })?
+        };
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits,
             greedy_token_hint: None,
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.whole_decoder
+            .take_fused_compute_evidence()
+            .or_else(|| self.logits_head_runtime.take_compute_evidence())
     }
 }
 
@@ -2180,11 +2193,9 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         } else {
             None
         };
-        // `run_step_auto` reuses the built decode graph across tokens only on
-        // the direct single-GPU lane (`is_gpu_class && !scheduler`). CPU
-        // compute and multi-backend scheduler paths rebuild the growing-KV
-        // graph each token because their in-place-KV reuse path is not
-        // byte-identical -- see `supports_graph_reuse`'s doc comment.
+        // `run_step_auto` reuses the built decode graph across tokens only
+        // when the immutable planner reuse_mode is ReusableGraph. Unproven
+        // lanes rebuild the growing-KV graph each token.
         let step = self
             .whole_decoder
             .run_step_auto(
@@ -2219,7 +2230,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
         &mut self,
         token_id: u32,
         cache_position: usize,
-    ) -> Result<Vec<f32>, Qwen3AsrGreedyDecodeError> {
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>), Qwen3AsrGreedyDecodeError> {
         if self.whole_decoder.supports_device_token_embedding() {
             let started_at = if qwen_decode_profile_enabled() {
                 Some(Instant::now())
@@ -2256,7 +2267,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                     step.compute_micros,
                 );
             }
-            return Ok(step.hidden);
+            return Ok((step.hidden, step.fused_logits));
         }
         let hidden = self
             .token_embedding_table
@@ -2265,6 +2276,7 @@ impl Qwen3AsrPrefillOnlyGreedyStepExecutor<'_> {
                 reason: error.to_string(),
             })?;
         self.run_llm_layers_with_kv(hidden, cache_position)
+            .map(|hidden| (hidden, None))
     }
 
     fn last_generated_token_id(
@@ -2649,26 +2661,39 @@ mod tests {
     }
 
     #[test]
-    fn split_loaded_qkv_is_limited_to_unified_exact_cuda_vulkan_runtime() {
+    fn split_loaded_qkv_stays_disabled_until_exact_gpu_reuse_is_proven() {
         for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
             let preference = exactly_addressable_preference(provider);
             let resolved = ResolvedFamilyRuntimeInput::resolve(
                 Some(preference.clone()),
                 crate::ggml_runtime::AutoGpuPolicy::AllBackends,
             );
-            assert!(qwen_unified_runtime_owner_enabled(
+            assert_eq!(
+                resolved.reuse_mode(),
+                crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+            );
+            let enabled = qwen_unified_runtime_owner_enabled(
                 resolved,
                 GgmlNativeGqaCapability::Validated,
                 true,
                 Some(&preference),
                 Some(ExecutionPlacement::FullDevice),
-            ));
+            );
+            assert!(!enabled);
             assert_eq!(
-                qwen_qkv_execution_mode(true, true),
+                qwen_qkv_execution_mode(enabled, true, GgmlNativeGqaCapability::Validated),
+                QwenQkvExecutionMode::FusedArena
+            );
+            assert_eq!(
+                qwen_qkv_execution_mode(true, false, GgmlNativeGqaCapability::Validated),
+                QwenQkvExecutionMode::FusedArena
+            );
+            assert_eq!(
+                qwen_qkv_execution_mode(true, true, GgmlNativeGqaCapability::Validated),
                 QwenQkvExecutionMode::SplitLoaded
             );
             assert_eq!(
-                qwen_qkv_execution_mode(true, false),
+                qwen_qkv_execution_mode(true, true, GgmlNativeGqaCapability::Unsupported),
                 QwenQkvExecutionMode::FusedArena
             );
         }
@@ -2694,7 +2719,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            qwen_qkv_execution_mode(false, true),
+            qwen_qkv_execution_mode(false, true, GgmlNativeGqaCapability::Validated),
             QwenQkvExecutionMode::FusedArena
         );
     }
@@ -2708,14 +2733,37 @@ mod tests {
             lane: lane.clone(),
             native_gqa: GgmlNativeGqaCapability::Validated,
             qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
         };
         let split = Qwen3AsrRuntimeOwnerCacheKey {
             content,
             lane,
             native_gqa: GgmlNativeGqaCapability::Validated,
             qkv_execution_mode: QwenQkvExecutionMode::SplitLoaded,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
         };
         assert_ne!(fused, split);
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:qwen-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let full_logits = Qwen3AsrRuntimeOwnerCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            native_gqa: GgmlNativeGqaCapability::Validated,
+            qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+        };
+        let compact = Qwen3AsrRuntimeOwnerCacheKey {
+            content,
+            lane,
+            native_gqa: GgmlNativeGqaCapability::Validated,
+            qkv_execution_mode: QwenQkvExecutionMode::FusedArena,
+            output_plan: GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        };
+        assert_ne!(full_logits, compact);
     }
 
     #[test]

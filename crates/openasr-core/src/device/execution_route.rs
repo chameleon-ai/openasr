@@ -24,7 +24,7 @@ use crate::ggml_runtime::{GgmlBackendDevice, GgmlBackendKind};
 
 /// Backend provider family for route identity. Distinct from the public coarse
 /// [`crate::ExecutionTarget`] surface (`auto` / `cpu` / `accelerated`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionProvider {
     Cpu,
     Metal,
@@ -406,14 +406,51 @@ impl EnumeratedComputeDevice {
 pub fn enumerate_compute_devices_from_ggml(
     devices: &[GgmlBackendDevice],
 ) -> Vec<EnumeratedComputeDevice> {
+    let activated_provider = crate::ggml_runtime::activated_backend_execution_provider();
     devices
         .iter()
         .enumerate()
         .map(|(registry_ordinal, device)| enumerated_from_ggml_device(registry_ordinal, device))
+        .filter(|device| {
+            provider_is_runtime_activatable(
+                device.provider,
+                activated_provider,
+                cfg!(target_os = "windows"),
+            )
+        })
         .collect()
 }
 
-fn enumerated_from_ggml_device(
+fn provider_is_runtime_activatable(
+    provider: ExecutionProvider,
+    activated_provider: Option<ExecutionProvider>,
+    require_signed_activation: bool,
+) -> bool {
+    provider == ExecutionProvider::Cpu
+        || !require_signed_activation
+        || activated_provider == Some(provider)
+        || compiled_into_this_process(provider)
+}
+
+/// Windows plugin hosts hide GPU routes until a signed pack is activated.
+/// A statically linked HIP/CUDA/Vulkan sidecar is not an optional plugin: the
+/// provider is already in this process and must remain enumerable.
+fn compiled_into_this_process(provider: ExecutionProvider) -> bool {
+    if crate::ggml_runtime::ggml_backend_dl_build_enabled() {
+        return false;
+    }
+    match provider {
+        ExecutionProvider::Hip => cfg!(feature = "hip"),
+        ExecutionProvider::Cuda => cfg!(feature = "cuda"),
+        ExecutionProvider::Vulkan => cfg!(feature = "vulkan"),
+        ExecutionProvider::Metal => cfg!(all(target_vendor = "apple", target_arch = "aarch64")),
+        ExecutionProvider::Cpu | ExecutionProvider::Accelerator | ExecutionProvider::Unknown => {
+            false
+        }
+    }
+}
+
+pub(crate) fn enumerated_from_ggml_device(
     registry_ordinal: usize,
     device: &GgmlBackendDevice,
 ) -> EnumeratedComputeDevice {
@@ -1000,5 +1037,45 @@ mod tests {
             Some(ExecutionHardwareVendor::Amd)
         );
         assert_eq!(inventory[1].hardware_vendor, None);
+    }
+
+    #[test]
+    fn signed_activation_policy_hides_all_unactivated_windows_gpu_routes() {
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Cpu,
+            None,
+            true
+        ));
+        assert!(!provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            None,
+            true
+        ));
+        assert!(!provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            Some(ExecutionProvider::Cuda),
+            true
+        ));
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Cuda,
+            Some(ExecutionProvider::Cuda),
+            true
+        ));
+        assert!(provider_is_runtime_activatable(
+            ExecutionProvider::Vulkan,
+            None,
+            false
+        ));
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn statically_linked_hip_stays_visible_without_a_signed_plugin() {
+        let visible = provider_is_runtime_activatable(ExecutionProvider::Hip, None, true);
+        assert_eq!(
+            visible,
+            !crate::ggml_runtime::ggml_backend_dl_build_enabled(),
+            "static HIP sidecars must enumerate HIP; plugin hosts must not"
+        );
     }
 }

@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlNativeGqaCapability, GgufTensorDataReader};
+use crate::ggml_runtime::{GgmlCpuGraphBackend, GgufTensorDataReader, ResolvedFamilyRuntimeInput};
 
 use crate::models::mapped_token_embedding::MappedTokenEmbeddingTable;
 use crate::models::qwen::{
@@ -84,12 +84,20 @@ pub(crate) struct MimoLlmPrefillOutput {
 }
 
 impl MimoLlmDecoderRuntime {
+    pub(crate) fn take_compute_evidence(
+        &mut self,
+    ) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.whole_decoder
+            .take_fused_compute_evidence()
+            .or_else(|| self.logits_runtime.take_compute_evidence())
+    }
+
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         metadata: MimoLlmMetadata,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
-        native_gqa: GgmlNativeGqaCapability,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<Self, MimoLlmDecoderError> {
+        let backend = resolved_runtime.backend();
         let reader =
             crate::models::runtime_preflight::build_runtime_tensor_reader_from_preflight(preflight)
                 .map_err(|error| MimoLlmDecoderError::TensorReadFailed {
@@ -131,9 +139,8 @@ impl MimoLlmDecoderRuntime {
                 rms_norm_epsilon: metadata.rms_norm_epsilon,
                 fused_logits_head: logits_head.fused_top1_spec(),
                 token_embedding: token_embedding.device_graph_spec(),
-                backend,
+                resolved_runtime,
             },
-            native_gqa,
         )
         .map_err(|error| MimoLlmDecoderError::GraphFailed {
             reason: error.to_string(),
@@ -410,6 +417,9 @@ impl MimoLlmDecoderRuntime {
             self.metadata.n_kv_heads * self.metadata.head_dim,
             layer_kv_caches,
         )?;
+        if let Some(logits) = step.fused_logits {
+            return Ok(logits);
+        }
         self.logits_runtime
             .compute_logits_for_last_hidden(&self.logits_head, &step.hidden)
             .map_err(|error| MimoLlmDecoderError::LogitsHeadFailed {
