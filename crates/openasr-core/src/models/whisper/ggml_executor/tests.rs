@@ -1904,3 +1904,48 @@ fn encoder_graph_upload_bytes_after_prepare_outputs_remains_supported() {
     let out = graph.compute_output_f32(output, 1).expect("compute output");
     assert_eq!(out, vec![0.0]);
 }
+
+#[test]
+fn whisper_dtw_onset_lead_default_curve_is_flat_then_density_capped() {
+    let tuning = WhisperDtwLeadTuning::default();
+    // The curve must mirror the compiled defaults exactly.
+    assert!((tuning.baseline - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+    assert!((tuning.knee - WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC).abs() < 1e-6);
+    assert!((tuning.slope - WHISPER_DTW_LEAD_DENSITY_SLOPE).abs() < 1e-6);
+    assert!((tuning.maximum - WHISPER_DTW_ONSET_LEAD_MAX_SECONDS).abs() < 1e-6);
+
+    // Sparse band (at or below the knee): flat baseline, no density term.
+    let slow = whisper_dtw_onset_lead_for(&tuning, 10.0, 20); // 2.0 words/s < 2.4
+    assert!((slow - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+
+    // Dense band: growth above the knee, capped at the 0.15s maximum. The cap
+    // is the whole point: the historical 0.35s ceiling over-led dense bands and
+    // dropped short truth words, so the lead must never exceed the measured
+    // onset-offset width even on the densest band.
+    let dense = whisper_dtw_onset_lead_for(&tuning, 1.0, 20); // 20 words/s
+    assert!(
+        (dense - WHISPER_DTW_ONSET_LEAD_MAX_SECONDS).abs() < 1e-6,
+        "dense band lead must cap at the maximum (got {dense}, max {})",
+        WHISPER_DTW_ONSET_LEAD_MAX_SECONDS
+    );
+
+    // A mild-density band (just past the knee) sits strictly between the
+    // baseline and the cap: 2.5 words/s -> baseline + slope * 0.1, still under
+    // the 0.15s ceiling.
+    let mid = whisper_dtw_onset_lead_for(&tuning, 10.0, 25); // 2.5 words/s
+    assert!(WHISPER_DTW_ONSET_LEAD_SECONDS < mid && mid < WHISPER_DTW_ONSET_LEAD_MAX_SECONDS);
+}
+
+#[test]
+fn whisper_dtw_onset_lead_tuning_default_matches_constants() {
+    // The env-override path (whisper_dtw_lead_tuning) falls back to these exact
+    // points when the four OPENASR_WHISPER_DTW_LEAD_* vars are unset, so the
+    // no-override lead is the historical curve. The pure Default is what the
+    // runtime reads, so pin it here rather than mutating process env (which is
+    // unsafe in this edition and races under parallel nextest).
+    let tuning = WhisperDtwLeadTuning::default();
+    assert_eq!(tuning.baseline, WHISPER_DTW_ONSET_LEAD_SECONDS);
+    assert_eq!(tuning.knee, WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC);
+    assert_eq!(tuning.slope, WHISPER_DTW_LEAD_DENSITY_SLOPE);
+    assert_eq!(tuning.maximum, WHISPER_DTW_ONSET_LEAD_MAX_SECONDS);
+}

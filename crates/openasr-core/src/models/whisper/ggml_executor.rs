@@ -5987,9 +5987,82 @@ const WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
 /// fixed lead cannot correct both sparse and dense bands.
 const WHISPER_DTW_LEAD_DENSITY_SLOPE: f32 = 0.43;
 
-/// Upper bound on the density-scaled onset lead. Above this the added lead
-/// outruns the true onset on dense bands as quickly as it helps.
-const WHISPER_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.35;
+/// Upper bound on the density-scaled onset lead. Whisper's DTW entry frames
+/// are already near-onset-accurate (short clips land in-window with the flat
+/// baseline alone), so the density term is nearly pure over-correction: once a
+/// band is dense the old 0.35s cap pushed every word start ~0.15-0.35s before
+/// its true speech onset, and the short truth words the fold protects then fell
+/// entirely outside their candidate window (the long-clip in-window coverage
+/// regression). Capping the lead at 0.15s -- still a touch above a typical
+/// spoken-word width -- keeps some density pull for the
+/// genuinely dense bands while leaving the short clip, which never leaves the
+/// flat baseline, byte-for-byte unchanged.
+const WHISPER_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.15;
+
+/// Tuning of the onset-lead curve. `Default` is the deployed curve; the four
+/// points can be overridden at run time (see `whisper_dtw_lead_tuning`) so a
+/// deployment can retune the lead per corpus without a rebuild.
+///
+/// The lead is subtracted from every word center before the boundary fold, so
+/// it is the one knob that shifts whole words earlier. DTW entry frames are
+/// already near-onset-accurate (short clips land in-window on the flat
+/// baseline alone), so a large lead pushes every word start before the true
+/// onset and drops the short truth words the fold protects. Kept as a plain
+/// struct so the lead curve is a pure, env-free function (and the no-override
+/// path stays byte-identical to the constants).
+#[derive(Debug, Clone, Copy)]
+struct WhisperDtwLeadTuning {
+    baseline: f32,
+    knee: f32,
+    slope: f32,
+    maximum: f32,
+}
+
+impl Default for WhisperDtwLeadTuning {
+    fn default() -> Self {
+        Self {
+            baseline: WHISPER_DTW_ONSET_LEAD_SECONDS,
+            knee: WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC,
+            slope: WHISPER_DTW_LEAD_DENSITY_SLOPE,
+            maximum: WHISPER_DTW_ONSET_LEAD_MAX_SECONDS,
+        }
+    }
+}
+
+/// The onset lead for a tuning curve and one band, scaled by how densely its
+/// words pack: a flat baseline up to the knee, then a linear growth with band
+/// density capped at the maximum. Split out as a pure function so the curve's
+/// shape is unit-testable without touching the process environment.
+fn whisper_dtw_onset_lead_for(
+    tuning: &WhisperDtwLeadTuning,
+    band_seconds: f32,
+    word_count: usize,
+) -> f32 {
+    let band_seconds = band_seconds.max(0.05);
+    let density = (word_count as f32) / band_seconds;
+    let excess = (density - tuning.knee).max(0.0);
+    (tuning.baseline + tuning.slope * excess).min(tuning.maximum)
+}
+
+/// The tuning curve to apply now, honoring the deployment env overrides. Each
+/// element falls back to its compiled default (see `WhisperDtwLeadTuning::default`)
+/// when unset or unparsable, so a bare environment is byte-identical to the
+/// historical behavior.
+fn whisper_dtw_lead_tuning() -> WhisperDtwLeadTuning {
+    let default = WhisperDtwLeadTuning::default();
+    let read = |name: &str, fallback: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    WhisperDtwLeadTuning {
+        baseline: read("OPENASR_WHISPER_DTW_LEAD_BASE_SECONDS", default.baseline),
+        knee: read("OPENASR_WHISPER_DTW_LEAD_KNEE_PER_SEC", default.knee),
+        slope: read("OPENASR_WHISPER_DTW_LEAD_SLOPE", default.slope),
+        maximum: read("OPENASR_WHISPER_DTW_LEAD_MAX_SECONDS", default.maximum),
+    }
+}
 
 /// The onset lead for one DTW band, scaled by how densely its words pack.
 ///
@@ -6004,11 +6077,7 @@ const WHISPER_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.35;
 /// be token-dense (many subwords) yet speak at a relaxed pace, in which case
 /// the late bias is small. Token density does not separate them; word density does.
 fn whisper_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
-    let band_seconds = band_seconds.max(0.05);
-    let density = (word_count as f32) / band_seconds;
-    let excess = (density - WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC).max(0.0);
-    (WHISPER_DTW_ONSET_LEAD_SECONDS + WHISPER_DTW_LEAD_DENSITY_SLOPE * excess)
-        .min(WHISPER_DTW_ONSET_LEAD_MAX_SECONDS)
+    whisper_dtw_onset_lead_for(&whisper_dtw_lead_tuning(), band_seconds, word_count)
 }
 
 /// Maximum duration, in seconds, a single DTW word may keep. The center fold
