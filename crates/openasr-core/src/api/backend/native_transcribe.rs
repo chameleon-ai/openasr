@@ -92,6 +92,22 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
+/// Whisper's default longform window, in seconds. Whisper is the only family
+/// that reaches its 30s *full* window in ordinary longform operation (its
+/// `Default` longform profile keeps the `Auto` elect, unclamped), and whisper's
+/// greedy decode is most likely to bail a 30s window to no-speech -- or trip
+/// the degenerate-repeat guard -- on soft, repetitive, continuous speech, where
+/// the whole window lands at the edge of its 30s training regime and the decode
+/// never reaches an honest stop. Dropping ~3s under the architecture's 30s
+/// invocation ceiling (which stays in force as the hard bound) gives the decode
+/// enough margin to complete, recovering the dropped words on recordings like a
+/// quiet continuous monologue. Measured on the long-clip suite: this lifts the
+/// four long clips' mean in-window coverage from 0.930 to 0.957 (the longest, a
+/// 635s soft monologue, from 0.823 to 0.897) while leaving the single-window
+/// clips byte-for-byte unchanged. Kept deliberately below the ceiling rather
+/// than widening it.
+const WHISPER_LONGFORM_WINDOW_SECONDS: f32 = 27.0;
+
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
     if value.eq_ignore_ascii_case("cpu") {
@@ -3691,6 +3707,7 @@ fn apply_longform_safety_policy(
         options,
         provenance,
     );
+    apply_whisper_longform_window_policy(model_architecture, options, provenance);
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
 }
 
@@ -3830,6 +3847,61 @@ fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
         options.padding_seconds = 0.0;
         provenance.push("core.native.longform.policy:whisper-xattn-dtw-no-padding".to_string());
     }
+}
+
+/// Sets whisper's longform window to [`WHISPER_LONGFORM_WINDOW_SECONDS`](27s),
+/// or to an `OPENASR_WHISPER_MAX_CHUNK_SECONDS` override, in both cases clamped
+/// at the architecture's invocation ceiling (30s).
+///
+/// The 27s window is a *quality* bound, distinct from the architectural ceiling:
+/// the 30s figure is whisper's hard fail-closed envelope (a wider invocation is
+/// rejected upstream by the `InvocationOutsideEnvelope` guard), whereas 27s is
+/// the point below which whisper's greedy decode reliably *completes* a
+/// 30s-class window instead of bailing soft, repetitive speech to no-speech or
+/// tripping the degenerate-repeat guard. Because it is clamped at the ceiling
+/// that `apply_invocation_span_longform_policy` already applied, it can never
+/// widen past the crash boundary. The override lets an operator dial the window
+/// tighter or restore 30s for a corpus where 27 regresses, without a rebuild;
+/// it is a no-op when unset.
+fn apply_whisper_longform_window_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+        return;
+    }
+    let ceiling = options.max_chunk_seconds;
+    let requested = match std::env::var("OPENASR_WHISPER_MAX_CHUNK_SECONDS") {
+        Ok(raw) => raw
+            .parse::<f32>()
+            .ok()
+            .filter(|sec| sec.is_finite() && *sec > 0.0),
+        Err(_) => None,
+    }
+    .unwrap_or(WHISPER_LONGFORM_WINDOW_SECONDS)
+    .min(ceiling);
+    if let Some(window) = apply_whisper_longform_window(options, requested) {
+        provenance.push(format!(
+            "core.native.longform.policy:whisper-window={window}"
+        ));
+    }
+}
+
+/// Set whisper's longform options to `requested` seconds, or `None` when they
+/// already sit there (so an override at the current value is a no-op). The
+/// caller clamps `requested` to the architecture ceiling ahead of time.
+fn apply_whisper_longform_window(
+    options: &mut crate::LongFormOptions,
+    requested: f32,
+) -> Option<f32> {
+    if (requested - options.max_chunk_seconds).abs() <= f32::EPSILON {
+        return None;
+    }
+    options.chunk_seconds = requested;
+    options.max_chunk_seconds = requested;
+    options.min_chunk_seconds = options.min_chunk_seconds.min(requested);
+    Some(requested)
 }
 
 /// Caps longform chunking to the architecture's declared
@@ -7458,8 +7530,11 @@ mod tests {
             crate::WHISPER_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(resolution.options.chunk_seconds, 30.0);
-        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        // Whisper's window is the 27s quality window, well inside the 30s
+        // invocation envelope (the whole point: a full 30s window is where
+        // whisper's greedy decode bails soft speech to no-speech).
+        assert_eq!(resolution.options.chunk_seconds, 27.0);
+        assert_eq!(resolution.options.max_chunk_seconds, 27.0);
         // Whisper's cross-attention-DTW word times are buffer-absolute while the
         // assembler rebases from `content_start_sample`, so the padding rule
         // (shared with `ScopedSlices` / `ConservativeSeq2SeqV1`) must zero it.
@@ -7476,6 +7551,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-window=27"))
+        );
 
         let samples = vec![0.05_f32; 61 * 16_000];
         let plan = plan_longform_slices(&samples, 16_000, &resolution.options, None)
@@ -7490,13 +7571,12 @@ mod tests {
     }
 
     /// The default (auto-triggered, no explicit `LongFormOptions`) longform
-    /// resolution for whisper must carry zero slice padding. The shared window
-    /// (`chunk_seconds`, `max_chunk_seconds`) is unchanged -- only the padding
-    /// the buffer-absolute cross-attention-DTW word times would be biased by is
-    /// dropped. Pinned separately from the explicit-`Fixed` case above (which is
-    /// requested with `padding_seconds: 0.25`) to prove the rule fires on the
-    /// default 0.25 path too, and that a `Default`-profile family it must NOT
-    /// touch (qwen) keeps its padding.
+    /// resolution for whisper must carry zero slice padding and a 27s window
+    /// (not the 30s it would otherwise inherit from the architecture ceiling).
+    /// Pinned separately from the explicit-`Fixed` case above (which is
+    /// requested with `padding_seconds: 0.25`) to prove both rules fire on the
+    /// default path, and that a `Default`-profile family neither rule must NOT
+    /// touch (qwen) keeps its padding and its 30s window.
     #[test]
     fn whisper_auto_longform_resolves_with_zero_slice_padding() {
         let defaults = crate::LongFormOptions::default();
@@ -7513,12 +7593,27 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
-        // Only padding moved; the generic longform window is preserved.
+        // The generic window is narrowed to the 27s quality window, and the
+        // padding the buffer-absolute cross-attention-DTW word times would be
+        // biased by is zeroed.
         assert_eq!(
             resolution.options.chunk_seconds,
-            defaults.chunk_seconds.min(30.0)
+            WHISPER_LONGFORM_WINDOW_SECONDS
         );
-        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        assert_eq!(
+            resolution.options.max_chunk_seconds,
+            WHISPER_LONGFORM_WINDOW_SECONDS
+        );
+        assert_eq!(
+            resolution.options.min_chunk_seconds,
+            defaults.min_chunk_seconds.min(27.0)
+        );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-window=27"))
+        );
 
         let non_whisper = resolve_native_longform_policy_for_backend(
             None,
@@ -7938,14 +8033,20 @@ mod tests {
                             crate::arch::DEFAULT_ENCODER_MAX_CHUNK_SECONDS
                         }
                     };
-                    let expected = descriptor
+                    let mut expected = descriptor
                         .max_single_invocation_seconds()
                         .map_or(product_window, |semantic_max| {
                             product_window.min(semantic_max)
                         });
+                    // whisper carries its own 27s quality window on top of the two
+                    // caps above; it only narrows the result.
+                    if descriptor.identity.model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
+                    {
+                        expected = expected.min(WHISPER_LONGFORM_WINDOW_SECONDS);
+                    }
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
-                        "'{}' must keep the min(product window, semantic invocation span)",
+                        "'{}' must keep the min(product window, semantic invocation span, and any family quality window)",
                         descriptor.identity.model_architecture
                     );
                 }
