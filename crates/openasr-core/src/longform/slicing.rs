@@ -4283,6 +4283,49 @@ mod tests {
     }
 
     #[test]
+    fn packed_window_cannot_exceed_the_chunk_ceiling_when_overlap_adds_on_top() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.min_chunk_seconds = 15.0;
+        options.overlap_seconds = 0.5;
+        let max_chunk_samples = 30 * 16_000;
+        options.max_chunk_seconds = 30.0;
+
+        // span1 is well under the ceiling (left whole by the silence-aware
+        // subdivide). span2 sits just under `chunk_samples` so the packer
+        // opens a window around it that inherits the full overlap tail from
+        // window 1: overlap + span2 = max_chunk_samples + overlap minus a
+        // hair -- strictly past the ceiling before the overlap shrink guard.
+        let span1_end = 25 * 16_000;
+        let span2_len = 30 * 16_000 - 960;
+        let spans = vec![
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: span1_end,
+            },
+            LongFormVadSlice {
+                start_sample: span1_end,
+                end_sample: span1_end + span2_len,
+            },
+        ];
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            16_000,
+            &options,
+            &[],
+            &TimelineMap::identity(),
+        );
+        for window in &windows {
+            assert!(
+                window.end_sample - window.start_sample <= max_chunk_samples,
+                "window [{start}..{end}] exceeds the {max_chunk_samples}-sample ceiling after the packer overlap was added: {windows:#?}",
+                start = window.start_sample,
+                end = window.end_sample
+            );
+        }
+    }
+
+    #[test]
     fn packed_layout_processed_samples_include_window_overlap_cost() {
         let layout = LongFormPlanningLayout {
             slices: vec![
