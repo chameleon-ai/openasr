@@ -3313,12 +3313,73 @@ const COHERE_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.42;
 /// the window's own decoded output (whisper counts decoded words; cohere
 /// decodes `<|notimestamps|>` so the content-token count of the band carries
 /// the same signal without re-decoding the whole window).
-fn cohere_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
+/// Tuning of the onset-lead curve, read once per call so a deployment can
+/// retune it without a rebuild. Each element falls back to its compiled
+/// default when unset or unparsable, so a bare environment is byte-identical
+/// to the historical behavior. The lead shifts every word start earlier
+/// (DTW entry frames are near-onset already), so the four points dial how far
+/// the fold reaches before the true speech onset.
+///
+/// Kept as a plain struct with a `Default` that mirrors the compiled constants
+/// so the lead curve is a pure, env-free function (and the no-override path
+/// stays byte-identical to the historical constants); see
+/// `cohere_dtw_onset_lead_for`. The run-time overrides exist so a deployment
+/// can retune the curve per corpus without a rebuild.
+#[derive(Debug, Clone, Copy)]
+struct CohereDtwLeadTuning {
+    baseline: f32,
+    knee: f32,
+    slope: f32,
+    maximum: f32,
+}
+
+impl Default for CohereDtwLeadTuning {
+    fn default() -> Self {
+        Self {
+            baseline: COHERE_DTW_ONSET_LEAD_SECONDS,
+            knee: COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC,
+            slope: COHERE_DTW_LEAD_DENSITY_SLOPE,
+            maximum: COHERE_DTW_ONSET_LEAD_MAX_SECONDS,
+        }
+    }
+}
+
+/// The onset lead for a tuning curve and one band: a flat baseline up to the
+/// knee, then a linear growth with band density capped at the maximum. Pure
+/// and env-free so the curve's shape is unit-testable.
+fn cohere_dtw_onset_lead_for(
+    tuning: &CohereDtwLeadTuning,
+    band_seconds: f32,
+    word_count: usize,
+) -> f32 {
     let band_seconds = band_seconds.max(0.05);
     let density = word_count as f32 / band_seconds;
-    let excess = (density - COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC).max(0.0);
-    (COHERE_DTW_ONSET_LEAD_SECONDS + COHERE_DTW_LEAD_DENSITY_SLOPE * excess)
-        .min(COHERE_DTW_ONSET_LEAD_MAX_SECONDS)
+    let excess = (density - tuning.knee).max(0.0);
+    (tuning.baseline + tuning.slope * excess).min(tuning.maximum)
+}
+
+/// The tuning curve to apply now, honoring the deployment env overrides. Each
+/// element falls back to its compiled default (see
+/// `CohereDtwLeadTuning::default`) when unset or unparsable, so a bare
+/// environment is byte-identical to the historical behavior.
+fn cohere_dtw_lead_tuning() -> CohereDtwLeadTuning {
+    let default = CohereDtwLeadTuning::default();
+    let read = |name: &str, fallback: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    CohereDtwLeadTuning {
+        baseline: read("OPENASR_COHERE_DTW_LEAD_BASE_SECONDS", default.baseline),
+        knee: read("OPENASR_COHERE_DTW_LEAD_KNEE_PER_SEC", default.knee),
+        slope: read("OPENASR_COHERE_DTW_LEAD_SLOPE", default.slope),
+        maximum: read("OPENASR_COHERE_DTW_LEAD_MAX_SECONDS", default.maximum),
+    }
+}
+
+fn cohere_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
+    cohere_dtw_onset_lead_for(&cohere_dtw_lead_tuning(), band_seconds, word_count)
 }
 
 /// Limit how long a single DTW word may run.
