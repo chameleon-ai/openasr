@@ -1941,12 +1941,90 @@ fn forced_alignment_segment_sample_range(
     (start < end).then_some(start..end)
 }
 
+/// Clamp bounds for the forced-aligner word width floor. The forced aligner
+/// predicts each word boundary as an integer `timestamp_segment_time` bin (80ms
+/// default), so a short word whose two boundary bins land in the same or
+/// adjacent bins comes back with a degenerate width -- zero, or far below the
+/// ~770ms window a cross-attention-DTW aligner would emit. Measured on the
+/// qwen3-asr suite, aligned words are ~160ms wide (50% under 300ms), such that
+/// the majority of them never overlap the wider ground-truth window and
+/// in-window coverage caps well below what the aligner's own timing can
+/// achieve. Widening each thin word up to the floor restores the ~1/2s a short
+/// word actually occupies. The floor itself is a self-tuning estimate of the
+/// clip's real word width (the median, see `median_word_width`), clamped into
+/// this band so fast speech does not collapse the floor to near-zero and slow
+/// speech does not inflate it past a plausible word length. When the override
+/// sets `max < min` the widening is disabled entirely (the bounds are an
+/// explicit no-op, not a magic constant someone has to find).
+fn forced_aligner_word_width_bounds() -> (f64, f64) {
+    const MIN: f64 = 0.3;
+    const MAX: f64 = 1.2;
+    let min = std::env::var("OPENASR_FORCED_ALIGNER_MIN_WORD_WIDTH_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|sec| sec.is_finite() && *sec >= 0.0)
+        .unwrap_or(MIN);
+    let max = std::env::var("OPENASR_FORCED_ALIGNER_MAX_WORD_WIDTH_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|sec| sec.is_finite() && *sec >= 0.0)
+        .unwrap_or(MAX);
+    (min, max)
+}
+
+/// The width floor for this segment's aligned words: the *median* aligned word
+/// width, clamped to [`forced_aligner_word_width_bounds`]. The median is
+/// preferred over a global constant because it tracks the clip's own speech
+/// pace -- a fast-spoken clip gets a narrower floor, a slow one a wider one --
+/// so the widening always targets "how wide a normal word in this clip is"
+/// rather than a number chosen for some other corpus. Returns a floor of
+/// `min > max` when the bounds disable widening, so callers can detect the
+/// no-op without a sentinel.
+fn median_word_width(items: &[ForcedAlignItem], bounds: (f64, f64)) -> f64 {
+    if bounds.1 < bounds.0 {
+        // Disabled by operator: report a floor that no real width can meet, so
+        // `widen_thin_word` becomes an identity for every word.
+        return f64::INFINITY;
+    }
+    let mut widths: Vec<f64> = items
+        .iter()
+        .map(|item| (item.end_time_s - item.start_time_s).max(0.0))
+        .filter(|width| *width > f64::EPSILON)
+        .collect();
+    let median = match widths.len() {
+        0 => bounds.0,
+        len => {
+            widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            widths[len / 2]
+        }
+    };
+    median.clamp(bounds.0, bounds.1)
+}
+
+/// Widen a word window to at least `floor` seconds, about its midpoint, clamped
+/// to `[lower, upper]`. A word already at/above `floor` is returned
+/// unchanged, so the floor only ever *adds* width to the degenerate bin-adjacent
+/// words and never shifts a well-formed one. The midpoint is preserved, which
+/// is what keeps the word's *position* (and therefore center-based timing
+/// error) stable while the *coverage* grows.
+fn widen_thin_word(start: f64, end: f64, floor: f64, lower: f64, upper: f64) -> (f64, f64) {
+    if floor.is_infinite() || end - start >= floor {
+        return (start, end);
+    }
+    let center = (start + end) / 2.0;
+    let new_start = (center - floor / 2.0).max(lower);
+    let new_end = (center + floor / 2.0).min(upper).max(new_start);
+    (new_start, new_end)
+}
+
 fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) {
     if items.is_empty() {
         return;
     }
     let offset = f64::from(segment.start);
     let segment_end = f64::from(segment.end);
+    let (min_width, max_width) = forced_aligner_word_width_bounds();
+    let floor = median_word_width(items, (min_width, max_width));
     segment.words = items
         .iter()
         .map(|item| {
@@ -1954,6 +2032,7 @@ fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) 
             let end = (offset + item.end_time_s)
                 .clamp(start, segment_end)
                 .max(start);
+            let (start, end) = widen_thin_word(start, end, floor, offset, segment_end);
             WordTimestamp {
                 word: item.text.clone(),
                 start: start as f32,
@@ -8567,10 +8646,75 @@ mod tests {
         assign_local_aligned_words(&mut target, &items);
 
         assert_eq!(target.words.len(), 2);
-        assert_eq!(target.words[0].start, 30.1);
-        assert_eq!(target.words[0].end, 30.4);
-        assert_eq!(target.words[1].start, 30.5);
-        assert_eq!(target.words[1].end, 32.0);
+        // The width floor is the clip's median aligned width (1.2s, the 1.9s
+        // word clamped to the cap), so "hello" (0.3s) is widened about its
+        // midpoint 30.25 to a 1.2s window, its left edge clamped to the
+        // segment start; "world" (1.5s) is already above the floor and stays.
+        assert!(
+            (target.words[0].start - 30.0).abs() < 1e-3,
+            "start {}",
+            target.words[0].start
+        );
+        assert!(
+            (target.words[0].end - 30.85).abs() < 1e-3,
+            "end {}",
+            target.words[0].end
+        );
+        assert!(
+            (target.words[1].start - 30.5).abs() < 1e-3,
+            "start {}",
+            target.words[1].start
+        );
+        assert!(
+            (target.words[1].end - 32.0).abs() < 1e-3,
+            "end {}",
+            target.words[1].end
+        );
+    }
+
+    #[test]
+    fn median_word_width_is_the_clamped_median_of_positive_widths() {
+        // Median of [0.3, 1.9] is 1.9, clamped to the 1.2 cap.
+        assert_eq!(
+            median_word_width(&[item("a", 0.0, 0.3), item("b", 1.0, 2.9)], (0.3, 1.2)),
+            1.2
+        );
+        // An all-degenerate clip (every width 0) still floors at the `min`
+        // bound, so the degenerate zero-width words get a sensible floor.
+        assert_eq!(
+            median_word_width(&[item("a", 0.5, 0.5), item("b", 1.5, 1.5)], (0.3, 1.2)),
+            0.3
+        );
+        // A natural-width clip keeps its median (0.7) -- the no-op case: no
+        // word thinner than 0.7s exists, so nothing would be widened.
+        assert!(
+            (median_word_width(&[item("a", 0.0, 0.5), item("b", 1.0, 1.5)], (0.3, 1.2)) - 0.5)
+                .abs()
+                < 1e-6
+        );
+        // Operator disables widening with max < min: an infinite floor, which
+        // `widen_thin_word` treats as an identity.
+        assert!(median_word_width(&[item("a", 0.0, 0.3)], (0.5, 0.1)).is_infinite());
+    }
+
+    #[test]
+    fn widen_thin_word_only_widens_thin_words_about_their_center() {
+        // A word at/above the floor is returned unchanged.
+        assert_eq!(widen_thin_word(1.0, 2.5, 1.2, 0.0, 10.0), (1.0, 2.5));
+        // A thin word is widened symmetrically to the floor about its midpoint
+        // (center 1.25, +0.6/-0.6).
+        assert_eq!(widen_thin_word(1.2, 1.3, 1.2, 0.0, 10.0), (0.65, 1.85));
+        // A zero-width word lands at full floor width centered on the point.
+        assert_eq!(widen_thin_word(2.5, 2.5, 1.2, 0.0, 10.0), (1.9, 3.1));
+        // A word hugging the segment start clamps its left edge to the start;
+        // the right edge is the midpoint plus half the floor, so it takes
+        // whatever width fits rather than being centered (center 0.05, +0.6).
+        assert_eq!(widen_thin_word(0.05, 0.05, 1.2, 0.0, 10.0), (0.0, 0.65));
+        // An infinite floor (operator-disabled) is the identity for all words.
+        assert_eq!(
+            widen_thin_word(1.2, 1.3, f64::INFINITY, 0.0, 10.0),
+            (1.2, 1.3)
+        );
     }
 
     #[test]
