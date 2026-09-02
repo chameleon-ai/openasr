@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::http::HeaderValue;
@@ -20,13 +21,127 @@ use openasr_core::{
     NativeAsrHardwareTarget, NativeAsrOfflineRequest, NativeAsrRequestOptions,
     NativeBackendExecutor, NativeRuntimeModelIdSource, PhraseBiasConfig, ResponseFormat,
     RuntimeModelResolutionError, Transcription, TranscriptionRequest, TranscriptionTask,
-    add_segment_word_timestamps, config::MAX_INFERENCE_THREADS, load_native_wav_16khz_mono_f32_v0,
-    native_runtime_model_adapter_for_path, parse_model_ref, prepare_audio_input,
-    refine_existing_transcription_timeline, render_transcription, resolve_runtime_model_ref,
-    runtime_registry,
+    add_segment_word_timestamps, align_plain_transcript_to_audio, config::MAX_INFERENCE_THREADS,
+    load_native_wav_16khz_mono_f32_v0, native_runtime_model_adapter_for_path, parse_model_ref,
+    prepare_audio_input, refine_existing_transcription_timeline, render_transcription,
+    resolve_runtime_model_ref, runtime_registry,
 };
 
 use crate::*;
+
+const REQUEST_ATTEMPT_HEADER: &str = "x-openasr-request-attempt";
+
+fn request_attempt_from_headers(
+    headers: &HeaderMap,
+) -> Result<openasr_core::RequestAttemptId, ApiError> {
+    match headers.get(REQUEST_ATTEMPT_HEADER) {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| {
+                ApiError::BadRequest(
+                    "x-openasr-request-attempt must be ASCII lowercase hexadecimal".to_string(),
+                )
+            })?;
+            openasr_core::RequestAttemptId::parse(value)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))
+        }
+        None => openasr_core::RequestAttemptId::generate().map_err(|_| {
+            ApiError::RequestAttemptIdentity(
+                "Could not allocate a request attempt identity".to_string(),
+            )
+        }),
+    }
+}
+
+fn request_server_timing_header(
+    snapshot: &openasr_core::NativeExecutionReceiptSnapshot,
+) -> Option<HeaderValue> {
+    let mut entries = Vec::new();
+    for (phase, wire_name) in [
+        (
+            openasr_core::RequestExecutionPhase::UploadIngest,
+            "upload_ingest",
+        ),
+        (
+            openasr_core::RequestExecutionPhase::DecodeNormalize,
+            "decode_normalize",
+        ),
+        (
+            openasr_core::RequestExecutionPhase::AdmissionWait,
+            "admission_wait",
+        ),
+        (openasr_core::RequestExecutionPhase::Compute, "compute"),
+    ] {
+        if let Some(micros) = snapshot.phase_duration_micros.get(&phase) {
+            entries.push(format!("{wire_name};dur={:.3}", *micros as f64 / 1_000.0));
+        }
+    }
+    (!entries.is_empty())
+        .then(|| HeaderValue::from_str(&entries.join(", ")).ok())
+        .flatten()
+}
+
+fn attach_request_attempt_header(
+    response: &mut Response,
+    attempt_id: openasr_core::RequestAttemptId,
+) {
+    response.headers_mut().insert(
+        REQUEST_ATTEMPT_HEADER,
+        HeaderValue::from_str(&attempt_id.to_string())
+            .expect("request attempt id is a valid HTTP header"),
+    );
+}
+
+#[cfg(test)]
+mod request_attempt_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn request_attempt_header_is_exact_or_server_minted() {
+        let mut headers = HeaderMap::new();
+        let minted = request_attempt_from_headers(&headers).unwrap();
+        assert_eq!(minted.to_string().len(), 32);
+        assert_ne!(minted, request_attempt_from_headers(&headers).unwrap());
+
+        headers.insert(
+            REQUEST_ATTEMPT_HEADER,
+            HeaderValue::from_static("00112233445566778899aabbccddeeff"),
+        );
+        assert_eq!(
+            request_attempt_from_headers(&headers).unwrap().to_string(),
+            "00112233445566778899aabbccddeeff"
+        );
+        headers.insert(
+            REQUEST_ATTEMPT_HEADER,
+            HeaderValue::from_static("00112233445566778899AABBCCDDEEFF"),
+        );
+        assert!(request_attempt_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn server_timing_uses_the_four_stable_phase_names() {
+        let receipt = openasr_core::NativeExecutionReceiptCollector::new();
+        for (phase, micros) in [
+            (openasr_core::RequestExecutionPhase::UploadIngest, 1_000),
+            (openasr_core::RequestExecutionPhase::DecodeNormalize, 2_000),
+            (openasr_core::RequestExecutionPhase::AdmissionWait, 3_000),
+            (openasr_core::RequestExecutionPhase::Compute, 4_000),
+        ] {
+            receipt.record_phase_duration(phase, Duration::from_micros(micros));
+        }
+        let value = request_server_timing_header(&receipt.snapshot())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            value,
+            "upload_ingest;dur=1.000, decode_normalize;dur=2.000, admission_wait;dur=3.000, compute;dur=4.000"
+        );
+        assert!(!value.contains("audio_prep"));
+        assert!(!value.contains("prepared_sample_attach"));
+    }
+}
 
 // ── Axum HTTP handlers ────────────────────────────────────────────────────────
 
@@ -43,30 +158,44 @@ pub(crate) async fn transcriptions(
         return crate::realtime::stream_transcription(
             runtime,
             distribution,
+            headers,
+            auth,
             multipart,
-            !remote_compute_client,
-            !remote_compute_client,
+            remote_compute_client,
         )
         .await;
     }
 
-    run_offline_transcription(runtime, headers, auth, distribution, multipart, None).await
+    run_offline_transcription_with_attempt(runtime, headers, auth, distribution, multipart, None)
+        .await
 }
 
-/// `POST /v1/audio/precise-timeline`: re-align word timestamps on an existing
-/// finished transcript without re-running ASR.
+/// `POST /v1/audio/precise-timeline`: produce a precise word/segment timeline
+/// without re-running ASR.
 ///
 /// Multipart fields:
 /// - `file` (required): source audio for forced alignment
-/// - `transcript_json` (required): verbose/json-style body with `text` + timed
-///   `segments` (and optional `subtitle_cues` / `timeline_quality` / `language`)
+/// - exactly one of:
+///   - `transcript`: plain-text manuscript (punctuation/case preserved in the
+///     returned `text`; the aligner tokenizes by stripping punctuation except
+///     letters, numbers, and apostrophes, splitting on ASCII whitespace, and
+///     treating each CJK ideograph as its own token)
+///   - `transcript_json`: verbose/json-style body with `text` + timed
+///     `segments` (and optional `subtitle_cues` / `timeline_quality` /
+///     `language`) used to refine an existing transcript
 /// - `word_timestamps` (optional, default true): keep per-word arrays on the
-///   refined dual-view result
-/// - `language` (optional): language hint when the transcript body omits one
+///   dual-view result
+/// - `language` (optional): ISO 639-1 or full name (`en` / `English`). Omitted
+///   or `auto` defaults to `en`. Japanese and Korean fail closed.
 /// - `execution_target` (optional): `auto` / `cpu` / `accelerated`
+/// - `response_format` (optional): `json`, `verbose_json` (default), `text`,
+///   `srt`, `vtt`, `markdown` — SRT/VTT reuse the shared subtitle exporter
 ///
-/// Returns the refined [`Transcription`] as verbose JSON. History persistence
-/// is left to the caller (`POST /v1/history/{id}/transcript` with If-Match).
+/// Returns the aligned [`Transcription`]. History persistence is left to the
+/// caller (`POST /v1/history/{id}/transcript` with If-Match). Missing Forced
+/// Aligner pack, unsupported language, empty normalized text, or a degenerate
+/// alignment fail closed. This is a compute route: paired device tokens may
+/// call it; it is not operator-only.
 pub(crate) async fn precise_timeline(
     State(runtime): State<ServerRuntime>,
     Extension(distribution): Extension<DistributionContext>,
@@ -77,6 +206,7 @@ pub(crate) async fn precise_timeline(
     let backend = runtime.backend;
     let ffmpeg_bin = runtime.ffmpeg_bin.clone();
     let ffmpeg_bin_explicit = runtime.ffmpeg_bin_explicit;
+    let response_format = parsed.response_format;
     let refined = tokio::task::spawn_blocking(move || {
         let prepared = prepare_audio_input(
             &parsed.audio_path,
@@ -111,25 +241,41 @@ pub(crate) async fn precise_timeline(
         let _activity_guard = NativeActivityGuard::enter();
         // Keep the upload temp path alive across prepare + load.
         let _audio_keepalive = parsed.audio_temp;
-        refine_existing_transcription_timeline(
-            parsed.transcription,
-            samples.as_slice(),
-            execution_services.as_ref(),
-            parsed.execution_target.unwrap_or_default(),
-            parsed.language_hint.as_deref(),
-            parsed.keep_word_timestamps,
-        )
-        .map_err(ApiError::Backend)
+        match parsed.transcript {
+            PreciseTimelineTranscript::Timed(transcription) => {
+                refine_existing_transcription_timeline(
+                    *transcription,
+                    samples.as_slice(),
+                    execution_services.as_ref(),
+                    parsed.execution_target.unwrap_or_default(),
+                    parsed.language_hint.as_deref(),
+                    parsed.keep_word_timestamps,
+                )
+                .map_err(ApiError::Backend)
+            }
+            PreciseTimelineTranscript::Plain(text) => align_plain_transcript_to_audio(
+                text,
+                samples.as_slice(),
+                execution_services.as_ref(),
+                parsed.execution_target.unwrap_or_default(),
+                parsed.language_hint.as_deref(),
+                parsed.keep_word_timestamps,
+            )
+            .map_err(ApiError::Backend),
+        }
     })
     .await
     .map_err(ApiError::BackendJoin)??;
-    let rendered =
-        render_transcription(&refined, ResponseFormat::VerboseJson).map_err(ApiError::Serialize)?;
+    let rendered = render_transcription(&refined, response_format).map_err(ApiError::Serialize)?;
+    let content_type = match response_format {
+        ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
+        ResponseFormat::Text
+        | ResponseFormat::Srt
+        | ResponseFormat::Vtt
+        | ResponseFormat::Markdown => mime::TEXT_PLAIN_UTF_8.as_ref(),
+    };
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(mime::APPLICATION_JSON.as_ref()),
-    );
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok((response_headers, rendered).into_response())
 }
 
@@ -138,10 +284,20 @@ struct PreciseTimelineUpload {
     audio_path: PathBuf,
     /// Keeps the uploaded temp file alive until prepare/load finish.
     audio_temp: tempfile::TempPath,
-    transcription: Transcription,
+    transcript: PreciseTimelineTranscript,
     language_hint: Option<String>,
     keep_word_timestamps: bool,
     execution_target: Option<ExecutionTarget>,
+    response_format: ResponseFormat,
+}
+
+#[derive(Debug)]
+enum PreciseTimelineTranscript {
+    /// Boxed: `Transcription` carries optional speaker-embedding payloads and
+    /// segment vectors; leaving it inline trips `large_enum_variant` against
+    /// the plain-text arm.
+    Timed(Box<Transcription>),
+    Plain(String),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -176,9 +332,11 @@ async fn parse_precise_timeline_multipart(
     let mut multipart = multipart.map_err(ApiError::MultipartRejection)?;
     let mut audio_temp: Option<tempfile::TempPath> = None;
     let mut transcript_json: Option<String> = None;
+    let mut transcript_plain: Option<String> = None;
     let mut language_hint: Option<String> = None;
     let mut keep_word_timestamps = true;
     let mut execution_target: Option<ExecutionTarget> = None;
+    let mut response_format = ResponseFormat::VerboseJson;
 
     while let Some(field) = multipart.next_field().await.map_err(ApiError::Multipart)? {
         let name = field.name().unwrap_or_default().to_string();
@@ -194,6 +352,9 @@ async fn parse_precise_timeline_multipart(
             "transcript_json" => {
                 transcript_json = Some(field.text().await.map_err(ApiError::Multipart)?);
             }
+            "transcript" => {
+                transcript_plain = Some(field.text().await.map_err(ApiError::Multipart)?);
+            }
             "language" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 let trimmed = value.trim();
@@ -207,6 +368,10 @@ async fn parse_precise_timeline_multipart(
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 execution_target = Some(parse_execution_target_field(&value)?);
             }
+            "response_format" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                response_format = ResponseFormat::from_str(&value).map_err(ApiError::Format)?;
+            }
             _ => {
                 // Ignore unknown fields for forward compatibility.
                 let _ = field.bytes().await.map_err(ApiError::Multipart)?;
@@ -214,21 +379,22 @@ async fn parse_precise_timeline_multipart(
         }
     }
 
-    let (audio_temp, body) =
-        finalize_precise_timeline_fields(audio_temp, transcript_json.as_deref())?;
+    let (audio_temp, transcript) = finalize_precise_timeline_fields(
+        audio_temp,
+        transcript_json.as_deref(),
+        transcript_plain.as_deref(),
+        language_hint.clone(),
+    )?;
     let audio_path = audio_temp.to_path_buf();
-    let mut transcription = body.into_transcription();
-    if transcription.language.is_none() {
-        transcription.language = language_hint.clone();
-    }
 
     Ok(PreciseTimelineUpload {
         audio_path,
         audio_temp,
-        transcription,
+        transcript,
         language_hint,
         keep_word_timestamps,
         execution_target,
+        response_format,
     })
 }
 
@@ -238,30 +404,52 @@ async fn parse_precise_timeline_multipart(
 fn finalize_precise_timeline_fields(
     audio_temp: Option<tempfile::TempPath>,
     transcript_json: Option<&str>,
-) -> Result<(tempfile::TempPath, PreciseTimelineTranscriptBody), ApiError> {
+    transcript_plain: Option<&str>,
+    language_hint: Option<String>,
+) -> Result<(tempfile::TempPath, PreciseTimelineTranscript), ApiError> {
     let audio_temp = audio_temp.ok_or_else(|| {
         ApiError::BadRequest(
-            "Missing required form field: file (source audio for precise timeline refine)".into(),
+            "Missing required form field: file (source audio for precise timeline)".into(),
         )
     })?;
-    let transcript_raw = transcript_json.ok_or_else(|| {
-        ApiError::BadRequest(
-            "Missing required form field: transcript_json (finished transcript body)".into(),
-        )
-    })?;
-    let body: PreciseTimelineTranscriptBody = serde_json::from_str(transcript_raw)
-        .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
-    if body.segments.is_empty() {
-        return Err(ApiError::BadRequest(
-            "transcript_json.segments must contain at least one timed segment".into(),
-        ));
+    match (transcript_json, transcript_plain) {
+        (Some(_), Some(_)) => Err(ApiError::BadRequest(
+            "Provide exactly one of transcript (plain text) or transcript_json (timed transcript body)".into(),
+        )),
+        (None, None) => Err(ApiError::BadRequest(
+            "Missing required form field: transcript (plain text) or transcript_json (timed transcript body)".into(),
+        )),
+        (None, Some(plain)) => {
+            if plain.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "transcript must contain at least one non-whitespace character".into(),
+                ));
+            }
+            Ok((audio_temp, PreciseTimelineTranscript::Plain(plain.to_string())))
+        }
+        (Some(transcript_raw), None) => {
+            let body: PreciseTimelineTranscriptBody = serde_json::from_str(transcript_raw)
+                .map_err(|error| ApiError::BadRequest(format!("Invalid transcript_json: {error}")))?;
+            if body.segments.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "transcript_json.segments must contain at least one timed segment".into(),
+                ));
+            }
+            let mut transcription = body.into_transcription();
+            if transcription.language.is_none() {
+                transcription.language = language_hint;
+            }
+            Ok((
+                audio_temp,
+                PreciseTimelineTranscript::Timed(Box::new(transcription)),
+            ))
+        }
     }
-    Ok((audio_temp, body))
 }
 
 #[cfg(test)]
 mod precise_timeline_parse_tests {
-    use super::{ApiError, finalize_precise_timeline_fields};
+    use super::{ApiError, PreciseTimelineTranscript, finalize_precise_timeline_fields};
 
     fn sample_transcript_json() -> String {
         serde_json::json!({
@@ -278,39 +466,78 @@ mod precise_timeline_parse_tests {
 
     #[test]
     fn missing_file_is_bad_request() {
-        let err = finalize_precise_timeline_fields(None, Some(&sample_transcript_json()))
-            .expect_err("file is required");
+        let err =
+            finalize_precise_timeline_fields(None, Some(&sample_transcript_json()), None, None)
+                .expect_err("file is required");
         assert!(matches!(err, ApiError::BadRequest(message) if message.contains("file")));
     }
 
     #[test]
-    fn missing_transcript_json_is_bad_request() {
+    fn missing_transcript_is_bad_request() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
-        let err = finalize_precise_timeline_fields(Some(audio), None)
-            .expect_err("transcript_json is required");
-        assert!(
-            matches!(err, ApiError::BadRequest(message) if message.contains("transcript_json"))
-        );
+        let err = finalize_precise_timeline_fields(Some(audio), None, None, None)
+            .expect_err("transcript is required");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("transcript")));
+    }
+
+    #[test]
+    fn both_transcript_forms_are_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let err = finalize_precise_timeline_fields(
+            Some(audio),
+            Some(&sample_transcript_json()),
+            Some("hello"),
+            None,
+        )
+        .expect_err("exactly one transcript form");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("exactly one")));
+    }
+
+    #[test]
+    fn empty_plain_transcript_is_bad_request() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let err = finalize_precise_timeline_fields(Some(audio), None, Some("  \n"), None)
+            .expect_err("empty plain transcript must fail closed");
+        assert!(matches!(err, ApiError::BadRequest(message) if message.contains("transcript")));
     }
 
     #[test]
     fn empty_segments_is_bad_request() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
         let body = r#"{"text":"","segments":[]}"#;
-        let err = finalize_precise_timeline_fields(Some(audio), Some(body))
+        let err = finalize_precise_timeline_fields(Some(audio), Some(body), None, None)
             .expect_err("empty segments must fail closed");
         assert!(matches!(err, ApiError::BadRequest(message) if message.contains("segments")));
     }
 
     #[test]
-    fn valid_fields_parse() {
+    fn valid_json_fields_parse() {
         let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
-        let (temp, body) =
-            finalize_precise_timeline_fields(Some(audio), Some(&sample_transcript_json()))
-                .expect("valid multipart fields");
+        let (temp, transcript) = finalize_precise_timeline_fields(
+            Some(audio),
+            Some(&sample_transcript_json()),
+            None,
+            None,
+        )
+        .expect("valid multipart fields");
+        let PreciseTimelineTranscript::Timed(body) = transcript else {
+            panic!("expected timed transcript");
+        };
         assert_eq!(body.text, "hello");
         assert_eq!(body.segments.len(), 1);
         assert!(temp.to_path_buf().exists() || !temp.to_path_buf().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn valid_plain_transcript_parses() {
+        let audio = super::write_upload_temp_file(b"RIFF", ".wav").expect("temp");
+        let (_temp, transcript) =
+            finalize_precise_timeline_fields(Some(audio), None, Some("hello world"), None)
+                .expect("plain transcript");
+        let PreciseTimelineTranscript::Plain(text) = transcript else {
+            panic!("expected plain transcript");
+        };
+        assert_eq!(text, "hello world");
     }
 }
 
@@ -325,7 +552,7 @@ pub(crate) async fn translations(
     Extension(distribution): Extension<DistributionContext>,
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<Response, ApiError> {
-    run_offline_transcription(
+    run_offline_transcription_with_attempt(
         runtime,
         headers,
         auth,
@@ -334,6 +561,36 @@ pub(crate) async fn translations(
         Some(TranscriptionTask::Translate),
     )
     .await
+}
+
+/// Mint or accept the request identity before entering the fallible upload and
+/// native pipeline, then echo it on every terminal response. Invalid identity
+/// syntax is the sole exception because no trustworthy value exists to echo.
+async fn run_offline_transcription_with_attempt(
+    runtime: ServerRuntime,
+    headers: HeaderMap,
+    auth: ServerAuth,
+    distribution: DistributionContext,
+    multipart: Result<Multipart, MultipartRejection>,
+    task_override: Option<TranscriptionTask>,
+) -> Result<Response, ApiError> {
+    let request_attempt_id = request_attempt_from_headers(&headers)?;
+    let mut response = match run_offline_transcription(
+        runtime,
+        headers,
+        auth,
+        distribution,
+        multipart,
+        task_override,
+        request_attempt_id,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    attach_request_attempt_header(&mut response, request_attempt_id);
+    Ok(response)
 }
 
 /// Fixed denominator for the backward-compatible `done`/`total` ratio: `done /
@@ -451,9 +708,39 @@ fn legacy_progress_response(
 /// run's progress silently impersonating "the" global progress. New callers
 /// should prefer the id-scoped `GET /v1/audio/transcriptions/{id}/progress`
 /// below, which never has this ambiguity. Auth is enforced by the shared
-/// middleware like every other non-operator route.
-pub(crate) async fn transcription_progress() -> Result<Response, ApiError> {
-    legacy_progress_response(openasr_core::api::backend::native_transcription_progress())
+/// middleware like every other non-operator route. Device tokens only see
+/// jobs they own; an operator-local job (no owner) reads as idle to a
+/// paired device, matching [`transcription_progress_by_id`].
+pub(crate) async fn transcription_progress(
+    Extension(auth): Extension<crate::ServerAuth>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let caller = auth.pairing_device_id_for_headers(&headers);
+    let caller_is_operator = auth.authorizes_pairing_admin(&headers);
+    let visible: Vec<String> = openasr_core::api::backend::native_active_transcription_ids()
+        .into_iter()
+        .filter(|id| {
+            caller_may_control_transcription(
+                distribution.transcription_owner(id).as_deref(),
+                caller.as_deref(),
+                caller_is_operator,
+            )
+        })
+        .collect();
+    let progress = match visible.as_slice() {
+        [] => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Idle,
+        [id] => match openasr_core::api::backend::native_transcription_progress_for_id(id) {
+            Some(progress) => {
+                openasr_core::api::backend::LegacyNativeTranscriptionProgress::Single(progress)
+            }
+            None => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Idle,
+        },
+        ids => openasr_core::api::backend::LegacyNativeTranscriptionProgress::Ambiguous {
+            active_count: ids.len(),
+        },
+    };
+    legacy_progress_response(progress)
 }
 
 /// `GET /v1/audio/transcriptions/{id}/progress`: progress of the file
@@ -464,7 +751,19 @@ pub(crate) async fn transcription_progress() -> Result<Response, ApiError> {
 /// names exactly one run. A live duplicate id is rejected at registration.
 pub(crate) async fn transcription_progress_by_id(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
+    Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let owner = distribution.transcription_owner(&id);
+    let caller = auth.pairing_device_id_for_headers(&headers);
+    if !caller_may_control_transcription(
+        owner.as_deref(),
+        caller.as_deref(),
+        auth.authorizes_pairing_admin(&headers),
+    ) {
+        return Ok(Json(TranscriptionProgressBody::idle()).into_response());
+    }
     let body = match openasr_core::api::backend::native_transcription_progress_for_id(&id) {
         Some(progress) => TranscriptionProgressBody::from_progress(progress),
         None => TranscriptionProgressBody::idle(),
@@ -502,7 +801,9 @@ pub(crate) struct TranscriptionControlBody {
 /// more worker thread to protect, so a normal completion must never also
 /// fire a spurious cancel.
 struct ActiveTranscriptionCleanup {
+    runtime: Option<ServerRuntime>,
     distribution: DistributionContext,
+    policy: RemoteRuntimePolicy,
     transcription_id: String,
     control: Arc<openasr_core::TranscriptionControl>,
     armed: bool,
@@ -510,15 +811,25 @@ struct ActiveTranscriptionCleanup {
 
 impl ActiveTranscriptionCleanup {
     fn new(
+        runtime: Option<ServerRuntime>,
         distribution: DistributionContext,
+        policy: RemoteRuntimePolicy,
         transcription_id: String,
         control: Arc<openasr_core::TranscriptionControl>,
     ) -> Self {
         Self {
+            runtime,
             distribution,
+            policy,
             transcription_id,
             control,
             armed: true,
+        }
+    }
+
+    fn observe_idle(&self) {
+        if let Some(runtime) = self.runtime.clone() {
+            schedule_apply_pending_idle_switch_when_native_idle(runtime, self.distribution.clone());
         }
     }
 
@@ -534,6 +845,22 @@ impl Drop for ActiveTranscriptionCleanup {
     fn drop(&mut self) {
         if self.armed {
             self.control.request_cancel();
+            if self.policy.is_file_queued(&self.transcription_id) {
+                self.policy.cancel_file(&self.transcription_id);
+                self.observe_idle();
+            } else if self.policy.file_running().as_deref() == Some(self.transcription_id.as_str())
+            {
+                // Abort must release the FIFO immediately. Native occupancy is
+                // still visible via has_active_sessions, so a follow-up file
+                // waits there instead of jumping a still-running worker.
+                self.policy.finish_file(&self.transcription_id);
+                self.observe_idle();
+            } else {
+                self.observe_idle();
+            }
+        } else {
+            self.policy.finish_file(&self.transcription_id);
+            self.observe_idle();
         }
         self.distribution
             .clear_transcription_if_current(&self.transcription_id, &self.control);
@@ -559,12 +886,80 @@ fn active_transcription_control(
     })
 }
 
+pub(crate) fn file_slot_occupied(runtime: &ServerRuntime, except_id: Option<&str>) -> bool {
+    let policy = runtime.native_execution.remote_policy();
+    let other_file = policy
+        .file_running()
+        .is_some_and(|running| except_id != Some(running.as_str()));
+    other_file || runtime.native_execution.has_active_sessions() || policy.has_held_realtime()
+}
+
+async fn wait_for_file_admission(
+    runtime: &ServerRuntime,
+    id: &str,
+    control: &openasr_core::TranscriptionControl,
+) -> Result<(), ApiError> {
+    let policy = runtime.native_execution.remote_policy();
+    loop {
+        if control.is_canceled() {
+            policy.cancel_file(id);
+            return Err(ApiError::Backend(
+                openasr_core::BackendError::TranscriptionCanceled,
+            ));
+        }
+        let occupied = file_slot_occupied(runtime, Some(id));
+        match policy.admit_file(id, occupied) {
+            Err(RemoteAdmitError::PendingIdleSwitch) => {
+                return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+            }
+            Ok(FileAdmit::Running) => return Ok(()),
+            Ok(FileAdmit::Queued) => {
+                tokio::select! {
+                    _ = policy.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        }
+    }
+}
+
+fn record_file_operator_run(
+    runtime: &ServerRuntime,
+    distribution: &DistributionContext,
+    auth: &ServerAuth,
+    headers: &HeaderMap,
+    started: Instant,
+    success: bool,
+    error_type: Option<&str>,
+) {
+    let device_name = auth
+        .pairing_device_id_for_headers(headers)
+        .unwrap_or_else(|| "operator".to_string());
+    let started_at = SystemTime::now()
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(SystemTime::now);
+    runtime
+        .native_execution
+        .remote_policy()
+        .record_run(OperatorRunRecord {
+            device_name,
+            started_at,
+            duration: started.elapsed(),
+            kind: "file".to_string(),
+            success,
+            error_type: error_type.map(str::to_string),
+        });
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), distribution.clone());
+}
+
 fn register_active_transcription(
     distribution: &DistributionContext,
     id: &str,
+    owner_device_id: Option<&str>,
 ) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
     let control = Arc::new(openasr_core::TranscriptionControl::new());
     if distribution.try_register_transcription(id, Arc::clone(&control)) {
+        distribution.set_transcription_owner(id, owner_device_id);
         Ok(control)
     } else {
         Err(ApiError::Conflict(format!(
@@ -573,15 +968,61 @@ fn register_active_transcription(
     }
 }
 
+pub(crate) fn caller_may_control_transcription(
+    owner_device_id: Option<&str>,
+    caller_device_id: Option<&str>,
+    caller_is_operator: bool,
+) -> bool {
+    if caller_is_operator {
+        return true;
+    }
+    match (owner_device_id, caller_device_id) {
+        (Some(owner), Some(caller)) => owner == caller,
+        // Missing owner is an operator-local job. A caller with no device id
+        // is the local operator path (pairing disabled). A paired device
+        // cannot control it.
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn require_transcription_control(
+    distribution: &DistributionContext,
+    auth: &crate::ServerAuth,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Arc<openasr_core::TranscriptionControl>, ApiError> {
+    let control = active_transcription_control(distribution, id)?;
+    let owner = distribution.transcription_owner(id);
+    let caller = auth.pairing_device_id_for_headers(headers);
+    if !caller_may_control_transcription(
+        owner.as_deref(),
+        caller.as_deref(),
+        auth.authorizes_pairing_admin(headers),
+    ) {
+        return Err(ApiError::Forbidden(
+            "Only the device that started this transcription can control it.".to_string(),
+        ));
+    }
+    Ok(control)
+}
+
 /// `POST /v1/audio/transcriptions/{id}/cancel`: cancel an in-flight file
 /// transcription. The decode stops at the next long-form slice boundary and the
 /// original transcription request fails closed with a canceled status; the
 /// already-decoded portion is discarded (see `BackendError::TranscriptionCanceled`).
 pub(crate) async fn cancel_transcription_job(
+    State(runtime): State<ServerRuntime>,
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_cancel();
+    let control = require_transcription_control(&distribution, &auth, &headers, &id)?;
+    control.request_cancel();
+    if runtime.native_execution.remote_policy().is_file_queued(&id) {
+        runtime.native_execution.remote_policy().cancel_file(&id);
+    }
     control_body_response(id, "canceled")
 }
 
@@ -590,9 +1031,11 @@ pub(crate) async fn cancel_transcription_job(
 /// the original request) block until a matching resume or cancel arrives.
 pub(crate) async fn pause_transcription_job(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_pause();
+    require_transcription_control(&distribution, &auth, &headers, &id)?.request_pause();
     control_body_response(id, "paused")
 }
 
@@ -601,10 +1044,155 @@ pub(crate) async fn pause_transcription_job(
 /// in-flight run, keeping the already-accumulated segments.
 pub(crate) async fn resume_transcription_job(
     AxumPath(id): AxumPath<String>,
+    Extension(auth): Extension<crate::ServerAuth>,
     Extension(distribution): Extension<DistributionContext>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    active_transcription_control(&distribution, &id)?.request_resume();
+    require_transcription_control(&distribution, &auth, &headers, &id)?.request_resume();
     control_body_response(id, "running")
+}
+
+pub(crate) struct FileTranscriptionOutcome {
+    pub transcription: openasr_core::Transcription,
+    pub history_request: TranscriptionRequest,
+    pub request_receipt: Option<openasr_core::NativeExecutionReceiptCollector>,
+}
+
+/// Shared file-job admission, cancel control, decode, and finish_file Drop
+/// guard. JSON and `?stream=true` both go through this so stream cannot skip
+/// the FIFO, owner registry, or abort cleanup.
+pub(crate) async fn transcribe_parsed_file(
+    runtime: ServerRuntime,
+    headers: HeaderMap,
+    auth: ServerAuth,
+    distribution: DistributionContext,
+    parsed: ParsedTranscriptionRequest,
+    request_attempt_id: Option<openasr_core::RequestAttemptId>,
+    request_receipt: Option<openasr_core::NativeExecutionReceiptCollector>,
+) -> Result<FileTranscriptionOutcome, ApiError> {
+    let history_request = parsed.request.clone();
+    let _uploaded_file = parsed._uploaded_file;
+    let control = if let Some(id) = parsed.transcription_id.clone() {
+        let owner = auth.pairing_device_id_for_headers(&headers);
+        let control = register_active_transcription(&distribution, &id, owner.as_deref())?;
+        Some((id, control))
+    } else {
+        None
+    };
+    let mut control_cleanup = control.as_ref().map(|(id, control)| {
+        ActiveTranscriptionCleanup::new(
+            Some(runtime.clone()),
+            distribution.clone(),
+            runtime.native_execution.remote_policy().clone(),
+            id.clone(),
+            Arc::clone(control),
+        )
+    });
+    let run_started = Instant::now();
+    if let Some((id, control)) = &control {
+        if let Err(error) = wait_for_file_admission(&runtime, id, control).await {
+            if matches!(
+                error,
+                ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled)
+            ) {
+                record_file_operator_run(
+                    &runtime,
+                    &distribution,
+                    &auth,
+                    &headers,
+                    run_started,
+                    false,
+                    Some("canceled"),
+                );
+            }
+            return Err(error);
+        }
+    } else if !runtime.native_execution.remote_policy().admits_new_tasks() {
+        return Err(ApiError::Conflict(PENDING_IDLE_SWITCH_MESSAGE.to_string()));
+    } else if file_slot_occupied(&runtime, None) {
+        return Err(ApiError::Busy(SERVER_BUSY_MESSAGE.to_string()));
+    }
+    let mut execution_context = match &control {
+        Some((id, control)) => {
+            openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
+        }
+        None => openasr_core::RequestExecutionContext::uncancellable(
+            "client never registered a transcription id for this request, so it has no cancel source",
+        ),
+    };
+    if let Some(request_attempt_id) = request_attempt_id {
+        execution_context = execution_context.with_request_attempt_id(request_attempt_id);
+    }
+    if let Some(receipt) = request_receipt.as_ref() {
+        execution_context = execution_context.with_native_execution_receipt(receipt.clone());
+    }
+    let execution_context = Arc::new(execution_context);
+    let transcription = match transcribe_with_runtime(
+        runtime.clone(),
+        parsed.request,
+        Arc::clone(&execution_context),
+    )
+    .await
+    {
+        Ok(transcription) => {
+            if let Some(receipt) = request_receipt.as_ref() {
+                receipt.record_terminal(openasr_core::RequestExecutionTerminal::Succeeded);
+            }
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
+            }
+            record_file_operator_run(
+                &runtime,
+                &distribution,
+                &auth,
+                &headers,
+                run_started,
+                true,
+                None,
+            );
+            transcription
+        }
+        Err(error) => {
+            if let Some(cleanup) = control_cleanup.as_mut() {
+                cleanup.disarm();
+            }
+            if execution_context.is_canceled() {
+                if let Some(receipt) = request_receipt.as_ref() {
+                    receipt.record_terminal(openasr_core::RequestExecutionTerminal::Canceled);
+                }
+                record_file_operator_run(
+                    &runtime,
+                    &distribution,
+                    &auth,
+                    &headers,
+                    run_started,
+                    false,
+                    Some("canceled"),
+                );
+                return Err(ApiError::Backend(
+                    openasr_core::BackendError::TranscriptionCanceled,
+                ));
+            }
+            if let Some(receipt) = request_receipt.as_ref() {
+                receipt.record_terminal(openasr_core::RequestExecutionTerminal::Failed);
+            }
+            record_file_operator_run(
+                &runtime,
+                &distribution,
+                &auth,
+                &headers,
+                run_started,
+                false,
+                Some("error"),
+            );
+            return Err(error);
+        }
+    };
+    Ok(FileTranscriptionOutcome {
+        transcription,
+        history_request,
+        request_receipt,
+    })
 }
 
 /// Shared non-streaming transcription/translation core. `task_override` forces
@@ -617,17 +1205,32 @@ async fn run_offline_transcription(
     distribution: DistributionContext,
     multipart: Result<Multipart, MultipartRejection>,
     task_override: Option<TranscriptionTask>,
+    request_attempt_id: openasr_core::RequestAttemptId,
 ) -> Result<Response, ApiError> {
     let home = distribution.openasr_home()?;
     let catalog = load_runtime_model_catalog(distribution.catalog_source(), &home)?;
-    let mut parsed =
-        parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await?;
-    if is_remote_compute_client_request(&headers, &auth) && parsed.request.voice_id {
-        return Err(ApiError::BadRequest(
-            "Voice ID is available only for local file transcription; remote-compute requests must omit diarize=true."
-                .to_string(),
-        ));
+    let upload_ingest_started = Instant::now();
+    let parsed = parse_transcription_multipart(multipart, runtime.backend, catalog.as_ref()).await;
+    let upload_ingest_duration = upload_ingest_started.elapsed();
+    openasr_core::stage_timing::log_stage(
+        "http_transcription",
+        "upload_ingest",
+        upload_ingest_duration,
+    );
+    let mut parsed = parsed?;
+    let request_receipt = (runtime.backend == BackendKind::Native)
+        .then(openasr_core::NativeExecutionReceiptCollector::new);
+    if let Some(receipt) = request_receipt.as_ref() {
+        receipt.record_phase_duration(
+            openasr_core::RequestExecutionPhase::UploadIngest,
+            upload_ingest_duration,
+        );
     }
+    let remote_compute_client = is_remote_compute_client_request(&headers, &auth);
+    if remote_compute_client {
+        apply_remote_compute_client_request_policy(&mut parsed.request);
+    }
+    reject_device_token_speaker_embeddings(&parsed.request, remote_compute_client)?;
     if parsed.stream_form_field {
         // Fail closed instead of silently returning a JSON body an OpenAI SDK
         // streaming client would hang on (it expects `transcript.text.*` SSE
@@ -675,72 +1278,23 @@ async fn run_offline_transcription(
                 .get(),
         );
     }
-    let history_request = parsed.request.clone();
-    // Register an in-session pause/cancel control when the client supplied a
-    // transcription id and the native backend is in use (control acts at
-    // long-form slice boundaries; the mock backend has no such loop). The
-    // cleanup guard removes the registry entry on every exit -- success, error,
-    // or cancel.
-    let control = if runtime.backend == BackendKind::Native {
-        if let Some(id) = parsed.transcription_id.clone() {
-            let control = register_active_transcription(&distribution, &id)?;
-            Some((id, control))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // Armed for as long as the decode call below is in flight: if the client
-    // disconnects and axum drops this handler future first, `Drop` cancels the
-    // control so the (possibly paused) worker thread wakes and exits instead
-    // of leaking. Disarmed immediately after that call returns, either way.
-    let mut control_cleanup = control.as_ref().map(|(id, control)| {
-        ActiveTranscriptionCleanup::new(distribution.clone(), id.clone(), Arc::clone(control))
-    });
-    // Explicit per-request context threaded all the way to the decode
-    // dispatch -- never a thread-local. A client that never registered a
-    // transcription id still gets a concrete (uncancellable) context: there
-    // is no "no context" code path below this point.
-    let execution_context = Arc::new(match &control {
-        Some((id, control)) => {
-            openasr_core::RequestExecutionContext::new(Some(id.clone()), Arc::clone(control))
-        }
-        None => openasr_core::RequestExecutionContext::uncancellable(
-            "client never registered a transcription id for this request, so it has no cancel source",
-        ),
-    });
-    let transcription = match transcribe_with_runtime(
-        runtime,
-        parsed.request,
-        Arc::clone(&execution_context),
+    let response_format = parsed.response_format;
+    let FileTranscriptionOutcome {
+        transcription,
+        history_request,
+        request_receipt,
+    } = transcribe_parsed_file(
+        runtime.clone(),
+        headers.clone(),
+        auth.clone(),
+        distribution.clone(),
+        parsed,
+        Some(request_attempt_id),
+        request_receipt,
     )
-    .await
-    {
-        Ok(transcription) => {
-            if let Some(cleanup) = control_cleanup.as_mut() {
-                cleanup.disarm();
-            }
-            transcription
-        }
-        Err(error) => {
-            if let Some(cleanup) = control_cleanup.as_mut() {
-                cleanup.disarm();
-            }
-            // A cancel surfaces from core as a generic fail-closed error (the
-            // typed cancel is flattened through the NativeAsrError layer), so
-            // consult the control to report it honestly as a 409 canceled result
-            // rather than a 400 fail-closed refusal.
-            if execution_context.is_canceled() {
-                return Err(ApiError::Backend(
-                    openasr_core::BackendError::TranscriptionCanceled,
-                ));
-            }
-            return Err(error);
-        }
-    };
-    let rendered = render_transcription(&transcription, parsed.response_format)
-        .map_err(ApiError::Serialize)?;
+    .await?;
+    let rendered =
+        render_transcription(&transcription, response_format).map_err(ApiError::Serialize)?;
     // History is a best-effort audit side-write: a successful transcription must
     // not fail because the history store could not be written (e.g. a read-only
     // or misconfigured OPENASR_HOME). Log and continue; the realtime path already
@@ -750,7 +1304,7 @@ async fn run_offline_transcription(
             &distribution,
             &history_request,
             &transcription,
-            parsed.response_format,
+            response_format,
         ) {
             Ok(entry) => entry.map(|entry| entry.id),
             Err(error) => {
@@ -764,7 +1318,7 @@ async fn run_offline_transcription(
         None
     };
 
-    let content_type = match parsed.response_format {
+    let content_type = match response_format {
         ResponseFormat::Json | ResponseFormat::VerboseJson => mime::APPLICATION_JSON.as_ref(),
         ResponseFormat::Text
         | ResponseFormat::Srt
@@ -774,6 +1328,11 @@ async fn run_offline_transcription(
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Some(receipt) = request_receipt.as_ref()
+        && let Some(value) = request_server_timing_header(&receipt.snapshot())
+    {
+        response_headers.insert("server-timing", value);
+    }
     if let Some(history_id) = history_id {
         response_headers.insert(
             "x-openasr-history-id",
@@ -924,6 +1483,43 @@ pub(crate) fn is_remote_compute_client_request(headers: &HeaderMap, auth: &Serve
     auth.authorizes_remote_compute_client(headers)
 }
 
+/// Remote clients never send enrolled Voice ID or local hardware policy.
+/// Speaker separation becomes anonymous labels; threads/target come from the
+/// operator machine preference (filled later) or Auto.
+pub(crate) fn apply_remote_compute_client_request_policy(request: &mut TranscriptionRequest) {
+    if request.voice_id {
+        request.voice_id = false;
+        request.anonymous_diarize = true;
+    }
+    request.inference_threads = None;
+    request.execution_target = None;
+}
+
+const SPEAKER_EMBEDDINGS_DEVICE_TOKEN_FORBIDDEN: &str = "Speaker embeddings are biometric-derived data and cannot be returned to a remote-compute device token. Omit return_speaker_embeddings to continue with anonymous speaker labels. Operator and loopback clients are not restricted.";
+
+pub(crate) fn reject_device_token_speaker_embeddings(
+    request: &TranscriptionRequest,
+    remote_compute_client: bool,
+) -> Result<(), ApiError> {
+    if request.return_speaker_embeddings && remote_compute_client {
+        return Err(ApiError::Authorization(
+            SPEAKER_EMBEDDINGS_DEVICE_TOKEN_FORBIDDEN.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_streaming_speaker_embeddings(
+    request: &TranscriptionRequest,
+) -> Result<(), ApiError> {
+    if request.return_speaker_embeddings {
+        return Err(ApiError::BadRequest(
+            "return_speaker_embeddings is not supported on streaming transcription.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn record_file_transcription_history(
     distribution: &DistributionContext,
     request: &TranscriptionRequest,
@@ -1024,6 +1620,7 @@ struct TranscriptionRequestBuilder {
     /// Optional request-layer timeline precision (`auto` / `always` / `off`).
     timeline_precision: Option<openasr_core::TimelinePrecisionPolicy>,
     diarize: bool,
+    return_speaker_embeddings: bool,
     speakers: Option<u8>,
     punctuate: bool,
     segment_mode: Option<String>,
@@ -1057,6 +1654,7 @@ impl Default for TranscriptionRequestBuilder {
             timestamp_granularities: Vec::new(),
             timeline_precision: None,
             diarize: false,
+            return_speaker_embeddings: false,
             speakers: None,
             // Auto-on, mirroring `TranscriptionRequest::new`'s default: this
             // form field is only a client-facing opt-out (the desktop
@@ -1126,6 +1724,11 @@ impl TranscriptionRequestBuilder {
             "diarize" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
                 self.diarize = parse_bool_field("diarize", &value)?;
+            }
+            "return_speaker_embeddings" => {
+                let value = field.text().await.map_err(ApiError::Multipart)?;
+                self.return_speaker_embeddings =
+                    parse_bool_field("return_speaker_embeddings", &value)?;
             }
             "punctuate" => {
                 let value = field.text().await.map_err(ApiError::Multipart)?;
@@ -1233,6 +1836,7 @@ impl TranscriptionRequestBuilder {
             timestamp_granularities,
             timeline_precision,
             diarize,
+            return_speaker_embeddings,
             speakers,
             punctuate,
             segment_mode,
@@ -1255,6 +1859,16 @@ impl TranscriptionRequestBuilder {
         if speakers.is_some() && !diarize {
             return Err(ApiError::BadRequest(
                 "Form field speakers requires diarize=true.".to_string(),
+            ));
+        }
+        if return_speaker_embeddings && !diarize {
+            return Err(ApiError::BadRequest(
+                "Form field return_speaker_embeddings requires diarize=true.".to_string(),
+            ));
+        }
+        if return_speaker_embeddings && response_format != ResponseFormat::VerboseJson {
+            return Err(ApiError::BadRequest(
+                "return_speaker_embeddings requires response_format=verbose_json.".to_string(),
             ));
         }
 
@@ -1339,6 +1953,7 @@ impl TranscriptionRequestBuilder {
             .with_display_file_name(file_name)
             .with_voice_id(diarize)
             .with_diarize_speakers(speakers)
+            .with_return_speaker_embeddings(return_speaker_embeddings)
             .with_punctuation(punctuate);
         if let Some(timeline_precision) = timeline_precision {
             request = request.with_timeline_precision(timeline_precision);
@@ -1385,10 +2000,9 @@ pub(crate) fn validate_native_runtime_pack(
 ) -> Result<openasr_core::NativeRuntimeModelAdapter, openasr_core::BackendError> {
     native_runtime_model_adapter_for_path(pack_root).ok_or_else(|| {
         openasr_core::BackendError::NativeFailClosed {
-            reason: format!(
-                "could not verify and select a native model adapter from runtime source '{}'",
-                pack_root.display()
-            ),
+            reason:
+                "could not verify and select a native model adapter from the selected runtime source"
+                    .to_string(),
         }
     })
 }
@@ -1618,7 +2232,7 @@ mod active_transcription_cleanup_tests {
     use std::sync::Arc;
 
     use super::{
-        ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime,
+        ActiveTranscriptionCleanup, DistributionContext, DistributionRuntime, RemoteRuntimePolicy,
         register_active_transcription,
     };
 
@@ -1638,7 +2252,9 @@ mod active_transcription_cleanup_tests {
 
         {
             let _cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
+                RemoteRuntimePolicy::new(),
                 "txn-disconnect".to_string(),
                 Arc::clone(&control),
             );
@@ -1667,7 +2283,9 @@ mod active_transcription_cleanup_tests {
 
         {
             let mut cleanup = ActiveTranscriptionCleanup::new(
+                None,
                 distribution.clone(),
+                RemoteRuntimePolicy::new(),
                 "txn-normal".to_string(),
                 Arc::clone(&control),
             );
@@ -1686,15 +2304,65 @@ mod active_transcription_cleanup_tests {
     #[test]
     fn duplicate_live_transcription_id_is_rejected_without_replacing_its_owner() {
         let distribution = distribution_for_test();
-        let first = register_active_transcription(&distribution, "txn-duplicate").unwrap();
+        let first = register_active_transcription(&distribution, "txn-duplicate", None).unwrap();
 
-        let error = register_active_transcription(&distribution, "txn-duplicate")
+        let error = register_active_transcription(&distribution, "txn-duplicate", None)
             .expect_err("a live client id must have exactly one owner");
         assert!(matches!(error, super::ApiError::Conflict(_)));
         let registered = distribution
             .transcription_control("txn-duplicate")
             .expect("the original owner must remain registered");
         assert!(Arc::ptr_eq(&registered, &first));
+    }
+
+    #[test]
+    fn paired_device_cannot_control_another_device_transcription() {
+        assert!(super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-a"),
+            false
+        ));
+        assert!(!super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-b"),
+            false
+        ));
+        assert!(super::caller_may_control_transcription(
+            Some("device-a"),
+            Some("device-b"),
+            true
+        ));
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-b"), false),
+            "a paired device must not control an operator-local job"
+        );
+        assert!(super::caller_may_control_transcription(None, None, false));
+        assert!(super::caller_may_control_transcription(
+            None,
+            Some("device-b"),
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_compute_client_policy_remaps_diarize_and_drops_local_hardware() {
+        let mut request =
+            openasr_core::TranscriptionRequest::new("fixtures/jfk.wav", "whisper-tiny")
+                .with_voice_id(true)
+                .with_diarize_speakers(Some(2))
+                .with_return_speaker_embeddings(true)
+                .with_inference_threads(Some(8))
+                .with_execution_target(Some(openasr_core::ExecutionTarget::Cpu));
+        super::apply_remote_compute_client_request_policy(&mut request);
+        assert!(!request.voice_id);
+        assert!(request.anonymous_diarize);
+        assert_eq!(request.diarize_speakers, Some(2));
+        assert!(
+            request.return_speaker_embeddings,
+            "remote policy must not silently drop return_speaker_embeddings"
+        );
+        assert!(request.inference_threads.is_none());
+        assert!(request.execution_target.is_none());
     }
 
     #[test]
@@ -1774,6 +2442,7 @@ pub(crate) fn apply_transcription_preferences(
     preferences: &openasr_core::config::Preferences,
 ) {
     request.voice_id_segmenter = preferences.voice_id_segmenter;
+    request.voice_id_embedder = preferences.voice_id_embedder;
     if request.inference_threads.is_none() {
         request.inference_threads = preferences.inference_threads;
     }
@@ -2003,12 +2672,33 @@ pub(crate) async fn transcribe_with_runtime(
     request: TranscriptionRequest,
     execution_context: Arc<openasr_core::RequestExecutionContext>,
 ) -> Result<openasr_core::Transcription, ApiError> {
+    let execution_receipt = execution_context.native_execution_receipt();
     match runtime.backend {
         BackendKind::Mock => {
-            // The mock backend runs a single opaque decode with no slice loop, so
-            // there is no boundary to observe a pause/cancel; the context (if
-            // any real control was registered) is simply not consulted here.
-            let _ = &execution_context;
+            #[cfg(test)]
+            let _suppress = openasr_core::testing::SuppressMockTranscribeDelay::install();
+            #[cfg(test)]
+            {
+                let deadline = Instant::now() + openasr_core::testing::take_mock_transcribe_delay();
+                while Instant::now() < deadline {
+                    if execution_context.is_canceled() {
+                        return Err(ApiError::Backend(
+                            openasr_core::BackendError::TranscriptionCanceled,
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if execution_context.is_canceled() {
+                    return Err(ApiError::Backend(
+                        openasr_core::BackendError::TranscriptionCanceled,
+                    ));
+                }
+            }
+            if execution_context.is_canceled() {
+                return Err(ApiError::Backend(
+                    openasr_core::BackendError::TranscriptionCanceled,
+                ));
+            }
             let prepared = prepare_audio_input(
                 &request.input_path,
                 &AudioPreparationOptions::new(runtime.backend),
@@ -2020,6 +2710,11 @@ pub(crate) async fn transcribe_with_runtime(
             let mut transcription =
                 openasr_core::api::backend::transcribe_with_mock_backend(request)
                     .map_err(ApiError::Backend)?;
+            if execution_context.is_canceled() {
+                return Err(ApiError::Backend(
+                    openasr_core::BackendError::TranscriptionCanceled,
+                ));
+            }
             if word_timestamps {
                 add_segment_word_timestamps(&mut transcription);
             }
@@ -2027,7 +2722,7 @@ pub(crate) async fn transcribe_with_runtime(
         }
         BackendKind::Native => {
             tokio::task::spawn_blocking(move || {
-                let model_pack_path = runtime.model_pack_path.current().ok_or_else(|| {
+                let active_model = runtime.model_pack_path.served_snapshot().ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeModelPackPathRejected {
                         reason: format!(
                             "Model '{}' is not installed. No models are installed on this server yet -- install one first (openasr pull {}, or via the model market).",
@@ -2035,12 +2730,10 @@ pub(crate) async fn transcribe_with_runtime(
                         ),
                     })
                 })?;
+                let model_pack_path = active_model.path().to_path_buf();
                 let adapter = native_runtime_model_adapter_for_path(&model_pack_path).ok_or_else(|| {
                     ApiError::Backend(openasr_core::BackendError::NativeFailClosed {
-                        reason: format!(
-                            "could not verify and select a native model adapter from runtime source '{}'",
-                            model_pack_path.display()
-                        ),
+                        reason: "could not verify and select a native model adapter from the selected runtime source".to_string(),
                     })
                 })?;
                 validate_native_request_model(&adapter, &request.model_id)
@@ -2050,6 +2743,7 @@ pub(crate) async fn transcribe_with_runtime(
                 // runtime. Keep it outside the per-model admission window so
                 // upload preparation cannot serialize an unrelated native session
                 // for the same model.
+                let decode_normalize_started = Instant::now();
                 let prepared = prepare_audio_input(
                     &request.input_path,
                     &AudioPreparationOptions::new(runtime.backend)
@@ -2057,19 +2751,54 @@ pub(crate) async fn transcribe_with_runtime(
                         .with_ffmpeg_bin_explicit(runtime.ffmpeg_bin_explicit)
                         .with_native_non_wav_conversion(true),
                 )
-                .map_err(ApiError::AudioPreparation)?;
+                .map_err(ApiError::AudioPreparation);
+                let decode_normalize_duration = decode_normalize_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "decode_normalize",
+                    decode_normalize_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::DecodeNormalize,
+                        decode_normalize_duration,
+                    );
+                }
+                let prepared = prepared?;
                 let resolved_route = resolve_execution_route_for_target(request.execution_target)
                     .map_err(ApiError::Backend)?;
                 let model_session_key = native_model_session_key(&adapter)?;
+                let admission_wait_started = Instant::now();
                 crate::realtime::wait_while_native_warmup_in_flight_blocking();
-                let model_session_permit = runtime
-                    .acquire_native_execution(&model_session_key, resolved_route.as_ref())?;
-                run_admitted_native_transcription(model_session_permit, move || {
-                    // Marks this offline (file-transcription / realtime-per-utterance
-                    // backend-job) decode as active for the whole synchronous run, so
-                    // the idle_unload reaper never evicts the model runtime cache out
-                    // from under it; dropped (any exit path) once the decode returns.
-                    let _activity_guard = NativeActivityGuard::enter();
+                let admitted_execution = runtime
+                    .acquire_native_execution_for_snapshot(
+                        &active_model,
+                        &model_session_key,
+                        resolved_route.as_ref(),
+                        NativeAdmissionKind::File,
+                        execution_context.request_id.as_deref(),
+                    );
+                let admission_wait_duration = admission_wait_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "admission_wait",
+                    admission_wait_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::AdmissionWait,
+                        admission_wait_duration,
+                    );
+                }
+                let (model_session_permit, activity_guard) =
+                    admitted_execution?.into_parts();
+                let compute_started = Instant::now();
+                let compute_result = run_admitted_native_transcription(model_session_permit, move || {
+                    // Admission entered native activity atomically with the
+                    // active-snapshot check. Keep that guard alive through the
+                    // whole synchronous decode; the idle reaper cannot unload
+                    // either during setup or under this compute.
+                    let _activity_guard = activity_guard;
                     let mut request = request;
                     request.input_path = prepared.path().to_path_buf();
                     let word_timestamps = request.word_timestamps;
@@ -2085,6 +2814,9 @@ pub(crate) async fn transcribe_with_runtime(
                                 .with_phrase_bias(request.phrase_bias.clone())
                                 .with_inference_threads(request.inference_threads)
                                 .with_voice_id(request.voice_id)
+                                .with_anonymous_diarize(request.anonymous_diarize)
+                                .with_diarize_speakers(request.diarize_speakers)
+                                .with_return_speaker_embeddings(request.return_speaker_embeddings)
                                 .with_word_timestamps(request.word_timestamps)
                                 .with_word_timestamps_refine(request.word_timestamps_refine),
                         )
@@ -2113,6 +2845,10 @@ pub(crate) async fn transcribe_with_runtime(
                         // `PreparedAudioInput::shared_samples`.
                         .with_prepared_samples(prepared.shared_samples())
                         .with_voice_id_segmenter(request.voice_id_segmenter)
+                        // NativeAsrOfflineRequest::new defaults the embedder to
+                        // ReDimNet2. Dropping this field would make a persisted
+                        // WeSpeaker preference silently load the wrong space.
+                        .with_voice_id_embedder(request.voice_id_embedder)
                         // Explicit cancel/pause/resume context for the whole
                         // synchronous decode call below -- never a thread-local.
                         .with_execution_context(Arc::clone(&execution_context))
@@ -2141,14 +2877,28 @@ pub(crate) async fn transcribe_with_runtime(
                     // built (or reused) and actually ran, so this is the resident
                     // signal `/health`'s `model_resident` field reads -- see
                     // `idle_activity::native_model_is_resident`.
-                    crate::idle_activity::mark_native_model_warm();
+                    crate::idle_activity::mark_native_model_warm(
+                        active_model.residency_key(),
+                    );
                     if word_timestamps {
                         add_segment_word_timestamps(&mut transcription);
                     }
                     drop(prepared);
                     Ok::<_, TranscriptionRuntimeError>(transcription)
-                })
-                .map_err(ApiError::from)
+                });
+                let compute_duration = compute_started.elapsed();
+                openasr_core::stage_timing::log_stage(
+                    "http_transcription",
+                    "compute",
+                    compute_duration,
+                );
+                if let Some(receipt) = execution_receipt.as_ref() {
+                    receipt.record_phase_duration(
+                        openasr_core::RequestExecutionPhase::Compute,
+                        compute_duration,
+                    );
+                }
+                compute_result.map_err(ApiError::from)
             })
             .await
             .map_err(ApiError::BackendJoin)?
@@ -2278,20 +3028,19 @@ fn check_temp_dir_headroom(temp_dir: Option<&Path>) -> Result<(), ApiError> {
     let Some(dir) = temp_dir else {
         return Ok(());
     };
-    check_disk_headroom_bytes(openasr_core::available_disk_space_bytes(dir), dir)
+    check_disk_headroom_bytes(openasr_core::available_disk_space_bytes(dir))
 }
 
 /// Pure decision function split out from `check_temp_dir_headroom` so the
 /// insufficient-space branch can be unit tested by injecting an `available_bytes`
 /// value directly, without needing to actually fill a disk.
-fn check_disk_headroom_bytes(available_bytes: Option<u64>, dir: &Path) -> Result<(), ApiError> {
+fn check_disk_headroom_bytes(available_bytes: Option<u64>) -> Result<(), ApiError> {
     match available_bytes {
         Some(available) if available < MIN_FREE_DISK_HEADROOM_BYTES => {
             Err(ApiError::InsufficientDiskSpace(format!(
-                "Not enough free disk space to receive this upload: {} MB free in '{}', \
+                "Not enough free disk space to receive this upload: {} MB free on the upload temporary volume, \
                  need at least {} MB headroom. Free up space on that volume and retry.",
                 available / (1024 * 1024),
-                dir.display(),
                 MIN_FREE_DISK_HEADROOM_BYTES / (1024 * 1024),
             )))
         }
@@ -2358,8 +3107,9 @@ mod native_runtime_tests {
     use std::fs;
 
     use axum::{
+        Extension,
         extract::{FromRequest, Path as AxumPath},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
     };
 
@@ -2604,13 +3354,12 @@ mod native_runtime_tests {
 
     #[test]
     fn disk_headroom_check_fails_closed_when_available_space_is_below_the_floor() {
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        let error = check_disk_headroom_bytes(Some(1024), dir).unwrap_err();
+        let error = check_disk_headroom_bytes(Some(1024)).unwrap_err();
 
         match error {
             super::ApiError::InsufficientDiskSpace(message) => {
                 assert!(message.contains("Not enough free disk space"), "{message}");
-                assert!(message.contains("/tmp/openasr-upload-test"), "{message}");
+                assert!(!message.contains("/tmp/openasr-upload-test"), "{message}");
             }
             other => panic!("expected InsufficientDiskSpace, got {other:?}"),
         }
@@ -2618,16 +3367,14 @@ mod native_runtime_tests {
 
     #[test]
     fn disk_headroom_check_passes_when_available_space_is_ample() {
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        assert!(check_disk_headroom_bytes(Some(64 * 1024 * 1024 * 1024), dir).is_ok());
+        assert!(check_disk_headroom_bytes(Some(64 * 1024 * 1024 * 1024)).is_ok());
     }
 
     #[test]
     fn disk_headroom_check_stays_permissive_when_probe_is_unsupported() {
         // `None` means the platform/probe couldn't tell -- must not block
         // uploads on that basis, matching pull.rs's `ensure_available_space`.
-        let dir = std::path::Path::new("/tmp/openasr-upload-test");
-        assert!(check_disk_headroom_bytes(None, dir).is_ok());
+        assert!(check_disk_headroom_bytes(None).is_ok());
     }
 
     async fn response_json_body(response: Response) -> serde_json::Value {
@@ -2647,9 +3394,18 @@ mod native_runtime_tests {
     // workspace-shared state; see AGENTS.md's `cargo nextest` requirement.
     #[tokio::test]
     async fn transcription_progress_idle_body_is_backward_compatible() {
-        let response = super::transcription_progress()
-            .await
-            .expect("no active run must not error");
+        let distribution = crate::DistributionContext::new(crate::DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+            catalog_local_override: None,
+        });
+        let response = super::transcription_progress(
+            Extension(crate::ServerAuth::disabled()),
+            Extension(distribution),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("no active run must not error");
         let value = response_json_body(response).await;
         assert_eq!(value["phase"], serde_json::Value::Null);
         assert_eq!(value["fraction"], serde_json::json!(0.0));
@@ -2665,9 +3421,17 @@ mod native_runtime_tests {
     /// "fall back to a time estimate."
     #[tokio::test]
     async fn transcription_progress_by_id_defaults_to_idle_body_for_unknown_id() {
-        let response = super::transcription_progress_by_id(AxumPath(
-            "transcription-progress-by-id-unknown-probe".to_string(),
-        ))
+        let distribution = crate::DistributionContext::new(crate::DistributionRuntime {
+            openasr_home: None,
+            catalog_url: None,
+            catalog_local_override: None,
+        });
+        let response = super::transcription_progress_by_id(
+            AxumPath("transcription-progress-by-id-unknown-probe".to_string()),
+            Extension(crate::ServerAuth::disabled()),
+            Extension(distribution),
+            HeaderMap::new(),
+        )
         .await
         .expect("unknown id must not error");
         let value = response_json_body(response).await;
@@ -2675,6 +3439,14 @@ mod native_runtime_tests {
         assert_eq!(value["fraction"], serde_json::json!(0.0));
         assert_eq!(value["done"], serde_json::json!(0));
         assert_eq!(value["total"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn device_cannot_read_operator_local_progress() {
+        assert!(
+            !super::caller_may_control_transcription(None, Some("device-a"), false),
+            "missing owner is operator-local; device tokens must see idle, not the live job"
+        );
     }
 
     #[tokio::test]

@@ -29,9 +29,11 @@ use crate::device::{
 };
 
 use super::native_execution_services::{
-    current_memory_reservation_cohort_id, current_native_execution_memory_broker,
-    current_native_execution_scope_id, record_current_execution_candidate_failure,
+    current_execution_cache_attempt_id, current_memory_reservation_cohort_id,
+    current_native_execution_memory_broker, current_native_execution_scope_id,
+    current_runtime_receipts, record_current_execution_candidate_failure,
 };
+use super::runtime_receipts::{RuntimeOwnerGuard, RuntimeOwnerPlacement, RuntimeResourceGuard};
 
 /// Checked accumulator for post-build engine-requested Rust heap capacity.
 /// `Vec` storage is measured from container capacity and `size_of::<T>()`, never
@@ -160,6 +162,8 @@ impl<T> SystemMemoryAllocationOutcome<T> {
 #[derive(Debug)]
 pub(crate) struct SystemMemoryOwner<T> {
     owner: T,
+    _receipt_resource: Option<RuntimeResourceGuard>,
+    _receipt_owner: Option<RuntimeOwnerGuard>,
     _lease: Option<DeviceMemoryReservationBatch>,
     committed_requested_bytes: u64,
 }
@@ -174,6 +178,8 @@ impl<T> SystemMemoryOwner<T> {
     pub(crate) const fn without_allocation(owner: T) -> Self {
         Self {
             owner,
+            _receipt_resource: None,
+            _receipt_owner: None,
             _lease: None,
             committed_requested_bytes: 0,
         }
@@ -183,6 +189,12 @@ impl<T> SystemMemoryOwner<T> {
         self.committed_requested_bytes
     }
 
+    pub(crate) fn record_receipt_reuse(&self) {
+        if let Some(owner) = self._receipt_owner.as_ref() {
+            owner.record_reuse(current_execution_cache_attempt_id());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn with_committed_requested_bytes_for_test(
         owner: T,
@@ -190,6 +202,8 @@ impl<T> SystemMemoryOwner<T> {
     ) -> Self {
         Self {
             owner,
+            _receipt_resource: None,
+            _receipt_owner: None,
             _lease: None,
             committed_requested_bytes,
         }
@@ -281,20 +295,30 @@ impl<T> SystemMemoryOwner<T> {
         let wait_deadline = Instant::now() + Duration::from_secs(30);
         let mut retry_delay = Duration::from_millis(1);
         let mut snapshot_before = snapshot_before;
+        let owner_scope_id = current_native_execution_scope_id();
+        let owner_placement = if owner_scope_id.is_some() {
+            RuntimeOwnerPlacement::HostNeutral
+        } else {
+            RuntimeOwnerPlacement::Unknown
+        };
         let mut reservation = loop {
-            match broker.try_reserve_batch(vec![DomainReservationRequest {
-                domain: MemoryDomainKey::SystemMemory,
-                snapshot: snapshot_before,
-                peak_bytes: quoted_peak_bytes,
-                retained_bytes: quoted_retained_bytes,
-                observed_peak_bytes: None,
-                // Rust allocator capacity is measured only after construction;
-                // the provisional/exclusive path is what makes reconciliation
-                // safe even when `reserve_exact` rounds upward.
-                requires_reconciliation: true,
-                resource_id: resource_id.clone(),
-                cohort_id: reservation_cohort,
-            }]) {
+            match broker.try_reserve_batch_for_scope_and_placement(
+                vec![DomainReservationRequest {
+                    domain: MemoryDomainKey::SystemMemory,
+                    snapshot: snapshot_before,
+                    peak_bytes: quoted_peak_bytes,
+                    retained_bytes: quoted_retained_bytes,
+                    observed_peak_bytes: None,
+                    // Rust allocator capacity is measured only after construction;
+                    // the provisional/exclusive path is what makes reconciliation
+                    // safe even when `reserve_exact` rounds upward.
+                    requires_reconciliation: true,
+                    resource_id: resource_id.clone(),
+                    cohort_id: reservation_cohort,
+                }],
+                owner_scope_id,
+                owner_placement,
+            ) {
                 Ok(reservation) => break reservation,
                 Err(crate::device::execution_memory::MemoryPlanningError::DeviceDomainBusy {
                     ..
@@ -334,6 +358,7 @@ impl<T> SystemMemoryOwner<T> {
                 SystemMemoryOwnerError::capacity_failure("host_state_observe_after", reason),
             )
         })?;
+        let observation_confidence = snapshot_after.confidence;
         reservation
             .reconcile_and_commit(&[DomainMemoryReconciliation {
                 domain: MemoryDomainKey::SystemMemory,
@@ -351,8 +376,43 @@ impl<T> SystemMemoryOwner<T> {
                     SystemMemoryOwnerError::capacity_failure("host_state_reconcile", reason),
                 )
             })?;
+        let (receipt_owner, receipt_resource) = current_runtime_receipts()
+            .filter(|collector| collector.is_available())
+            .and_then(|collector| {
+                let descriptor = collector.host_neutral_owner_descriptor(
+                    "system-memory-owner",
+                    None,
+                    Some(&resource_id),
+                )?;
+                let owner = collector.start_owner(descriptor, current_execution_cache_attempt_id());
+                let resource = owner.owner_id().and_then(|owner_id| {
+                    collector
+                        .resource_descriptor(
+                            "system-memory",
+                            &MemoryDomainKey::SystemMemory,
+                            quoted_retained_bytes,
+                            reconciled_peak_bytes,
+                            reconciled_retained_bytes,
+                            crate::device::execution_memory::QuoteConfidence::CommittedUpperBound,
+                            Some(observation_confidence),
+                        )
+                        .and_then(|descriptor| collector.acquire_resource(owner_id, descriptor))
+                        .inspect(|resource| {
+                            // Receipts are attached after the broker lease has
+                            // already committed. Leaving them Reserved would
+                            // make shadow comparison charge them as pending.
+                            resource.set_state(
+                                crate::models::runtime_receipts::RuntimeResourceState::Committed,
+                            );
+                        })
+                });
+                Some((Some(owner), resource))
+            })
+            .unwrap_or((None, None));
         Ok(Self {
             owner: outcome.owner,
+            _receipt_resource: receipt_resource,
+            _receipt_owner: receipt_owner,
             _lease: Some(reservation),
             committed_requested_bytes: reconciled_retained_bytes,
         })
@@ -524,6 +584,129 @@ mod tests {
             broker.usage(&MemoryDomainKey::SystemMemory),
             DeviceMemoryUsage::default()
         );
+    }
+
+    #[test]
+    fn shipped_allocate_commits_receipts_that_cover_the_broker_lease() {
+        let services =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                test_broker(),
+            )
+            .expect("native execution services must construct for receipt shadow tests");
+        let _guard =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let quote = SystemMemoryAllocationQuote::new("test.shadow-owner", 96, 96).unwrap();
+        let owner = SystemMemoryOwner::try_allocate_with(
+            quote,
+            Some(Arc::clone(services.memory_broker())),
+            true,
+            || Ok(snapshot(200)),
+            || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 96], 96, 96)),
+        )
+        .unwrap();
+        let snapshot = services.runtime_receipts().snapshot();
+        assert_eq!(snapshot.live_owners.len(), 1);
+        let resource = snapshot.live_owners[0]
+            .resources
+            .values()
+            .next()
+            .expect("system-memory owner must publish a resource receipt");
+        assert_eq!(
+            resource.state,
+            crate::models::runtime_receipts::RuntimeResourceState::Committed
+        );
+        assert_eq!(
+            resource.descriptor.retained,
+            crate::models::runtime_receipts::RuntimeReceiptMetric::Known(96)
+        );
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(owner);
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases(services.memory_broker()),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert!(
+            services
+                .runtime_receipts()
+                .snapshot()
+                .live_owners
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn independent_service_roots_reconcile_only_their_scoped_broker_leases() {
+        let broker = test_broker();
+        let first =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                Arc::clone(&broker),
+            )
+            .unwrap();
+        let second =
+            crate::models::native_execution_services::NativeExecutionServices::new_with_broker(
+                Arc::new(crate::device::execution_policy::DefaultExecutionPolicyResolver),
+                Arc::clone(&broker),
+            )
+            .unwrap();
+        let first_owner = {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(&first);
+            SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.scope-first", 96, 96).unwrap(),
+                Some(Arc::clone(&broker)),
+                true,
+                || Ok(snapshot(220)),
+                || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 96], 96, 96)),
+            )
+            .unwrap()
+        };
+        let second_owner = {
+            let _guard =
+                crate::models::native_execution_services::install_native_execution_services(
+                    &second,
+                );
+            SystemMemoryOwner::try_allocate_with(
+                SystemMemoryAllocationQuote::new("test.scope-second", 64, 64).unwrap(),
+                Some(Arc::clone(&broker)),
+                true,
+                || Ok(snapshot(180)),
+                || Ok(SystemMemoryAllocationOutcome::new(vec![0_u8; 64], 64, 64)),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            first.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            second.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            broker.usage(&MemoryDomainKey::SystemMemory).committed_bytes,
+            160
+        );
+
+        drop(first_owner);
+        assert_eq!(
+            first.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        assert_eq!(
+            second.runtime_receipts().reconcile_live_leases(&broker),
+            crate::models::runtime_receipts::LeaseReceiptShadow::Matched
+        );
+        drop(second_owner);
     }
 
     #[test]

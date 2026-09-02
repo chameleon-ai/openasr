@@ -46,7 +46,9 @@ use crate::{
     NativeExecutionServices, OasrV1MetadataError, PcmBuffer, PcmSlice, parse_model_ref,
 };
 
-use crate::api::backend::{FailureCategory, log_failure_context, log_request_context};
+use crate::api::backend::{
+    FailureCategory, SpeakerEmbeddingPayload, log_failure_context, log_request_context,
+};
 
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
@@ -59,6 +61,7 @@ use crate::models::firered_punc::runtime::FireRedPuncRuntime;
 use crate::models::policy_resolved_aux_runtime::PolicyResolvedAuxRuntimeError;
 use crate::models::qwen::{
     ForcedAlignItem, Qwen3ForcedAlignerSession, forced_aligner_pack, verify_forced_aligner_pack,
+    word_list_for_language,
 };
 use crate::models::{
     aux_pack_registry::AuxPackKind,
@@ -319,6 +322,7 @@ fn run_dispatch_once_with_progress(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     chunk: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -343,6 +347,7 @@ fn run_dispatch_once_with_progress(
         execution_services,
         verified_pack,
         selected_family,
+        candidate,
         chunk,
         request_options,
         backend_preference,
@@ -358,6 +363,27 @@ fn run_dispatch_once_with_progress(
 struct SliceExecutionFallback {
     failures: Vec<(ExecutionCandidate, ExecutionCandidateFailure)>,
     selected: ExecutionCandidate,
+}
+
+fn candidate_execution_lane(
+    candidate: &ExecutionCandidate,
+) -> Option<crate::models::native_execution_services::ExecutionLaneKey> {
+    let backend = match candidate.device.route.provider {
+        crate::device::execution_route::ExecutionProvider::Cpu => GgmlCpuGraphBackend::Cpu,
+        crate::device::execution_route::ExecutionProvider::Metal => GgmlCpuGraphBackend::Metal,
+        crate::device::execution_route::ExecutionProvider::Cuda
+        | crate::device::execution_route::ExecutionProvider::Hip
+        | crate::device::execution_route::ExecutionProvider::Vulkan => GgmlCpuGraphBackend::Gpu,
+        crate::device::execution_route::ExecutionProvider::Accelerator
+        | crate::device::execution_route::ExecutionProvider::Unknown => return None,
+    };
+    crate::models::native_execution_services::ExecutionLaneKey::from_candidate(candidate, backend)
+        .ok()
+}
+
+fn log_candidate_failure_context(error: &BackendError, candidate: &ExecutionCandidate) {
+    let lane = candidate_execution_lane(candidate);
+    log_failure_context(classify_backend_error_for_failure_log(error), lane.as_ref());
 }
 
 /// Runs one slice through the immutable execution plan. Every attempt covers
@@ -383,6 +409,10 @@ fn run_dispatch_once_with_progress_and_policy(
 ) -> Result<(GgmlAsrExecutionResult, Option<SliceExecutionFallback>), BackendError> {
     let mut failures = Vec::new();
     let candidates = execution_plan.candidates();
+    let _receipt_guard =
+        crate::models::native_execution_services::install_execution_receipt_collector(
+            execution_context.native_execution_receipt(),
+        );
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         let backend_preference = match candidate.placement {
             ExecutionPlacement::CpuOnly => GgmlAsrBackendPreference::CpuOnly,
@@ -390,6 +420,10 @@ fn run_dispatch_once_with_progress_and_policy(
                 GgmlAsrBackendPreference::Accelerated
             }
         };
+        let _activation_pack =
+            crate::models::native_execution_services::install_candidate_activation_pack(
+                verified_pack.clone(),
+            );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services.as_ref(),
             candidate,
@@ -399,10 +433,13 @@ fn run_dispatch_once_with_progress_and_policy(
                     execution_services,
                     verified_pack,
                     selected_family,
+                    candidate,
                     chunk.clone(),
                     request_options.clone(),
                     backend_preference,
-                    request_backend_preference_for_candidate(candidate),
+                    crate::models::device_greedy_token::request_backend_preference_for_candidate(
+                        candidate,
+                    ),
                     auto_gpu_policy,
                     execution_context,
                     decode_progress,
@@ -418,16 +455,20 @@ fn run_dispatch_once_with_progress_and_policy(
                 });
                 return Ok((result, fallback));
             }
-            (Err(error), None) => return Err(error),
+            (Err(error), None) => {
+                log_candidate_failure_context(&error, candidate);
+                return Err(error);
+            }
             (result, Some(failure)) => {
                 let error = crate::models::native_execution_services::execution_candidate_failure_source(result)
                     .unwrap_or_else(|| BackendError::NativeFailClosed {
                         reason: format!(
-                            "execution candidate reported {:?} during '{}' despite returning success",
-                            failure.kind, failure.operation
+                            "execution candidate reported {:?} during '{}' despite returning success: {}",
+                            failure.kind, failure.operation, failure.detail
                         ),
                     });
                 if candidate_index + 1 == candidates.len() {
+                    log_candidate_failure_context(&error, candidate);
                     return Err(error);
                 }
                 crate::stage_timing::log_detail_event(
@@ -449,12 +490,12 @@ fn run_dispatch_once_with_progress_and_policy(
     })
 }
 
-/// Upper bound on concurrent long-audio slice workers. Kept small: the win is
-/// filling encode/decode GPU bubbles (2-4 in-flight slices saturate a single
-/// GPU's execution pipeline, the same admission-concurrency effect the server
-/// path already relies on), not unbounded fan-out, and every extra worker costs
-/// another resident decoder runtime + KV cache.
-const SLICE_PIPELINE_MAX_WIDTH: usize = 4;
+/// Upper bound on concurrent long-audio slice workers. Kept at 2: that still
+/// fills encode/decode GPU bubbles on a single discrete GPU without keeping
+/// four resident decoder runtimes + KV caches, which is what pushed HIP
+/// longform peak RSS above the v0.1.36 packaged host. Extra width remains
+/// available via `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to this max).
+const SLICE_PIPELINE_MAX_WIDTH: usize = 2;
 
 /// Memory head-room the concurrent slice pipeline always leaves free when
 /// deciding how many workers fit, so it never claims the last of available
@@ -493,8 +534,9 @@ fn slice_pipeline_explicit_width() -> Option<usize> {
 /// - Carry `Disabled`: the serial loop threads no cross-slice prompt anyway,
 ///   so the carry-light concurrent path is transcript-equivalent (proven
 ///   byte-identical by `concurrent_slice_pipeline_equivalence`). Default to
-///   [`SLICE_PIPELINE_MAX_WIDTH`] and let the capacity and slice-count gates
-///   in [`effective_slice_pipeline_width`] pick what actually fits.
+///   one worker so peak RSS stays at a single decoder+KV; extra width is
+///   opt-in through `OPENASR_SLICE_PIPELINE_WIDTH` (clamped to
+///   [`SLICE_PIPELINE_MAX_WIDTH`]).
 /// - Carry active (`Text` / `TokenHistory`): the concurrent path would drop
 ///   the carry and change the transcript (the short-audio audit measured
 ///   whole-clause deletions), so the default stays 1 -- the byte-identical
@@ -506,8 +548,9 @@ fn slice_pipeline_requested_width(carry_prompt_mode: LongformPromptCarryMode) ->
         return explicit;
     }
     match carry_prompt_mode {
-        LongformPromptCarryMode::Disabled => SLICE_PIPELINE_MAX_WIDTH,
-        LongformPromptCarryMode::Text | LongformPromptCarryMode::TokenHistory => 1,
+        LongformPromptCarryMode::Disabled
+        | LongformPromptCarryMode::Text
+        | LongformPromptCarryMode::TokenHistory => 1,
     }
 }
 
@@ -762,6 +805,17 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         let decode_positions_ref = &decode_positions;
         let cursor_ref = &cursor;
         let stop_ref = &stop;
+        // Concurrent slices are one request, not independent candidates.
+        // Each worker still opens its own attempt journal, so without a
+        // parent activation cohort they mint distinct exclusive gates and
+        // fail closed with DeviceDomainBusy while a sibling's pack import
+        // or runner-context is still pending. Install the request cohort
+        // before capturing TLS so workers inherit it.
+        let request_activation_cohort = crate::ActivationReservationContext::mint();
+        let _request_activation_cohort =
+            crate::models::native_execution_services::install_activation_reservation_context(Some(
+                request_activation_cohort,
+            ));
         // `thread::scope` does not inherit TLS. Capture the complete request
         // execution context once so every slice worker keeps the same broker,
         // Exact route namespace, telemetry, and transactional observation
@@ -783,6 +837,9 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                 let native_execution_context = native_execution_context.clone();
                 let execution_observation_sink = execution_observation_sink.clone();
                 scope.spawn(move || {
+                    let _request_activation_cohort = crate::models::native_execution_services::install_activation_reservation_context(
+                        Some(request_activation_cohort),
+                    );
                     let _native_execution_context = native_execution_context.map(
                         crate::models::native_execution_services::install_native_execution_context,
                     );
@@ -975,9 +1032,34 @@ struct SpeakerFinalizationContext {
     /// Word stripping after projection is decided from request keep-words policy.
     #[allow(dead_code)]
     strip_forced_word_timestamps: bool,
+    /// Enrolled-person naming. Anonymous remote diarize leaves this off.
+    name_enrolled: bool,
+    /// Built from clustering centroids while the embedder is still live, then
+    /// attached after attribution. `None` unless the caller opted in.
+    speaker_embeddings: Option<SpeakerEmbeddingPayload>,
 }
 
 impl SpeakerFinalizationContext {
+    fn new(
+        attribution: SpeakerAttribution,
+        embedder: Option<Arc<dyn crate::diarize::embed::SpeakerEmbedder>>,
+        plan: SpeakerPlan,
+        scope_by_segment: Vec<Option<usize>>,
+        strip_forced_word_timestamps: bool,
+        name_enrolled: bool,
+        speaker_embeddings: Option<SpeakerEmbeddingPayload>,
+    ) -> Self {
+        Self {
+            attribution,
+            embedder,
+            plan,
+            scope_by_segment,
+            strip_forced_word_timestamps,
+            name_enrolled,
+            speaker_embeddings,
+        }
+    }
+
     /// External Voice ID needs word anchors when a multi-speaker segment must
     /// be split for text ownership. Empty words or present-but-unreliable
     /// anchors both force FA / fail-closed; single-speaker identity alone does not.
@@ -1032,7 +1114,7 @@ pub(super) fn run_native_transcription_with_intent(
 ) -> Result<Transcription, BackendError> {
     run_native_transcription_fallible(request, &execution_services, execution_intent).inspect_err(
         |error| {
-            log_failure_context(classify_backend_error_for_failure_log(error));
+            log_failure_context(classify_backend_error_for_failure_log(error), None);
         },
     )
 }
@@ -1050,7 +1132,7 @@ pub(super) fn run_native_transcription_with_verified_pack(
         NativeRuntimePackInput::Verified(verified_pack),
     )
     .inspect_err(|error| {
-        log_failure_context(classify_backend_error_for_failure_log(error));
+        log_failure_context(classify_backend_error_for_failure_log(error), None);
     })
 }
 
@@ -1076,6 +1158,7 @@ fn classify_backend_error_for_failure_log(error: &BackendError) -> FailureCatego
         | BackendError::DiarizationSegmenterUnavailable
         | BackendError::VoiceIdIdentityFailed(_)
         | BackendError::DiarizeSpeakersRequiresDiarization
+        | BackendError::SpeakerEmbeddingsRequireDiarization
         | BackendError::PhraseBiasNotSupported { .. }
         | BackendError::AdapterNotSupported { .. }
         | BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -1130,6 +1213,9 @@ fn run_native_transcription_fallible_with_input(
         return Err(BackendError::VoiceIdUnsupportedForRealtime {
             request_source: request.source.as_log_label(),
         });
+    }
+    if request.return_speaker_embeddings && !request.voice_id && !request.anonymous_diarize {
+        return Err(BackendError::SpeakerEmbeddingsRequireDiarization);
     }
     let refine = request.word_timestamps_refine;
     if refine && !request.word_timestamps {
@@ -1403,6 +1489,9 @@ fn apply_punctuation_stage_with_policy(
         execution_services,
         &execution_plan,
         "firered-punctuation",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_pack.clone(),
+        ),
         |candidate| {
             // Punctuation is an optional accuracy stage: malformed/missing
             // runtime errors keep the ASR output unchanged. Candidate-local
@@ -1654,6 +1743,89 @@ pub fn refine_existing_transcription_timeline(
     ))
 }
 
+/// Align a user-provided plain-text transcript onto audio.
+///
+/// Does **not** run ASR. Builds a single full-span segment from `transcript`
+/// and reuses [`refine_existing_transcription_timeline`] / the Qwen3 Forced
+/// Aligner pack. Text normalization matches the aligner's tokenizer:
+///
+/// - split on ASCII whitespace
+/// - keep letters, numbers, and apostrophes; strip other punctuation
+/// - case is preserved
+/// - each CJK ideograph becomes its own token
+/// - Japanese and Korean fail closed (morphological segmenters are not ported)
+///
+/// Missing pack, unsupported language or Japanese/Korean script, empty
+/// normalized text, audio past the timestamp grid, a prompt past decoder
+/// context, or a degenerate (collapsed) alignment fail closed instead of
+/// returning a fabricated timeline.
+pub fn align_plain_transcript_to_audio(
+    transcript: String,
+    prepared_audio_16khz_mono: &[f32],
+    execution_services: &NativeExecutionServices,
+    execution_target: crate::ExecutionTarget,
+    language_hint: Option<&str>,
+    keep_word_timestamps: bool,
+) -> Result<Transcription, BackendError> {
+    if prepared_audio_16khz_mono.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "audio is empty; cannot align a transcript without PCM samples".into(),
+        });
+    }
+    let transcript = transcript.trim().to_string();
+    if transcript.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: "transcript is empty".into(),
+        });
+    }
+    let language = language_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+        .unwrap_or("en")
+        .to_string();
+    let normalized_words = word_list_for_language(&transcript, &language).map_err(|error| {
+        BackendError::WordTimestampAlignmentFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    if normalized_words.is_empty() {
+        return Err(BackendError::WordTimestampAlignmentFailed {
+            reason: crate::subtitle::ForcedAlignmentMismatch::EmptyWordList.to_string(),
+        });
+    }
+    let audio_duration_s = prepared_audio_16khz_mono.len() as f32 / 16_000.0;
+    let transcription = Transcription {
+        text: transcript.clone(),
+        language: Some(language.clone()),
+        segments: vec![crate::Segment {
+            start: 0.0,
+            end: audio_duration_s,
+            text: transcript,
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let refined = refine_existing_transcription_timeline(
+        transcription,
+        prepared_audio_16khz_mono,
+        execution_services,
+        execution_target,
+        Some(language.as_str()),
+        true,
+    )?;
+    if keep_word_timestamps {
+        Ok(refined)
+    } else {
+        let mut stripped = refined;
+        crate::subtitle::strip_unrequested_word_timestamps(&mut stripped);
+        Ok(stripped)
+    }
+}
+
 /// Maps a resolved provider/placement pair to one measured aligner topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForcedAlignerSessionPlan {
@@ -1731,11 +1903,15 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         execution_services,
         &execution_plan,
         "qwen3-forced-aligner",
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Pack(
+            verified_forced_aligner.clone(),
+        ),
         |candidate| {
             if execution_context.is_canceled() {
                 return Err(BackendError::TranscriptionCanceled);
             }
-            let backend = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate).backend();
+            let resolved_runtime = crate::models::policy_resolved_aux_runtime::resolved_runtime_for_auxiliary_candidate(candidate);
+            let backend = resolved_runtime.backend();
             let session_load_started = Instant::now();
             let session_plan =
                 forced_aligner_session_plan(candidate.placement, candidate.device.route.provider)
@@ -1748,11 +1924,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
             let session = match session_plan {
                 ForcedAlignerSessionPlan::Uniform => Qwen3ForcedAlignerSession::load_verified(
                     verified_forced_aligner.clone(),
-                    backend,
+                    resolved_runtime,
                 ),
                 ForcedAlignerSessionPlan::GpuAudioHybrid => {
                     Qwen3ForcedAlignerSession::load_verified_gpu_audio_hybrid(
                         verified_forced_aligner.clone(),
+                        resolved_runtime,
                     )
                 }
             }
@@ -1854,6 +2031,12 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     if let Some(progress) = progress {
         progress.complete_stage();
     }
+    let audio_duration_s = prepared_audio.as_slice().len() as f32 / 16_000.0;
+    crate::subtitle::reject_degenerate_forced_alignment(&result, audio_duration_s).map_err(
+        |mismatch| BackendError::WordTimestampAlignmentFailed {
+            reason: mismatch.to_string(),
+        },
+    )?;
     Ok(result)
 }
 
@@ -2112,6 +2295,25 @@ impl SpeakerPlan {
     }
 }
 
+fn reject_return_speaker_embeddings_for_plan(
+    return_speaker_embeddings: bool,
+    speaker_plan: SpeakerPlan,
+    adapter_id: &'static str,
+) -> Result<(), BackendError> {
+    if !return_speaker_embeddings {
+        return Ok(());
+    }
+    match speaker_plan {
+        SpeakerPlan::Off => Err(BackendError::SpeakerEmbeddingsRequireDiarization),
+        SpeakerPlan::InDecoder => Err(BackendError::RequestOptionUnsupportedByModel {
+            adapter: adapter_id,
+            option: "return_speaker_embeddings",
+            reason: "The model separates speakers in-decoder and does not produce clustering centroids; this request does not compute embeddings.",
+        }),
+        SpeakerPlan::External => Ok(()),
+    }
+}
+
 fn voice_id_audio_view(audio: &PcmBuffer, speaker_plan: SpeakerPlan) -> Option<PcmSlice> {
     (speaker_plan != SpeakerPlan::Off).then(|| audio.full_slice())
 }
@@ -2227,11 +2429,14 @@ fn run_native_transcription_impl(
     // Resolve the one segmentation source for this request. Exactly one runs:
     // the family's own decode, or the external segment/embed/cluster pass --
     // never both, so nothing can overwrite the other's labels downstream.
-    let speaker_plan = SpeakerPlan::resolve(request.voice_id, selected_family.speaker_segmentation);
+    let speaker_plan = SpeakerPlan::resolve(
+        request.voice_id || request.anonymous_diarize,
+        selected_family.speaker_segmentation,
+    );
     if request.diarize_speakers.is_some() {
         // Fail closed instead of silently ignoring the clustering hint: it
         // needs Voice ID on, and only the external clustering path clusters.
-        if !request.voice_id {
+        if !request.voice_id && !request.anonymous_diarize {
             return Err(BackendError::DiarizeSpeakersRequiresDiarization);
         }
         if speaker_plan == SpeakerPlan::InDecoder {
@@ -2242,6 +2447,11 @@ fn run_native_transcription_impl(
             });
         }
     }
+    reject_return_speaker_embeddings_for_plan(
+        request.return_speaker_embeddings,
+        speaker_plan,
+        selected_family.adapter_id,
+    )?;
     // OPENASR_TIMING=1 detail: model-pack path validation + gguf metadata/
     // tensor-index preflight + family/adapter selection, i.e. everything
     // above this point in the request path. Nested inside the coarse
@@ -2255,16 +2465,23 @@ fn run_native_transcription_impl(
     progress.report_fraction(1.0);
     progress.complete_stage();
     progress.enter_stage_indeterminate(TranscriptionStage::Prepare);
-    let audio_prep_started = Instant::now();
+    let prepared_sample_attach_started = Instant::now();
     let prepared_audio = resolve_prepared_audio_samples(&request.input_path, prepared_samples)
         .map_err(|error| BackendError::NativeUnsupportedInputFormat {
             reason: error.to_string(),
         })?;
+    let prepared_sample_attach_duration = prepared_sample_attach_started.elapsed();
     crate::stage_timing::log_stage(
         "native_transcribe",
-        "audio_prep",
-        audio_prep_started.elapsed(),
+        "prepared_sample_attach",
+        prepared_sample_attach_duration,
     );
+    if let Some(receipt) = execution_context.native_execution_receipt() {
+        receipt.record_phase_duration(
+            crate::RequestExecutionPhase::PreparedSampleAttach,
+            prepared_sample_attach_duration,
+        );
+    }
     progress.report_fraction(1.0);
     progress.complete_stage();
     // Empty-but-valid PCM must reach the ASR family's established empty-input
@@ -2345,13 +2562,23 @@ fn run_native_transcription_impl(
     }
 
     let audio_duration_seconds = prepared_audio.len() as f32 / 16_000.0;
+    // Stream-VAD, ReDimNet, and the segmenter admit through SystemMemoryOwner,
+    // which requires the process-wide broker. Install NES before materialize,
+    // not only around compute_speaker_attribution: 0.1.37 --diarize failed
+    // closed with VadUnavailable because admission ran with no broker.
+    let _voice_id_memory_context = (speaker_plan != SpeakerPlan::Off).then(|| {
+        crate::models::native_execution_services::install_native_execution_services(
+            execution_services.as_ref(),
+        )
+    });
     let speaker_runtime = if speaker_plan == SpeakerPlan::Off {
         None
     } else {
         Some(
-            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_intent(
+            crate::diarize::embed::PolicyResolvedSpeakerRuntime::load_with_preference(
                 Arc::clone(execution_services),
                 request_execution_intent.clone(),
+                request.voice_id_embedder,
             )
             .map_err(|error| BackendError::NativeFailClosed {
                 reason: format!("could not construct the admitted speaker runtime: {error}"),
@@ -2387,15 +2614,6 @@ fn run_native_transcription_impl(
     // be attributed onto whichever transcription path runs below.
     let voice_id_audio = voice_id_audio_view(&prepared_audio, speaker_plan);
     let speaker_turns = if let Some(diarizer) = external_diarizer.as_ref() {
-        // External diarization runs outside the ASR candidate attempt, but its
-        // invocation-local scratch still belongs to this process-wide broker.
-        // Install only the service context for this phase: the scratch owner
-        // below creates and drops its own reservation, while persistent
-        // segmenter/embedder owners keep their independent candidate leases.
-        let _memory_context =
-            crate::models::native_execution_services::install_native_execution_services(
-                execution_services.as_ref(),
-            );
         let hint = match request.diarize_speakers {
             Some(speakers) => crate::diarize::contract::DiarizeHint::NumSpeakers(speakers),
             None => crate::diarize::contract::DiarizeHint::Auto,
@@ -2410,12 +2628,24 @@ fn run_native_transcription_impl(
                 .as_deref()
                 .expect("external speaker plan has a resolved embedder"),
             hint,
+            request.voice_id,
             &execution_context,
             progress,
         )?
     } else {
         SpeakerAttribution::default()
     };
+    // Copy centroids while the embedder is still live. External plans drop the
+    // ReDimNet lease before ASR admission; the payload is then just data.
+    let speaker_embeddings =
+        if request.return_speaker_embeddings && speaker_plan == SpeakerPlan::External {
+            let embedder = voice_id_embedder
+                .as_deref()
+                .expect("external speaker plan has a resolved embedder");
+            SpeakerEmbeddingPayload::from_timeline(&speaker_turns.timeline, embedder)?
+        } else {
+            None
+        };
     // External attribution is pure data at this point: both the timeline and
     // enrolled-person assignments have been copied out of the auxiliary
     // runtimes. Do not retain the segmenter/ReDimNet candidate leases while
@@ -2491,7 +2721,12 @@ fn run_native_transcription_impl(
         .first()
         .expect("execution policy plans are non-empty");
     let resolved_runtime_for_request =
-        resolved_runtime_for_candidate(primary_candidate, auto_gpu_policy);
+        crate::models::device_greedy_token::resolved_runtime_for_family_candidate(
+            primary_candidate,
+            auto_gpu_policy,
+            selected_family.adapter_id,
+            decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
+        );
     // Actual device class after candidate selection: Auto may land on Metal/GPU
     // even though the intent-only provisional plan used AutoOrCpu weights.
     let resolved_backend_class =
@@ -2537,10 +2772,19 @@ fn run_native_transcription_impl(
             execution_services.as_ref(),
             &request_execution_intent,
         )?;
+        let vad_activation_quote =
+            crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+                crate::diarize::vad::FireRedStreamVadModel::system_memory_quote().map_err(
+                    |reason| BackendError::NativeFailClosed {
+                        reason: format!("longform Stream-VAD resident quote failed: {reason}"),
+                    },
+                )?,
+            );
         let (mut plan, vad_engine_label) = run_auxiliary_stage_with_policy(
             execution_services.as_ref(),
             &vad_execution_plan,
             "longform-vad",
+            vad_activation_quote,
             |candidate| {
                 let (vad_provider, vad_engine_label) =
                     resolve_longform_vad_provider(
@@ -2652,13 +2896,15 @@ fn run_native_transcription_impl(
                 },
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: Vec::new(),
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    Vec::new(),
                     strip_forced_word_timestamps,
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -2997,13 +3243,15 @@ fn run_native_transcription_impl(
                     transcription,
                     prepared_audio,
                     emits_punctuation,
-                    speaker_finalization: SpeakerFinalizationContext {
-                        attribution: speaker_turns,
-                        embedder: voice_id_embedder,
-                        plan: speaker_plan,
-                        scope_by_segment: Vec::new(),
+                    speaker_finalization: SpeakerFinalizationContext::new(
+                        speaker_turns,
+                        voice_id_embedder,
+                        speaker_plan,
+                        Vec::new(),
                         strip_forced_word_timestamps,
-                    },
+                        request.voice_id,
+                        speaker_embeddings,
+                    ),
                     progress_backend: backend_class,
                     progress_segmenter: segmenter_kind,
                 });
@@ -3019,13 +3267,15 @@ fn run_native_transcription_impl(
                 transcription,
                 prepared_audio,
                 emits_punctuation,
-                speaker_finalization: SpeakerFinalizationContext {
-                    attribution: speaker_turns,
-                    embedder: voice_id_embedder,
-                    plan: speaker_plan,
-                    scope_by_segment: speaker_scope_by_segment,
+                speaker_finalization: SpeakerFinalizationContext::new(
+                    speaker_turns,
+                    voice_id_embedder,
+                    speaker_plan,
+                    speaker_scope_by_segment,
                     strip_forced_word_timestamps,
-                },
+                    request.voice_id,
+                    speaker_embeddings,
+                ),
                 progress_backend: backend_class,
                 progress_segmenter: segmenter_kind,
             });
@@ -3103,13 +3353,15 @@ fn run_native_transcription_impl(
         transcription,
         prepared_audio,
         emits_punctuation,
-        speaker_finalization: SpeakerFinalizationContext {
-            attribution: speaker_turns,
-            embedder: voice_id_embedder,
-            plan: speaker_plan,
-            scope_by_segment: Vec::new(),
+        speaker_finalization: SpeakerFinalizationContext::new(
+            speaker_turns,
+            voice_id_embedder,
+            speaker_plan,
+            Vec::new(),
             strip_forced_word_timestamps,
-        },
+            request.voice_id,
+            speaker_embeddings,
+        ),
         progress_backend: backend_class,
         progress_segmenter: segmenter_kind,
     })
@@ -3201,7 +3453,7 @@ fn finalize_native_transcription(
         transcription = apply_speaker_attribution(transcription, &speaker.attribution)?;
     }
     match speaker.plan {
-        SpeakerPlan::InDecoder => {
+        SpeakerPlan::InDecoder if speaker.name_enrolled => {
             // Each independently decoded slice is a label scope. The shared
             // identity stage disambiguates those local counters, gathers
             // acoustic evidence, stitches matching voices, and names enrolled
@@ -3241,10 +3493,12 @@ fn finalize_native_transcription(
             // evidence from transcript segments: coarse ASR segments can span
             // several speakers even when the timeline is correct.
             transcription.unnamed_speakers = speaker.attribution.unnamed_speakers.clone();
+            transcription.speaker_embeddings = speaker.speaker_embeddings.clone();
         }
         SpeakerPlan::Off => {
             transcription.unnamed_speakers.clear();
         }
+        SpeakerPlan::InDecoder => {}
     }
     // Identity runs before reading/cue projection. Besides avoiding redundant
     // embedding work over presentation-only cue fragments, this preserves the
@@ -3383,14 +3637,16 @@ struct SpeakerAttribution {
 }
 
 /// Diarize the prepared audio into recording-local speaker turns, then match
-/// enrolled people from those turns. All external protocol details stay
-/// behind `ExternalDiarizer`; this layer only consumes normalized turns and
-/// centroids.
+/// enrolled people from those turns when enrolled naming is on. Anonymous
+/// diarize (`!name_enrolled`) keeps `SPEAKER_XX` labels and never opens the
+/// operator person store. All external protocol details stay behind
+/// `ExternalDiarizer`; this layer only consumes normalized turns and centroids.
 fn compute_speaker_attribution(
     diarizer: &crate::diarize::external::ExternalDiarizer,
     samples: PcmSlice,
     embedder: &dyn crate::diarize::embed::SpeakerEmbedder,
     hint: crate::diarize::contract::DiarizeHint,
+    name_enrolled: bool,
     execution_context: &crate::RequestExecutionContext,
     progress: &ProgressReporter,
 ) -> Result<SpeakerAttribution, BackendError> {
@@ -3456,6 +3712,22 @@ fn compute_speaker_attribution(
                 turn.overlap
             );
         }
+    }
+    if !name_enrolled {
+        crate::stage_timing::log_detail_event(
+            "speaker_attribution",
+            format_args!(
+                "stage=complete speakers={} named=0 unnamed={} duration_ms={:.3}",
+                timeline.centroids.len(),
+                timeline.centroids.len(),
+                total_started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+        return Ok(SpeakerAttribution {
+            timeline,
+            identities: BTreeMap::new(),
+            unnamed_speakers: Vec::new(),
+        });
     }
     progress.enter_stage(TranscriptionStage::IdentifySpeakers);
     let identity_progress = progress.clone();
@@ -4290,6 +4562,24 @@ fn is_cooperative_cancel_reason(reason: &str) -> bool {
         || reason.contains("aborted by cancel request")
 }
 
+fn capture_request_execution_facts(
+    verified_pack: &VerifiedPack,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    execution_lane: crate::models::native_execution_services::ExecutionLaneKey,
+) -> Result<crate::models::native_execution_services::ExecutionLaneKey, BackendError> {
+    let receipt = crate::models::native_execution_services::current_execution_receipt_collector();
+    crate::models::request_execution_receipt::record_request_execution_facts(
+        receipt.as_ref(),
+        verified_pack,
+        selected_family,
+        resolved_runtime,
+        &execution_lane,
+    )
+    .map_err(|reason| BackendError::NativeFailClosed { reason })?;
+    Ok(execution_lane)
+}
+
 /// Builds the request's resolved runtime from the exact candidate route passed
 /// by the policy loop. Recomputing it per attempt is required because a retry
 /// can change both provider and placement.
@@ -4298,6 +4588,7 @@ fn run_dispatch_once(
     execution_services: &Arc<NativeExecutionServices>,
     verified_pack: &VerifiedPack,
     selected_family: &GgmlFamilyAdapterDescriptor,
+    candidate: &ExecutionCandidate,
     samples: PcmSlice,
     request_options: GgmlAsrExecutionOptions,
     backend_preference: GgmlAsrBackendPreference,
@@ -4306,9 +4597,30 @@ fn run_dispatch_once(
     execution_context: &Arc<crate::RequestExecutionContext>,
 ) -> Result<GgmlAsrExecutionResult, BackendError> {
     let runtime_preflight = verified_pack.preflight();
-    let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+    let resolved_runtime = resolved_runtime_for_family_preference(
         resolved_preference,
         auto_gpu_policy,
+        selected_family,
+        decode_logits_consumers_for_options(selected_family.adapter_id, &request_options),
+    );
+    let execution_lane =
+        crate::models::native_execution_services::ExecutionLaneKey::from_candidate(
+            candidate,
+            resolved_runtime.backend(),
+        )
+        .map_err(|reason| BackendError::NativeFailClosed {
+            reason: reason.to_string(),
+        })?;
+    let execution_lane = capture_request_execution_facts(
+        verified_pack,
+        selected_family,
+        resolved_runtime,
+        execution_lane,
+    )?;
+    let request_execution_context = Arc::new(
+        (**execution_context)
+            .clone()
+            .with_native_execution_lane(execution_lane),
     );
     let execution_request = GgmlAsrExecutionViewRequest {
         execution_services: Arc::clone(execution_services),
@@ -4319,7 +4631,7 @@ fn run_dispatch_once(
         request_options,
         backend_preference,
         resolved_runtime,
-        execution_context: Arc::clone(execution_context),
+        execution_context: Arc::clone(&request_execution_context),
     };
     let planning_input =
         crate::models::ggml_asr_executor::GgmlAsrDecoderStatePlanningInput::for_offline_view_request(
@@ -4404,10 +4716,14 @@ fn run_auxiliary_stage_with_policy<T>(
     execution_services: &NativeExecutionServices,
     execution_plan: &ExecutionPlan,
     stage: &'static str,
+    activation_quote: crate::models::native_execution_services::CandidateActivationQuoteSource,
     mut operation: impl FnMut(&ExecutionCandidate) -> Result<T, BackendError>,
 ) -> Result<T, PolicyResolvedAuxRuntimeError<BackendError>> {
     let candidates = execution_plan.candidates();
     for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let _quote = crate::models::native_execution_services::install_candidate_activation_quote(
+            activation_quote.clone(),
+        );
         let attempt = crate::models::native_execution_services::run_execution_candidate_attempt(
             execution_services,
             candidate,
@@ -4466,25 +4782,45 @@ fn execution_policy_error_to_backend(error: ExecutionPolicyError) -> BackendErro
     }
 }
 
+fn decode_logits_consumers_for_options(
+    adapter_id: &str,
+    options: &GgmlAsrExecutionOptions,
+) -> crate::ggml_runtime::GgmlDecodeLogitsConsumers {
+    crate::models::device_greedy_token::decode_logits_consumers_for_request(
+        adapter_id,
+        options
+            .phrase_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty()),
+        options.word_timestamps,
+        crate::adapter_pack::active_adapter_path(options.adapter_path.as_deref()).is_some(),
+    )
+}
+
+fn resolved_runtime_for_family_preference(
+    preference: Option<RequestBackendPreference>,
+    auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
+    selected_family: &GgmlFamilyAdapterDescriptor,
+    logits_consumers: crate::ggml_runtime::GgmlDecodeLogitsConsumers,
+) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
+    crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+        preference,
+        auto_gpu_policy,
+        crate::models::device_greedy_token::decode_output_contract_for_adapter(
+            selected_family.adapter_id,
+        ),
+        logits_consumers,
+    )
+}
+
 fn resolved_runtime_for_candidate(
     candidate: &ExecutionCandidate,
     auto_gpu_policy: crate::ggml_runtime::AutoGpuPolicy,
 ) -> crate::ggml_runtime::ResolvedFamilyRuntimeInput {
     crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-        request_backend_preference_for_candidate(candidate),
+        crate::models::device_greedy_token::request_backend_preference_for_candidate(candidate),
         auto_gpu_policy,
     )
-}
-
-fn request_backend_preference_for_candidate(
-    candidate: &ExecutionCandidate,
-) -> Option<RequestBackendPreference> {
-    match candidate.placement {
-        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
-        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
-            RequestBackendPreference::Exact(candidate.device.route.clone()),
-        ),
-    }
 }
 
 /// Whole-slice RMS against an absolute dBFS line. The one caller is the
@@ -5109,14 +5445,81 @@ mod tests {
         let services = native_execution_services_for_test();
         let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
             .expect("Auto VAD plan");
-        let error =
-            run_auxiliary_stage_with_policy(services.as_ref(), &plan, "longform-vad", |_| {
-                Err::<(), BackendError>(BackendError::TranscriptionCanceled)
-            })
-            .expect_err("canceled long-form VAD must fail the auxiliary stage");
+        let error = run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| Err::<(), BackendError>(BackendError::TranscriptionCanceled),
+        )
+        .expect_err("canceled long-form VAD must fail the auxiliary stage");
         assert!(matches!(
             required_auxiliary_stage_error(error),
             BackendError::TranscriptionCanceled
+        ));
+    }
+
+    #[test]
+    fn run_auxiliary_stage_with_policy_installs_quote_and_does_not_capacity_exhaust() {
+        let services = native_execution_services_for_test();
+        let plan = resolve_longform_vad_execution_plan(services.as_ref(), &ExecutionIntent::Auto)
+            .expect("Auto VAD plan");
+        let installed = std::sync::atomic::AtomicBool::new(false);
+        run_auxiliary_stage_with_policy(
+            services.as_ref(),
+            &plan,
+            "longform-vad",
+            longform_vad_activation_quote_for_test(),
+            |_| {
+                installed.store(
+                    crate::models::native_execution_services::current_candidate_activation_quote()
+                        .is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Ok::<_, BackendError>(())
+            },
+        )
+        .expect("shipped auxiliary stage must install its quote source");
+        assert!(
+            installed.load(std::sync::atomic::Ordering::SeqCst),
+            "run_auxiliary_stage_with_policy must install CandidateActivationQuoteSource before the attempt"
+        );
+    }
+
+    #[test]
+    fn voice_id_installs_nes_before_vad_materialize() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/api/backend/native_transcribe.rs"),
+        )
+        .expect("read native_transcribe.rs");
+        let impl_body = source
+            .split("fn run_native_transcription_impl(")
+            .nth(1)
+            .expect("run_native_transcription_impl")
+            .split("\nfn ")
+            .next()
+            .expect("impl body");
+        let install = impl_body
+            .find("install_native_execution_services")
+            .expect("Voice ID must install NES");
+        let materialize = impl_body
+            .find(".materialize(")
+            .expect("external diarizer materialize");
+        assert!(
+            install < materialize,
+            "Stream-VAD admission requires NES before ExternalDiarizer::materialize, got install@{install} materialize@{materialize}"
+        );
+    }
+
+    #[test]
+    fn native_boundary_rejects_speaker_embeddings_without_diarization() {
+        let services = native_execution_services_for_test();
+        let mut request = TranscriptionRequest::new("unused.wav", "unused-model");
+        request.return_speaker_embeddings = true;
+        assert!(matches!(
+            run_native_transcription_fallible(request, &services, None),
+            Err(BackendError::SpeakerEmbeddingsRequireDiarization)
         ));
     }
 
@@ -5190,6 +5593,30 @@ mod tests {
 
     fn native_execution_services_for_test() -> Arc<NativeExecutionServices> {
         crate::models::native_execution_services::test_native_execution_services()
+    }
+
+    fn longform_vad_activation_quote_for_test()
+    -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::diarize::vad::FireRedStreamVadModel::system_memory_quote()
+                .expect("Stream-VAD declared resident quote"),
+        )
+    }
+
+    fn auxiliary_stage_activation_quote_for_test(
+        stage: &str,
+    ) -> crate::models::native_execution_services::CandidateActivationQuoteSource {
+        if stage == "longform-vad" {
+            return longform_vad_activation_quote_for_test();
+        }
+        crate::models::native_execution_services::CandidateActivationQuoteSource::Declared(
+            crate::models::system_memory_owner::SystemMemoryAllocationQuote::new(
+                format!("aux.{stage}.test.declared-resident"),
+                128 * 1024,
+                96 * 1024,
+            )
+            .expect("test auxiliary declared resident"),
+        )
     }
 
     const ASR_EXACT_SMOKE_PACK_ENV: &str = "OPENASR_ASR_SMOKE_PACK";
@@ -6437,6 +6864,34 @@ mod tests {
             SpeakerPlan::InDecoder
         );
         assert_eq!(SpeakerPlan::resolve(true, External), SpeakerPlan::External);
+    }
+
+    #[test]
+    fn return_speaker_embeddings_fail_closed_for_off_and_in_decoder_plans() {
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(false, SpeakerPlan::Off, "unused"),
+            Ok(())
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(true, SpeakerPlan::Off, "unused"),
+            Err(BackendError::SpeakerEmbeddingsRequireDiarization)
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(
+                true,
+                SpeakerPlan::InDecoder,
+                "moss-transcribe-diarize"
+            ),
+            Err(BackendError::RequestOptionUnsupportedByModel {
+                option: "return_speaker_embeddings",
+                adapter: "moss-transcribe-diarize",
+                ..
+            })
+        ));
+        assert!(matches!(
+            reject_return_speaker_embeddings_for_plan(true, SpeakerPlan::External, "whisper"),
+            Ok(())
+        ));
     }
 
     #[test]
@@ -9196,6 +9651,7 @@ mod tests {
                 native_execution_services_for_test().as_ref(),
                 &typed_fallback_test_plan(),
                 stage,
+                auxiliary_stage_activation_quote_for_test(stage),
                 |_| {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     crate::models::native_execution_services::record_current_execution_candidate_failure(
@@ -9351,15 +9807,13 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENASR_SLICE_PIPELINE_WIDTH");
         }
-        // Carry disabled: concurrent is transcript-equivalent, so the default
-        // requests the maximum and lets the capacity gate pick K.
+        // Default is serial so longform peak RSS stays at one decoder+KV.
+        // Concurrent width is opt-in via OPENASR_SLICE_PIPELINE_WIDTH.
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
-            "carry-disabled run defaults to the concurrent pipeline"
+            1,
+            "carry-disabled run defaults to serial"
         );
-        // ... which still flows through the capacity gate: plenty of memory
-        // admits the full width, tight memory caps it back to serial.
         assert_eq!(
             slice_pipeline_capped_width(
                 slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
@@ -9368,7 +9822,7 @@ mod tests {
                 1 << 20,
                 0,
             ),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_capped_width(
@@ -9399,7 +9853,7 @@ mod tests {
         // Explicit widths override the carry-gated default in both directions:
         // ">=2" forces the carry-light concurrent path onto a carry-active
         // run, and "0"/"1" pin a carry-disabled run to serial.
-        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 4), ("9", 4)] {
+        for (value, expected) in [("0", 1), ("1", 1), ("2", 2), ("4", 2), ("9", 2)] {
             // SAFETY: nextest runs each test in its own process, so mutating
             // this process-global env var cannot race another test.
             unsafe {
@@ -9424,7 +9878,7 @@ mod tests {
         }
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::Disabled),
-            SLICE_PIPELINE_MAX_WIDTH,
+            1,
         );
         assert_eq!(
             slice_pipeline_requested_width(LongformPromptCarryMode::TokenHistory),

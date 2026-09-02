@@ -5,12 +5,27 @@ name: Family Regression
 # signature-verified) and transcribe a committed fixture on the CPU backend,
 # comparing against committed goldens (tooling/family-regression/goldens/).
 #
-# Runs nightly, after a release is published, and on demand. Kept outside
-# push/PR CI because it performs real network downloads and native inference.
-# Nightly/manual runs reuse the latest published CLI too; a raw tag no longer
-# races the release matrix and falls back to two duplicate local builds.
+# Nightly and published-release jobs remain CPU-only/post-release monitoring.
+# They cannot authorize catalog or release activation. The reusable
+# `workflow_call` with `pre_publication: true` is the candidate blocker:
+# release-core must call it with immutable candidate and staging-catalog bytes
+# before deploying the PublishedInert catalog. GPU correctness is a separate,
+# post-publication exact-target activation gate.
 
 on:
+  # This reusable entrypoint is the pre-publication contract seam. The release
+  # orchestrator must call it with staged candidate artifacts before catalog
+  # activation; the release event below remains monitoring only.
+  workflow_call:
+    inputs:
+      pre_publication:
+        description: "Require a release-candidate family regression contract"
+        required: true
+        type: boolean
+      release_tag:
+        description: "Exact draft/public vX.Y.Z release whose CLI is under test"
+        required: false
+        type: string
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * *"
@@ -23,7 +38,9 @@ concurrency:
 
 permissions:
   attestations: read
-  contents: read
+  # Pre-publication runs download a GitHub *draft* release. Drafts are
+  # invisible to contents:read, so this workflow needs write to see them.
+  contents: write
   packages: read
 
 defaults:
@@ -34,6 +51,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  pre-publication-contract:
+    name: Pre-publication family regression contract
+    if: ${{ inputs.pre_publication == true && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify exact draft CLI provenance and committed staging catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          mkdir -p staging/candidate
+          asset="openasr-${version}-linux-x86_64.tar.gz"
+          python3 tooling/release-manifest/gh_release.py download \
+            "$RELEASE_TAG" staging/candidate "$asset" SHA256SUMS
+          python3 tooling/release-manifest/release_asset_verifier.py \
+            --asset "staging/candidate/$asset" --checksums staging/candidate/SHA256SUMS
+          git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          source_digest="$(git rev-parse "${RELEASE_TAG}^{}")"
+          gh attestation verify "staging/candidate/$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml" \
+            --source-digest "$source_digest"
+          python3 -m json.tool model-registry/catalog.json >/dev/null
+          sha256sum model-registry/catalog.json model-registry/catalog.signature.json
+          echo "exact release CLI and committed staging catalog verified"
+
   build-cli-linux:
     name: Build CLI (ubuntu-latest)
     # The public repository also hosts desktop-vX.Y.Z releases. Those do not
@@ -54,7 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: linux-x86_64
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
@@ -66,8 +113,8 @@ jobs:
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
-              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+          if python3 tooling/release-manifest/gh_release.py download \
+              "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
             gh attestation verify "${workdir}/${asset}" \
@@ -136,7 +183,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_SUFFIX: macos-arm64
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
           available=false
@@ -148,8 +195,8 @@ jobs:
           asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if gh release download "${tag}" --repo "${GITHUB_REPOSITORY}" \
-              --dir "${workdir}" --pattern "${asset}" --pattern SHA256SUMS; then
+          if python3 tooling/release-manifest/gh_release.py download \
+              "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
             gh attestation verify "${workdir}/${asset}" \

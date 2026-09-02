@@ -60,6 +60,24 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(digest, expected.hexdigest())
             self.assertEqual([item[0] for item in rows], ["vendor/B.bin", "vendor/a.bin"])
 
+    def test_vendor_tree_rows_reject_nonportable_collisions_and_file_prefixes(
+        self,
+    ):
+        digest = hashlib.sha256(b"payload").hexdigest()
+        invalid_rows = (
+            [("vendor/A.dll", 7, digest), ("vendor/a.dll", 7, digest)],
+            [("vendor/runtime", 7, digest), ("vendor/runtime/a.dll", 7, digest)],
+            [("vendor/bad?.dll", 7, digest)],
+            [("vendor/caf\u00e9.dll", 7, digest)],
+            [("vendor/oversized.dll", 1 << 64, digest)],
+            [("vendor/type.dll", 7, None)],
+        )
+        for rows in invalid_rows:
+            with self.subTest(rows=rows), self.assertRaises(
+                backend_catalog.BackendCatalogError
+            ):
+                backend_catalog.materialized_tree_sha256_rows(rows)
+
     def test_compile_binds_actual_plugin_vendor_tree_and_host_abi(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -463,6 +481,7 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(backend_catalog.head_cdn_url("https://example.invalid/file"), (200, 42))
 
         command = run.call_args.args[0]
+        self.assertIn("--http1.1", command)
         self.assertIn("--connect-timeout", command)
         self.assertIn("--max-time", command)
         self.assertIn("--retry", command)
@@ -472,7 +491,12 @@ class BackendCatalogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = []
-            for provider, target in (("cuda", "sm_86"), ("cuda", "sm_89"), ("hip", "gfx1100")):
+            for provider, target in (
+                ("cuda", "sm_86"),
+                ("cuda", "sm_89"),
+                ("hip", "gfx1100"),
+                ("vulkan", "generic"),
+            ):
                 entry = {
                     "id": f"{provider}-pack-{target}",
                     "vendor": provider,
@@ -481,7 +505,7 @@ class BackendCatalogTest(unittest.TestCase):
                         "fingerprint": "a" * 64,
                         "ggml_revision": "f" * 40,
                     },
-                    "targets": [target],
+                    "targets": [] if provider == "vulkan" else [target],
                     "min_driver_api": "1.0",
                     "files": [
                         {
@@ -527,6 +551,10 @@ class BackendCatalogTest(unittest.TestCase):
             self.assertEqual(
                 hints["providers"]["cuda"]["vendor"]["filename"], "cuda-vendor.zip"
             )
+            self.assertEqual(
+                hints["providers"]["vulkan"]["targets"]["generic"]["backend_id"],
+                "vulkan-pack-generic",
+            )
 
             bad = json.loads(paths[-1].read_text(encoding="utf-8"))
             bad["host_abi"]["fingerprint"] = "e" * 64
@@ -542,6 +570,7 @@ class BackendCatalogTest(unittest.TestCase):
                 ("cuda", "sm_86", "cuda-12-6.zip"),
                 ("cuda", "sm_120", "cuda-12-8.zip"),
                 ("hip", "gfx1100", "hip-vendor.zip"),
+                ("vulkan", "generic", "vulkan-loader.zip"),
             ):
                 entry = {
                     "id": f"{provider}-pack-{target}",
@@ -551,7 +580,7 @@ class BackendCatalogTest(unittest.TestCase):
                         "fingerprint": "a" * 64,
                         "ggml_revision": "f" * 40,
                     },
-                    "targets": [target],
+                    "targets": [] if provider == "vulkan" else [target],
                     "min_driver_api": "1.0",
                     "files": [
                         {
@@ -594,7 +623,11 @@ class BackendCatalogTest(unittest.TestCase):
             root = Path(tmp)
             entries = []
             expected_entries = []
-            for provider, marker in (("cuda", b"cuda"), ("hip", b"hip")):
+            for provider, marker, targets in (
+                ("cuda", b"cuda", ["sm_86"]),
+                ("hip", b"hip", ["gfx1100"]),
+                ("vulkan", b"vulkan", []),
+            ):
                 plugin = root / f"ggml-{provider}.dll"
                 vendor = root / f"{provider}-vendor.zip"
                 plugin.write_bytes(marker + b"-plugin")
@@ -626,7 +659,7 @@ class BackendCatalogTest(unittest.TestCase):
                     "vendor": provider,
                     "version": "1.2.3",
                     "host_abi": {"fingerprint": "a" * 64},
-                    "targets": ["sm_86" if provider == "cuda" else "gfx1100"],
+                    "targets": targets,
                     "files": files,
                 }
                 path = root / f"entry-{provider}.json"
@@ -635,8 +668,8 @@ class BackendCatalogTest(unittest.TestCase):
                 expected_entries.append(entry)
 
             report = backend_catalog.verify_release_assets(entries, root, "1.2.3")
-            self.assertEqual(report["verified_files"], 4)
-            self.assertEqual(set(report["providers"]), {"cuda", "hip"})
+            self.assertEqual(report["verified_files"], 6)
+            self.assertEqual(set(report["providers"]), {"cuda", "hip", "vulkan"})
 
             catalog = root / "catalog.json"
             catalog.write_text(
@@ -645,7 +678,8 @@ class BackendCatalogTest(unittest.TestCase):
             )
             catalog_report = backend_catalog.verify_catalog_entries(catalog, entries)
             self.assertEqual(
-                catalog_report["verified_backend_ids"], ["cuda-release", "hip-release"]
+                catalog_report["verified_backend_ids"],
+                ["cuda-release", "hip-release", "vulkan-release"],
             )
 
             plugin = root / "ggml-cuda.dll"
@@ -735,18 +769,16 @@ class BackendCatalogTest(unittest.TestCase):
                 "ggml.dll": minimal_pe(b"host"),
                 "ggml-base.dll": minimal_pe(b"base"),
                 "ggml-cpu-avx2.dll": minimal_pe(b"cpu"),
-                "ggml-vulkan.dll": minimal_pe(b"vulkan"),
-                "vulkan-1.dll": minimal_pe(b"loader"),
             }
             for name, payload in payloads.items():
                 (root / name).write_bytes(payload)
 
             out = root / "openasr-backend-bundle-v1.json"
-            backend_catalog.compile_bundled_manifest(root, host_abi, out, True)
+            backend_catalog.compile_bundled_manifest(root, host_abi, out)
             result = json.loads(out.read_text(encoding="utf-8"))
 
             self.assertEqual(result["host_abi_fingerprint"], fingerprint)
-            self.assertEqual(result["schema_version"], 3)
+            self.assertEqual(result["schema_version"], 4)
             self.assertEqual(len(result["bundle_contract_sha256"]), 64)
             self.assertEqual(
                 result["cpu_contract_sha256"],
@@ -755,17 +787,8 @@ class BackendCatalogTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(
-                result["vulkan_contract_sha256"],
-                backend_catalog.provider_bundle_contract_sha256(
-                    fingerprint, result["files"], "vulkan"
-                ),
-            )
-            self.assertNotEqual(
-                result["cpu_contract_sha256"], result["vulkan_contract_sha256"]
-            )
-            self.assertEqual(
                 {entry["provider"] for entry in result["files"]},
-                {"host", "cpu", "vulkan", "dependency"},
+                {"host", "cpu"},
             )
             for entry in result["files"]:
                 payload = payloads[entry["filename"]]
@@ -789,17 +812,21 @@ class BackendCatalogTest(unittest.TestCase):
                 backend_catalog.pe_image_identity(signed),
             )
 
-    def test_bundle_manifest_requires_release_vulkan_loader(self):
+    def test_neutral_bundle_rejects_optional_vulkan_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             host_abi = root / "abi.json"
             host_abi.write_text(json.dumps({"fingerprint": "b" * 64}), encoding="utf-8")
-            for name in ("ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-vulkan.dll"):
+            for name in (
+                "ggml.dll",
+                "ggml-base.dll",
+                "ggml-cpu.dll",
+                "ggml-vulkan.dll",
+                "vulkan-1.dll",
+            ):
                 (root / name).write_bytes(minimal_pe(name.encode("ascii")))
             with self.assertRaises(backend_catalog.BackendCatalogError):
-                backend_catalog.compile_bundled_manifest(
-                    root, host_abi, root / "bundle.json", True
-                )
+                backend_catalog.compile_bundled_manifest(root, host_abi, root / "bundle.json")
 
 
 if __name__ == "__main__":

@@ -20,9 +20,10 @@ use crate::NativeAsrSession;
 use crate::api::backend::{Segment, Transcription};
 use crate::arch::FUNASR_NANO_DECODE_POLICY_ID;
 use crate::device::execution_policy::ExecutionPlacement;
+#[cfg(test)]
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, RequestBackendPreference, request_backend_override,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, RequestBackendPreference, request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -82,7 +83,7 @@ pub(crate) const FUNASR_NANO_MAX_INPUT_SECONDS: f32 = 40.0;
 pub(crate) const FUNASR_NANO_MAX_GENERATED_TOKENS: usize = 512;
 
 type FunasrNanoEncoderAdapterRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
-type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
+type FunasrNanoDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, GgmlDecodeOutputPlan);
 
 /// Resident encoder-side runtime: the SAN-M encoder graph + transformer
 /// adaptor with their weights already uploaded to (or bound zero-copy in)
@@ -113,6 +114,7 @@ type FunasrNanoDecoderRuntimeActor =
 struct FunasrNanoUnifiedRuntimeCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
+    output_plan: GgmlDecodeOutputPlan,
 }
 
 struct FunasrNanoUnifiedRuntime {
@@ -180,12 +182,7 @@ fn funasr_nano_unified_runtime_enabled(
     allow_unified_runtime
         && backend == GgmlCpuGraphBackend::Gpu
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
 }
 
 fn validate_funasr_nano_unified_runtime(
@@ -261,14 +258,15 @@ fn funasr_nano_decoder_system_memory_quote(
 fn allocate_funasr_nano_decoder_runtime(
     preflight: &crate::GgufRuntimeSourcePreflight,
     metadata: FunasrNanoDecoderMetadata,
-    backend: GgmlCpuGraphBackend,
+    resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     quote: SystemMemoryAllocationQuote,
 ) -> Result<SystemMemoryOwner<FunasrNanoDecoderRuntime>, FunasrNanoExecutorError> {
     match SystemMemoryOwner::try_allocate_transaction(quote, || {
-        let runtime = FunasrNanoDecoderRuntime::new_from_preflight(preflight, metadata, backend)
-            .map_err(|error| FunasrNanoExecutorError::DecoderFailed {
-                reason: error.to_string(),
-            })?;
+        let runtime =
+            FunasrNanoDecoderRuntime::new_from_preflight(preflight, metadata, resolved_runtime)
+                .map_err(|error| FunasrNanoExecutorError::DecoderFailed {
+                    reason: error.to_string(),
+                })?;
         let retained = runtime.retained_system_memory_bytes().map_err(|reason| {
             FunasrNanoExecutorError::RuntimeOwnershipFailed {
                 stage: "decoder",
@@ -479,6 +477,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for FunasrNanoGreedyStepExecutor<'_> {
             greedy_token_hint: None,
         })
     }
+
+    fn take_compute_evidence(&mut self) -> Option<crate::ggml_runtime::GgmlSelectionEvidenceRef> {
+        self.decoder.take_compute_evidence()
+    }
 }
 
 impl FunasrNanoGgmlExecutor {
@@ -562,11 +564,13 @@ impl FunasrNanoGgmlExecutor {
         &self,
         preflight: &crate::GgufRuntimeSourcePreflight,
         metadata: FunasrNanoDecoderMetadata,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     ) -> Result<FunasrNanoDecoderRuntimeActor, FunasrNanoExecutorError> {
+        let backend = resolved_runtime.backend();
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
             current_execution_lane_key(backend),
+            resolved_runtime.output_plan(),
         );
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -578,7 +582,7 @@ impl FunasrNanoGgmlExecutor {
                 Ok((quote.retained_bytes, (build_preflight, quote)))
             },
             move |(preflight, quote)| {
-                allocate_funasr_nano_decoder_runtime(&preflight, metadata, backend, quote)
+                allocate_funasr_nano_decoder_runtime(&preflight, metadata, resolved_runtime, quote)
             },
             |error| Self::map_actor_error("decoder", error),
         )
@@ -590,11 +594,13 @@ impl FunasrNanoGgmlExecutor {
         encoder_metadata: super::runtime_contract::FunasrNanoEncoderMetadata,
         adapter_metadata: super::runtime_contract::FunasrNanoAdapterMetadata,
         decoder_metadata: FunasrNanoDecoderMetadata,
-        backend: GgmlCpuGraphBackend,
+        resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
     ) -> Result<FunasrNanoUnifiedRuntimeActor, FunasrNanoExecutorError> {
+        let backend = resolved_runtime.backend();
         let key = FunasrNanoUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
+            output_plan: resolved_runtime.output_plan(),
         };
         let quote_preflight = preflight.clone();
         let build_preflight = preflight.clone();
@@ -610,9 +616,9 @@ impl FunasrNanoGgmlExecutor {
                 // transaction on the owner thread. The outer actor adds only
                 // native-domain graph owners already admitted by their runtime
                 // constructors, so it must not reserve the decoder bytes twice.
-                Ok((0, (build_preflight, decoder_quote)))
+                Ok((0, (build_preflight, decoder_quote, resolved_runtime)))
             },
-            move |(preflight, decoder_quote)| {
+            move |(preflight, decoder_quote, resolved_runtime)| {
                 let encoder = FunasrNanoEncoderGraph::new_from_preflight(
                     &preflight,
                     encoder_metadata,
@@ -632,7 +638,7 @@ impl FunasrNanoGgmlExecutor {
                 let decoder = allocate_funasr_nano_decoder_runtime(
                     &preflight,
                     decoder_metadata,
-                    backend,
+                    resolved_runtime,
                     decoder_quote,
                 )?;
                 let runtime = FunasrNanoUnifiedRuntime {
@@ -774,7 +780,7 @@ impl FunasrNanoGgmlExecutor {
                 encoder_metadata,
                 adapter_metadata,
                 decoder_metadata,
-                backend,
+                request.resolved_runtime,
             )?)
         } else {
             None
@@ -854,8 +860,11 @@ impl FunasrNanoGgmlExecutor {
                 })
                 .map_err(|error| Self::map_actor_error("unified-decoder", error))??
         } else {
-            let decoder_actor =
-                self.checkout_decoder_runtime(preflight, decoder_metadata, backend)?;
+            let decoder_actor = self.checkout_decoder_runtime(
+                preflight,
+                decoder_metadata,
+                request.resolved_runtime,
+            )?;
             decoder_actor
                 .call_mut(move |runtime| {
                     let result = decode_with_decoder(
@@ -1068,8 +1077,12 @@ mod tests {
     }
 
     #[test]
-    fn unified_owner_is_limited_to_offline_exact_cuda_and_vulkan_full_device() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
+    fn unified_owner_is_limited_to_offline_exact_cuda_hip_and_vulkan_full_device() {
+        for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Hip,
+            ExecutionProvider::Vulkan,
+        ] {
             let preference = exactly_addressable_preference(provider);
             assert!(funasr_nano_unified_runtime_enabled(
                 true,
@@ -1093,7 +1106,6 @@ mod tests {
         for provider in [
             ExecutionProvider::Cpu,
             ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
             ExecutionProvider::Accelerator,
             ExecutionProvider::Unknown,
         ] {
@@ -1105,6 +1117,32 @@ mod tests {
                 Some(ExecutionPlacement::FullDevice),
             ));
         }
+    }
+
+    #[test]
+    fn output_plan_partitions_unified_runtime_cache_identity() {
+        let content = PackContentKey::new("sha256:funasr-nano-output-plan-fixture");
+        let lane = current_execution_lane_key(GgmlCpuGraphBackend::Cpu);
+        let full_logits = FunasrNanoUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            output_plan: GgmlDecodeOutputPlan::FullLogits,
+        };
+        let compact = FunasrNanoUnifiedRuntimeCacheKey {
+            content: content.clone(),
+            lane: lane.clone(),
+            output_plan: GgmlDecodeOutputPlan::NativeFirstMaxToken,
+        };
+        assert_ne!(full_logits, compact);
+
+        let full_decoder: FunasrNanoDecoderRuntimeCacheKey = (
+            content.clone(),
+            lane.clone(),
+            GgmlDecodeOutputPlan::FullLogits,
+        );
+        let compact_decoder: FunasrNanoDecoderRuntimeCacheKey =
+            (content, lane, GgmlDecodeOutputPlan::NativeFirstMaxToken);
+        assert_ne!(full_decoder, compact_decoder);
     }
 
     /// Bring-up golden: reads the committed reference LFR features + adaptor
@@ -1220,10 +1258,14 @@ mod tests {
             let speech_rows = speech_rows_full[..n_aud * adapter_metadata.llm_dim].to_vec();
             let decode_prompt =
                 build_funasr_nano_decode_prompt(&tokenizer, n_aud).expect("decode prompt");
+            let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            );
             let mut decoder = FunasrNanoDecoderRuntime::new_from_preflight(
                 &preflight,
                 decoder_metadata,
-                GgmlCpuGraphBackend::Cpu,
+                resolved_runtime,
             )
             .expect("decoder");
             let control = std::sync::Arc::new(crate::api::backend::TranscriptionControl::new());

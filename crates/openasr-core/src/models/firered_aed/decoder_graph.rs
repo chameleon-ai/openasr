@@ -15,9 +15,9 @@
 //! ([`crate::nn::decoder::seq2seq_layer`]): pre-norm causal self-attention
 //! with an f16 KV cache, pre-norm cross-attention over cross-KV precomputed
 //! once from the encoder output, and a GELU feed-forward. On the
-//! single-backend GPU path (`nn::decoder::reusable_decode_graph_supported`:
-//! GPU-class backend, scheduler off -- the Metal default, see
-//! [`super::graph_config`]) the single-token incremental step runs through a
+//! single-backend GPU path when the immutable runtime planner authorizes reuse
+//! (`GgmlDecodeReuseMode::ReusableGraph`; see [`super::graph_config`]) the
+//! single-token incremental step runs through a
 //! build-once/re-run [`Seq2SeqReusableDecodeGraph`] (fixed-span self-KV via
 //! `set_rows` + an externally-uploaded attention mask, the cohere/moonshine
 //! pattern), eliminating the per-token graph rebuild; prefill and every CPU
@@ -31,16 +31,13 @@ use thiserror::Error;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError, GgmlCpuGraphRunner, GgmlCpuTensor,
-    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlStaticTensor,
-    GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
+    GgmlDecodeReuseMode, GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext,
+    GgmlSelectionEvidenceRef, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinSeq2SeqDecodePolicyConfigInput, run_builtin_seq2seq_decode_policy,
 };
-use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, first_max_argmax_reverse_indices,
-    first_max_token_id_from_reversed_argmax,
-};
+use crate::models::device_greedy_token::{DeviceGreedyStepOutputMode, device_top1_token_id};
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeResult, Seq2SeqGreedyDecodeStepExecutor,
@@ -50,7 +47,7 @@ use crate::models::seq2seq_greedy_decode::{
 use crate::nn::decoder::{
     CrossKvHandle, SelfKvHandle, Seq2SeqLayerConfig, Seq2SeqLayerWeights,
     Seq2SeqReusableDecodeGraph, build_causal_mask_f16_bits, build_fixed_kv_attention_mask_bits,
-    reusable_decode_graph_supported, reusable_decode_graph_supported_for_runner, seq2seq_layer,
+    reusable_decode_graph_supported, seq2seq_layer,
 };
 use crate::nn::ffn::FeedForwardActivation;
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
@@ -96,14 +93,8 @@ fn map_err(step: &'static str, source: GgmlCpuGraphError) -> FireRedDecoderError
 /// into their own backend buffer sized from the tensors' actual shapes
 /// (`ggml_backend_alloc_ctx_tensors`), independent of this context's size.
 /// Previously hardcoded to a flat 256 MiB regardless of layer count.
-fn firered_decoder_arena_context_bytes(
-    decoder_n_layers: usize,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
-) -> usize {
+fn firered_decoder_arena_context_bytes(decoder_n_layers: usize) -> usize {
     let tensor_count = FIRERED_DECODER_ARENA_FIXED_TENSORS
-        .saturating_add(usize::from(
-            greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1,
-        ))
         .saturating_add(FIRERED_DECODER_ARENA_TENSORS_PER_LAYER.saturating_mul(decoder_n_layers));
     GgmlCpuGraphConfig::metadata_context_bytes(tensor_count)
 }
@@ -141,9 +132,6 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     /// Shared zero bias for the two bias-free K projections (self-attn and
     /// cross-attn `w_ks`), length `d_model`.
     zero_bias: GgmlStaticTensor,
-    /// Reverse vocabulary rows used to preserve the shared driver's first-max
-    /// tie semantics when a direct CUDA/Vulkan graph returns only top-1.
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     cross_layers: Vec<FireRedDecoderCrossCacheLayer>,
     self_kv_layers: Vec<FireRedDecoderSelfKvLayer>,
     decoder_state: Seq2SeqDecoderState,
@@ -165,6 +153,8 @@ pub(crate) struct FireRedDecoderGraphRuntime {
     reuse_cross_frame_count: usize,
     cached_positions: usize,
     greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 /// The static-tensor arena plus everything allocated directly in it
@@ -175,7 +165,6 @@ pub(crate) struct FireRedDecoderGraphRuntime {
 struct FireRedDecoderArenaState {
     arena: GgmlStaticTensorArena,
     zero_bias: GgmlStaticTensor,
-    argmax_reverse_indices: Option<GgmlStaticTensor>,
     cross_layers: Vec<FireRedDecoderCrossCacheLayer>,
     self_kv_layers: Vec<FireRedDecoderSelfKvLayer>,
 }
@@ -185,27 +174,17 @@ fn build_firered_decoder_arena_state(
     metadata: &FireRedAedExecutionMetadata,
     self_kv_capacity_positions: usize,
     cross_capacity_frames: usize,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    _greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<FireRedDecoderArenaState, FireRedDecoderError> {
     let arena = runner
         .start_static_tensor_arena(firered_decoder_arena_context_bytes(
             metadata.decoder_n_layers,
-            greedy_step_output_mode,
         ))
         .map_err(|source| map_err("static_tensor_arena", source))?;
     let zero_bias = arena
         .new_tensor_1d_f32(metadata.d_model, "firered_dec_zero_bias")
         .map_err(|source| map_err("zero_bias_alloc", source))?;
-    let argmax_reverse_indices =
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            Some(
-                arena
-                    .new_tensor_1d_i32(metadata.vocab_size, "firered_dec_argmax_reverse_indices")
-                    .map_err(|source| map_err("argmax_reverse_indices_alloc", source))?,
-            )
-        } else {
-            None
-        };
     let mut cross_layers = Vec::with_capacity(metadata.decoder_n_layers);
     let mut self_kv_layers = Vec::with_capacity(metadata.decoder_n_layers);
     for _ in 0..metadata.decoder_n_layers {
@@ -252,16 +231,6 @@ fn build_firered_decoder_arena_state(
             "firered_dec_zero_bias",
         )
         .map_err(|source| map_err("zero_bias_upload", source))?;
-    if let Some(reverse_indices) = argmax_reverse_indices {
-        arena
-            .set_i32_slice(
-                reverse_indices,
-                &first_max_argmax_reverse_indices(metadata.vocab_size)
-                    .map_err(|source| map_err("argmax_reverse_indices", source))?,
-                "firered_dec_argmax_reverse_indices",
-            )
-            .map_err(|source| map_err("argmax_reverse_indices_upload", source))?;
-    }
 
     // Zero-fill the persistent self-KV tensors so the fixed-span reusable
     // decode graph's masked (not-yet-written) rows never feed uninitialized
@@ -271,17 +240,11 @@ fn build_firered_decoder_arena_state(
     // softmax. Same convention as `allocate_zeroed_llm_resident_kv_arena`
     // (the all-zero f16 bit pattern is 0.0).
     //
-    // Gated to runners where the reusable decode graph can actually activate
-    // (`reusable_decode_graph_supported_for_runner` is a pure function of the
-    // runner's backend + scheduler config, fixed for the runner's lifetime):
-    // the rebuild-per-step path views only written rows, so on CPU /
-    // scheduler-on runners no unwritten row is ever read and the fill is pure
-    // waste -- worse than waste, actually, because touching every byte of the
-    // full planner-reserved cache commits all of its pages up front where the
-    // untouched malloc'd CPU arena
-    // pages would otherwise stay uncommitted until the decode actually wrote
-    // them.
-    if reusable_decode_graph_supported_for_runner(runner) {
+    // Gated to the immutable planner reuse mode. The rebuild-per-step path
+    // views only written rows, so FreshGraph never reads an unwritten row and
+    // the fill is waste -- worse than waste, because touching every byte of
+    // the full planner-reserved cache commits all of its pages up front.
+    if reusable_decode_graph_supported(reuse_mode) {
         let self_kv_tensor_bytes = metadata
             .head_dim
             .checked_mul(self_kv_capacity_positions)
@@ -302,7 +265,6 @@ fn build_firered_decoder_arena_state(
     Ok(FireRedDecoderArenaState {
         arena,
         zero_bias,
-        argmax_reverse_indices,
         cross_layers,
         self_kv_layers,
     })
@@ -316,19 +278,19 @@ impl FireRedDecoderGraphRuntime {
     pub(crate) fn system_memory_quote(
         metadata: FireRedAedExecutionMetadata,
         decoder_state: Seq2SeqDecoderState,
-        backend: crate::ggml_runtime::GgmlCpuGraphBackend,
+        _backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
         pack_content_id: &str,
     ) -> Result<crate::models::system_memory_owner::SystemMemoryAllocationQuote, String> {
         decoder_state
             .validate()
             .map_err(|error| error.to_string())?;
         let retained = Self::quoted_retained_system_memory_bytes(metadata)?;
-        let config = firered_decoder_graph_config(backend);
         let transient = firered_decoder_construction_transient_system_memory_bytes(
             metadata,
             decoder_state,
-            reusable_decode_graph_supported(config.backend, config.use_scheduler),
+            reusable_decode_graph_supported(reuse_mode),
             greedy_step_output_mode,
         )?;
         let peak = retained.checked_add(transient).ok_or_else(|| {
@@ -397,7 +359,7 @@ impl FireRedDecoderGraphRuntime {
         firered_decoder_construction_transient_system_memory_bytes(
             self.metadata,
             self.decoder_state,
-            reusable_decode_graph_supported_for_runner(&self.runner),
+            reusable_decode_graph_supported(self.reuse_mode),
             self.greedy_step_output_mode,
         )
     }
@@ -414,6 +376,7 @@ impl FireRedDecoderGraphRuntime {
             decoder_state,
             backend,
             DeviceGreedyStepOutputMode::FullLogits,
+            GgmlDecodeReuseMode::FreshGraph,
         )
     }
 
@@ -423,6 +386,7 @@ impl FireRedDecoderGraphRuntime {
         decoder_state: Seq2SeqDecoderState,
         backend: crate::ggml_runtime::GgmlCpuGraphBackend,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
+        reuse_mode: GgmlDecodeReuseMode,
     ) -> Result<Self, FireRedDecoderError> {
         decoder_state
             .validate()
@@ -452,13 +416,6 @@ impl FireRedDecoderGraphRuntime {
         let persistent_graph_context_bytes = config.context_bytes;
         let runner =
             GgmlCpuGraphRunner::new(config).map_err(|source| map_err("runner_init", source))?;
-        if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-            && !reusable_decode_graph_supported_for_runner(&runner)
-        {
-            return Err(FireRedDecoderError::InvalidInput {
-                reason: "device top-1 requires a direct GPU-class decoder runner".to_string(),
-            });
-        }
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(|source| map_err("load_gguf_weight_context", source))?;
@@ -469,6 +426,7 @@ impl FireRedDecoderGraphRuntime {
             decoder_state.self_attention.resident_positions,
             cross_capacity_frames,
             greedy_step_output_mode,
+            reuse_mode,
         )?;
 
         Ok(Self {
@@ -480,7 +438,6 @@ impl FireRedDecoderGraphRuntime {
             persistent_graph_context_bytes,
             arena: arena_state.arena,
             zero_bias: arena_state.zero_bias,
-            argmax_reverse_indices: arena_state.argmax_reverse_indices,
             cross_layers: arena_state.cross_layers,
             self_kv_layers: arena_state.self_kv_layers,
             decoder_state,
@@ -489,6 +446,8 @@ impl FireRedDecoderGraphRuntime {
             reuse_cross_frame_count: 0,
             cached_positions: 0,
             greedy_step_output_mode,
+            reuse_mode,
+            last_step_compute_evidence: None,
         })
     }
 
@@ -545,6 +504,14 @@ impl FireRedDecoderGraphRuntime {
         self.decoder_state = decoder_state;
         self.cross_frame_count = decoder_state.cross_attention.logical_positions;
         Ok(())
+    }
+
+    pub(crate) fn release_transient_compute_memory(&mut self) -> Result<(), FireRedDecoderError> {
+        self.reuse = None;
+        match self.runner.release_request_compute_residency() {
+            Ok(()) | Err(GgmlCpuGraphError::PersistentGraphSessionActive) => Ok(()),
+            Err(error) => Err(map_err("release_request_compute_residency", error)),
+        }
     }
 
     /// Precompute cross-attention K/V for every layer from the encoder output
@@ -625,7 +592,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(key_rows, key_target)
                 .map_err(|source| map_err("cross_cache_k_write", source))?;
             graph
-                .add_side_effect_root(write_key)
+                .add_kv_write_root(write_key)
                 .map_err(|source| map_err("cross_cache_k_root", source))?;
 
             let value_rows = apply_linear_with_bias(
@@ -643,7 +610,7 @@ impl FireRedDecoderGraphRuntime {
                 .cpy(value_rows, value_target)
                 .map_err(|source| map_err("cross_cache_v_write", source))?;
             graph
-                .add_side_effect_root(write_value)
+                .add_kv_write_root(write_value)
                 .map_err(|source| map_err("cross_cache_v_root", source))?;
             last_value_rows = Some(value_rows);
         }
@@ -678,10 +645,9 @@ impl FireRedDecoderGraphRuntime {
     /// Compute logits for the next token given the full token prefix so far
     /// (prompt + already-generated tokens). Incremental: after the first call
     /// (which may prefill more than one token), every subsequent call must
-    /// append exactly one new token. On the single-backend GPU path a
-    /// single-token incremental step runs through the build-once/re-run
-    /// reusable decode graph ([`Self::compute_reused_incremental_step_logits`]);
-    /// everywhere else (prefill, CPU, scheduler-on) it rebuilds a fresh graph.
+    /// append exactly one new token. A single-token step may use the
+    /// planner-authorized build-once/re-run graph; unknown reuse evidence
+    /// rebuilds a fresh graph.
     pub(crate) fn compute_step_logits(
         &mut self,
         decoder_tokens: &[u32],
@@ -733,6 +699,7 @@ impl FireRedDecoderGraphRuntime {
         allow_reuse: bool,
         output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<Seq2SeqGreedyDecodeStepLogitsOutput, FireRedDecoderError> {
+        self.last_step_compute_evidence = None;
         let total_prefix_tokens = decoder_tokens.len();
         if total_prefix_tokens == 0 {
             return Err(FireRedDecoderError::InvalidInput {
@@ -929,17 +896,9 @@ impl FireRedDecoderGraphRuntime {
             .mul_mat(self.weights.out_proj_weight.as_graph_tensor(), last_state)
             .map_err(|source| map_err("output_proj", source))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices =
-                self.argmax_reverse_indices
-                    .ok_or(FireRedDecoderError::InvalidInput {
-                        reason: "device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(|source| map_err("output_top1", source))?,
             )
         } else {
@@ -982,42 +941,49 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| FireRedDecoderError::GraphExecutionFailed {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    FireRedDecoderError::GraphExecutionFailed {
                         reason: "device top-1 returned no token id".to_string(),
-                    })?;
+                    }
+                })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
+                    greedy_token_hint: Some(map_device_top1_token(
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 }
             }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, self.metadata.vocab_size)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            },
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                }
+            }
         };
         self.cached_positions = total_token_count;
         Ok(output)
     }
 
-    /// Reused decode graphs with in-place resident KV are only correct on the
-    /// single-backend GPU path (see `nn::decoder::reusable_decode_graph_supported`);
-    /// everywhere else the rebuild-per-step path above stays authoritative.
+    /// Reused decode graphs are opt-in from the immutable runtime planner.
+    /// Unknown evidence is always a fresh graph, even on a GPU-class backend.
     fn supports_reusable_decode_graph(&self) -> bool {
-        reusable_decode_graph_supported_for_runner(&self.runner)
+        reusable_decode_graph_supported(self.reuse_mode)
     }
 
     /// Single-token incremental step through the build-once/re-run persistent
@@ -1101,32 +1067,40 @@ impl FireRedDecoderGraphRuntime {
 
         let output = match top1 {
             Some(top1) => {
-                let reversed_token_id = graph
-                    .compute_output_i32(top1, 1)
-                    .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
-                        reason: error.to_string(),
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| FireRedDecoderError::GraphExecutionFailed {
+                let readback =
+                    graph
+                        .compute_output_i32_with_evidence(top1, 1)
+                        .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
+                            reason: error.to_string(),
+                        })?;
+                let (token_ids, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                let token_id = token_ids.into_iter().next().ok_or_else(|| {
+                    FireRedDecoderError::GraphExecutionFailed {
                         reason: "reused device top-1 returned no token id".to_string(),
-                    })?;
+                    }
+                })?;
                 Seq2SeqGreedyDecodeStepLogitsOutput {
                     logits: Vec::new(),
-                    greedy_token_hint: Some(map_reversed_top1_token(
-                        reversed_token_id,
+                    greedy_token_hint: Some(map_device_top1_token(
+                        token_id,
                         self.metadata.vocab_size,
                     )?),
                 }
             }
-            None => Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits: graph
-                    .compute_output_f32(logits, self.metadata.vocab_size)
+            None => {
+                let readback = graph
+                    .compute_output_f32_with_evidence(logits, self.metadata.vocab_size)
                     .map_err(|error| FireRedDecoderError::GraphExecutionFailed {
                         reason: error.to_string(),
-                    })?,
-                greedy_token_hint: None,
-            },
+                    })?;
+                let (logits, evidence) = readback.into_parts();
+                self.last_step_compute_evidence = evidence;
+                Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                }
+            }
         };
         self.cached_positions = total_tokens;
         Ok(output)
@@ -1289,17 +1263,9 @@ impl FireRedDecoderGraphRuntime {
             .mul_mat(self.weights.out_proj_weight.as_graph_tensor(), last_state)
             .map_err(|source| map_err("reuse_output_proj", source))?;
         let top1 = if output_mode == DeviceGreedyStepOutputMode::DeviceTop1 {
-            let reverse_indices =
-                self.argmax_reverse_indices
-                    .ok_or(FireRedDecoderError::InvalidInput {
-                        reason: "device top-1 reverse indices are unavailable".to_string(),
-                    })?;
             Some(
                 graph
-                    .top1_argmax_first_max_reversed(
-                        logits,
-                        self.arena.graph_tensor(reverse_indices),
-                    )
+                    .top1_argmax_first_max(logits)
                     .map_err(|source| map_err("reuse_output_top1", source))?,
             )
         } else {
@@ -1342,23 +1308,14 @@ fn firered_decoder_construction_transient_system_memory_bytes(
     metadata: FireRedAedExecutionMetadata,
     decoder_state: Seq2SeqDecoderState,
     reusable_graph_supported: bool,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    _greedy_step_output_mode: DeviceGreedyStepOutputMode,
 ) -> Result<u64, String> {
     let zero_bias_bytes = metadata
         .d_model
         .checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| "firered-aed zero-bias staging byte count overflowed".to_string())?;
-    let reverse_indices_bytes = if greedy_step_output_mode == DeviceGreedyStepOutputMode::DeviceTop1
-    {
-        quoted_vec_capacity_bytes::<i32>(
-            metadata.vocab_size,
-            "firered-aed argmax reverse-index staging",
-        )?
-    } else {
-        0
-    };
-    let base_transient = zero_bias_bytes.max(reverse_indices_bytes);
+    let base_transient = zero_bias_bytes;
     if !reusable_graph_supported {
         return Ok(base_transient);
     }
@@ -1372,25 +1329,20 @@ fn firered_decoder_construction_transient_system_memory_bytes(
     Ok(base_transient.max(self_kv_zero_bytes))
 }
 
-fn map_reversed_top1_token(
-    reversed_token_id: i32,
-    vocab_size: usize,
-) -> Result<u32, FireRedDecoderError> {
-    let token_id = first_max_token_id_from_reversed_argmax(reversed_token_id, vocab_size).map_err(
-        |error| FireRedDecoderError::GraphExecutionFailed {
+fn map_device_top1_token(token_id: i32, vocab_size: usize) -> Result<u32, FireRedDecoderError> {
+    device_top1_token_id(token_id, vocab_size).map_err(|error| {
+        FireRedDecoderError::GraphExecutionFailed {
             reason: error.to_string(),
-        },
-    )?;
-    u32::try_from(token_id).map_err(|_| FireRedDecoderError::GraphExecutionFailed {
-        reason: format!("device top-1 token id {token_id} does not fit u32"),
+        }
     })
 }
 
 /// firered-aed decodes through the shared seq2seq greedy driver: every step
 /// recomputes logits for the full `<sos> ++ generated` prefix (the incremental
 /// KV cache inside [`Self::compute_step_logits`] makes this cheap after the
-/// prefill). Exact direct CUDA/Vulkan requests return only a first-max top-1
-/// hint; every other route returns full logits and keeps the host argmax path.
+/// prefill). The output plan is resolved by `ResolvedFamilyRuntimeInput`; only
+/// a proven CPU native first-max plan uses compact device top-1. Unproven lanes
+/// keep FullDevice execution and read back complete logits.
 impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
     fn decode_step_logits(
         &mut self,
@@ -1407,6 +1359,10 @@ impl Seq2SeqGreedyDecodeStepExecutor for FireRedDecoderGraphRuntime {
                 reason: error.to_string(),
             }
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 }
 

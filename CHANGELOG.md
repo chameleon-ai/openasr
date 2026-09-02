@@ -7,11 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- API: `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept
+  opt-in `return_speaker_embeddings=true` with `diarize=true` and
+  `response_format=verbose_json`. The response then includes a WhisperX/Speakr
+  `speaker_embeddings` map plus sibling `speaker_embedding_space` metadata
+  copied from already-computed diarization centroids. Default requests omit
+  both fields. Remote-compute device tokens requesting the field receive HTTP
+  403 `authorization_error`; operator and loopback clients are unrestricted.
 - Subtitles: transcription results now keep readable paragraphs separate from
   short subtitle cues. JSON responses expose `subtitle_cues` and
   `timeline_quality`; SRT/VTT render the cue view. The server also provides
   `POST /v1/audio/precise-timeline` to refine an existing transcript against
-  its source audio when the Qwen3 Forced Aligner capability pack is installed.
+  its source audio, or to force-align a user-supplied plain-text manuscript
+  (`transcript` form field) onto the audio, when the Qwen3 Forced Aligner
+  capability pack is installed. `openasr align` is the matching CLI.
+- Forced alignment of an external transcript fails closed when the aligner
+  pack is missing, the language is Japanese/Korean, the normalized text is
+  empty, the audio exceeds the aligner's timestamp grid, or the resulting
+  timeline is degenerate (collapsed bins / zero-duration words).
 - CLI: `openasr bench-receipt short-audio` writes a machine-readable receipt
   for a measured short-audio run, binding the report to the selected pack,
   source audio, runtime settings, and recorded measurements.
@@ -44,6 +57,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: `--diarize` / Voice ID now installs the native execution broker
+  before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
+  `could not load the vendored FireRed Stream-VAD` because those weights
+  started requiring the process-wide broker after GPU ownership work, but
+  NES was only installed around speaker-turn computation.
+- Core: tearing down a scheduler-backed persistent graph (MOSS decode on
+  macOS, and any `start_graph` then persistent-session handoff) no longer
+  use-after-frees inside `ggml_backend_sched_reset`. Reset detaches the
+  scheduler-owned split graph instead of a caller cgraph that may already
+  have been parked, and the idle runner context is reset before it is
+  freed. 0.1.37 exited 139 after a successful moss-transcribe-diarize
+  CPU/Metal run.
+- Core: a DedicatedDevice quarantine from a terminal device failure can
+  recover when a later candidate presents a healthy heap snapshot (new
+  backend generation after the poisoned handle was leaked). Ledger
+  corruption stays sticky until process restart. SystemMemory still never
+  disables the independent CPU fallback.
+- Core: discrete GPU activation no longer forecasts the pack mmap as a second
+  VRAM copy. Weights are reserved once at allocation, so packs near half of
+  card memory (for example `mimo-v2.5-asr:q4` on 12 GiB) admit instead of
+  fail-closed. CUDA FullDevice reuses the ggml graph on the same proven lane
+  as HIP/Vulkan.
+- Core: already-open file-backed pack mappings still occupy the SystemMemory
+  policy ledger so two distinct packs fail closed, but they no longer consume
+  this candidate's observed-free remainder or crowd out its later anonymous
+  host allocations and graph buffers. UMA hosts can load a pack larger than
+  live free (for example `firered2-llm:q4` or `mimo-v2.5-asr:q4` on 16 GiB)
+  and still admit encoder metadata, prepared-runtime counters, reuse-pass
+  weight contexts, and long-form graph workspace.
+- Core: growing-KV seq2seq logits read directly into caller storage now keep
+  the native compute witness. Granite Metal token steps no longer fail
+  short-audio receipts with `token step has no native compute witness`.
+- Core: a discrete CUDA/HIP/Vulkan request now keeps encoder and decoder
+  graphs on one unified GPU owner, so weights and KV stay on a single ggml
+  actor instead of bouncing between thread-local caches.
+- Core: CUDA/HIP graph capture is reserved for persistent reuse sessions.
+  One-shot encoder/prefill graphs no longer instantiate HIP fragment
+  executables. The capture flag lives in ggml-impl, not the hashed host ABI.
+- ggml/Vulkan: DeviceLocal weight buffers prefer memory types that are not
+  also HostVisible. On ReBAR discrete GPUs those heaps are still HostVisible
+  to the process; the plugin skips mapping them and copies through chunked
+  staging. SPIR-V float-controls patching is opt-in (the host disables it
+  unless the operator sets `GGML_VK_ENABLE_FLOAT_CONTROLS_PATCH`).
 - Qwen3 Forced Aligner now publishes the policy-guarded `q4_k` tier as its
   recommended default. Boundary-sensitive audio, token-embedding, and
   timestamp-head matrices remain Q8_0; legacy all-Q4, Q3, and mislabeled mixed
@@ -79,6 +135,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Core: live capture no longer panics when a downsampled mic callback (for
+  example 44.1 kHz stereo in 512-frame chunks) leaves the resampler read head
+  past the current buffer. The leftover position continues in the next chunk
+  instead of draining past the held samples.
+- Core: long-form slices no longer exceed the decoder-state `max_chunk`
+  envelope after overlap, packing, or a short-tail remainder. A request that
+  previously failed closed with `decoder invocation lies outside its declared
+  session envelope` and no partial transcript now emits windows at or under
+  the same integer ceiling the executor already declared, while still cutting
+  on a nearby pause when one exists.
+- Windows: HE-AAC (and other formats the in-process decoder cannot handle)
+  fall back to Media Foundation to produce 16 kHz mono PCM16 WAV, the same
+  role `/usr/bin/afconvert` plays on macOS. AAC-LC and bare ADTS stay
+  in-process. If system decoding also fails, the error says so and points at
+  ffmpeg.
+- Windows: promoting an installed GPU backend pack retries antivirus directory
+  locks (`os error 5` / sharing / lock violation) and copies the readable
+  staging tree if rename stays locked. A failed copy does not leave a truncated
+  directory that the next install would treat as already complete.
+- HIP decode reuse no longer recaptures every token after the first stable
+  capture: uid reuse keys on node count, op, type, and shape, and ignores
+  input-pointer churn that HIP writes on each launch.
+- ggml: throwaway Vulkan/HIP plugin probes now release their device contexts
+  instead of leaving them in the process working set.
 - `ggml`: unsupported Metal flash-attention head widths now select the existing
   non-flash attention path before graph construction instead of failing the
   request.

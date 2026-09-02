@@ -1,14 +1,16 @@
 # Releasing
 
-OpenASR uses a single workspace version and a commit-driven release flow: a
-version bump pushed to `main` IS the release.
+OpenASR uses a single workspace version. A version bump and annotated
+`vX.Y.Z` tag pin the commit; they do **not** publish. Publishing is a
+maintainer-triggered `workflow_dispatch` of `.github/workflows/release-core.yml`,
+the same posture as the desktop product's `release-desktop.yml`.
 
-Feature, fix, and any other content changes go through pull requests as usual.
-The release bump itself is the exception: a maintainer pushes it directly to
-`main` as a single `chore(release)` commit plus its annotated `vX.Y.Z` tag.
-Routing the bump through a PR adds nothing (the release fires on the merge
-commit anyway). Routine CI is PR-only to avoid rebuilding every merge; its
-narrow `main` push gate runs only for this direct `chore(release)` commit.
+Feature, fix, and other content changes go through pull requests as usual.
+The release bump may be pushed directly to `main` as a single
+`chore(release)` commit plus its annotated tag; ordinary CI still runs, but
+the release workflows do not. Routine CI is PR-only to avoid rebuilding every
+merge; its narrow `main` push gate runs only for this direct `chore(release)`
+commit.
 
 ## Versioning
 
@@ -47,35 +49,37 @@ bump, or CI's `--locked` builds fail:
    commit, and if the tag already exists locally it is left alone (delete it
    first with `git tag -d vX.Y.Z` to redo the notes).
 
-2. Push the commit **and** the tag together:
+2. Push the commit **and** the tag together (this is only the pin; it must
+   not start a release):
 
    ```bash
    git push --follow-tags
    ```
 
-   Pushing just the commit without the tag (plain `git push`) is a mistake
-   `release-core.yml` catches and fails loudly on -- it needs the tag's
-   annotation for Highlights and refuses to guess.
+   Pushing just the commit without the tag (plain `git push`) leaves nothing
+   for `release-core.yml` to check out. The dispatch fails closed until the
+   annotated tag exists on origin.
 
-3. The `Release core` workflow (`.github/workflows/release-core.yml`)
-   triggers on `Cargo.toml` changes:
-   - reads the workspace version and confirms the `vX.Y.Z` tag exists on
-     origin (failing loudly if it's missing -- see step 2);
-   - exits cleanly if a GitHub Release for `vX.Y.Z` already exists (so
-     unrelated `Cargo.toml` edits and re-runs are no-ops);
-   - otherwise reads the tag annotation for Highlights and immediately creates
-     an empty draft GitHub Release with a three-part body (see below);
-   - then calls `.github/workflows/release-binaries.yml` directly (as a
-     `workflow_call`, the only formal matrix entrypoint) to build the full
-     release matrix (Linux x86_64/arm64, macOS
-     x86_64/arm64, Windows, plus Vulkan/CUDA/HIP feature variants) and
-     upload every archive to the draft. There is no bootstrap macOS/Linux
-     rebuild and no second `push: tags` matrix racing the orchestrator;
-   - `release-binaries.yml`'s own completeness gate then asserts the release
-     ends up with every expected platform archive, failing the run if one is
-     missing instead of silently shipping a partial release;
-   - finally, `release-core.yml` rewrites the release's Install & Verify
-     section from the now-complete, real asset list.
+3. Confirm `main` is green at that bump commit, then dispatch `Release core`
+   (`release-core.yml`) from **protected `main`**. The `version` input must
+   equal `Cargo.toml` -- it confirms the committed pin and cannot override
+   it. For a new draft the annotated tag must peel to this same commit.
+   Agents do not dispatch this workflow.
+
+   ```bash
+   gh workflow run release-core.yml -f version=X.Y.Z
+   ```
+
+   - If no GitHub Release exists yet, the workflow creates the **draft**, then
+     calls `release-binaries.yml` with `formal_release: true` (Linux
+     x86_64/arm64, macOS x86_64/arm64, Windows, plus Vulkan/CUDA/HIP
+     variants). There is no bootstrap macOS/Linux rebuild and no `push: tags`
+     matrix racing the orchestrator. Completeness fails the run if a required
+     archive is missing.
+   - If the matching release is still a draft, a second dispatch runs the
+     pre-publication family gate and deploys the committed PublishedInert
+     catalog (see below).
+   - A published (non-draft) release is a no-op.
 
 ### Release notes structure
 
@@ -94,74 +98,115 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 
 ## Manual runs
 
-`workflow_dispatch` on the `Release core` workflow performs the same
-resolve-and-release for the version currently on `main`. It can create a
-missing draft, but an already-existing draft is an intentional no-op; recover
-failed matrix legs through the `Release binaries` workflow below rather than
-starting a competing second orchestrator.
+`Release core` is `workflow_dispatch` only. The first dispatch (no GitHub
+Release yet) creates the draft and builds the matrix. After the generated
+PublishedInert catalog has been reviewed, signed, committed, and pushed,
+dispatch it again with the same `version` to run the pre-publication family
+gate and catalog deployment for that draft. Failed build or aggregation jobs
+are recovered only with GitHub's **Re-run failed jobs** on the original
+release run, which preserves its exact tag/source/artifact lineage.
 
 `workflow_dispatch` on `Release binaries` (`.github/workflows/release-binaries.yml`)
-independently rebuilds/re-uploads the full matrix for an existing tag: pass
-`ref: vX.Y.Z` to target it, or `dry_run: true` to exercise the tag-resolution,
-upload, and completeness-gate logic without mutating the release's assets
-(the completeness check still runs and will fail loudly if that release is
-genuinely incomplete -- that failure is expected and informative, not a bug
-in the dry run).
+is diagnostic-only: `only_target` is mandatory and the run may publish only an
+Actions artifact for that one matrix row. It cannot aggregate or attest a
+release subject set and cannot upload, replace, or delete either draft or
+public GitHub Release assets. Full release assembly is available only through
+the `formal_release` capability declared on `workflow_call` and supplied by
+`Release core`.
 
 The core GitHub Release is created as a **draft**. This is load-bearing for the
-Windows plugin topology: CUDA/HIP payload hashes exist only after the release
+Windows plugin topology: provider payload hashes exist only after the release
 matrix has built them, while the neutral host resolves those hashes from the
 production-signed catalog. Core 0.1.34 and later publish no legacy whole-engine
-Windows sidecars and no per-release `backends-manifest.json`. A draft is not
-made public until the signed catalog distribution plane is complete:
+Windows sidecars and no per-release `backends-manifest.json`.
 
-1. Attach `backend-hardware-evidence-*.json` receipts for every provider that is
-   intended to become runtime-selectable. Schema v1 approves only the exact
-   tested target; schema v2 may approve an explicit provider matrix. For 0.1.36,
-   produce schema v2 with
-   `tooling/release-manifest/generate_backend_hardware_evidence.py` and attach
-   both its `backend-hardware-evidence-*.json` summary and separately named
-   `backend-hardware-audit-*.json` raw audit. The runner verifies every release
-   subject against `SHA256SUMS` and GitHub build provenance, proves the executed
-   binary and its complete companion-file tree match the neutral release ZIP,
-   restricts the local preview catalog to exact file-URL substitutions from the
-   attested candidate, cryptographically preflights its local-dev signature in
-   a fresh empty home, checks the evidence-home cache is the same signed pair,
-   and checks the model pack against that candidate. It owns at least five fresh
-   child processes, checks the exact activation before
-   and after each child, and binds each raw receipt to a unique nonce. Model and
-   audio inputs are content-hash bound but are not release subjects. The
-   summary's `evidence_sha256` is the
-   canonical raw-audit digest. The v0.1.36 tag gate validates the schema-v2
-   summary and provider matrix; it does not parse the raw audit, which must be
-   downloaded and independently checked before catalog publication. A future
-   release may make that binding part of the tag-integrated schema. A
-   provider-matrix receipt is compatibility policy, not a claim that every GPU
-   ran. Building a target, copying one receipt five times, scheduler/hybrid
-   execution, or CPU/other-provider compute is rejected.
-2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2
-   release credentials. It copies the hardware-approved plugin and vendor
-   files to `https://dl.openasr.org/core/vX.Y.Z/`. The signed catalog's
-   `files[].url` values point only at this prefix; GitHub release mirrors are
-   not a runtime download fallback.
+Artifact publication and runtime capability activation are separate. A signed
+provider pack may be public as `PublishedInert`, but ordinary Auto and explicit
+selection reject it. Real-hardware evidence can therefore test the exact public
+bytes without exposing an unqualified provider to users.
+
+### Publish the inert release bytes
+
+1. Let `Release core` create the draft and let its single formal
+   `release-binaries.yml` call build and checksum the complete release matrix,
+   sign the applicable Windows binaries, and attest the full subject set. Do not
+   use the diagnostic one-target dispatch to assemble or mutate a release.
+2. Run `scripts/sync-windows-backend-cdn.sh vX.Y.Z` locally with the B2 release
+   credentials. It verifies and copies every file declared by the 1 Vulkan, 6
+   CUDA, and 14 HIP release entries to
+   `https://dl.openasr.org/core/vX.Y.Z/`. GitHub is the provenance mirror, not a
+   runtime download fallback.
 3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally with
-   the production catalog signing seed. It downloads and hashes all 6 CUDA and
-   14 HIP build artifacts, but merges only the target entries approved by those
-   receipts. Before touching the catalog it verifies that every selected CDN
-   payload is already live, then bumps the epoch and signs the full/public
-   catalogs. Review, commit, and push those catalog files.
-4. Wait for `deploy-catalog.yml` to repeat the no-credential CDN gate and prove
-   the signed public bytes are live. Metadata is never deployed ahead of its
-   immutable payloads.
-5. Run `scripts/finalize-core-release.sh vX.Y.Z`. It requires the live signed
-   catalog target set to equal the hardware-approved subset exactly, and it
-   HEADs every signed CDN URL for that version; only then does it publish the
-   draft and mark it latest.
+   the production catalog signing seed. It verifies all 21 exact entries and
+   their already-live CDN bytes, merges every entry as `PublishedInert`, bumps
+   the epoch, and signs the full/public catalogs. It consumes no hardware or
+   token-correctness receipt. Review, commit, and push the five catalog/epoch
+   files.
+4. Dispatch `Release core` again. It re-verifies the draft's complete attested
+   subject set (the same completeness gate as the original matrix, so a later
+   CI-only fix can still see the draft), then runs the reusable pre-publication
+   family contract against the immutable draft CLI and the real-pack CPU family
+   gate. The orchestrator then calls the sole deployment entrypoint,
+   `.github/workflows/deploy-catalog.yml`, with
+   `activation_transition: published-inert`. The deploy job checks the signed
+   catalog, CDN payloads, and released-binary compatibility before writing it.
+5. Record the successful orchestrator run id as
+   `OPENASR_DEPLOY_CATALOG_RUN_ID`, wait until the no-credential catalog/CDN
+   checks see the committed bytes, and run
+   `scripts/finalize-core-release.sh vX.Y.Z`. The finalizer binds the exact tag,
+   source commit, deploy run, catalog SHA, signature SHA, release subjects, and
+   live CDN bytes before removing the GitHub draft flag.
 
-None of these scripts publishes code or a catalog implicitly. A failure leaves
-the release draft and therefore unavailable to users. Publishing the GitHub
-release triggers `publish-core-channels.yml`, which moves Docker/Homebrew only
-after the canonical catalog/CDN plane is complete.
+Publishing the release triggers two independent GitHub Actions workflows:
+
+- `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
+  catalog/CDN plane is complete.
+- `sync-release-to-cnb.yml` mirrors the published GitHub assets to
+  [cnb.cool/openasr/openasr](https://cnb.cool/openasr/openasr). GitHub stays
+  the signed source; CI downloads each public asset and uploads it. Local
+  `finalize-core-release.sh` must not pull the matrix onto a maintainer
+  laptop for this. Missing `CNB_TOKEN` skips; a token present with a failed
+  upload fails that workflow only and does not roll back GitHub.
+
+Any failure in the pre-publication sequence leaves the GitHub release as a
+draft.
+
+### Qualify and activate one exact backend after publication
+
+1. Dispatch `.github/workflows/qualify-windows-backend.yml` on the exact release
+   tag (`--ref vX.Y.Z`) for one `(provider, device_target, backend_id, model_id,
+   quant)` cell. The workflow accepts only an already-public stable release and
+   re-hashes every executed release subject against `SHA256SUMS` and build
+   provenance.
+2. The qualification workflow emits separately attested placement/resource
+   evidence (`backend-hardware-evidence-*.json` plus its raw audit) and
+   token/transcript evidence (the projected matrix, receipts, and traces). It
+   proves the exact provider, target, backend id, artifact tree, pack, fixture,
+   driver, FullDevice placement, cold/reuse behavior, and fresh-process nonces.
+   It never edits a release or catalog and never grants runtime authority.
+3. Once the run ids cover every required matrix cell for that exact backend,
+   run `scripts/activate-windows-backend-catalog-release.sh vX.Y.Z BACKEND_ID
+   RUN_ID...` locally with the production signing seed. The script independently
+   authenticates and replays `PublishedInert -> Qualified -> Activated`, verifies
+   the intermediate Qualified projection, and signs one new reviewed catalog
+   epoch. A separate public Qualified epoch is not required.
+4. Review, commit, and push the catalog/epoch files, then dispatch
+   `.github/workflows/activate-backend-catalog.yml` with those run ids and the
+   exact authorization text `activate:<backend_id>`. The reusable deploy workflow
+   replays both gates before deployment; qualification success alone cannot
+   activate anything.
+5. To fail safe, prepare a one-way exact-backend revocation with
+   `scripts/revoke-windows-backend-catalog-release.sh`, then dispatch
+   `.github/workflows/revoke-backend-catalog.yml` with
+   `revoke:<backend_id>`. Revocation preserves old bindings for audit and cannot
+   activate another backend as a side effect.
+
+Hardware qualification is exact-target and exact-backend scoped: an `sm_89`
+receipt cannot approve `sm_75`, a HIP/Vulkan/CPU result cannot approve CUDA, and
+placement evidence cannot replace token correctness. A failed post-publication
+qualification leaves the release public but the provider inert and unselectable.
+See `tooling/release-manifest/README.md` for the two gate authorities and local
+validation commands.
 
 ## Legacy backends manifests
 
@@ -226,12 +271,35 @@ secret is not set, the job prints a `::notice::` and builds without pushing
 A red Docker job fails that leg of the workflow only and does not delete or
 roll back the already-published Release.
 
+The distribution gate and Homebrew formula updater check out helper scripts
+from the repository default branch, not the release tag, so a later CI-only
+fix still applies when repairing an already-public tag. Docker images still
+build from the tag's Dockerfiles and the published Linux tarballs.
+
 Manual dry-run / re-publish against an existing tag:
 
 ```bash
+gh workflow run publish-core-channels.yml -f tag=vX.Y.Z
 gh workflow run docker-release.yml \
   -f version=X.Y.Z -f tag=vX.Y.Z -f push=false -f mark_latest=false -f variants=all
 ```
 
 Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for
 development and `docker-smoke.yml`; they are not the release path.
+
+## China mirror (CNB)
+
+`sync-release-to-cnb.yml` runs on `release: published` for a stable `vX.Y.Z`
+core tag (not `desktop-v*`). It does not require the tag to be GitHub
+`latest`, so a later repair of an older tag is still valid. The job streams
+one GitHub asset at a time through `scripts/sync-release-to-cnb.sh` and is
+idempotent: already-mirrored names with a matching size are skipped.
+
+Repair or finish a partial mirror:
+
+```bash
+gh workflow run sync-release-to-cnb.yml -f tag=vX.Y.Z
+```
+
+`sync-main-to-cnb.yml` only fast-forwards git `main`. It never copies release
+assets.

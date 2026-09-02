@@ -35,20 +35,16 @@ use crate::arch::shape_orchestrator::{
 use crate::arch::{
     COHERE_TRANSCRIBE_GGML_ARCHITECTURE_ID, OpenAsrArchitectureRegistry, OpenAsrBlockStackStrategy,
 };
-use crate::device::execution_policy::ExecutionPlacement;
-use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
-    GgmlCpuGraphBackend, GgufRuntimeSourcePreflight, RequestBackendPreference,
-    request_backend_override,
+    GgmlCpuGraphBackend, GgmlDecodeOutputPlan, GgmlDecodeReuseMode, GgufRuntimeSourcePreflight,
+    ResolvedFamilyRuntimeInput,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
     PinnedRuntimeActorCheckout, PinnedRuntimeActorError,
 };
 use crate::models::decode_token_history::build_longform_token_history_carry;
-use crate::models::device_greedy_token::{
-    DeviceGreedyStepOutputMode, device_greedy_step_output_mode,
-};
+use crate::models::device_greedy_token::DeviceGreedyStepOutputMode;
 use crate::models::ggml_asr_executor::{
     GgmlAsrCarryContext, GgmlAsrExecutionError, GgmlAsrExecutionResult,
     GgmlAsrExecutionViewRequest, GgmlAsrPreparedAudioView, GgmlAsrStreamingExecutor,
@@ -57,9 +53,7 @@ use crate::models::ggml_asr_executor::{
 use crate::models::incremental_streaming_driver::{
     STREAMING_PARTIAL_TUNING_HEAVY_SEQ2SEQ, build_seq2seq_streaming_session,
 };
-use crate::models::native_execution_services::{
-    ExecutionLaneKey, current_execution_lane_key, current_execution_placement,
-};
+use crate::models::native_execution_services::{ExecutionLaneKey, current_execution_lane_key};
 use crate::models::prepared_runtime_cache::PreparedRuntimeHandle;
 use crate::models::runtime_cache_coordinator::{PackContentKey, canonical_runtime_cache_path};
 use crate::models::runtime_prepared_registry::{
@@ -88,14 +82,21 @@ type CohereEncoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey);
 /// replacement at the same path from reusing a runtime built from the old
 /// bytes. Logical per-chunk shapes do not belong in this key: the runtime
 /// activates them inside the planner-reserved spans without reallocating.
-type CohereDecoderRuntimeCacheKey = (PackContentKey, ExecutionLaneKey, Seq2SeqResidentCapacity);
+type CohereDecoderRuntimeCacheKey = (
+    PackContentKey,
+    ExecutionLaneKey,
+    Seq2SeqResidentCapacity,
+    GgmlDecodeOutputPlan,
+    GgmlDecodeReuseMode,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CohereUnifiedRuntimeCacheKey {
     content: PackContentKey,
     lane: ExecutionLaneKey,
     resident_capacity: Seq2SeqResidentCapacity,
-    greedy_step_output_mode: DeviceGreedyStepOutputMode,
+    output_plan: GgmlDecodeOutputPlan,
+    reuse_mode: GgmlDecodeReuseMode,
 }
 
 /// The graph runtimes are backend-owned (`GgmlCpuGraphRunner` is not `Send`)
@@ -248,52 +249,38 @@ impl CohereUnifiedRuntimeActorState {
 
 fn cohere_unified_runtime_enabled(
     allow_unified_runtime: bool,
-    backend: GgmlCpuGraphBackend,
-    backend_preference: Option<&RequestBackendPreference>,
-    placement: Option<ExecutionPlacement>,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
     adapter_active: bool,
     serve_batch_active: bool,
-    prefer_cpu_decoder: bool,
 ) -> bool {
-    if !allow_unified_runtime
-        || adapter_active
-        || serve_batch_active
-        || prefer_cpu_decoder
-        || backend != GgmlCpuGraphBackend::Gpu
-        || placement != Some(ExecutionPlacement::FullDevice)
-    {
-        return false;
-    }
-    if !matches!(
-        backend_preference,
-        Some(RequestBackendPreference::Exact(route))
-            if route.addressability.is_exactly_addressable()
-                && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-    ) {
-        return false;
-    }
-    let encoder = cohere_encoder_graph_config(backend);
-    let decoder = cohere_decoder_graph_config(backend, false);
-    encoder.backend == GgmlCpuGraphBackend::Gpu
-        && !encoder.use_scheduler
-        && decoder.backend == GgmlCpuGraphBackend::Gpu
-        && !decoder.use_scheduler
+    // The request boundary owns the immutable output/reuse decision. Cohere's
+    // production decoder is deliberately complete-logits + fresh-graph for
+    // every lane; this gate only keeps the unified owner available for the
+    // same selected GPU without reintroducing provider, scheduler, or
+    // placement-derived authorization.
+    allow_unified_runtime
+        && !adapter_active
+        && !serve_batch_active
+        && resolved_runtime.backend() == GgmlCpuGraphBackend::Gpu
+        && resolved_runtime.output_plan() != GgmlDecodeOutputPlan::NativeFirstMaxToken
+        && resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::FreshGraph
+        && {
+            let encoder = cohere_encoder_graph_config(GgmlCpuGraphBackend::Gpu);
+            let decoder = cohere_decoder_graph_config(GgmlCpuGraphBackend::Gpu, false);
+            !encoder.use_scheduler && !decoder.use_scheduler
+        }
 }
 
 fn cohere_greedy_step_output_mode(
-    base_mode: DeviceGreedyStepOutputMode,
+    resolved_runtime: ResolvedFamilyRuntimeInput,
     force_full_logits: bool,
-    adapter_active: bool,
-    phrase_bias_active: bool,
-    word_timestamps: bool,
-    debug_tokens: bool,
 ) -> DeviceGreedyStepOutputMode {
-    if force_full_logits || adapter_active || phrase_bias_active || word_timestamps || debug_tokens
-    {
-        DeviceGreedyStepOutputMode::FullLogits
-    } else {
-        base_mode
+    if force_full_logits {
+        return DeviceGreedyStepOutputMode::FullLogits;
     }
+    crate::models::device_greedy_token::device_greedy_step_output_mode_for_resolved_runtime(
+        resolved_runtime,
+    )
 }
 
 #[derive(Debug, Error)]
@@ -400,13 +387,18 @@ impl CohereTranscribeGgmlExecutor {
 
         let preflight_start = debug_timing_start();
         let preflight = request.runtime_source_preflight();
+        let resolved_runtime = request.resolved_runtime;
+        let backend = resolved_runtime.backend();
+        // Snapshot the exact request lane once at the boundary. Every owner and
+        // cache below receives this identity; none may re-read ambient TLS.
+        let execution_lane = current_execution_lane_key(backend);
         emit_cohere_debug_timing_if_enabled("runtime_preflight", preflight_start, None);
         let prepared_runtime_start = debug_timing_start();
         let prepared_runtime_owner = self.runtime_cache_by_path.prepared_runtime_for_preflight(
             PreparedRuntimeLookup {
                 model_architecture: request.selected_family.model_architecture,
                 preflight,
-                backend: request.resolved_runtime.backend(),
+                backend,
             },
             map_prepared_runtime_registry_error,
             cohere_runtime_cache_slot_unavailable,
@@ -445,6 +437,7 @@ impl CohereTranscribeGgmlExecutor {
             decoder_state,
             skip_serve_batch,
             allow_unified_runtime,
+            execution_lane,
         )
     }
 
@@ -459,6 +452,7 @@ impl CohereTranscribeGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         skip_serve_batch: bool,
         allow_unified_runtime: bool,
+        execution_lane: ExecutionLaneKey,
     ) -> Result<GgmlAsrExecutionResult, CohereTranscribeGgmlExecutorError> {
         let runtime_source = &preflight.runtime_source;
         let runtime_path = runtime_source.path();
@@ -536,40 +530,32 @@ impl CohereTranscribeGgmlExecutor {
                 reason: "cohere decode prompt is missing EOS token id".to_string(),
             }
         })?;
-        let backend = request.resolved_runtime.backend();
-        let prefer_cpu_decoder = request
-            .request_options
-            .auto_prefer_cpu_decoder_for_multichunk_metal;
+        let resolved_runtime = request.resolved_runtime;
+        let backend = resolved_runtime.backend();
+        // Cohere must keep the request-selected GPU lane. Do not re-resolve a
+        // provider, consult placement telemetry, or opt into a CPU decoder.
+        let prefer_cpu_decoder = false;
         let serve_batch_config =
             cohere_serve_batch_config_from_server_policy(request.request_options.serve_batch);
         let decoder_config = cohere_decoder_graph_config(backend, prefer_cpu_decoder);
         let can_use_serve_batch = !skip_serve_batch
             && decoder_config.backend.is_gpu_class()
-            && !decoder_config.use_scheduler;
+            && !decoder_config.use_scheduler
+            && resolved_runtime.output_plan() == GgmlDecodeOutputPlan::FullLogits
+            // The generic owner currently requires a persistent batched graph;
+            // no evidence means FreshGraph, so production Cohere serve-batch is
+            // deliberately disabled rather than silently reusing topology.
+            && resolved_runtime.reuse_mode() == GgmlDecodeReuseMode::ReusableGraph;
         let serve_batch_active = serve_batch_config.is_some() && can_use_serve_batch;
-        let backend_preference = request_backend_override();
-        let placement = current_execution_placement();
         let greedy_step_output_mode = cohere_greedy_step_output_mode(
-            device_greedy_step_output_mode(
-                decoder_config.backend,
-                decoder_config.use_scheduler,
-                backend_preference.as_ref(),
-                placement,
-            ),
+            resolved_runtime,
             skip_serve_batch || !allow_unified_runtime || serve_batch_active,
-            request.request_options.adapter_path.is_some(),
-            request.request_options.phrase_bias.is_some(),
-            request.request_options.word_timestamps,
-            std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some(),
         );
         let unified_gpu_runtime = if cohere_unified_runtime_enabled(
             allow_unified_runtime,
-            backend,
-            backend_preference.as_ref(),
-            placement,
+            resolved_runtime,
             request.request_options.adapter_path.is_some(),
             serve_batch_active,
-            prefer_cpu_decoder,
         ) {
             Some(self.checkout_unified_gpu_runtime(
                 preflight,
@@ -578,6 +564,8 @@ impl CohereTranscribeGgmlExecutor {
                 decoder_state,
                 prepared_runtime.metadata.decoder_d_model,
                 backend,
+                execution_lane.clone(),
+                resolved_runtime,
                 greedy_step_output_mode,
             )?)
         } else {
@@ -590,6 +578,7 @@ impl CohereTranscribeGgmlExecutor {
                 preflight,
                 features,
                 backend,
+                execution_lane.clone(),
                 Arc::clone(&prepared_runtime_owner),
             ),
         }
@@ -649,6 +638,9 @@ impl CohereTranscribeGgmlExecutor {
                             runtime_source,
                         ),
                     backend: decoder_config.backend,
+                    lane: execution_lane.clone(),
+                    output_plan: resolved_runtime.output_plan(),
+                    reuse_mode: resolved_runtime.reuse_mode(),
                     uses_scheduler: decoder_config.use_scheduler,
                     decoder_weights: prepared_runtime.decoder_weights.clone(),
                     decoder_state,
@@ -691,6 +683,8 @@ impl CohereTranscribeGgmlExecutor {
                 request.request_options.phrase_bias.as_ref(),
                 backend,
                 prefer_cpu_decoder,
+                resolved_runtime,
+                execution_lane.clone(),
                 request.request_options.word_timestamps,
                 audio_duration,
                 &request.execution_context.control,
@@ -784,13 +778,16 @@ impl CohereTranscribeGgmlExecutor {
         decoder_state: crate::models::seq2seq_decoder_state::Seq2SeqDecoderState,
         cross_hidden_size: usize,
         backend: GgmlCpuGraphBackend,
+        lane: ExecutionLaneKey,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
         greedy_step_output_mode: DeviceGreedyStepOutputMode,
     ) -> Result<CohereUnifiedRuntimeActor, CohereTranscribeGgmlExecutorError> {
         let key = CohereUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
-            lane: current_execution_lane_key(backend),
+            lane: lane.clone(),
             resident_capacity: decoder_state.resident_capacity(),
-            greedy_step_output_mode,
+            output_plan: resolved_runtime.output_plan(),
+            reuse_mode: resolved_runtime.reuse_mode(),
         };
         let preflight = preflight.clone();
         let pack_content_id = preflight.runtime_source.content_id().to_string();
@@ -840,7 +837,7 @@ impl CohereTranscribeGgmlExecutor {
                         backend,
                         false,
                         &preflight,
-                        greedy_step_output_mode,
+                        resolved_runtime.reuse_mode(),
                     )
                     .map_err(|error| CohereTranscribeGgmlExecutorError::DecoderFailed {
                         reason: error.to_string(),
@@ -850,15 +847,19 @@ impl CohereTranscribeGgmlExecutor {
                         decoder,
                         _prepared_owner: prepared_owner,
                     };
-                    let expected_lane = (GgmlCpuGraphBackend::Gpu, false);
+                    let expected_lane = (lane.backend(), false);
                     if state.encoder.graph_lane() != expected_lane
                         || state.decoder.graph_lane() != expected_lane
                     {
                         return Err(
                             CohereTranscribeGgmlExecutorError::RuntimeOwnershipFailed {
                                 stage: "unified-runtime",
-                                reason: "unified Cohere runtime requires direct GPU encoder and decoder lanes"
-                                    .to_string(),
+                                reason: format!(
+                                    "unified Cohere runtime lane drift: expected {:?}, encoder={:?}, decoder={:?}",
+                                    expected_lane,
+                                    state.encoder.graph_lane(),
+                                    state.decoder.graph_lane(),
+                                ),
                             },
                         );
                     }
@@ -908,11 +909,11 @@ impl CohereTranscribeGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
         backend: GgmlCpuGraphBackend,
+        lane: ExecutionLaneKey,
     ) -> Result<CohereEncoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
-        let encoder_backend = cohere_encoder_graph_config(backend).backend;
         let key = (
             PackContentKey::for_runtime_source(&preflight.runtime_source),
-            current_execution_lane_key(encoder_backend),
+            lane.clone(),
         );
         let preflight = preflight.clone();
         self.encoder_runtimes.checkout_or_try_build_with(
@@ -944,6 +945,16 @@ impl CohereTranscribeGgmlExecutor {
                         reason: error.to_string(),
                     }
                 })?;
+                if runtime.graph_lane().0 != lane.backend() {
+                    return Err(CohereTranscribeGgmlExecutorError::RuntimeOwnershipFailed {
+                        stage: "encoder",
+                        reason: format!(
+                            "Cohere encoder lane drift: request={:?}, runtime={:?}",
+                            lane.backend(),
+                            runtime.graph_lane(),
+                        ),
+                    });
+                }
                 Ok(SystemMemoryOwner::without_allocation(
                     CohereEncoderRuntimeActorState {
                         runtime,
@@ -960,11 +971,12 @@ impl CohereTranscribeGgmlExecutor {
         preflight: &GgufRuntimeSourcePreflight,
         features: CohereTranscribeMelFeatures,
         backend: GgmlCpuGraphBackend,
+        lane: ExecutionLaneKey,
         prepared_owner: PreparedRuntimeHandle<BuiltinPreparedRuntime>,
     ) -> Result<super::encoder_graph::CohereTranscribeEncoderOutput, CohereTranscribeEncoderError>
     {
         let actor = self
-            .checkout_encoder_runtime(preflight, prepared_owner, backend)
+            .checkout_encoder_runtime(preflight, prepared_owner, backend, lane)
             .map_err(|error| CohereTranscribeEncoderError::GraphExecutionFailed {
                 reason: error.to_string(),
             })?;
@@ -1012,12 +1024,15 @@ impl CohereTranscribeGgmlExecutor {
         cross_hidden_size: usize,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
+        lane: ExecutionLaneKey,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
     ) -> Result<CohereDecoderRuntimeActor, CohereTranscribeGgmlExecutorError> {
-        let decoder_backend = cohere_decoder_graph_config(backend, prefer_cpu_backend).backend;
         let key = (
             PackContentKey::new(pack_content_id),
-            current_execution_lane_key(decoder_backend),
+            lane.clone(),
             decoder_state.resident_capacity(),
+            resolved_runtime.output_plan(),
+            resolved_runtime.reuse_mode(),
         );
         self.decoder_runtimes.checkout_or_try_build_with(
             key,
@@ -1037,19 +1052,30 @@ impl CohereTranscribeGgmlExecutor {
                                     .to_string(),
                             }
                         })?;
-                let runtime = CohereDecoderGraphRuntime::new(
+                let runtime = CohereDecoderGraphRuntime::new_with_reuse_mode(
                     &prepared_runtime.decoder_weights,
                     prepared_runtime.metadata,
                     decoder_state,
                     cross_hidden_size,
                     backend,
                     prefer_cpu_backend,
+                    resolved_runtime.reuse_mode(),
                 )
                 .map_err(|error| {
                     CohereTranscribeGgmlExecutorError::DecoderFailed {
                         reason: error.to_string(),
                     }
                 })?;
+                if runtime.graph_lane().0 != lane.backend() {
+                    return Err(CohereTranscribeGgmlExecutorError::RuntimeOwnershipFailed {
+                        stage: "decoder",
+                        reason: format!(
+                            "Cohere decoder lane drift: request={:?}, runtime={:?}",
+                            lane.backend(),
+                            runtime.graph_lane(),
+                        ),
+                    });
+                }
                 Ok(SystemMemoryOwner::without_allocation(
                     CohereDecoderRuntimeActorState {
                         runtime,
@@ -1074,6 +1100,8 @@ impl CohereTranscribeGgmlExecutor {
         phrase_bias: Option<&crate::PhraseBiasConfig>,
         backend: GgmlCpuGraphBackend,
         prefer_cpu_backend: bool,
+        resolved_runtime: ResolvedFamilyRuntimeInput,
+        lane: ExecutionLaneKey,
         word_timestamps: bool,
         audio_duration_seconds: f32,
         control: &Arc<crate::TranscriptionControl>,
@@ -1089,6 +1117,8 @@ impl CohereTranscribeGgmlExecutor {
                 encoder_output.hidden_size,
                 backend,
                 prefer_cpu_backend,
+                lane,
+                resolved_runtime,
             )
             .map_err(|error| CohereDecoderGraphError::GraphExecutionFailed {
                 reason: format!("decoder runtime actor checkout failed: {error}"),
@@ -1476,8 +1506,10 @@ mod tests {
     use crate::api::backend::{NativeBackend, TranscriptionBackend};
     use crate::arch::builtin_adapter_descriptor;
     use crate::device::execution_route::{
-        DeviceAddressability, PhysicalResourceKey, ResolvedExecutionRoute, RouteDeviceKind,
+        DeviceAddressability, ExecutionProvider, PhysicalResourceKey, ResolvedExecutionRoute,
+        RouteDeviceKind,
     };
+    use crate::ggml_runtime::RequestBackendPreference;
     use crate::models::serve_batch_env::OPENASR_SERVE_BATCH_ENV;
     use crate::testing::{
         TinyGgufFixtureSpec, with_forced_cpu_backend_for_test, write_tiny_gguf_runtime_source,
@@ -1501,59 +1533,81 @@ mod tests {
     }
 
     #[test]
-    fn unified_runtime_policy_is_ordinary_exact_direct_cuda_or_vulkan_only() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
-            let preference = exact_route(provider);
-            let _backend =
-                crate::ggml_runtime::install_request_backend_override(Some(preference.clone()));
-            assert!(cohere_unified_runtime_enabled(
-                true,
-                GgmlCpuGraphBackend::Gpu,
-                Some(&preference),
-                Some(ExecutionPlacement::FullDevice),
-                false,
-                false,
-                false,
-            ));
-            for excluded in 0..4 {
-                assert!(!cohere_unified_runtime_enabled(
-                    excluded != 0,
-                    GgmlCpuGraphBackend::Gpu,
-                    Some(&preference),
-                    Some(ExecutionPlacement::FullDevice),
-                    excluded == 1,
-                    excluded == 2,
-                    excluded == 3,
-                ));
-            }
-        }
-
+    fn cohere_gpu_routes_are_complete_logits_and_fresh_graph() {
         for provider in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Vulkan,
             ExecutionProvider::Hip,
             ExecutionProvider::Metal,
-            ExecutionProvider::Accelerator,
-            ExecutionProvider::Unknown,
         ] {
-            let preference = exact_route(provider);
-            assert!(!cohere_unified_runtime_enabled(
-                true,
-                GgmlCpuGraphBackend::Gpu,
-                Some(&preference),
-                Some(ExecutionPlacement::FullDevice),
-                false,
-                false,
-                false,
-            ));
+            let resolved = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+                Some(exact_route(provider)),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            );
+            assert_eq!(
+                resolved.backend(),
+                if provider == ExecutionProvider::Metal {
+                    GgmlCpuGraphBackend::Metal
+                } else {
+                    GgmlCpuGraphBackend::Gpu
+                }
+            );
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+            assert_eq!(
+                cohere_greedy_step_output_mode(resolved, false),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
         }
-        assert!(!cohere_unified_runtime_enabled(
-            true,
-            GgmlCpuGraphBackend::Gpu,
-            Some(&RequestBackendPreference::Accelerated),
-            Some(ExecutionPlacement::FullDevice),
-            false,
-            false,
-            false,
-        ));
+    }
+
+    #[test]
+    fn cohere_request_features_cannot_authorize_compact_output() {
+        use crate::ggml_runtime::GgmlDecodeLogitsConsumers;
+        use crate::models::device_greedy_token::decode_logits_consumers_for_request;
+
+        let gpu = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            Some(exact_route(ExecutionProvider::Cuda)),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
+        assert_eq!(
+            cohere_greedy_step_output_mode(gpu, true),
+            DeviceGreedyStepOutputMode::FullLogits
+        );
+
+        for consumers in [
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                true,
+                false,
+                false,
+            ),
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                false,
+                true,
+                false,
+            ),
+            decode_logits_consumers_for_request(
+                COHERE_TRANSCRIBE_GGML_ADAPTER_ID,
+                false,
+                false,
+                true,
+            ),
+            GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            GgmlDecodeLogitsConsumers::none().with_suppression(true),
+        ] {
+            let resolved = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+                Some(crate::ggml_runtime::RequestBackendPreference::CpuOnly),
+                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                consumers,
+            );
+            assert_eq!(
+                cohere_greedy_step_output_mode(resolved, false),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+        }
     }
 
     #[test]
@@ -1564,50 +1618,6 @@ mod tests {
         );
         assert!(cohere_unified_system_memory_shape(u64::MAX, 1, 0).is_err());
         assert!(cohere_unified_system_memory_shape(u64::MAX, 0, 1).is_err());
-    }
-
-    #[test]
-    fn device_top1_policy_requires_an_ordinary_consumer_without_logit_observers() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
-            let preference = exact_route(provider);
-            let base = device_greedy_step_output_mode(
-                GgmlCpuGraphBackend::Gpu,
-                false,
-                Some(&preference),
-                Some(ExecutionPlacement::FullDevice),
-            );
-            assert_eq!(
-                cohere_greedy_step_output_mode(base, false, false, false, false, false),
-                DeviceGreedyStepOutputMode::DeviceTop1,
-                "provider={provider:?}"
-            );
-            for excluded in 0..5 {
-                assert_eq!(
-                    cohere_greedy_step_output_mode(
-                        base,
-                        excluded == 0,
-                        excluded == 1,
-                        excluded == 2,
-                        excluded == 3,
-                        excluded == 4,
-                    ),
-                    DeviceGreedyStepOutputMode::FullLogits,
-                    "provider={provider:?} excluded={excluded}"
-                );
-            }
-        }
-
-        assert_eq!(
-            cohere_greedy_step_output_mode(
-                DeviceGreedyStepOutputMode::FullLogits,
-                false,
-                false,
-                false,
-                false,
-                false,
-            ),
-            DeviceGreedyStepOutputMode::FullLogits
-        );
     }
 
     fn sample_wav_fixture_path() -> PathBuf {

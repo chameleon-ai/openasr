@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """Sync core release assets to Backblaze B2 behind https://dl.openasr.org.
 
-  b2_sync.py sync --version <semver> \\
-      dist/openasr-<v>-windows-x86_64-vulkan.zip \\
-      dist/openasr-<v>-windows-x86_64-cuda-sidecar.zip \\
-      dist/openasr-<v>-windows-x86_64-rocm-sidecar.zip \\
-      dist/backends-manifest.json \\
-      [dist/backends-manifest.signature.json]
-
-  b2_sync.py sync-vendor \\
-      dist/openasr-vendor-cuda-runtime-<sha12>.zip \\
-      dist/openasr-vendor-rocm-runtime-<sha12>.zip
+  b2_sync.py sync --version <semver> <signed backend artifact> [...]
 
 `sync` uploads each given file to `core/v<version>/<basename>` in the SAME B2
 bucket/Cloudflare-Worker setup used by the desktop installers already use
@@ -18,17 +9,7 @@ bucket/Cloudflare-Worker setup used by the desktop installers already use
 `b2-s3-client.mjs`, which this script's SigV4 signer is a Python port of --
 `desktop/releases/v<version>/...` there, `core/v<version>/...` here).
 
-`sync-vendor` (schema v2) instead uploads to the VERSION-INDEPENDENT,
-content-addressed `core/vendor/<sha256>/<basename>` prefix -- see
-`sync_vendor_files`'s doc comment and `docs/backend-kernels.md`'s schema v2
-section. **Policy note**: these vendor archives are large (NVIDIA's/AMD's
-full GPU runtime, several hundred MB) and GitHub Releases is the intended
-PRIMARY distribution point for them (already uploaded there by
-release-binaries.yml, no extra step needed); syncing them to B2 as well is
-OPTIONAL, not required before a release is usable -- run `sync-vendor` only
-if dl.openasr.org's CDN fronting is specifically wanted for that layer too.
-
-Both subcommands use THE SAME environment variable names as
+The command uses the same environment variable names as
 `b2-s3-client.mjs`:
 
   B2_S3_ENDPOINT        Required. e.g. https://s3.us-east-005.backblazeb2.com
@@ -50,13 +31,10 @@ message pointing at the `source` step.
 Immutability, same policy as the desktop publish script: before uploading a
 key, HEAD it. If an object already exists there with a DIFFERENT sha256, this
 aborts rather than silently overwriting a shipped release asset -- bump the
-version instead (or, for `sync-vendor`'s content-addressed keys, this would
-only ever trip on a genuine sha256 collision or a key-computation bug, since
-the key IS the content hash). Re-uploading byte-identical content is a no-op.
+version instead. Re-uploading byte-identical content is a no-op.
 
-This is deliberately NOT wired into any GitHub Actions workflow yet -- see
-tooling/release-manifest/README.md's "dl.openasr.org sync" section for why
-(credential/bucket-sharing decision, not a technical blocker).
+This is deliberately not wired into GitHub Actions. It is invoked by the
+maintainer-controlled Windows backend CDN sync path after target approval.
 """
 from __future__ import annotations
 
@@ -73,6 +51,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
+
+from retention import apply_release_retention
 
 ALGORITHM = "AWS4-HMAC-SHA256"
 SERVICE = "s3"
@@ -319,10 +299,7 @@ def _sync_to_keys(
     key_for: Callable[[Path, bytes], str],
     dl_base_url: str,
 ) -> list[str]:
-    """Shared upload-with-immutability-gate loop behind both [`sync_files`]
-    (per-release `core/v<version>/` keys) and [`sync_vendor_files`]
-    (version-independent, content-addressed `core/vendor/<sha256>/` keys) --
-    only the key derivation differs between the two."""
+    """Upload files with an immutable-object gate."""
     urls = []
     for path in files:
         if not path.is_file():
@@ -357,30 +334,6 @@ def sync_files(
     return _sync_to_keys(client, files, lambda path, _data: f"core/v{version}/{path.name}", dl_base_url)
 
 
-def sync_vendor_files(
-    client: B2Client, files: list[Path], dl_base_url: str = DEFAULT_DL_BASE_URL
-) -> list[str]:
-    """Uploads each `vendor_layers` archive (schema v2 -- the large NVIDIA/AMD
-    GPU runtime zips release-binaries.yml stages via
-    `tooling/release-manifest/deterministic_zip.py`) to the VERSION-INDEPENDENT,
-    content-addressed key `core/vendor/<sha256>/<basename>` instead of
-    `sync_files`' `core/v<version>/<basename>` -- the whole point of this
-    routing is that a later core release referencing the SAME vendor archive
-    (same sha256) reuses the object already there instead of re-uploading it.
-    The sha256 is computed HERE from the file's actual bytes (the authoritative
-    source), not parsed out of the filename's embedded short hash -- same
-    "trust the bytes, not the label" posture as
-    `backend_manifest.rs::VendorLayer::verify_sha256` on the reading side.
-
-    Same immutability gate as `sync_files`; a conflict at a content-addressed
-    key would mean either a real sha256 collision (practically impossible) or
-    a bug elsewhere computing a wrong/mismatched key, so this still fails
-    closed rather than silently treating it as a hash-based dedup no-op."""
-    return _sync_to_keys(
-        client, files, lambda path, data: f"core/vendor/{sha256_hex(data)}/{path.name}", dl_base_url
-    )
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -390,12 +343,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sync.add_argument("--dl-base-url", default=DEFAULT_DL_BASE_URL)
     sync.add_argument("files", nargs="+", type=Path)
 
-    sync_vendor = subparsers.add_parser(
-        "sync-vendor",
-        help="Upload vendor_layers archives to the content-addressed core/vendor/<sha256>/ prefix on B2",
+    prune = subparsers.add_parser(
+        "prune",
+        help="Plan Official (B2) retention. Dry-run unless --execute or OPENASR_RELEASE_PRUNE=1.",
     )
-    sync_vendor.add_argument("--dl-base-url", default=DEFAULT_DL_BASE_URL)
-    sync_vendor.add_argument("files", nargs="+", type=Path)
+    prune.add_argument("--latest-stable", required=True)
+    prune.add_argument(
+        "--keys-file",
+        type=Path,
+        help="Object keys to consider, one per line. Without this, only the policy is logged.",
+    )
+    prune.add_argument("--execute", action="store_true", help="Actually delete (also honors OPENASR_RELEASE_PRUNE=1).")
 
     return parser.parse_args(argv)
 
@@ -412,17 +370,23 @@ def main(argv: list[str]) -> int:
             return 1
         for url in urls:
             print(url)
+        apply_release_retention(profile="official", latest_stable=args.version)
         return 0
-    if args.command == "sync-vendor":
-        try:
-            credentials = B2Credentials.from_env()
-            client = B2Client(credentials)
-            urls = sync_vendor_files(client, args.files, args.dl_base_url)
-        except B2SyncError as error:
-            print(f"b2_sync.py: {error}", file=sys.stderr)
-            return 1
-        for url in urls:
-            print(url)
+    if args.command == "prune":
+        keys = args.keys_file.read_text(encoding="utf-8").splitlines() if args.keys_file else []
+        keys = [line.strip() for line in keys if line.strip() and not line.startswith("#")]
+        apply_release_retention(
+            profile="official",
+            latest_stable=args.latest_stable,
+            keys=keys,
+            prune=False,
+        )
+        if args.execute or os.environ.get("OPENASR_RELEASE_PRUNE") == "1":
+            print(
+                "b2_sync.py: --execute/OPENASR_RELEASE_PRUNE is set but object "
+                "delete is not wired; listed would-delete only",
+                file=sys.stderr,
+            )
         return 0
     raise SystemExit(f"unknown command: {args.command}")
 

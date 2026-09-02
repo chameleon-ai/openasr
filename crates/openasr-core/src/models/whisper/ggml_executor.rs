@@ -29,9 +29,10 @@ use crate::device::execution_policy::ExecutionPlacement;
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlLoadedTensor, GgmlLoadedWeightBindingIdentity,
-    GgmlLoadedWeightContext, GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight,
-    RequestBackendPreference, request_backend_override,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlLoadedTensor,
+    GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlSelectionEvidenceRef,
+    GgmlStaticTensor, GgmlStaticTensorArena, GgufRuntimeSourcePreflight, RequestBackendPreference,
+    request_backend_override,
 };
 use crate::models::admitted_pinned_runtime_actor_pool::{
     AdmittedPinnedRuntimeActorCheckoutPool, AdmittedPinnedRuntimeActorCheckoutPoolLimits,
@@ -64,7 +65,7 @@ use crate::nn::attn::{
 use crate::nn::conv::{
     Conv1dParams, ConvActivation, ConvBlockSteps, apply_conv_1d_bias_activation,
 };
-use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported_for_runner};
+use crate::nn::decoder::{Seq2SeqReusableDecodeGraph, reusable_decode_graph_supported};
 use crate::nn::half::{f16_bits_to_f32, f32_to_f16_bits};
 use crate::nn::norm::{AffineLayerNormSteps, apply_affine_layer_norm};
 use crate::{
@@ -130,8 +131,8 @@ use super::ggml_tensor_binding::{
     WhisperGgufTensorBindings, bind_whisper_gguf_tensors,
 };
 use super::graph_config::{
-    WhisperDecoderPlacementPolicy, whisper_decoder_graph_config,
-    whisper_encoder_prelude_graph_config, whisper_runtime_graph_config,
+    WhisperDecoderPlacementPolicy, whisper_decoder_graph_config, whisper_encoder_graph_config,
+    whisper_encoder_prelude_graph_config,
 };
 use super::mel::{
     WHISPER_CHANNELS, WHISPER_HOP_LENGTH, WHISPER_SAMPLE_RATE_HZ,
@@ -191,11 +192,22 @@ const OPENASR_WHISPER_DISABLE_GPU_LOADED_F16_WEIGHTS: &str =
 const WHISPER_ENCODER_LAYER_NORM_EPSILON: f32 = 1.0e-5;
 
 fn whisper_can_use_serve_batch(
-    graph_config: GgmlCpuGraphConfig,
+    reuse_mode: GgmlDecodeReuseMode,
     _request_options: &GgmlAsrExecutionOptions,
     _allow_persistent_session_reuse: bool,
 ) -> bool {
-    graph_config.backend.is_gpu_class() && !graph_config.use_scheduler
+    reusable_decode_graph_supported(reuse_mode)
+}
+
+/// Serve-batch keeps the encoder-only actor. Every other offline unified GPU
+/// request must checkout the combined owner first so prelude, encode, and
+/// decode share one TLS backend.
+fn whisper_should_checkout_unified_gpu_owner(
+    skip_serve_batch: bool,
+    will_use_serve_batch: bool,
+    unified_enabled: bool,
+) -> bool {
+    !skip_serve_batch && !will_use_serve_batch && unified_enabled
 }
 
 #[derive(Debug, Error)]
@@ -810,6 +822,7 @@ struct WhisperDecoderActorJob {
     audio_duration: f32,
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
+    reuse_mode: GgmlDecodeReuseMode,
     decoder_placement_policy: WhisperDecoderPlacementPolicy,
     loaded_f16_weight_mode: WhisperGpuLoadedF16WeightMode,
     control: Arc<crate::api::backend::TranscriptionControl>,
@@ -953,8 +966,13 @@ impl WhisperDecoderActorJob {
                 &self.control,
                 self.decode_work_progress.as_ref(),
                 self.unstable_decode_text.as_ref(),
+                self.reuse_mode,
             )
         })();
+        if let Some(session) = state.session.as_mut() {
+            session.reuse = None;
+            let _ = session.runner.release_request_compute_residency();
+        }
         if !self.allow_persistent_session_reuse {
             // Request-scoped graph/KV state must be destroyed on the owner
             // thread on success and on every early error path.
@@ -1161,6 +1179,7 @@ struct WhisperDecoderStepLogits {
     last_token_cross_attention_frame_probs: Option<Vec<f32>>,
     decoder_graph_run_ms: u128,
     logits_ms: u128,
+    compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3189,10 +3208,6 @@ fn whisper_encoder_resident_weights_enabled() -> bool {
     )
 }
 
-fn whisper_encoder_graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
-    whisper_runtime_graph_config(backend)
-}
-
 fn apply_encoder_affine_layer_norm<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     uploads: &mut Vec<WhisperEncoderGraphUpload<'a>>,
@@ -3629,6 +3644,7 @@ fn run_whisper_decoder_step_ggml_v0(
         last_token_cross_attention_frame_probs: output.last_token_cross_attention_frame_probs,
         decoder_graph_run_ms,
         logits_ms: logits_start.elapsed().as_millis(),
+        compute_evidence: output.compute_evidence,
     })
 }
 
@@ -3749,12 +3765,7 @@ fn whisper_gpu_loaded_f16_weight_mode_with_override(
         && encoder_config.backend == GgmlCpuGraphBackend::Gpu
         && !encoder_config.use_scheduler
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
     {
         WhisperGpuLoadedF16WeightMode::LoadedView
     } else {
@@ -3787,17 +3798,12 @@ fn whisper_unified_runtime_enabled_with_override(
     disable_raw: Option<&str>,
     enable_raw: Option<&str>,
 ) -> bool {
-    let exact_provider = match backend_preference {
-        Some(RequestBackendPreference::Exact(route))
-            if route.addressability.is_exactly_addressable() =>
-        {
-            Some(route.provider)
-        }
-        _ => None,
-    };
+    let exact_provider = crate::ggml_runtime::proven_discrete_gpu_provider(backend_preference);
     let default_enabled = matches!(exact_provider, Some(ExecutionProvider::Vulkan))
-        || (matches!(exact_provider, Some(ExecutionProvider::Cuda))
-            && (allow_persistent_session_reuse || geometry.favors_cuda_unified_runtime()));
+        || (matches!(
+            exact_provider,
+            Some(ExecutionProvider::Cuda | ExecutionProvider::Hip)
+        ) && (allow_persistent_session_reuse || geometry.favors_cuda_unified_runtime()));
     let enabled =
         crate::ggml_runtime::env_toggle_with_raw(disable_raw, enable_raw, default_enabled);
     enabled
@@ -3807,12 +3813,7 @@ fn whisper_unified_runtime_enabled_with_override(
         && !encoder_config.use_scheduler
         && !decoder_config.use_scheduler
         && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            backend_preference,
-            Some(RequestBackendPreference::Exact(route))
-                if route.addressability.is_exactly_addressable()
-                    && matches!(route.provider, ExecutionProvider::Cuda | ExecutionProvider::Vulkan)
-        )
+        && crate::ggml_runtime::exact_discrete_gpu_unified_owner_is_proven(backend_preference)
 }
 
 fn whisper_unified_runtime_enabled(
@@ -3957,6 +3958,34 @@ fn checkout_whisper_unified_runtime(
     )
 }
 
+fn run_whisper_encoder_prelude_state(
+    state: &mut WhisperEncoderRuntimeActorState,
+    prepared: &WhisperPreparedRuntime,
+    plan: &WhisperEncoderPreludePlan,
+    mel_input: &WhisperMelFeatureInput,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
+    if !state
+        .prelude
+        .as_ref()
+        .is_some_and(|runtime| runtime.matches(plan, backend))
+    {
+        state.prelude = Some(WhisperEncoderPreludeCachedRuntime::build(
+            &prepared.encoder_weights,
+            plan,
+            backend,
+        )?);
+    }
+    state
+        .prelude
+        .as_mut()
+        .ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+            stage: "encoder_prelude",
+            reason: "actor prelude runtime was not initialized".to_string(),
+        })?
+        .run(mel_input)
+}
+
 fn run_whisper_encoder_prelude_actor(
     actor: &WhisperEncoderRuntimeActor,
     prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
@@ -3966,27 +3995,29 @@ fn run_whisper_encoder_prelude_actor(
 ) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
     actor
         .call_mut_fallible(move |state| {
-            if !state
-                .prelude
-                .as_ref()
-                .is_some_and(|runtime| runtime.matches(&plan, backend))
-            {
-                state.prelude = Some(WhisperEncoderPreludeCachedRuntime::build(
-                    &prepared.encoder_weights,
-                    &plan,
-                    backend,
-                )?);
-            }
-            state
-                .prelude
-                .as_mut()
-                .ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
-                    stage: "encoder_prelude",
-                    reason: "actor prelude runtime was not initialized".to_string(),
-                })?
-                .run(&mel_input)
+            run_whisper_encoder_prelude_state(state, prepared.as_ref(), &plan, &mel_input, backend)
         })
         .map_err(|error| map_whisper_actor_error("encoder_prelude", error))?
+}
+
+fn run_whisper_encoder_prelude_unified(
+    actor: &WhisperUnifiedRuntimeActor,
+    prepared: PreparedRuntimeHandle<WhisperPreparedRuntime>,
+    plan: WhisperEncoderPreludePlan,
+    mel_input: WhisperMelFeatureInput,
+    backend: GgmlCpuGraphBackend,
+) -> Result<WhisperEncoderPreludeSeamResult, WhisperGgmlExecutorError> {
+    actor
+        .call_mut_fallible(move |state| {
+            run_whisper_encoder_prelude_state(
+                &mut state.encoder,
+                prepared.as_ref(),
+                &plan,
+                &mel_input,
+                backend,
+            )
+        })
+        .map_err(|error| map_whisper_actor_error("unified-prelude", error))?
 }
 
 fn run_whisper_encoder_actor(
@@ -4262,6 +4293,7 @@ impl WhisperGgmlExecutor {
             skip_serve_batch,
             &request.execution_context,
             request.resolved_runtime.backend(),
+            request.resolved_runtime.reuse_mode(),
         )
         .map_err(|error| match error {
             WhisperGgmlExecutorError::ServeBatchUnavailable { reason, retryable } => {
@@ -4680,6 +4712,7 @@ fn execute_whisper_with_prepared_runtime(
     skip_serve_batch: bool,
     execution_context: &std::sync::Arc<crate::RequestExecutionContext>,
     resolved_backend: GgmlCpuGraphBackend,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let runtime_source = &preflight.runtime_source;
     let runtime = prepared_owner.as_ref();
@@ -4734,23 +4767,79 @@ fn execute_whisper_with_prepared_runtime(
         decoder_state,
         prelude_plan.output_frames,
     )?;
-    let encoder_actor = checkout_whisper_encoder_runtime(
-        encoder_runtimes,
-        runtime_source,
-        Arc::clone(&prepared_owner),
-        Arc::clone(&encoder_graph_runner),
-        resolved_backend,
-        gpu_loaded_f16_weight_mode,
-    )?;
+    // Resolve once on the submitting request thread, while the typed Exact
+    // route is still installed. Decoder actors and serve-batch owners execute
+    // on separate threads and must consume this snapshot rather than infer a
+    // provider from their generic Gpu backend.
+    let decoder_placement_policy = WhisperDecoderPlacementPolicy::resolve();
+    let serve_batch_config =
+        whisper_serve_batch_config_from_server_policy(request_options.serve_batch);
+    let can_use_serve_batch = !skip_serve_batch
+        && whisper_can_use_serve_batch(reuse_mode, request_options, allow_persistent_session_reuse);
+    let will_use_serve_batch = serve_batch_config.is_some() && can_use_serve_batch;
+    let use_unified_gpu_owner = whisper_should_checkout_unified_gpu_owner(
+        skip_serve_batch,
+        will_use_serve_batch,
+        whisper_unified_runtime_enabled(
+            resolved_backend,
+            decoder_placement_policy,
+            runtime,
+            allow_persistent_session_reuse,
+        ),
+    );
+    // Unified GPU ownership must install the only TLS Vulkan context on the
+    // combined owner thread. Checking out the encoder-only actor first would
+    // leave a second pinned backend alive after that checkout is dropped.
+    let unified_actor = if use_unified_gpu_owner {
+        Some(checkout_whisper_unified_runtime(
+            unified_gpu_runtimes,
+            runtime_source,
+            Arc::clone(&prepared_owner),
+            Arc::clone(&encoder_graph_runner),
+            decoder_state,
+            resolved_backend,
+            decoder_placement_policy,
+            gpu_loaded_f16_weight_mode,
+        )?)
+    } else {
+        None
+    };
+    let encoder_actor = if use_unified_gpu_owner {
+        None
+    } else {
+        Some(checkout_whisper_encoder_runtime(
+            encoder_runtimes,
+            runtime_source,
+            Arc::clone(&prepared_owner),
+            Arc::clone(&encoder_graph_runner),
+            resolved_backend,
+            gpu_loaded_f16_weight_mode,
+        )?)
+    };
     let prelude_result = trace.run_stage("prelude_run", || {
         if prelude_runner.supports_owner_thread_cached_runtime() {
-            run_whisper_encoder_prelude_actor(
-                &encoder_actor,
-                Arc::clone(&prepared_owner),
-                prelude_plan.clone(),
-                mel_input,
-                resolved_backend,
-            )
+            if let Some(unified_actor) = unified_actor.as_ref() {
+                run_whisper_encoder_prelude_unified(
+                    unified_actor,
+                    Arc::clone(&prepared_owner),
+                    prelude_plan.clone(),
+                    mel_input,
+                    resolved_backend,
+                )
+            } else {
+                run_whisper_encoder_prelude_actor(
+                    encoder_actor.as_ref().ok_or_else(|| {
+                        WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                            stage: "encoder_prelude",
+                            reason: "split Whisper path is missing the encoder owner".to_string(),
+                        }
+                    })?,
+                    Arc::clone(&prepared_owner),
+                    prelude_plan.clone(),
+                    mel_input,
+                    resolved_backend,
+                )
+            }
         } else {
             run_encoder_prelude_seam(
                 runtime_source,
@@ -4798,22 +4887,14 @@ fn execute_whisper_with_prepared_runtime(
         } => output_hidden_f32.clone(),
     };
     let audio_duration = audio_duration_seconds(prepared_audio);
-    let serve_batch_config =
-        whisper_serve_batch_config_from_server_policy(request_options.serve_batch);
-    // Resolve once on the submitting request thread, while the typed Exact
-    // route is still installed. Decoder actors and serve-batch owners execute
-    // on separate threads and must consume this snapshot rather than infer a
-    // provider from their generic Gpu backend.
-    let decoder_placement_policy = WhisperDecoderPlacementPolicy::resolve();
     let decoder_graph_config =
         whisper_decoder_graph_config(resolved_backend, decoder_placement_policy);
-    let can_use_serve_batch = !skip_serve_batch
-        && whisper_can_use_serve_batch(
-            decoder_graph_config,
-            request_options,
-            allow_persistent_session_reuse,
-        );
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
+        let encoder_actor =
+            encoder_actor.ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                stage: "encoder",
+                reason: "serve-batch Whisper path is missing the encoder owner".to_string(),
+            })?;
         let encoder_result = run_whisper_encoder_actor(
             encoder_actor,
             preflight.clone(),
@@ -4875,6 +4956,7 @@ fn execute_whisper_with_prepared_runtime(
                     ),
                 backend: decoder_graph_config.backend,
                 uses_scheduler: decoder_graph_config.use_scheduler,
+                reuse_mode,
                 execution: runtime.execution.clone(),
                 decoder_weights: runtime.decoder_weights.clone(),
                 tokenizer: runtime.tokenizer.clone(),
@@ -4902,27 +4984,7 @@ fn execute_whisper_with_prepared_runtime(
             },
         });
     }
-    if !skip_serve_batch
-        && whisper_unified_runtime_enabled(
-            resolved_backend,
-            decoder_placement_policy,
-            runtime,
-            allow_persistent_session_reuse,
-        )
-    {
-        // The prelude actor owns only its small convolution/position arena;
-        // release its checkout before entering the combined pack-weight owner.
-        drop(encoder_actor);
-        let unified_actor = checkout_whisper_unified_runtime(
-            unified_gpu_runtimes,
-            runtime_source,
-            Arc::clone(&prepared_owner),
-            Arc::clone(&encoder_graph_runner),
-            decoder_state,
-            resolved_backend,
-            decoder_placement_policy,
-            gpu_loaded_f16_weight_mode,
-        )?;
+    if let Some(unified_actor) = unified_actor {
         let unified_execution = runtime.execution.clone();
         let unified_preflight: GgufRuntimeSourcePreflight = (*preflight).clone();
         let mut decoder_job = WhisperDecoderActorJob {
@@ -4937,6 +4999,7 @@ fn execute_whisper_with_prepared_runtime(
             audio_duration,
             allow_persistent_session_reuse,
             backend: resolved_backend,
+            reuse_mode,
             decoder_placement_policy,
             loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
             control: Arc::clone(&execution_context.control),
@@ -4946,6 +5009,16 @@ fn execute_whisper_with_prepared_runtime(
         };
         return unified_actor
             .call_mut_fallible(move |state| {
+                // Prelude kept its own loaded-weight context on this thread.
+                // Drop it before the pack-wide encoder/decoder sessions so they
+                // can coalesce on one TLS weight slot. If the encoder session
+                // itself must be rebuilt, drop the decoder too so both owners
+                // are constructed against the same loaded context.
+                state.encoder.prelude = None;
+                let encoder_needs_build = state.encoder.session.is_none();
+                if encoder_needs_build {
+                    state.decoder.session = None;
+                }
                 let encoder_result = run_whisper_encoder_state(
                     &mut state.encoder,
                     unified_preflight,
@@ -4959,17 +5032,21 @@ fn execute_whisper_with_prepared_runtime(
                     gpu_loaded_f16_weight_mode,
                     trace,
                 )?;
-                let binding = state
-                    .encoder
-                    .session
-                    .as_ref()
-                    .and_then(WhisperEncoderPersistentStaticSession::loaded_weight_binding_identity)
-                    .ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
-                        stage: "unified-runtime",
-                        reason: "unified Whisper encoder did not retain a loaded pack binding"
-                            .to_string(),
-                    })?;
-                decoder_job.expected_loaded_weight_binding = Some(binding);
+                if encoder_needs_build {
+                    let binding = state
+                        .encoder
+                        .session
+                        .as_ref()
+                        .and_then(
+                            WhisperEncoderPersistentStaticSession::loaded_weight_binding_identity,
+                        )
+                        .ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+                            stage: "unified-runtime",
+                            reason: "unified Whisper encoder did not retain a loaded pack binding"
+                                .to_string(),
+                        })?;
+                    decoder_job.expected_loaded_weight_binding = Some(binding);
+                }
                 let result = decoder_job.run(
                     &mut state.decoder,
                     WhisperEncoderResultDelivery::Ready(Ok(encoder_result)),
@@ -4982,6 +5059,11 @@ fn execute_whisper_with_prepared_runtime(
             .map_err(|error| map_whisper_actor_error("unified-runtime", error))?;
     }
 
+    let encoder_actor =
+        encoder_actor.ok_or_else(|| WhisperGgmlExecutorError::RuntimeOwnershipFailed {
+            stage: "encoder",
+            reason: "split Whisper path is missing the encoder owner".to_string(),
+        })?;
     let decoder_actor = checkout_whisper_decoder_runtime(
         decoder_runtimes,
         runtime_source,
@@ -5004,6 +5086,7 @@ fn execute_whisper_with_prepared_runtime(
         audio_duration,
         allow_persistent_session_reuse,
         backend: resolved_backend,
+        reuse_mode,
         decoder_placement_policy,
         loaded_f16_weight_mode: gpu_loaded_f16_weight_mode,
         control: Arc::clone(&execution_context.control),
@@ -5117,6 +5200,7 @@ fn execute_whisper_ggml_non_streaming_cpu(
             "test-only non-streaming CPU decode helper",
         )),
         GgmlCpuGraphBackend::Cpu,
+        GgmlDecodeReuseMode::FreshGraph,
     )
     .map(|output| output.text)
 }
@@ -6347,11 +6431,13 @@ struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
     decoder_self_kv_state: WhisperDecoderSelfKvCacheState,
     decoder_reuse: &'a mut Option<Seq2SeqReusableDecodeGraph>,
     decoder_graph_runner: &'a mut GgmlCpuGraphRunner,
+    reuse_mode: GgmlDecodeReuseMode,
     decoder_graph_input: WhisperDecoderGraphExecutionInput,
     decoder_step_input: WhisperDecoderStepSeamInput,
     decoder_tensor_cache: WhisperDecoderExecutionTensorCache,
     plan_by_token_count: BTreeMap<usize, Arc<WhisperDecoderGraphPlan>>,
     token_alignments: Vec<WhisperGeneratedTokenAlignment>,
+    last_step_compute_evidence: Option<GgmlSelectionEvidenceRef>,
 }
 
 impl WhisperGreedyDecodeStepRunnerAdapter<'_> {
@@ -6471,7 +6557,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
         let logits_start = Instant::now();
         let use_reusable_graph = !input.generated_tokens.is_empty()
             && !self.decoder_graph_config.collect_cross_attention
-            && reusable_decode_graph_supported_for_runner(self.decoder_graph_runner);
+            && reusable_decode_graph_supported(self.reuse_mode);
         let step_logits = if use_reusable_graph {
             let token_id = *self
                 .decoder_graph_input
@@ -6521,6 +6607,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
                 last_token_cross_attention_frame_probs: None,
                 decoder_graph_run_ms,
                 logits_ms: logits_start.elapsed().as_millis(),
+                compute_evidence: output.compute_evidence,
             })
         } else {
             run_whisper_decoder_step_ggml_v0(
@@ -6595,10 +6682,15 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
                 self.decode_loop_start,
             );
         }
+        self.last_step_compute_evidence = step_logits.compute_evidence;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits: step_logits.logits,
             greedy_token_hint: step_logits.greedy_token_hint,
         })
+    }
+
+    fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
+        self.last_step_compute_evidence.take()
     }
 }
 
@@ -6617,6 +6709,7 @@ fn run_whisper_decode_loop(
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
+    reuse_mode: GgmlDecodeReuseMode,
 ) -> Result<WhisperExecutionOutput, WhisperGgmlExecutorError> {
     let prelude_summary = match prelude_result {
         WhisperEncoderPreludeSeamResult::GraphExecuted {
@@ -6784,6 +6877,7 @@ fn run_whisper_decode_loop(
         decoder_self_kv_state: WhisperDecoderSelfKvCacheState::new(),
         decoder_reuse: &mut decoder_persistent_static.reuse,
         decoder_graph_runner: &mut decoder_persistent_static.runner,
+        reuse_mode,
         decoder_graph_input: WhisperDecoderGraphExecutionInput {
             decoder_prefix_tokens: Vec::with_capacity(
                 initial_prompt_tokens
@@ -6806,6 +6900,7 @@ fn run_whisper_decode_loop(
         decoder_tensor_cache: WhisperDecoderExecutionTensorCache::default(),
         plan_by_token_count: BTreeMap::new(),
         token_alignments: Vec::new(),
+        last_step_compute_evidence: None,
     };
     let decode_text_token_ids = |token_ids: &[u32]| {
         tokenizer.decode_text_token_ids(token_ids).map_err(|error| {

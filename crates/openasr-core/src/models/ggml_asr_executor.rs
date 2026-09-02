@@ -14,6 +14,7 @@ use crate::ggml_runtime::{
     request_backend_override,
 };
 use crate::models::ggml_family_adapter::GgmlAdapterBindingStrategy;
+use crate::models::native_execution_services::ExecutionLaneKey;
 use crate::{
     GgmlExecutionCapability, GgmlFamilyAdapterDescriptor, GgmlRuntimeSource, LongFormOptions,
     NativeAsrBackpressurePolicy, NativeAsrSession, PcmSlice, PhraseBiasConfig, RealtimeAudioFormat,
@@ -495,70 +496,27 @@ fn offline_invocation_envelope_samples(
         request_options
             .longform
             .as_ref()
-            .map(|options| duration_samples_ceil(options.max_chunk_seconds, sample_rate_hz))
+            .map(|options| {
+                crate::longform::executor_window_limit_samples(
+                    options.max_chunk_seconds,
+                    sample_rate_hz,
+                )
+                .map_err(|error| {
+                    GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
+                        value: match error {
+                            crate::longform::ExecutorWindowLimitError::InvalidDuration {
+                                value,
+                            } => value,
+                        },
+                    }
+                })
+            })
             .transpose()?
             .unwrap_or(actual_samples)
     } else {
         actual_samples
     };
     Ok(configured_samples)
-}
-
-fn duration_samples_ceil(
-    seconds: f32,
-    sample_rate_hz: NonZeroU32,
-) -> Result<usize, GgmlAsrDecoderStatePlanningError> {
-    // Decode the finite positive f32 at the configuration boundary into its
-    // exact binary rational, then perform ceil(rate * seconds) in integers.
-    // No float is allowed into family topology/oracle arithmetic.
-    let bits = seconds.to_bits();
-    let sign = bits >> 31;
-    let exponent_bits = (bits >> 23) & 0xff;
-    let fraction = bits & 0x7f_ff_ff;
-    if sign != 0 || exponent_bits == 0xff || (exponent_bits == 0 && fraction == 0) {
-        return Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-            value: seconds.to_string(),
-        });
-    }
-    let (significand, exponent_two): (u128, i32) = if exponent_bits == 0 {
-        (u128::from(fraction), -149)
-    } else {
-        (
-            u128::from((1 << 23) | fraction),
-            exponent_bits as i32 - 127 - 23,
-        )
-    };
-    let scaled = significand
-        .checked_mul(u128::from(sample_rate_hz.get()))
-        .ok_or_else(
-            || GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                value: seconds.to_string(),
-            },
-        )?;
-    let samples = if exponent_two >= 0 {
-        scaled.checked_shl(exponent_two as u32).ok_or_else(|| {
-            GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                value: seconds.to_string(),
-            }
-        })?
-    } else {
-        let shift = exponent_two.unsigned_abs();
-        if shift >= u128::BITS {
-            1
-        } else {
-            let denominator = 1_u128 << shift;
-            scaled.checked_add(denominator - 1).ok_or_else(|| {
-                GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-                    value: seconds.to_string(),
-                }
-            })? / denominator
-        }
-    };
-    usize::try_from(samples).map_err(|_| {
-        GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration {
-            value: seconds.to_string(),
-        }
-    })
 }
 
 pub(crate) type GgmlAsrDecoderStatePlanner = for<'a> fn(
@@ -962,6 +920,10 @@ pub struct GgmlAsrStreamingSessionRequest {
     /// The shared streaming drivers copy it into every per-frame
     /// `GgmlAsrExecutionRequest` they build for the life of the session.
     pub resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput,
+    /// Candidate-resolved exact lane copied into every streaming frame context.
+    /// This is mandatory: a streaming session is already pinned to one policy
+    /// candidate and must never re-resolve or silently omit that identity.
+    pub(crate) execution_lane: ExecutionLaneKey,
     /// Optional session-stable auxiliary FINAL-text processor. It has its own
     /// execution plan/lane and is never derived from `resolved_runtime`.
     pub(crate) final_text_processor: Option<GgmlAsrStreamingFinalTextProcessorSlot>,
@@ -1016,6 +978,24 @@ impl GgmlAsrExecutionViewRequest<'_> {
 impl GgmlAsrStreamingSessionRequest {
     pub fn runtime_source_preflight(&self) -> &GgufRuntimeSourcePreflight {
         self.verified_pack.preflight()
+    }
+
+    /// Build the immutable authority carried by every per-frame decode in
+    /// this session. Streaming frames still have no independent cancel/pause
+    /// surface, but they must retain the session's attempt, receipt, and exact
+    /// lane instead of silently creating a second untracked request.
+    pub(crate) fn per_frame_execution_context(
+        &self,
+        uncancellable_reason: &'static str,
+    ) -> Arc<RequestExecutionContext> {
+        let mut context = RequestExecutionContext::uncancellable(uncancellable_reason);
+        if let Some(attempt_id) = self.session_context.request_attempt_id() {
+            context = context.with_request_attempt_id(attempt_id);
+        }
+        if let Some(receipt) = self.session_context.native_execution_receipt() {
+            context = context.with_native_execution_receipt(receipt);
+        }
+        Arc::new(context.with_native_execution_lane(self.execution_lane.clone()))
     }
 }
 
@@ -1480,6 +1460,11 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
+        let _resolved_lane = request
+            .execution_context
+            .native_execution_lane()
+            .cloned()
+            .map(crate::models::native_execution_services::install_resolved_execution_lane);
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Honor the request's execution preference for the few remaining
         // thread-local readers unrelated to backend resolution proper (the
@@ -1537,6 +1522,11 @@ impl GgmlAsrExecutionDispatch {
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
             );
+        let _resolved_lane = request
+            .execution_context
+            .native_execution_lane()
+            .cloned()
+            .map(crate::models::native_execution_services::install_resolved_execution_lane);
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         let attempt_override =
             crate::models::native_execution_services::current_execution_placement()
@@ -1634,6 +1624,10 @@ impl GgmlAsrExecutionDispatch {
         let _execution_scope =
             crate::models::native_execution_services::install_native_execution_services(
                 request.execution_services.as_ref(),
+            );
+        let _resolved_lane =
+            crate::models::native_execution_services::install_resolved_execution_lane(
+                request.execution_lane.clone(),
             );
         ensure_verified_pack_matches_family(&request.verified_pack, &request.selected_family)?;
         // Same reasoning as `execute` above: the family's resolved backend
@@ -1839,22 +1833,35 @@ mod tests {
     };
 
     #[test]
-    fn duration_boundary_ceil_uses_exact_integer_binary_rational() {
+    fn offline_envelope_maps_longform_oracle_errors() {
         let rate = NonZeroU32::new(16_000).unwrap();
-        assert_eq!(duration_samples_ceil(30.0, rate).unwrap(), 480_000);
-        assert_eq!(duration_samples_ceil(30.5, rate).unwrap(), 488_000);
-        // The stored f32 value is slightly greater than decimal 0.1. Exact
-        // integer ceil must retain that conservative final sample.
-        assert_eq!(duration_samples_ceil(0.1, rate).unwrap(), 1_601);
-        assert_eq!(duration_samples_ceil(f32::from_bits(1), rate).unwrap(), 1);
-        assert!(matches!(
-            duration_samples_ceil(0.0, rate),
-            Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
-        ));
-        assert!(matches!(
-            duration_samples_ceil(f32::NAN, rate),
-            Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
-        ));
+        for seconds in [0.0_f32, f32::NAN] {
+            let options = GgmlAsrExecutionOptions {
+                longform: Some(crate::LongFormOptions {
+                    max_chunk_seconds: seconds,
+                    ..crate::LongFormOptions::default()
+                }),
+                ..GgmlAsrExecutionOptions::default()
+            };
+            assert!(
+                matches!(
+                    offline_invocation_envelope_samples(&options, rate, 160_000),
+                    Err(GgmlAsrDecoderStatePlanningError::InvalidEnvelopeDuration { .. })
+                ),
+                "seconds={seconds}"
+            );
+        }
+        let tenth = GgmlAsrExecutionOptions {
+            longform: Some(crate::LongFormOptions {
+                max_chunk_seconds: 0.1,
+                ..crate::LongFormOptions::default()
+            }),
+            ..GgmlAsrExecutionOptions::default()
+        };
+        assert_eq!(
+            offline_invocation_envelope_samples(&tenth, rate, 16_000).unwrap(),
+            1_601
+        );
     }
 
     #[test]
@@ -2429,6 +2436,10 @@ mod tests {
             crate::models::runtime_preflight::leaked_tiny_runtime_source_preflight(),
             model_architecture,
         );
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+        );
         GgmlAsrStreamingSessionRequest {
             execution_services:
                 crate::models::native_execution_services::test_native_execution_services(),
@@ -2438,9 +2449,9 @@ mod tests {
             request_options: GgmlAsrExecutionOptions::default(),
             configured_diarize: false,
             backend_preference,
-            resolved_runtime: crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
-                backend_preference.request_backend_override(),
-                crate::ggml_runtime::AutoGpuPolicy::AllBackends,
+            resolved_runtime,
+            execution_lane: crate::models::native_execution_services::current_execution_lane_key(
+                resolved_runtime.backend(),
             ),
             final_text_processor: None,
             session_context: crate::NativeAsrSessionContext::new("rt_ggml_streaming"),

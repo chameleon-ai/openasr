@@ -32,7 +32,7 @@ This copies the whole skill directory -- `SKILL.md` plus
 example `.claude/skills/openasr/` for Claude Code). Verified locally with
 `npx skills add <path-to-checkout> --skill openasr --agent claude-code`,
 which installs both files under `./.claude/skills/openasr/`. The Skill
-teaches the agent the `openasr` CLI surface: `transcribe`, `live`,
+teaches the agent the `openasr` CLI surface: `transcribe`, `align`, `live`,
 `search`/`pull`/`list`, `serve`, and `apikey`, including expected output
 shapes and common failure modes (missing model, `--offline` fail-closed,
 non-WAV without `ffmpeg`); the reference file carries the full HTTP API
@@ -159,7 +159,9 @@ local equivalent (`temperature`, `include[]`, `chunking_strategy`,
 `known_speaker_*`) are accepted and ignored. SDK `stream=True` (the `stream`
 form field) is rejected with an actionable 400: SSE streaming is the
 OpenASR realtime protocol behind the `?stream=true` query parameter, not
-OpenAI `transcript.text.*` events.
+OpenAI `transcript.text.*` events. When that query-parameter stream is used
+for a file job, a busy server returns HTTP 429 instead of joining the
+cancelable JSON file FIFO; see [Known Limitations](KNOWN_LIMITATIONS.md).
 
 ### Incomplete transcripts
 

@@ -41,6 +41,20 @@ fn serve_batch_unavailable_non_retryable_maps_to_503() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+#[test]
+fn non_loopback_tls_escape_still_requires_authentication() {
+    let err = validate_listen_security_with_escape(
+        "0.0.0.0:0".parse().unwrap(),
+        &ServerLaunchOptions::default(),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("requires device authentication"),
+        "unexpected error: {err:?}"
+    );
+}
+
 fn header_map_with_bearer(token: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -485,6 +499,9 @@ fn write_mock_gguf_runtime_source(path: &std::path::Path, metadata_model_id: Opt
         Some(model_id) if model_id.starts_with("moonshine") => {
             TinyGgufFixtureSpec::moonshine_oasr_v1_runtime_ready(model_id)
         }
+        Some(model_id) if model_id.starts_with("cohere") => {
+            TinyGgufFixtureSpec::cohere_oasr_v1_runtime_ready(model_id)
+        }
         Some(model_id) if model_id.starts_with("qwen") => {
             TinyGgufFixtureSpec::qwen3_asr_oasr_v1_runtime_ready(model_id)
         }
@@ -499,6 +516,15 @@ fn remote_transcription_multipart_body() -> (String, Vec<u8>) {
     let boundary = "openasr-loopback-boundary";
     let body = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n"
+    )
+    .into_bytes();
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn remote_precise_timeline_multipart_body() -> (String, Vec<u8>) {
+    let boundary = "openasr-loopback-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcript\"\r\n\r\nhello world\r\n--{boundary}--\r\n"
     )
     .into_bytes();
     (format!("multipart/form-data; boundary={boundary}"), body)
@@ -1040,6 +1066,88 @@ async fn loopback_tls_pairing_device_transcription_skips_server_history() {
 }
 
 #[tokio::test]
+async fn loopback_tls_pairing_device_can_call_precise_timeline() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let bearer_auth = bearer_auth_header(&credential.bearer_token);
+
+    let (content_type, body) = remote_precise_timeline_multipart_body();
+    let response = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &content_type),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        400,
+        "device tokens may call forced alignment; invalid WAV is 400 not 401/403: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let device_history = https_request(
+        server.addr,
+        "GET",
+        "/v1/history",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(device_history.status, 403);
+}
+
+#[tokio::test]
+async fn loopback_tls_pairing_device_reads_bound_models_not_installed_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let bearer_auth = bearer_auth_header(&credential.bearer_token);
+
+    let models = https_request(
+        server.addr,
+        "GET",
+        "/v1/models",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(models.status, 200);
+    let models_json: serde_json::Value = serde_json::from_slice(&models.body).unwrap();
+    assert_eq!(models_json["object"], "list");
+    assert!(models_json["data"].as_array().is_some());
+
+    let local = https_request(
+        server.addr,
+        "GET",
+        "/v1/models/local",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(local.status, 403);
+
+    let set_default = https_request(
+        server.addr,
+        "POST",
+        "/v1/models/default",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"model":"xasr-zh-en:fp16"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(set_default.status, 403);
+}
+
+#[tokio::test]
 async fn loopback_tls_pairing_device_realtime_skips_server_history() {
     let temp = tempfile::tempdir().unwrap();
     let server = spawn_loopback_pairing_server(temp.path()).await;
@@ -1116,6 +1224,21 @@ async fn loopback_tls_revoked_pairing_device_cannot_access_remote_compute() {
     )
     .await;
     assert_eq!(transcription.status, 401);
+
+    let (align_content_type, align_body) = remote_precise_timeline_multipart_body();
+    let align = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &align_content_type),
+        ],
+        align_body,
+    )
+    .await;
+    assert_eq!(align.status, 401);
 
     let error =
         match try_connect_loopback_realtime_websocket(&server, &credential.bearer_token).await {
@@ -1293,11 +1416,30 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
         &Method::DELETE,
         "/v1/voice-id/samples/sample_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
+    // Installed inventory is operator-local; handshake identity is GET /v1/models.
+    assert!(is_operator_only_path(&Method::GET, "/v1/models/local"));
+    assert!(is_operator_only_path(
+        &Method::POST,
+        "/v1/models/default/idle-switch/cancel"
+    ));
+    assert!(is_operator_only_path(&Method::GET, "/v1/runtime/runs"));
+    assert!(is_operator_only_path(&Method::DELETE, "/v1/runtime/runs"));
+    assert!(is_operator_only_path(
+        &Method::GET,
+        "/v1/capabilities/requests"
+    ));
+    assert!(is_operator_only_path(
+        &Method::POST,
+        "/v1/capabilities/requests/approve"
+    ));
     // Open to paired compute clients:
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/default"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models"));
-    assert!(!is_operator_only_path(&Method::GET, "/v1/models/local"));
     assert!(!is_operator_only_path(&Method::GET, "/v1/capabilities"));
+    assert!(!is_operator_only_path(
+        &Method::POST,
+        "/v1/capabilities/requests"
+    ));
     assert!(!is_operator_only_path(
         &Method::POST,
         "/v1/audio/transcriptions"
@@ -1306,6 +1448,12 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
     assert!(!is_operator_only_path(
         &Method::POST,
         "/v1/audio/translations"
+    ));
+    // Forced alignment is a compute capability (SSOT remote-compute §1/§2/§4.24),
+    // not an operator mutation. Paired device tokens may call it.
+    assert!(!is_operator_only_path(
+        &Method::POST,
+        "/v1/audio/precise-timeline"
     ));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/pull/job1"));
 }
@@ -1316,10 +1464,21 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
     let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
     persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
     let distribution = distribution_context_for_test(temp.path());
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.path.clone()).into(),
+    };
 
-    let response = delete_model(AxumPath(pack.pull.clone()), Extension(distribution.clone()))
-        .await
-        .unwrap();
+    let response = delete_model(
+        State(runtime.clone()),
+        AxumPath(pack.pull.clone()),
+        Extension(distribution.clone()),
+    )
+    .await
+    .unwrap();
     let response = response.0;
 
     assert!(response.deleted);
@@ -1328,11 +1487,28 @@ async fn delete_model_allows_current_default_and_clears_default_selection() {
         Some("moonshine-tiny:q8")
     );
     assert!(list_installed_packs(temp.path()).unwrap().is_empty());
-    let default = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let active = runtime.model_pack_path.current();
+    let default = default_model_response(
+        temp.path(),
+        distribution.catalog_source(),
+        active.as_deref(),
+    )
+    .unwrap();
     assert!(default.default_model.is_none());
     assert!(default.default_pull.is_none());
     assert!(default.pack.is_none());
     assert_eq!(default.default_model_status, "unset");
+    assert_eq!(default.activation, DefaultModelActivationState::Unavailable);
+    assert!(runtime.model_pack_path.current().is_none());
+    let cleared =
+        openasr_core::default_selection::read_active_model_selection_v2(temp.path()).unwrap();
+    assert!(
+        cleared.as_ref().is_none_or(|record| {
+            record.status == openasr_core::default_selection::ActiveModelSelectionStatus::Unset
+                && record.pull.is_none()
+        }),
+        "deleting the current default must clear durable V2: {cleared:?}"
+    );
 }
 
 #[tokio::test]
@@ -1340,29 +1516,41 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
     let temp = tempfile::tempdir().unwrap();
     let distribution = distribution_context_for_test(temp.path());
 
-    let unset = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let unset = default_model_response(temp.path(), distribution.catalog_source(), None).unwrap();
     assert_eq!(unset.default_model_status, "unset");
     assert!(unset.pack.is_none());
+    assert_eq!(unset.activation, DefaultModelActivationState::Unavailable);
 
     let mut document = openasr_core::load_config_document(temp.path()).unwrap();
     document.config.default_model = Some("whisper-small".to_string());
     openasr_core::save_config_document(temp.path(), &document).unwrap();
-    let not_installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let not_installed =
+        default_model_response(temp.path(), distribution.catalog_source(), None).unwrap();
     assert_eq!(not_installed.default_model_status, "not_installed");
     assert_eq!(
         not_installed.default_model.as_deref(),
         Some("whisper-small")
     );
     assert!(not_installed.pack.is_none());
+    assert_eq!(
+        not_installed.activation,
+        DefaultModelActivationState::Unavailable
+    );
 
     let pack = write_valid_installed_pack_for_test(temp.path(), "whisper-small", "q8_0", "q8");
     persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
-    let installed = default_model_response(temp.path(), distribution.catalog_source()).unwrap();
+    let installed = default_model_response(
+        temp.path(),
+        distribution.catalog_source(),
+        Some(pack.path.as_path()),
+    )
+    .unwrap();
     assert_eq!(installed.default_model_status, "installed");
     assert_eq!(
         installed.pack.as_ref().map(|pack| pack.pull.as_str()),
         Some("whisper-small:q8")
     );
+    assert_eq!(installed.activation, DefaultModelActivationState::Committed);
 }
 
 #[test]
@@ -1370,6 +1558,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
+        voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker,
         ..Default::default()
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
@@ -1379,6 +1568,10 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     assert_eq!(
         request.voice_id_segmenter,
         openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0
+    );
+    assert_eq!(
+        request.voice_id_embedder,
+        openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker
     );
 
     request.inference_threads = Some(2);
@@ -1665,6 +1858,143 @@ fn rebind_native_model_pack_returns_conflict_while_session_is_active() {
 }
 
 #[tokio::test]
+async fn scheduled_idle_switch_waits_while_native_slot_is_occupied() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack_a = temp.path().join("pack-a.oasr");
+    write_mock_gguf_runtime_source(&pack_a, Some("whisper-tiny"));
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    let permit = runtime
+        .acquire_native_execution("native:whisper-tiny@idle-switch-wait", None)
+        .unwrap();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-tiny:fp16");
+    assert!(runtime.native_rebind_blocked());
+    assert!(!idle_switch_slot_is_clear(&runtime));
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(temp.path().join("home")),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    schedule_apply_pending_idle_switch_when_native_idle(runtime.clone(), dist);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .as_deref(),
+        Some("whisper-tiny:fp16"),
+        "must not apply while the native permit is still held"
+    );
+    drop(permit);
+    for _ in 0..50 {
+        if idle_switch_slot_is_clear(&runtime) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        idle_switch_slot_is_clear(&runtime),
+        "dropping the permit must clear the native slot so idle-switch can apply"
+    );
+}
+
+#[test]
+fn try_acquire_native_execution_rejects_pending_idle_switch() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let error = runtime
+        .acquire_native_execution("native:whisper-tiny@pending-switch", None)
+        .expect_err("pending idle switch must reject new native slots");
+    assert!(
+        matches!(error, ApiError::Conflict(ref message) if message == PENDING_IDLE_SWITCH_MESSAGE),
+        "expected pending-idle-switch conflict, got {error}"
+    );
+}
+
+#[test]
+fn try_acquire_native_execution_succeeds_when_no_idle_switch_is_pending() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .acquire_native_execution("native:whisper-tiny@idle", None)
+        .expect("idle runtime must admit a native slot");
+}
+
+#[tokio::test]
+async fn apply_pending_idle_switch_if_idle_rebounds_to_the_bound_pack() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(home),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    apply_pending_idle_switch_if_idle(&runtime, &dist);
+    assert!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .is_none(),
+        "idle apply must consume the pending switch"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path()),
+        "idle apply must rebind onto the requested pack"
+    );
+}
+
+#[tokio::test]
 async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
@@ -1688,6 +2018,15 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
         "q4",
         "whisper-base",
     );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
 
     let runtime = ServerRuntime {
         backend: BackendKind::Native,
@@ -1702,7 +2041,7 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     let app = app_with_runtime_and_distribution(
         runtime.clone(),
         DistributionRuntime {
-            openasr_home: Some(home),
+            openasr_home: Some(home.clone()),
             catalog_url: None,
             catalog_local_override: None,
         },
@@ -1721,18 +2060,1276 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed["idle_switch_pending"].as_str(),
+        Some("whisper-base:q4")
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .as_deref(),
+        Some("whisper-base:q4")
+    );
+}
+
+fn activation_probe_ok() -> Result<(), String> {
+    Ok(())
+}
+
+fn activation_probe_fail() -> Result<(), String> {
+    Err("injected activation probe failure".to_string())
+}
+
+fn installed_pack_by_pull(home: &std::path::Path, pull: &str) -> InstalledPack {
+    list_installed_packs(home)
+        .unwrap()
+        .into_iter()
+        .find(|pack| pack.pull == pull)
+        .unwrap_or_else(|| panic!("installed pack {pull} must exist"))
+}
+
+#[tokio::test]
+async fn set_default_model_http_keeps_previous_selection_when_activation_probe_fails() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_fail()));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(
         parsed["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("native transcription or realtime session is running")
+            .contains("injected activation probe failure"),
+        "{parsed}"
     );
     assert_eq!(
         runtime.model_pack_path.current().as_deref(),
         Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+}
+
+#[tokio::test]
+async fn activation_rechecks_capacity_after_successful_forecast_and_preserves_old_state() {
+    use axum::body::{Body, to_bytes};
+    use openasr_core::device::execution_memory::{
+        DeviceMemorySnapshot, DomainFootprint, DomainReservationRequest, MemoryDomainKey,
+        MemoryObservationConfidence,
+    };
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let native_execution = NativeExecutionSupervisor::default();
+    let services = Arc::clone(native_execution.execution_services());
+    let broker = Arc::clone(services.memory_broker());
+    let next = installed_pack_by_pull(&home, "whisper-base:q4");
+    let verified_next = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(next_path))
+        .expect("forecast candidate pack must verify");
+    let before_forecast = broker.usage(&MemoryDomainKey::SystemMemory);
+    let forecast = openasr_core::resolve_default_model_activation(
+        services.as_ref(),
+        &verified_next,
+        openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+        next.pull.clone(),
+        next.path.clone(),
+    )
+    .expect("advisory activation facts must resolve")
+    .quote()
+    .expect("advisory activation forecast must succeed before pressure changes");
+    drop(forecast);
+    assert_eq!(
+        broker.usage(&MemoryDomainKey::SystemMemory),
+        before_forecast,
+        "an advisory quote must not reserve or commit physical capacity"
+    );
+
+    // Capacity changes after the successful advisory forecast. The real
+    // activation below must obtain a fresh quote/reservation and reject this
+    // pressure rather than treating forecast success as authorization.
+    let pressure_bytes = 1_u64 << 60;
+    let mut pressure = broker
+        .try_reserve_batch(vec![DomainReservationRequest::from_footprint(
+            DomainFootprint {
+                domain: MemoryDomainKey::SystemMemory,
+                peak_bytes: pressure_bytes,
+                retained_bytes: pressure_bytes,
+                requires_reconciliation: false,
+                resource_ids: vec!["external-host-pressure".to_string()],
+            },
+            DeviceMemorySnapshot {
+                free_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+                confidence: MemoryObservationConfidence::DeviceSnapshot,
+            },
+        )])
+        .unwrap();
+    pressure.commit_quoted().unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution,
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path.clone()).into(),
+    };
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("activation reserve failed"),
+        "{parsed}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(previous_path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+    assert_eq!(
+        services.runtime_receipts().reconcile_live_leases(&broker),
+        openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+    );
+    drop(pressure);
+}
+
+#[tokio::test]
+async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let _pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let previous_v2 =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    openasr_core::default_selection::set_persist_commit_failpoint_for_test(true);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    openasr_core::default_selection::set_persist_commit_failpoint_for_test(false);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected persist failure"),
+        "{parsed}"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_a.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        previous_v2
+    );
+}
+
+#[tokio::test]
+async fn set_default_model_failure_matrix_preserves_precommit_state() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-failure-a",
+        "whisper-failure-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-failure-a",
+    );
+    let _next_path = write_installed_pack_ref(
+        &home,
+        "whisper-failure-b",
+        "whisper-failure-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-failure-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-failure-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    for failpoint in [
+        ModelActivationFailpoint::PackVerification,
+        ModelActivationFailpoint::CandidateResolution,
+        ModelActivationFailpoint::QuoteObservation,
+        ModelActivationFailpoint::BrokerReservation,
+        ModelActivationFailpoint::NativeMaterialization,
+        ModelActivationFailpoint::FirstComputeAttestation,
+        ModelActivationFailpoint::Reconciliation,
+        ModelActivationFailpoint::V2StagingWrite,
+        ModelActivationFailpoint::V2StagingSync,
+        ModelActivationFailpoint::AtomicBeforeReplace,
+    ] {
+        let runtime = ServerRuntime {
+            backend: BackendKind::Native,
+            native_execution: NativeExecutionSupervisor::default(),
+            ffmpeg_bin: None,
+            ffmpeg_bin_explicit: false,
+            model_pack_path: Some(previous_path.clone()).into(),
+        };
+        runtime
+            .model_pack_path
+            .set_activation_probe_failpoint(Some(activation_probe_ok()));
+        runtime
+            .model_pack_path
+            .set_activation_failpoint_for_test(Some(failpoint));
+        let app = app_with_runtime_and_distribution(
+            runtime.clone(),
+            DistributionRuntime {
+                openasr_home: Some(home.clone()),
+                catalog_url: None,
+                catalog_local_override: None,
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/models/default")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "pull": "whisper-failure-b:q4" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{failpoint:?}");
+        assert_eq!(
+            runtime.model_pack_path.current().as_deref(),
+            Some(previous_path.as_path()),
+            "live state changed at {failpoint:?}"
+        );
+        assert_eq!(
+            openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+            durable_before,
+            "durable state changed at {failpoint:?}"
+        );
+        let services = runtime.native_execution.execution_services();
+        assert_eq!(
+            services
+                .runtime_receipts()
+                .reconcile_live_leases_quiescent(services.memory_broker()),
+            openasr_core::runtime_receipts::LeaseReceiptShadow::Matched,
+            "owner ledger leaked at {failpoint:?}"
+        );
+        assert!(
+            std::fs::read_dir(&home)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !(name.starts_with(".openasr-") && name.ends_with(".tmp"))
+                }),
+            "orphan staging file after {failpoint:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn atomic_after_replace_commits_and_publishes_instead_of_rolling_back() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-after-replace-a",
+        "whisper-after-replace-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-after-replace-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "whisper-after-replace-b",
+        "whisper-after-replace-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-after-replace-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-after-replace-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .model_pack_path
+        .set_activation_failpoint_for_test(Some(ModelActivationFailpoint::AtomicAfterReplace));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-after-replace-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.pull.as_deref(), Some("whisper-after-replace-b:q4"));
+}
+
+#[tokio::test]
+async fn restart_reactivates_commit_that_preceded_live_pointer_exchange() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "whisper-restart-a",
+        "whisper-restart-a:q4",
+        "q4_0",
+        "q4",
+        "whisper-restart-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "whisper-restart-b",
+        "whisper-restart-b:q4",
+        "q4_0",
+        "q4",
+        "whisper-restart-b",
+    );
+    let previous = installed_pack_by_pull(&home, "whisper-restart-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .model_pack_path
+        .set_activation_failpoint_for_test(Some(
+            ModelActivationFailpoint::DurableCommitBeforeLivePublish,
+        ));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-restart-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(previous_path.as_path()),
+        "the killed process never exchanged its live pointer"
+    );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.pull.as_deref(), Some("whisper-restart-b:q4"));
+
+    let restarted = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(next_path.clone())),
+    };
+    restarted
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    let next = installed_pack_by_pull(&home, "whisper-restart-b:q4");
+    let intent =
+        openasr_core::default_selection::execution_intent_from_v2_wire(&durable.execution_intent)
+            .unwrap();
+    activate_default_model_blocking(
+        &restarted,
+        &home,
+        &next,
+        durable.quant_preference.clone(),
+        intent,
+        DefaultModelActivationMode::ReactivateDurableSelection,
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home)
+            .unwrap()
+            .unwrap(),
+        durable,
+        "restart reactivation must not mint another durable generation"
+    );
+}
+
+#[tokio::test]
+async fn set_default_model_http_persists_only_after_activation_probe_succeeds() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "whisper-base:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["default_model"], "whisper-base");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path())
+    );
+    let persisted = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .expect("successful activation must persist V2");
+    assert_eq!(persisted.pull.as_deref(), Some("whisper-base:q4"));
+    assert_eq!(
+        persisted.status,
+        openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut config = openasr_core::load_config_document(&home).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(&home, &config).unwrap();
+    let previous_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-a",
+        "cohere-transcribe-a:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-a",
+    );
+    let next_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-b",
+        "cohere-transcribe-b:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-b",
+    );
+    let previous = installed_pack_by_pull(&home, "cohere-transcribe-a:q4");
+    persist_default_pack(&home, &previous, QuantPreference::pinned(&previous.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(previous_path).into(),
+    };
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(home.clone()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "pull": "cohere-transcribe-b:q4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["activation"], "committed");
+    assert_eq!(parsed["default_pull"], "cohere-transcribe-b:q4");
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(next_path.as_path())
+    );
+    let durable = openasr_core::default_selection::read_active_model_selection_v2(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.execution_intent, "cpu_only");
+    assert!(durable.architecture_id.is_some());
+}
+
+#[test]
+fn active_runtime_barrier_closes_session_admission_race() {
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: None.into(),
+    };
+
+    let activation = runtime.begin_native_activation().unwrap();
+    assert!(matches!(
+        runtime.acquire_native_execution("activation-barrier", None),
+        Err(ApiError::Conflict(_))
+    ));
+    drop(activation);
+
+    let permit = runtime
+        .acquire_native_execution("activation-barrier", None)
+        .unwrap();
+    let activation = runtime.begin_native_activation().unwrap();
+    assert!(runtime.native_rebind_blocked());
+    drop(activation);
+    drop(permit);
+}
+
+#[test]
+fn stale_active_runtime_snapshot_cannot_start_after_republication() {
+    let pack = PathBuf::from("active-runtime-snapshot.oasr");
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .current_snapshot()
+        .expect("initial active runtime snapshot");
+
+    // Re-publishing even the same path is a new generation: the underlying
+    // bytes may have been reinstalled in place, so path equality cannot be an
+    // admission authority and must not create an ABA hole.
+    runtime
+        .model_pack_path
+        .set_legacy_binding(Some(pack.clone()));
+
+    assert!(matches!(
+        runtime.acquire_native_execution_for_snapshot(
+            &snapshot,
+            "stale-snapshot",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        ),
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(!runtime.native_execution.has_active_sessions());
+
+    let fresh = runtime
+        .model_pack_path
+        .current_snapshot()
+        .expect("republished active runtime snapshot");
+    let permit = runtime
+        .acquire_native_execution_for_snapshot(
+            &fresh,
+            "fresh-snapshot",
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
+        .expect("the current publication may be admitted");
+    drop(permit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut config = openasr_core::load_config_document(&home).unwrap();
+    config.preferences.execution_target = openasr_core::ExecutionTarget::Cpu;
+    openasr_core::save_config_document(&home, &config).unwrap();
+    let pack_path = write_installed_pack_ref(
+        &home,
+        "cohere-transcribe-restart",
+        "cohere-transcribe-restart:q4",
+        "q4_0",
+        "q4",
+        "cohere-transcribe-restart",
+    );
+    let pack = installed_pack_by_pull(&home, "cohere-transcribe-restart:q4");
+    let verified = openasr_core::PackVerifier
+        .verify_candidate(openasr_core::PackCandidate::new(pack.path.clone()))
+        .unwrap();
+    openasr_core::default_selection::persist_activation_detailed(
+        &home,
+        &pack,
+        QuantPreference::pinned(&pack.quant),
+        verified.model_architecture(),
+        &openasr_core::device::execution_policy::ExecutionIntent::CpuOnly,
+    )
+    .unwrap();
+    let durable_before =
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap();
+
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack_path.clone())),
+    };
+    assert!(runtime.model_pack_path.current().is_none());
+    assert_eq!(
+        runtime.model_pack_path.requested_path().as_deref(),
+        Some(pack_path.as_path())
+    );
+    assert_eq!(
+        runtime.model_pack_path.served_pack_path().as_deref(),
+        Some(pack_path.as_path()),
+        "served identity must be available from launch intent before attestation"
+    );
+
+    let reactivation = realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(30), reactivation)
+        .await
+        .expect("boot reactivation must finish within the integration-test deadline")
+        .expect("boot reactivation worker must not panic");
+
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_path.as_path())
+    );
+    assert!(
+        runtime.model_is_resident(),
+        "successful reactivation must publish the exact candidate resident marker without staling its warmup generation"
+    );
+    assert_eq!(
+        openasr_core::default_selection::read_active_model_selection_v2(&home).unwrap(),
+        durable_before,
+        "startup reactivation must validate, not rewrite, durable V2"
+    );
+    let services = runtime.native_execution.execution_services();
+    assert_eq!(
+        services
+            .runtime_receipts()
+            .reconcile_live_leases_quiescent(services.memory_broker()),
+        openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+    );
+}
+
+async fn issue_376_get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("json response"),
+    )
+}
+
+fn issue_376_realtime_handshake_accepts(runtime: &ServerRuntime, model_id: &str) {
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("served pack for realtime handshake");
+    let adapter = validate_native_runtime_pack(snapshot.path()).expect("verify served pack");
+    validate_native_request_model(&adapter, model_id)
+        .expect("session.start identity must match the served pack");
+    let key = native_model_session_key(&adapter).expect("native session key");
+    let admitted = runtime
+        .acquire_native_execution_for_snapshot(
+            &snapshot,
+            &key,
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
+        .expect("session.start admission must accept the served snapshot");
+    drop(admitted);
+}
+
+#[tokio::test]
+async fn issue_376_requested_launch_pack_lists_verified_identity_before_attestation() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack.path.clone())),
+    };
+    assert!(
+        runtime.model_pack_path.current().is_none(),
+        "attestation must not have published the live pointer yet"
+    );
+
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(temp.path().to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"].as_array().unwrap().len(), 1);
+    assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+
+    let (status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default["default_model"], "moonshine-tiny");
+    assert_eq!(
+        default["activation"], "committed",
+        "served launch path must count as the bound default before attestation"
+    );
+
+    let (status, health) = issue_376_get_json(app.clone(), "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+    assert_eq!(
+        health["model_resident"], false,
+        "launch identity must not be conflated with residency"
+    );
+
+    let (status, capabilities) = issue_376_get_json(app, "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities["object"], "capabilities");
+    assert!(
+        capabilities["transcription"].is_object(),
+        "capabilities must be derived from the served pack: {capabilities}"
+    );
+
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+}
+
+#[tokio::test]
+async fn issue_376_idle_unload_keeps_served_identity_on_models_default_and_realtime_handshake() {
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.path.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    idle_activity::mark_native_model_warm(snapshot.residency_key());
+    assert!(runtime.model_is_resident());
+
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(temp.path().to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, models_before) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models_before["data"][0]["id"], "moonshine-tiny");
+    let (status, default_before) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_before["default_model"], "moonshine-tiny");
+    assert_eq!(default_before["activation"], "committed");
+    let (status, capabilities_before) = issue_376_get_json(app.clone(), "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+
+    idle_activity::bump_native_unload_generation();
+    runtime
+        .native_execution
+        .execution_services()
+        .unload_idle_native_model_runtime_caches();
+    assert!(
+        !runtime.model_is_resident(),
+        "idle unload must evict residency"
+    );
+    assert_eq!(
+        runtime.model_pack_path.served_pack_path().as_deref(),
+        Some(pack.path.as_path()),
+        "idle unload must not clear served identity"
+    );
+
+    let (status, models_after) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models_after, models_before);
+    let (status, default_after) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_after["default_model"], "moonshine-tiny");
+    assert_eq!(default_after["activation"], "committed");
+    let (status, health) = issue_376_get_json(app.clone(), "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+    assert_eq!(health["model_resident"], false);
+    let (status, capabilities_after) = issue_376_get_json(app, "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities_after, capabilities_before);
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+}
+
+#[test]
+fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
+    let start = include_str!("realtime/ws_session.rs")
+        .split("pub(crate) async fn start_native_streaming_session")
+        .nth(1)
+        .expect("start_native_streaming_session")
+        .split("\n    pub(crate)")
+        .next()
+        .expect("start_native_streaming_session body");
+    assert!(
+        start.contains("served_snapshot()"),
+        "session.start must admit the served pack, not only the attested live pointer: {start}"
+    );
+    assert!(
+        !start.contains("current_snapshot()"),
+        "session.start must not fall back to current_snapshot: {start}"
+    );
+
+    let native_arm = include_str!("routes/transcription.rs")
+        .split("pub(crate) async fn transcribe_with_runtime")
+        .nth(1)
+        .expect("transcribe_with_runtime")
+        .split("BackendKind::Native =>")
+        .nth(1)
+        .expect("native transcription arm");
+    assert!(
+        native_arm.contains("served_snapshot()"),
+        "native transcription must admit the served pack: {native_arm}"
+    );
+
+    let served = include_str!("lib.rs")
+        .split("pub(crate) fn served_snapshot")
+        .nth(1)
+        .expect("served_snapshot")
+        .split("fn snapshot_is_current")
+        .next()
+        .expect("served_snapshot body");
+    assert_eq!(
+        served.matches("lock_read()").count(),
+        1,
+        "served_snapshot must observe active and requested under one lock: {served}"
+    );
+    assert!(
+        !served.contains("current_snapshot()"),
+        "served_snapshot must not re-enter current_snapshot across a second lock: {served}"
+    );
+}
+
+#[test]
+fn idle_unload_reaper_does_not_clear_served_identity() {
+    let source = include_str!("idle_activity.rs");
+    let spawn = source
+        .split("pub(crate) fn spawn_idle_unload_reaper")
+        .nth(1)
+        .expect("spawn_idle_unload_reaper")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("reaper body");
+    assert!(
+        spawn.contains("unload_idle_native_model_runtime_caches")
+            && spawn.contains("bump_native_unload_generation"),
+        "reaper must evict residency, not served identity: {spawn}"
+    );
+    assert!(
+        !spawn.contains("clear_active") && !spawn.contains("clear_active_native_model"),
+        "idle unload must not clear served identity: {spawn}"
+    );
+}
+
+#[test]
+fn set_default_model_http_stage_does_not_publish_live() {
+    let source = include_str!("routes/models_api.rs");
+    assert!(
+        !source.contains("rebind_native_model_pack"),
+        "production model routes must not restore the legacy path-only rebind"
+    );
+    let owner_impl = source
+        .split("impl NativeActivationStagedOwner")
+        .nth(1)
+        .expect("NativeActivationStagedOwner impl");
+    let stage = owner_impl
+        .split("fn discard_candidate")
+        .next()
+        .expect("stage precedes discard");
+    assert!(
+        stage.contains("fn stage("),
+        "expected NativeActivationStagedOwner::stage in source audit window"
+    );
+    assert!(
+        !stage.contains("rebind_native_model_pack"),
+        "materialize/stage must not publish live: {stage}"
+    );
+    let set_default = source
+        .split("pub(crate) fn activate_default_model_blocking")
+        .nth(1)
+        .expect("activate_default_model_blocking")
+        .split("struct NativeActivationStagedOwner")
+        .next()
+        .expect("activation body");
+    assert!(
+        !set_default.contains("NoopActivationReservation"),
+        "set_default_model must not reserve with NoopActivationReservation"
+    );
+    assert!(
+        set_default.contains(".quote()") && set_default.contains(".reserve(services.as_ref())"),
+        "set_default_model must separate quote observation from broker reservation"
+    );
+    assert!(
+        !set_default.contains("ResolvedExecutionRoute::cpu()"),
+        "set_default_model must not quote a dummy CPU candidate: {set_default}"
+    );
+    assert!(
+        set_default.contains("PackVerifier")
+            && set_default.contains("resolve_default_model_activation"),
+        "set_default_model must quote the pack being activated on its real lane: {set_default}"
+    );
+    let persist_idx = set_default
+        .find("commit_activation")
+        .expect("persist/commit must exist");
+    let publish_idx = set_default
+        .find("publish_attested_native_model")
+        .expect("live publication must exist after persist");
+    assert!(
+        persist_idx < publish_idx,
+        "live publication must follow V2 commit, got persist@{persist_idx} publish@{publish_idx}"
+    );
+}
+
+#[test]
+fn spawn_boot_native_warmup_uses_set_default_transaction_entry() {
+    let source = include_str!("realtime/native_worker.rs");
+    let spawn = source
+        .split("pub(crate) fn spawn_boot_native_warmup")
+        .nth(1)
+        .expect("spawn_boot_native_warmup")
+        .split("/// Attest a candidate pack")
+        .next()
+        .expect("spawn_boot_native_warmup body");
+    assert!(
+        spawn.contains("activate_default_model_blocking(")
+            && spawn.contains("ReactivateDurableSelection"),
+        "boot warmup must use the same complete transaction entry as set-default: {spawn}"
+    );
+    assert!(
+        !spawn.contains("warm_up_default_native_streaming_worker"),
+        "boot warmup must not bypass probe_native_activation: {spawn}"
+    );
+    assert!(
+        !spawn.contains("rebind_native_model_pack")
+            && !spawn.contains("persist_detailed")
+            && !spawn.contains("PersistSelection"),
+        "boot reactivation must not bypass the read-only durable journal: {spawn}"
     );
 }
 
@@ -2215,9 +3812,13 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     let control = Arc::new(openasr_core::TranscriptionControl::new());
     assert!(distribution.try_register_transcription("txn-1", Arc::clone(&control)));
 
+    let auth = crate::ServerAuth::disabled();
+    let headers = HeaderMap::new();
     pause_transcription_job(
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
@@ -2225,15 +3826,20 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
 
     resume_transcription_job(
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
     assert!(!control.is_paused());
 
     cancel_transcription_job(
+        State(ServerRuntime::default()),
         AxumPath("txn-1".to_string()),
+        Extension(auth.clone()),
         Extension(distribution.clone()),
+        headers.clone(),
     )
     .await
     .unwrap();
@@ -2243,8 +3849,11 @@ async fn transcription_control_endpoints_flip_pause_resume_cancel_flags() {
     assert!(distribution.clear_transcription_if_current("txn-1", &control));
     assert!(distribution.transcription_control("txn-1").is_none());
     let error = cancel_transcription_job(
+        State(ServerRuntime::default()),
         AxumPath("txn-1".to_string()),
+        Extension(auth),
         Extension(distribution.clone()),
+        headers,
     )
     .await
     .unwrap_err();
@@ -2256,6 +3865,33 @@ fn transcription_canceled_backend_error_maps_to_409() {
     let response =
         ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled).into_response();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn speaker_embeddings_authorization_is_403_authorization_error() {
+    let response =
+        ApiError::Authorization("Speaker embeddings are biometric-derived data.".to_string())
+            .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "authorization_error");
+}
+
+#[tokio::test]
+async fn pause_forbidden_stays_openasr_error_not_authorization_error() {
+    let response = ApiError::Forbidden(
+        "Only the device that started this transcription can control it.".to_string(),
+    )
+    .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "openasr_error");
 }
 
 #[test]
@@ -2967,4 +4603,441 @@ fn build_native_longform_options_override_keeps_explicit_fields() {
     assert_eq!(options.energy_silence_threshold_db, -42.0);
     assert_eq!(options.min_chunk_seconds, 1.0);
     assert!(options.suppress_silent_slices);
+}
+
+fn policy_transcription_multipart(transcription_id: Option<&str>) -> (String, Vec<u8>) {
+    let boundary = "openasr-policy-boundary";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"
+    );
+    if let Some(id) = transcription_id {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"transcription_id\"\r\n\r\n{id}\r\n"
+        ));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        body.into_bytes(),
+    )
+}
+
+fn policy_test_app(runtime: ServerRuntime, home: std::path::PathBuf) -> axum::Router {
+    app_with_runtime_and_distribution(
+        runtime,
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn pairing_mode_file_diarize_returns_anonymous_speaker_labels() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let auth = ServerAuth::pairing("admin-secret");
+    let request = auth.create_pairing_request("Phone").unwrap();
+    auth.approve_pairing_request(&request.request_id).unwrap();
+    let PairingCredentialState::Ready(credential) =
+        auth.pairing_credential(&request.request_id).unwrap()
+    else {
+        panic!("expected approved pairing credential");
+    };
+
+    let app = app_with_runtime_and_distribution_and_launch_options(
+        ServerRuntime::default(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+        ServerLaunchOptions {
+            auth,
+            ..ServerLaunchOptions::default()
+        },
+    );
+
+    let boundary = "openasr-pairing-diarize";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"diarize\"\r\n\r\ntrue\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"inference_threads\"\r\n\r\n8\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"execution_target\"\r\n\r\ncpu\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.bearer_token),
+                )
+                .header(REMOTE_COMPUTE_HEADER, REMOTE_COMPUTE_CLIENT_VALUE)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let segment = &json["segments"][0];
+    assert_eq!(segment["speaker"].as_str(), Some("SPEAKER_00"));
+    assert_eq!(segment["speaker_label"].as_str(), Some("SPEAKER_00"));
+    assert!(
+        segment.get("speaker_person_id").is_none() || segment["speaker_person_id"].is_null(),
+        "remote file diarize must not leak enrolled person ids: {segment}"
+    );
+}
+
+#[tokio::test]
+async fn busy_server_queues_file_jobs_and_rejects_uncancellable_ones() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = ServerRuntime::default();
+    let _permit = runtime
+        .native_execution
+        .try_acquire("hold-native-slot")
+        .unwrap();
+    let app = policy_test_app(runtime.clone(), home);
+
+    let (content_type, body) = policy_transcription_multipart(None);
+    let immediate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(immediate.status(), StatusCode::TOO_MANY_REQUESTS);
+    let immediate_body = to_bytes(immediate.into_body(), 1024 * 64).await.unwrap();
+    let immediate_json: serde_json::Value = serde_json::from_slice(&immediate_body).unwrap();
+    assert_eq!(
+        immediate_json["error"]["message"].as_str(),
+        Some(SERVER_BUSY_MESSAGE)
+    );
+
+    let (content_type, body) = policy_transcription_multipart(Some("file-queued"));
+    let queued = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    let queued_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !runtime
+        .native_execution
+        .remote_policy()
+        .is_file_queued("file-queued")
+    {
+        assert!(
+            std::time::Instant::now() < queued_deadline,
+            "busy file job must enter the cancelable FIFO"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let cancel = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions/file-queued/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+
+    let queued_response = queued.await.unwrap();
+    assert_eq!(queued_response.status(), StatusCode::CONFLICT);
+    let queued_body = to_bytes(queued_response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let queued_json: serde_json::Value = serde_json::from_slice(&queued_body).unwrap();
+    assert!(
+        queued_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("cancel"),
+        "queued file cancel must fail closed as canceled: {queued_json}"
+    );
+}
+
+#[tokio::test]
+async fn pending_idle_switch_rejects_new_file_jobs_until_canceled() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let app = policy_test_app(runtime.clone(), home);
+
+    let (content_type, body) = policy_transcription_multipart(Some("blocked-by-switch"));
+    let blocked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let blocked_body = to_bytes(blocked.into_body(), 1024 * 64).await.unwrap();
+    let blocked_json: serde_json::Value = serde_json::from_slice(&blocked_body).unwrap();
+    assert_eq!(
+        blocked_json["error"]["message"].as_str(),
+        Some(PENDING_IDLE_SWITCH_MESSAGE)
+    );
+
+    let cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/models/default/idle-switch/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::OK);
+    assert!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .is_none()
+    );
+
+    let (content_type, body) = policy_transcription_multipart(Some("after-cancel"));
+    let admitted = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn operator_run_log_records_file_jobs_without_content_fields() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let app = policy_test_app(ServerRuntime::default(), home);
+
+    let (content_type, body) = policy_transcription_multipart(Some("run-log"));
+    let transcribed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transcribed.status(), StatusCode::OK);
+
+    let runs = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/runtime/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runs.status(), StatusCode::OK);
+    let runs_body = to_bytes(runs.into_body(), 1024 * 64).await.unwrap();
+    let runs_json: serde_json::Value = serde_json::from_slice(&runs_body).unwrap();
+    let rendered = runs_json.to_string();
+    assert!(!rendered.contains("audio"));
+    assert!(!rendered.contains("hotword"));
+    assert!(!rendered.contains("transcript"));
+    assert_eq!(runs_json["object"], "runtime.runs");
+    assert_eq!(runs_json["data"][0]["kind"], "file");
+    assert_eq!(runs_json["data"][0]["success"], true);
+    assert!(runs_json["data"][0]["device_name"].is_string());
+    assert!(runs_json["data"][0]["started_at_unix_ms"].is_number());
+    assert!(runs_json["data"][0]["duration_ms"].is_number());
+
+    let cleared = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/runtime/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_requests_are_device_submittable_and_operator_confirmed() {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let catalog_path = copy_bundled_production_catalog_to(temp.path());
+    let app = app_with_runtime_and_distribution(
+        ServerRuntime::default(),
+        DistributionRuntime {
+            openasr_home: Some(home),
+            catalog_url: None,
+            catalog_local_override: Some(openasr_core::LocalCatalogEnvOverride {
+                path: catalog_path,
+                identity: openasr_core::default_catalog_url().to_string(),
+            }),
+        },
+    );
+
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/capabilities/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"features":["speakers"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/capabilities/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = to_bytes(listed.into_body(), 1024 * 64).await.unwrap();
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed_body).unwrap();
+    assert_eq!(listed_json["data"][0]["features"][0], "speakers");
+
+    let approved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/capabilities/requests/approve")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    let approved_body = to_bytes(approved.into_body(), 1024 * 64).await.unwrap();
+    let approved_json: serde_json::Value = serde_json::from_slice(&approved_body).unwrap();
+    assert_eq!(approved_json["request"]["features"][0], "speakers");
+    assert_eq!(
+        approved_json["pulls"][0]["model_id"].as_str(),
+        Some("diarizen-large-s80-v2")
+    );
+    let job_id = approved_json["pulls"][0]["job_id"]
+        .as_str()
+        .expect("capability approval must start a pull job")
+        .to_string();
+    let cancel = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/models/pull/{job_id}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cancel.status().is_success() || cancel.status() == StatusCode::ACCEPTED,
+        "capability pull {job_id} must be cancelable"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let job = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/models/pull/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let job_body = to_bytes(job.into_body(), 1024 * 64).await.unwrap();
+        let job_json: serde_json::Value = serde_json::from_slice(&job_body).unwrap();
+        let state = job_json["state"].as_str().unwrap_or("");
+        if matches!(state, "canceled" | "failed" | "cancelled") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capability pull {job_id} did not settle after cancel: {job_json}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

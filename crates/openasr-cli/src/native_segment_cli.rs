@@ -31,6 +31,7 @@ pub(super) fn transcribe_many(
     output_dir: &Path,
     skipped: usize,
     options: &TranscribeCommandOptions<'_>,
+    voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference,
 ) -> Result<()> {
     ensure_batch_output_dir(output_dir)?;
     let longform = if prepared_run.backend_kind == BackendKind::Native {
@@ -48,6 +49,7 @@ pub(super) fn transcribe_many(
         ffmpeg_bin_explicit: prepared_run.ffmpeg_bin_explicit,
         longform,
         diarize: options.diarize,
+        voice_id_embedder,
         speakers: options.speakers,
         language: options.language.clone(),
         task: options.task,
@@ -168,6 +170,7 @@ fn batch_item_transcription_request(
                 .map(str::to_string),
         )
         .with_voice_id(context.diarize)
+        .with_voice_id_embedder(context.voice_id_embedder)
         .with_diarize_speakers(context.speakers)
         // Match single-file `transcribe`: SRT/VTT export requests a precise
         // timeline under TimelinePrecisionPolicy::Auto.
@@ -329,7 +332,8 @@ pub(super) fn resolve_model_source_for_backend(
     model_pack: Option<&Path>,
     config: &OpenAsrConfig,
 ) -> Result<ResolvedModelSource> {
-    let catalog = load_cli_model_catalog(&openasr_home()?)?;
+    let home = openasr_home()?;
+    let catalog = load_cli_model_catalog(&home)?;
 
     if backend_kind != BackendKind::Native {
         if model_pack.is_some() {
@@ -338,7 +342,7 @@ pub(super) fn resolve_model_source_for_backend(
             );
         }
         let cards = runtime_registry(catalog.as_ref()).context("Could not load model registry")?;
-        let model_ref = selected_model_ref(model, config, &cards);
+        let model_ref = selected_model_ref(model, &home)?;
         let model_id = find_runtime_model_id(&cards, catalog.as_ref(), &model_ref)?;
         return Ok(ResolvedModelSource {
             model_id,
@@ -382,26 +386,16 @@ pub(super) fn resolve_model_source_for_backend(
     })
 }
 
-/// Resolves the installed `.oasr` pack for a model id (the resolved default when
-/// `model` is `None`), or `Ok(None)` when no matching pack is installed yet (a
-/// normal state right after a fresh install, before the user has pulled any
-/// model). Genuine environment/registry errors (unreadable `OPENASR_HOME`,
-/// corrupt registry, ...) still return `Err`. Never pulls either way.
-///
-/// An explicit `model` reference is a CLI-local concern (not "the default") and
-/// is matched directly against installed packs with `QuantPreference::Auto`.
-/// With no explicit reference, resolving `config.default_model` against
-/// installed packs -- including the `default.json` pointer fallback and
-/// `Pinned` quant recovery -- is delegated to `openasr_core::default_selection`,
-/// the single authority also used by the server; only the
-/// no-persisted-default-at-all fallback to `DEFAULT_MODEL_ID` stays here, since
-/// that bare-invocation convention is CLI-specific, not part of "the default".
+/// With no explicit reference, resolving the persisted default against installed
+/// packs is delegated to `openasr_core::default_selection`, the single authority
+/// also used by the server. The V2 record wins over compatibility projections;
+/// only a missing V2 file falls back to legacy state. The no-persisted-default-at-
+/// all fallback to `DEFAULT_MODEL_ID` stays here, since that bare-invocation
+/// convention is CLI-specific, not part of "the default".
 fn resolve_installed_native_pack_opt(
     model: Option<&str>,
-    // `default_selection::resolve_with_catalog` reads `config.default_model`
-    // straight off disk (the single-authority contract requires re-reading, not
-    // trusting a possibly-stale in-memory copy); kept for signature parity with
-    // `resolve_installed_native_pack`, whose error message still needs it.
+    // Kept for signature parity with `resolve_installed_native_pack`, whose error
+    // message still needs the config-derived runtime settings.
     _config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<Option<PathBuf>> {
@@ -445,7 +439,8 @@ pub(super) fn resolve_installed_native_pack(
     config: &OpenAsrConfig,
     catalog: Option<&openasr_core::ModelCatalog>,
 ) -> Result<PathBuf> {
-    let model_ref = selected_model_ref(model, config, &[]);
+    let home = openasr_home()?;
+    let model_ref = selected_model_ref(model, &home)?;
     resolve_installed_native_pack_opt(model, config, catalog)?.ok_or_else(|| {
         anyhow!(
             "Model '{model_ref}' is not installed.\nRun: openasr pull {model_ref}\n(Or pass --model-pack <local.oasr> to run a specific local pack file.)"
@@ -551,6 +546,51 @@ pub(super) fn resolve_serve_model_source(
     })
 }
 
+/// Serve `--model-pack` must name the content-addressed object already in
+/// `InstalledModelStore`, and a durable V2 selection must already request
+/// that same digest. Loose `.oasr` files are not a second runtime authority.
+fn require_installed_durable_pack_for_serve(
+    home: &Path,
+    validated_pack_path: &Path,
+) -> Result<PathBuf> {
+    let want = fs::canonicalize(validated_pack_path).with_context(|| {
+        format!(
+            "could not canonicalize native serve pack '{}'",
+            validated_pack_path.display()
+        )
+    })?;
+    let packs = openasr_core::list_installed_packs(home)
+        .context("Could not list installed packs for native serve")?;
+    let Some(pack) = packs.into_iter().find(|pack| {
+        fs::canonicalize(&pack.path)
+            .ok()
+            .is_some_and(|installed| installed == want)
+    }) else {
+        bail!(
+            "Native serve --model-pack must be an already installed content-addressed pack under OPENASR_HOME/models (objects/sha256/<sha>/content).\nLoose .oasr files are not a second runtime. Install with `openasr pull <id> --from <file>` so catalog sha256/size match, persist the V2 default selection, then serve."
+        );
+    };
+    match openasr_core::default_selection::read_active_model_selection_v2(home) {
+        Ok(Some(record))
+            if record.status
+                == openasr_core::default_selection::ActiveModelSelectionStatus::Installed
+                && record
+                    .expected_pack
+                    .as_ref()
+                    .is_some_and(|expected| expected.sha256 == pack.sha256) => {}
+        Ok(Some(_)) => bail!(
+            "Native serve --model-pack requires the durable V2 default-selection to request this installed pack before the listener binds.\nSet the default after pull; serve will not listen with an empty active runtime."
+        ),
+        Ok(None) => bail!(
+            "Native serve --model-pack requires a durable V2 default-selection for this installed pack before the listener binds.\nSet the default after pull; serve will not listen with an empty active runtime."
+        ),
+        Err(error) => {
+            return Err(anyhow!(error).context("Could not read durable V2 default-selection"));
+        }
+    }
+    Ok(pack.path)
+}
+
 pub(super) async fn serve(
     native_execution_services: Arc<NativeExecutionServices>,
     addr: SocketAddr,
@@ -604,6 +644,27 @@ pub(super) async fn serve(
                 local_model_id
             );
         }
+        // `--model-pack` is launch intent, not a second runtime. Boot
+        // reactivation only attests an InstalledModelStore object that a
+        // durable V2 record already names. A loose file would leave
+        // `active=None` while the listener reports ready.
+        //
+        // Desktop always passes `--model-pack` when resolve() finds a pack via
+        // legacy `default.json`. Server boot also migrates that two-file state,
+        // but this gate currently runs first — a pre-V2 home then exits before
+        // bind and the UI stays daemon-offline. Migrate first; the gate still
+        // rejects a missing/mismatched V2 and any loose file.
+        if model_pack.is_some() {
+            if openasr_core::default_selection::read_active_model_selection_v2(&home)
+                .context("Could not read durable V2 default-selection")?
+                .is_none()
+            {
+                openasr_core::default_selection::migrate_legacy_to_v2(&home).context(
+                    "Could not migrate legacy default-selection before native serve --model-pack",
+                )?;
+            }
+            let _ = require_installed_durable_pack_for_serve(&home, model_pack_path)?;
+        }
     } else if backend == BackendKind::Native && no_model {
         eprintln!(
             "openasr-server: --no-model requested; starting with no model bound. Transcription requests will fail closed until the server is restarted with a model."
@@ -654,7 +715,10 @@ pub(super) async fn serve(
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
-            model_pack_path: model_source.model_pack_path.into(),
+            // Launch path is served identity; current() waits for attestation.
+            model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
+                model_source.model_pack_path,
+            ),
         },
         launch_options,
     )
@@ -856,25 +920,20 @@ fn runtime_resolution_unknown_model(error: &openasr_core::RuntimeModelResolution
 pub(super) fn resolve_transcribe_model<'a>(
     cards: &'a [ModelCard],
     model: Option<&str>,
-    config: &OpenAsrConfig,
+    home: &Path,
 ) -> Result<&'a ModelCard> {
-    Ok(find_model(cards, &selected_model_ref(model, config, cards))?.card)
+    Ok(find_model(cards, &selected_model_ref(model, home)?)?.card)
 }
 
-pub(super) fn selected_model_ref(
-    model: Option<&str>,
-    config: &OpenAsrConfig,
-    _cards: &[ModelCard],
-) -> String {
+pub(super) fn selected_model_ref(model: Option<&str>, home: &Path) -> Result<String> {
     if let Some(model) = model {
-        return model.to_string();
+        return Ok(model.to_string());
     }
 
-    if let Some(config_default) = config.default_model.as_deref() {
-        return config_default.to_string();
-    }
-
-    DEFAULT_MODEL_ID.to_string()
+    Ok(
+        openasr_core::default_selection::current_default_model(home)?
+            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+    )
 }
 
 pub(super) fn resolve_backend(
@@ -1404,6 +1463,145 @@ pub(super) fn write_rendered_output_atomic(rendered: &str, output: &Path) -> Res
     })
 }
 
+pub(super) fn align_plain_transcript_command(
+    native_execution_services: &Arc<NativeExecutionServices>,
+    options: AlignCommandOptions<'_>,
+) -> Result<()> {
+    let dash = Path::new("-");
+    if options.audio == dash && options.transcript == dash {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "audio and --transcript cannot both be '-' (stdin)".to_string(),
+        )
+        .into());
+    }
+
+    let home = openasr_home()?;
+    let config = load_config(&home)?;
+    let backend = resolve_backend(options.backend_kind, &config)?;
+    if backend != BackendKind::Native {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "openasr align requires the native backend.".to_string(),
+        )
+        .into());
+    }
+
+    let needs_subtitle_export = options
+        .formats
+        .iter()
+        .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt));
+    ensure_cli_word_timestamps_pack_installed(
+        native_execution_services,
+        backend,
+        None,
+        false,
+        Some(WordTimestampsMode::Aligned),
+        needs_subtitle_export,
+        &options.consent,
+    )?;
+
+    let execution_target = parse_align_execution_target(options.execution_target)?;
+    let audio_pathbuf = options.audio.to_path_buf();
+    let stdin_audio = crate::maybe_read_stdin_to_temp(std::slice::from_ref(&audio_pathbuf))?;
+    let audio_path = match &stdin_audio {
+        Some(temp) => temp.path().to_path_buf(),
+        None => audio_pathbuf,
+    };
+    let transcript_text = read_align_transcript(options.transcript)?;
+
+    let ffmpeg_bin = resolve_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &config);
+    let ffmpeg_bin_explicit =
+        resolve_explicit_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &config).is_some();
+    let prepared = openasr_core::prepare_audio_input(
+        &audio_path,
+        &audio_preparation_options(backend, ffmpeg_bin, ffmpeg_bin_explicit),
+    )
+    .map_err(|error| consent::CliExit::new(consent::ExitCode::InputError, error.to_string()))?;
+    print_audio_input_notes(prepared.original());
+    print_audio_preparation_notes(&prepared);
+
+    let samples = if let Some(shared) = prepared.shared_samples() {
+        shared
+    } else {
+        Arc::new(
+            openasr_core::load_native_wav_16khz_mono_f32_v0(
+                prepared.path(),
+                "openasr align",
+                "openasr align audio",
+            )
+            .map_err(|error| {
+                consent::CliExit::new(consent::ExitCode::InputError, error.to_string())
+            })?,
+        )
+    };
+    if samples.is_empty() {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "Audio decoded to zero samples; cannot align transcript.".to_string(),
+        )
+        .into());
+    }
+
+    configure_native_cpu_inference_threads();
+    let transcription = openasr_core::align_plain_transcript_to_audio(
+        transcript_text,
+        samples.as_slice(),
+        native_execution_services,
+        execution_target,
+        options.language.as_deref(),
+        options.keep_word_timestamps,
+    )
+    .map_err(|error| consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string()))?;
+    write_rendered_formats(
+        &transcription,
+        options.formats,
+        &audio_path,
+        options.output,
+        false,
+    )?;
+    Ok(())
+}
+
+fn read_align_transcript(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut buf)
+            .map_err(|error| {
+                consent::CliExit::new(
+                    consent::ExitCode::InputError,
+                    format!("Could not read transcript from stdin: {error}"),
+                )
+            })?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).map_err(|error| {
+        consent::CliExit::new(
+            consent::ExitCode::InputError,
+            format!("Could not read transcript {}: {error}", path.display()),
+        )
+        .into()
+    })
+}
+
+fn parse_align_execution_target(raw: Option<&str>) -> Result<openasr_core::ExecutionTarget> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("auto") => Ok(openasr_core::ExecutionTarget::Auto),
+        Some("cpu") => Ok(openasr_core::ExecutionTarget::Cpu),
+        Some("accelerated") => Ok(openasr_core::ExecutionTarget::Accelerated),
+        Some(other) => Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            format!(
+                "Unsupported --execution-target '{other}'. Use one of: auto, cpu, accelerated."
+            ),
+        )
+        .into()),
+    }
+}
+
 pub(super) fn parse_response_format(value: &str) -> Result<ResponseFormat, String> {
     ResponseFormat::from_str(value)
 }
@@ -1472,6 +1670,7 @@ mod tests {
             ffmpeg_bin_explicit: false,
             longform: None,
             diarize: false,
+            voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
             speakers: None,
             language: None,
             task: None,
@@ -1500,6 +1699,7 @@ mod tests {
                 ffmpeg_bin_explicit: false,
                 longform: None,
                 diarize: false,
+                voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
                 speakers: None,
                 language: None,
                 task: None,
@@ -1641,41 +1841,58 @@ mod tests {
         });
     }
 
-    // Locks the three-tier priority `selected_model_ref` must keep: an explicit
-    // `--model` always wins, then the persisted `config.default_model`, and only
-    // with neither does the CLI fall back to `DEFAULT_MODEL_ID` -- the
-    // bare-invocation convention that (post-refactor) is no longer implicitly
-    // written into `config.json` (see `openasr_core::config::DEFAULT_MODEL_ID`
-    // and `default_selection`).
     #[test]
-    fn selected_model_ref_explicit_wins_over_config_default() {
-        let config = OpenAsrConfig {
-            default_model: Some("whisper-small".to_string()),
-            ..OpenAsrConfig::default()
-        };
+    fn selected_model_ref_explicit_wins_over_persisted_default() {
+        let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            selected_model_ref(Some("whisper-large-v3-turbo"), &config, &[]),
+            selected_model_ref(Some("whisper-large-v3-turbo"), home.path()).unwrap(),
             "whisper-large-v3-turbo"
         );
     }
 
     #[test]
-    fn selected_model_ref_falls_back_to_config_default_when_no_explicit_model() {
-        let config = OpenAsrConfig {
-            default_model: Some("whisper-small".to_string()),
-            ..OpenAsrConfig::default()
-        };
-        assert_eq!(selected_model_ref(None, &config, &[]), "whisper-small");
+    fn selected_model_ref_reads_v2_before_stale_legacy_projection() {
+        let home = tempfile::tempdir().unwrap();
+        openasr_core::save_config(
+            home.path(),
+            &OpenAsrConfig {
+                default_model: Some("stale-model".to_string()),
+                ..OpenAsrConfig::default()
+            },
+        )
+        .unwrap();
+        openasr_core::default_selection::persist_v2_record(
+            home.path(),
+            openasr_core::default_selection::ActiveModelSelectionV2 {
+                schema_version:
+                    openasr_core::default_selection::ACTIVE_MODEL_SELECTION_V2_SCHEMA_VERSION,
+                selection_generation: 0,
+                status: openasr_core::default_selection::ActiveModelSelectionStatus::Unset,
+                pull: None,
+                model_id: None,
+                quant: None,
+                architecture_id: None,
+                expected_pack: None,
+                quant_preference: openasr_core::QuantPreference::Auto,
+                execution_intent: "auto".to_string(),
+                checksum: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected_model_ref(None, home.path()).unwrap(),
+            DEFAULT_MODEL_ID
+        );
     }
 
     #[test]
-    fn selected_model_ref_falls_back_to_default_model_id_when_config_default_is_unset() {
-        // A fresh config (or one built by `OpenAsrConfig::default()`) has
-        // `default_model: None` -- the CLI convention fallback, not a config value,
-        // must still resolve to something usable.
-        let config = OpenAsrConfig::default();
-        assert_eq!(config.default_model, None);
-        assert_eq!(selected_model_ref(None, &config, &[]), DEFAULT_MODEL_ID);
+    fn selected_model_ref_falls_back_to_default_model_id_when_unset() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            selected_model_ref(None, home.path()).unwrap(),
+            DEFAULT_MODEL_ID
+        );
     }
 
     #[test]

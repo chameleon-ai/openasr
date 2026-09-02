@@ -63,67 +63,60 @@ for name in catalog.json catalog.signature.json catalog.public.json catalog.publ
 done
 
 echo "==> downloading backend entries for ${tag}"
-gh release download "$tag" \
-  -p 'backend-pack-*.json' \
-  -p 'backend-hardware-evidence-*.json' \
-  -D "$workdir" --clobber
+python3 - "$tag" "$workdir" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
+import release_completeness
+
+tag, root = sys.argv[1], Path(sys.argv[2])
+for pack_name in release_completeness.backend_pack_names(release_completeness.load_matrix()):
+    print(f"downloading {pack_name}", flush=True)
+    gh_release.download_asset(tag, pack_name, root)
+PY
 
 shopt -s nullglob
 backend_entries=("$workdir"/backend-pack-*.json)
-hardware_evidence=("$workdir"/backend-hardware-evidence-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
-if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#backend_entries[@]}" -ne 20 ]; then
-  fail "release ${tag} must contain exactly 6 CUDA SM and 14 HIP gfx backend-pack metadata files"
+vulkan_entries=("$workdir"/backend-pack-vulkan-generic.json)
+if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ] || [ "${#backend_entries[@]}" -ne 21 ]; then
+  fail "release ${tag} must contain 1 Vulkan, 6 CUDA SM, and 14 HIP gfx backend-pack metadata files"
 fi
 all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do
   all_backend_entry_args+=(--entry "$entry")
 done
-[ "${#hardware_evidence[@]}" -gt 0 ] \
-  || fail "release ${tag} has no real-hardware backend evidence; build artifacts alone are not publishable catalog claims"
-hardware_evidence_args=()
-for evidence in "${hardware_evidence[@]}"; do
-  hardware_evidence_args+=(--evidence "$evidence")
-done
-python3 tooling/release-manifest/backend_hardware_evidence.py \
-  "${all_backend_entry_args[@]}" "${hardware_evidence_args[@]}" \
-  > "$workdir/hardware-approved-entries.txt"
-# Native Windows Python writes CRLF even when invoked from Git Bash. Strip
-# the record terminator before using each emitted path as an argv value.
-# Portable read loop (not mapfile) so macOS stock bash 3.2 can sign.
-approved_entries=()
-while IFS= read -r line || [ -n "$line" ]; do
-  [ -n "$line" ] || continue
-  approved_entries+=("$line")
-done < <(tr -d '\r' < "$workdir/hardware-approved-entries.txt")
-[ "${#approved_entries[@]}" -gt 0 ] \
-  || fail "release ${tag} has no backend entry approved by hardware evidence"
 backend_entry_args=()
-for entry in "${approved_entries[@]}"; do
+for entry in "${backend_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
+echo "==> downloading signed plugin and vendor payloads from CDN"
 python3 - "$workdir" <<'PY'
 import json
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, "tooling/release-manifest")
+import gh_release
 
 root = Path(sys.argv[1])
 downloaded = set()
 for entry_path in sorted(root.glob("backend-pack-*.json")):
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
+    version = entry["version"]
     for file in entry.get("files", []):
         name = file.get("filename")
         if not isinstance(name, str) or not name or Path(name).name != name:
             raise SystemExit(f"unsafe backend release filename: {name!r}")
         if name in downloaded:
             continue
-        subprocess.run(
-            ["gh", "release", "download", f"v{entry['version']}", "-p", name, "-D", str(root), "--clobber"],
-            check=True,
-        )
+        url = f"https://dl.openasr.org/core/v{version}/{name}"
+        print(f"downloading {url}", flush=True)
+        gh_release.download_url(url, root / name)
         downloaded.add(name)
 PY
 
@@ -173,12 +166,16 @@ python3 tooling/release-manifest/backend_catalog.py verify-catalog \
 python3 tooling/release-manifest/backend_catalog.py verify-catalog \
   --catalog model-registry/catalog.public.json \
   "${backend_entry_args[@]}"
+python3 tooling/release-manifest/backend_hardware_evidence.py \
+  "${all_backend_entry_args[@]}" \
+  --catalog model-registry/catalog.public.json --version "$version" >/dev/null
 python3 tooling/publish-model/scripts/check_catalog_consistency.py
 
 restore=0
 echo
 echo "CATALOG-PREPARED for ${tag}"
-echo "  hardware-approved backend entries: ${#approved_entries[@]} of ${#backend_entries[@]} built"
+echo "  published-inert/signed backend entries: ${#backend_entries[@]}"
+echo "  hardware-qualified exact entries: 0 (qualification is post-publication)"
 echo "  epoch: ${old_epoch} -> ${new_epoch}"
 echo "  next: review and commit model-registry/catalog{,.public}{,.signature}.json + catalog.epoch"
 echo "  then push the catalog commit, wait for deploy-catalog.yml (which rechecks CDN), and run:"

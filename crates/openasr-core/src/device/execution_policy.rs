@@ -67,12 +67,22 @@ impl From<crate::ExecutionTarget> for ExecutionIntent {
 }
 
 /// Placement shapes implemented by a family/runtime pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum ExecutionPlacement {
     CpuOnly,
     FullDevice,
     /// Weights/operations may be split across CPU and the selected device.
     Hybrid,
+}
+
+impl ExecutionPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuOnly => "cpu-only",
+            Self::FullDevice => "full-device",
+            Self::Hybrid => "hybrid",
+        }
+    }
 }
 
 /// Accelerated placement shapes supported by one provider implementation.

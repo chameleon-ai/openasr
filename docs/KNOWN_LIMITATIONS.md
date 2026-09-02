@@ -30,12 +30,17 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   guarantees are still pending.
 - Universal Voice ID is currently a local **file-transcription** feature. MOSS
   supplies its own speaker turns; all other ASR families use FireRed Stream-VAD,
-  a speaker segmenter, ReDimNet2-B6, automatic clustering, and overlap-aware
-  reconstruction. Both paths reuse the shared identity/evidence stage and both
-  require ReDimNet2-B6. Missing or broken required packs fail closed. This
-  universal contract is qualified for local file transcription; realtime and
-  remote-compute diarization remain separate surfaces with their own output and
-  privacy gates.
+  a speaker segmenter, a speaker embedder, automatic clustering, and
+  overlap-aware reconstruction. Both paths reuse the shared identity/evidence
+  stage. The default embedder is ReDimNet2-B6, and the default capability probe
+  still requires that pack. An explicit `voice_id_embedder=wespeaker` preference
+  (or `OPENASR_WESPEAKER_PACK`) loads the optional WeSpeaker ResNet family
+  (256-d, VoxCeleb English LM, sizes 34/152/221/293) instead; there is no Auto
+  fallback, and ReDimNet and WeSpeaker occupy different identity spaces so enrollments
+  do not transfer. Missing or broken required or selected packs fail closed.
+  This universal contract is qualified for local file transcription; realtime
+  and remote-compute diarization remain separate surfaces with their own output
+  and privacy gates.
   Labels stay session-relative (`SPEAKER_00/01`, ...) unless an enrolled person
   clears Voice ID's evidence gates. See [FAQ.md](FAQ.md#is-diarization-available)
   and [SECURITY.md](../SECURITY.md).
@@ -105,6 +110,30 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   timestamps unchanged. Explicit `aligned` only refines words; the automatic
   Voice ID path additionally consumes those words to assign each text run to
   the canonical speaker timeline.
+- External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
+  with `transcript=`) reuses the same Forced Aligner pack and tokenizer. The
+  returned `text` keeps the caller's punctuation and casing. Internally the
+  aligner: splits on ASCII whitespace; keeps letters, numbers, and apostrophes;
+  strips other punctuation; treats each CJK ideograph as its own token; defaults
+  omitted/`auto` language to `en`. Japanese and Korean fail closed by language
+  tag (`ja`/`jp`/`jpn`/`ko`/`kr`/`kor`) and by script (hiragana, katakana,
+  hangul) even when the hint is `en`. Audio longer than the classify-head grid
+  (5000 × 80 ms = 400 s for the shipped pack) fails closed rather than wrapping
+  timestamps. A prompt that would exceed decoder context (`llm_max_positions`,
+  8192 in the shipped pack) also fails closed before the encoder/prefill graphs
+  are built — the 400 s grid is not a substitute for that budget. A collapsed or
+  zero-duration timeline is treated as a severe transcript/audio mismatch;
+  pauses longer than 4 s in a correctly aligned manuscript are not. The server
+  never downloads the pack; paired device tokens may call the endpoint (it is a
+  compute route, not operator-only). This route is not yet on the file
+  FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
+  that has entered alignment cannot be cancelled that way. The plain-transcript
+  path still aligns the whole recording as one Forced Aligner item: it does
+  not auto-split. Inputs that would exceed decoder context or the 400 s grid
+  fail closed instead of being chunked. Kanji-only Japanese with no kana, when
+  tagged `en`/`auto`, still takes the CJK character path and is not caught by
+  the hiragana/katakana/hangul script guard. CLI `align`
+  is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
   `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
   device. There is no public per-provider/per-device pinning surface such as
@@ -131,6 +160,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   cards or falling back to CPU. Unavailable coarse `accelerated` targets still
   fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
   BDF grammar validation is a follow-up.
+- On Windows ReBAR discrete GPUs, Vulkan Peak Working Set can exceed the HIP
+  and CPU figures even when DeviceLocal buffers are not mapped. ReBAR types
+  are DeviceLocal|HostVisible, so Windows still counts that VRAM toward the
+  process working set. This is a measured PeakWS tax, not a host leak; HIP
+  does not pay it the same way.
 - No public reproducible real-backend benchmark or long-audio stability evidence
   is published. The performance harness, regression gates, and competitive
   comparisons are internal (see [Performance](../perf/PERFORMANCE.md)); no claim of
@@ -209,6 +243,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are retained. See
   [Graph cancellation contract](design/graph-cancellation.md).
   Pause still only blocks at slice boundaries and never arms graph cancellation.
+- `POST /v1/audio/transcriptions?stream=true` shares owner checks, cancel
+  control, and `finish_file` cleanup with JSON file jobs, but a busy server
+  rejects the stream with HTTP 429 instead of enqueueing it on the cancelable
+  file FIFO. JSON `POST /v1/audio/transcriptions` still queues. Desktop remote
+  file transcription uses the JSON endpoint. A later change can emit a queued
+  SSE event and then stream the result.
 
 ## What works now
 

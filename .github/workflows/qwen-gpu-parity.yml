@@ -1,17 +1,26 @@
-name: qwen GPU parity gate
+name: qwen GPU parity diagnostic
 
-# Catches GPU-only qwen inference regressions that the Linux/ARM CI cannot see
-# (it has no discrete GPU): asserts the qwen3-asr transcript on the auto-selected
-# GPU backend matches the CPU reference for the committed audio fixtures. This is
-# the gate that would have caught the RDNA4 / gfx1200 native-GQA flash-broadcast
-# bug, where recognition degenerated into garbled, repeated tokens on the GPU
-# while CPU stayed correct. Runs on the self-hosted Windows HIP runner (same
-# runner as the HIP compile gate) -- GitHub-hosted runners have no AMD GPU, so
-# this stays pinned to that dedicated hardware. Maintainer AMD hardware gate,
-# dispatch manually after registering the runner.
+# Manual raw diagnostic only. Its free-text expectations and runner-local active
+# provider are deliberately not release authority. Output from this workflow is
+# never accepted by gpu_correctness_gate.py and cannot qualify or activate a
+# backend. The self-hosted Windows HIP runner is required because GitHub-hosted
+# runners have no AMD GPU.
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_cli_artifact:
+        required: true
+        type: string
+      expected_provider:
+        required: true
+        type: string
+      expected_device:
+        required: true
+        type: string
+      pack_artifact:
+        required: true
+        type: string
 
 concurrency:
   group: qwen-gpu-parity-${{ github.ref }}
@@ -22,7 +31,7 @@ env:
 
 jobs:
   windows-hip-parity:
-    name: qwen GPU vs CPU transcript parity (HIP)
+    name: qwen GPU vs CPU raw diagnostic (HIP)
     if: github.repository_owner == 'QuintinShaw'
     runs-on: [self-hosted, Windows, X64, HIP]
     steps:
@@ -30,7 +39,14 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.candidate_cli_artifact }}
+          path: staging/candidate
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.pack_artifact }}
+          path: staging/pack
 
       - name: Verify HIP SDK toolchain
         shell: pwsh
@@ -44,19 +60,52 @@ jobs:
           }
           Write-Host "HIP SDK: $hipRoot"
 
-      - name: Build openasr-cli (HIP)
+      - name: Verify the diagnostic CLI and pack inputs
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
-          cargo build -p openasr-cli --release --features hip
+          $candidates = @(Get-ChildItem -Path staging/candidate -Filter *.exe -File -Recurse)
+          $packs = @(Get-ChildItem -Path staging/pack -Filter *.oasr -File -Recurse)
+          if ($candidates.Count -ne 1) { Write-Error "expected exactly one diagnostic CLI executable, found $($candidates.Count)"; exit 1 }
+          if ($packs.Count -ne 1) { Write-Error "expected exactly one diagnostic model pack, found $($packs.Count)"; exit 1 }
+          $candidate = $candidates[0]
+          $pack = $packs[0]
+          gh attestation verify $candidate.FullName --repo $env:GITHUB_REPOSITORY --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
+          if ($LASTEXITCODE -ne 0) { Write-Error "diagnostic CLI attestation verification failed"; exit 1 }
+          Get-FileHash $candidate.FullName,$pack.FullName -Algorithm SHA256
+          Copy-Item $candidate.FullName target\release\openasr.exe -Force
+          Copy-Item $pack.FullName "$env:RUNNER_TEMP\qwen-diagnostic.oasr" -Force
+          "OPENASR_QWEN_PARITY_EXE=$((Resolve-Path target\release\openasr.exe).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_PACK=$((Resolve-Path "$env:RUNNER_TEMP\qwen-diagnostic.oasr").Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Ensure qwen3-asr-0.6b pack is available
+      - name: Trace producer environment
         shell: pwsh
         run: |
-          .\target\release\openasr.exe pull qwen3-asr-0.6b
+          $traceDir = Join-Path $env:RUNNER_TEMP "qwen-traces"
+          New-Item -ItemType Directory -Force -Path $traceDir | Out-Null
+          "OPENASR_QWEN_PARITY_TRACE_DIR=$traceDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_EXPECTED_PROVIDER=${{ inputs.expected_provider }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENASR_QWEN_PARITY_EXPECTED_DEVICE=${{ inputs.expected_device }}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: qwen GPU vs CPU transcript parity
         shell: pwsh
         run: |
           if (-not $env:OPENASR_HIP_GPU_TARGETS) { $env:OPENASR_HIP_GPU_TARGETS = "gfx1200" }
           pwsh tooling/qwen-gpu-parity/run.ps1
+
+      - name: Verify and upload raw diagnostic output
+        shell: pwsh
+        run: |
+          $traces = @(Get-ChildItem -Path $env:OPENASR_QWEN_PARITY_TRACE_DIR -Filter *.diagnostic.jsonl)
+          if ($traces.Count -lt 2 -or -not ($traces.Name -match "cold") -or -not ($traces.Name -match "reuse")) {
+            Write-Error "runtime did not produce cold/reuse diagnostic traces"; exit 1
+          }
+          $diagnostics = @(Get-ChildItem -Path $env:OPENASR_QWEN_PARITY_TRACE_DIR -Filter *.diagnostic.json)
+          if ($diagnostics.Count -lt 2) { Write-Error "runtime did not produce cold/reuse diagnostic records"; exit 1 }
+          Get-FileHash $traces.FullName,$diagnostics.FullName -Algorithm SHA256
+      - uses: actions/upload-artifact@v8
+        with:
+          name: qwen-gpu-parity-diagnostic-output-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/qwen-traces

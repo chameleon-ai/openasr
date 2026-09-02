@@ -1,13 +1,15 @@
 //! Shared policy and first-max index helpers for device-only greedy decode.
 //!
 //! A family may return only a token id when its decode policy does not need
-//! logits, probabilities, phrase bias, or timestamps. The route gate here is
-//! intentionally narrow: the first rollout is limited to an explicitly pinned
-//! CUDA/Vulkan FullDevice candidate on a direct (non-scheduler) GPU runner.
+//! logits, probabilities, phrase bias, or timestamps. The route and reuse
+//! decision is resolved once by [`ResolvedFamilyRuntimeInput`]; this module
+//! only translates that immutable output plan into the graph-facing mode.
 
-use crate::device::execution_policy::ExecutionPlacement;
-use crate::device::execution_route::ExecutionProvider;
-use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphError, RequestBackendPreference};
+use crate::device::execution_policy::{ExecutionCandidate, ExecutionPlacement};
+use crate::ggml_runtime::{
+    AutoGpuPolicy, GgmlCpuGraphError, GgmlDecodeLogitsConsumers, GgmlDecodeOutputContract,
+    GgmlDecodeOutputPlan, RequestBackendPreference, ResolvedFamilyRuntimeInput,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DeviceGreedyStepOutputMode {
@@ -15,62 +17,153 @@ pub(crate) enum DeviceGreedyStepOutputMode {
     DeviceTop1,
 }
 
-pub(crate) fn device_greedy_step_output_mode(
-    backend: GgmlCpuGraphBackend,
-    use_scheduler: bool,
-    backend_preference: Option<&RequestBackendPreference>,
-    placement: Option<ExecutionPlacement>,
+pub(crate) fn device_greedy_step_output_mode_for_resolved_runtime(
+    resolved_runtime: ResolvedFamilyRuntimeInput,
 ) -> DeviceGreedyStepOutputMode {
-    let exact_provider = match backend_preference {
-        Some(RequestBackendPreference::Exact(route)) => route.provider,
-        Some(RequestBackendPreference::CpuOnly | RequestBackendPreference::Accelerated) | None => {
-            return DeviceGreedyStepOutputMode::FullLogits;
+    match resolved_runtime.output_plan() {
+        GgmlDecodeOutputPlan::NativeFirstMaxToken => DeviceGreedyStepOutputMode::DeviceTop1,
+        GgmlDecodeOutputPlan::FullLogits | GgmlDecodeOutputPlan::CompleteScores => {
+            DeviceGreedyStepOutputMode::FullLogits
         }
-    };
-    if backend == GgmlCpuGraphBackend::Gpu
-        && !use_scheduler
-        && placement == Some(ExecutionPlacement::FullDevice)
-        && matches!(
-            exact_provider,
-            ExecutionProvider::Cuda | ExecutionProvider::Vulkan
-        )
-    {
-        DeviceGreedyStepOutputMode::DeviceTop1
-    } else {
-        DeviceGreedyStepOutputMode::FullLogits
     }
 }
 
-pub(crate) fn first_max_argmax_reverse_indices(
-    vocab_size: usize,
-) -> Result<Vec<i32>, GgmlCpuGraphError> {
-    (0..vocab_size)
-        .rev()
-        .map(|index| {
-            i32::try_from(index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-                reason: "first-max argmax vocab index exceeds ggml int boundary",
-            })
-        })
-        .collect()
+/// Family host-oracle contracts that must not enter native first-max compact
+/// selection. XASR keeps last-max host selection; SenseVoice keeps complete
+/// frame logits. Other token families request the native-first-max fallback.
+pub(crate) fn decode_output_contract_for_adapter(adapter_id: &str) -> GgmlDecodeOutputContract {
+    if adapter_id == crate::arch::XASR_ZIPFORMER_GGML_ADAPTER_ID
+        || adapter_id == crate::arch::SENSEVOICE_GGML_ADAPTER_ID
+    {
+        GgmlDecodeOutputContract::FullLogits
+    } else {
+        GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits
+    }
 }
 
-pub(crate) fn first_max_token_id_from_reversed_argmax(
-    reversed_token_id: i32,
+pub(crate) fn decode_logits_consumers_for_request(
+    adapter_id: &str,
+    phrase_bias_active: bool,
+    word_timestamps: bool,
+    adapter_active: bool,
+) -> GgmlDecodeLogitsConsumers {
+    let debug_logits = adapter_id == crate::arch::COHERE_TRANSCRIBE_GGML_ADAPTER_ID
+        && std::env::var_os("OPENASR_COHERE_DEBUG_TOKENS").is_some();
+    GgmlDecodeLogitsConsumers::new(
+        phrase_bias_active,
+        word_timestamps,
+        suppression_active_for_adapter(adapter_id),
+        debug_logits,
+    )
+    .with_host_visible(adapter_active)
+}
+
+/// Convert one immutable policy candidate into the exact request preference
+/// consumed by the shared runtime planner. Offline, streaming, warm-up, and
+/// activation must not grow independent provider/placement tables.
+pub(crate) fn request_backend_preference_for_candidate(
+    candidate: &ExecutionCandidate,
+) -> Option<RequestBackendPreference> {
+    match candidate.placement {
+        ExecutionPlacement::CpuOnly => Some(RequestBackendPreference::CpuOnly),
+        ExecutionPlacement::FullDevice | ExecutionPlacement::Hybrid => Some(
+            RequestBackendPreference::Exact(candidate.device.route.clone()),
+        ),
+    }
+}
+
+/// Resolve one immutable family runtime input from a concrete candidate.
+/// This is the shared output-plan/reuse combiner for every execution surface.
+pub(crate) fn resolved_runtime_for_family_candidate(
+    candidate: &ExecutionCandidate,
+    auto_gpu_policy: AutoGpuPolicy,
+    adapter_id: &str,
+    logits_consumers: GgmlDecodeLogitsConsumers,
+) -> ResolvedFamilyRuntimeInput {
+    ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+        request_backend_preference_for_candidate(candidate),
+        auto_gpu_policy,
+        decode_output_contract_for_adapter(adapter_id),
+        logits_consumers,
+    )
+}
+
+fn suppression_active_for_adapter(adapter_id: &str) -> bool {
+    crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_adapter_id(adapter_id)
+        .and_then(|descriptor| descriptor.topology_contract.decode_driver.shared_policy())
+        .is_some_and(|policy| {
+            !matches!(
+                policy.seq2seq_suppression_kind,
+                crate::models::decode_policy_component_registry::BuiltinDecodePolicySeq2SeqSuppressionKind::None
+            )
+        })
+}
+
+/// Shared greedy-step finish for every seq2seq family. The graph output
+/// read mints selection evidence here so `take_compute_evidence` cannot stay
+/// a silent `None` default on a family that actually ran a decode graph.
+pub(crate) fn compute_greedy_step_output_with_evidence<'a>(
+    graph: &mut crate::ggml_runtime::GgmlCpuGraphBuilder<'a>,
+    logits: crate::ggml_runtime::GgmlCpuTensor<'a>,
+    top1: Option<crate::ggml_runtime::GgmlCpuTensor<'a>>,
     vocab_size: usize,
-) -> Result<i32, GgmlCpuGraphError> {
-    let reversed_index =
-        usize::try_from(reversed_token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is negative",
-        })?;
-    if reversed_index >= vocab_size {
+) -> Result<
+    (
+        crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput,
+        Option<crate::ggml_runtime::GgmlSelectionEvidenceRef>,
+    ),
+    GgmlCpuGraphError,
+> {
+    match top1 {
+        Some(top1) => {
+            let readback = graph.compute_output_i32_with_evidence(top1, 1)?;
+            let (token_ids, evidence) = readback.into_parts();
+            let token_id =
+                token_ids
+                    .into_iter()
+                    .next()
+                    .ok_or(GgmlCpuGraphError::UnsupportedInputs {
+                        reason: "device top-1 returned no token id",
+                    })?;
+            Ok((
+                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits: Vec::new(),
+                    greedy_token_hint: Some(device_top1_token_id(token_id, vocab_size)?),
+                },
+                evidence,
+            ))
+        }
+        None => {
+            let readback = graph.compute_output_f32_with_evidence(logits, vocab_size)?;
+            let (logits, evidence) = readback.into_parts();
+            Ok((
+                crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStepLogitsOutput {
+                    logits,
+                    greedy_token_hint: None,
+                },
+                evidence,
+            ))
+        }
+    }
+}
+
+pub(crate) fn device_top1_token_id(
+    token_id: i32,
+    vocab_size: usize,
+) -> Result<u32, GgmlCpuGraphError> {
+    let token = u32::try_from(token_id).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+        reason: "device top-1 token id is negative",
+    })?;
+    if usize::try_from(token)
+        .ok()
+        .is_none_or(|id| id >= vocab_size)
+    {
         return Err(GgmlCpuGraphError::UnsupportedInputs {
-            reason: "first-max argmax reversed token id is outside vocab size",
+            reason: "device top-1 token id is outside vocab size",
         });
     }
-    let original_index = vocab_size - 1 - reversed_index;
-    i32::try_from(original_index).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
-        reason: "first-max argmax token id exceeds ggml int boundary",
-    })
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -78,11 +171,13 @@ mod tests {
     use crate::device::execution_route::{
         DeviceAddressability, ResolvedExecutionRoute, RouteDeviceKind,
     };
-    use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphRunner};
+    use crate::ggml_runtime::{AutoGpuPolicy, GgmlCpuGraphBackend, RequestBackendPreference};
 
     use super::*;
 
-    fn exact_preference(provider: ExecutionProvider) -> RequestBackendPreference {
+    fn exact_preference(
+        provider: crate::device::execution_route::ExecutionProvider,
+    ) -> RequestBackendPreference {
         RequestBackendPreference::Exact(ResolvedExecutionRoute {
             provider,
             stable_id: format!("{}0", provider.as_str()),
@@ -95,126 +190,231 @@ mod tests {
     }
 
     #[test]
-    fn route_policy_only_enables_direct_exact_cuda_and_vulkan_full_device() {
-        for provider in [ExecutionProvider::Cuda, ExecutionProvider::Vulkan] {
-            let preference = exact_preference(provider);
-            assert_eq!(
-                device_greedy_step_output_mode(
-                    GgmlCpuGraphBackend::Gpu,
-                    false,
-                    Some(&preference),
-                    Some(ExecutionPlacement::FullDevice),
-                ),
-                DeviceGreedyStepOutputMode::DeviceTop1
-            );
-        }
-
+    fn exact_cuda_and_vulkan_without_selected_device_evidence_stay_complete() {
         for provider in [
-            ExecutionProvider::Cpu,
-            ExecutionProvider::Metal,
-            ExecutionProvider::Hip,
-            ExecutionProvider::Accelerator,
-            ExecutionProvider::Unknown,
+            crate::device::execution_route::ExecutionProvider::Cuda,
+            crate::device::execution_route::ExecutionProvider::Vulkan,
         ] {
-            let preference = exact_preference(provider);
-            assert_eq!(
-                device_greedy_step_output_mode(
-                    GgmlCpuGraphBackend::Gpu,
-                    false,
-                    Some(&preference),
-                    Some(ExecutionPlacement::FullDevice),
-                ),
-                DeviceGreedyStepOutputMode::FullLogits,
-                "provider={provider:?}"
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact_preference(provider)),
+                AutoGpuPolicy::AllBackends,
+                crate::ggml_runtime::GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
             );
-        }
-    }
-
-    #[test]
-    fn route_policy_rejects_scheduler_hybrid_non_gpu_and_non_exact_paths() {
-        let cuda = exact_preference(ExecutionProvider::Cuda);
-        for (backend, scheduler, preference, placement) in [
-            (
-                GgmlCpuGraphBackend::Gpu,
-                true,
-                Some(&cuda),
-                Some(ExecutionPlacement::FullDevice),
-            ),
-            (
-                GgmlCpuGraphBackend::Gpu,
-                false,
-                Some(&cuda),
-                Some(ExecutionPlacement::Hybrid),
-            ),
-            (
-                GgmlCpuGraphBackend::Metal,
-                false,
-                Some(&cuda),
-                Some(ExecutionPlacement::FullDevice),
-            ),
-            (
-                GgmlCpuGraphBackend::Cpu,
-                false,
-                Some(&cuda),
-                Some(ExecutionPlacement::CpuOnly),
-            ),
-            (
-                GgmlCpuGraphBackend::Gpu,
-                false,
-                None,
-                Some(ExecutionPlacement::FullDevice),
-            ),
-        ] {
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Gpu);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
             assert_eq!(
-                device_greedy_step_output_mode(backend, scheduler, preference, placement),
+                resolved.reuse_mode(),
+                crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+            );
+            assert_eq!(
+                device_greedy_step_output_mode_for_resolved_runtime(resolved),
                 DeviceGreedyStepOutputMode::FullLogits
             );
         }
+    }
+
+    #[test]
+    fn cpu_lane_authorizes_native_first_max_without_reuse() {
+        let resolved = ResolvedFamilyRuntimeInput::resolve(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+        );
+        assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Cpu);
         assert_eq!(
-            device_greedy_step_output_mode(
-                GgmlCpuGraphBackend::Gpu,
-                false,
-                Some(&RequestBackendPreference::Accelerated),
-                Some(ExecutionPlacement::FullDevice),
-            ),
-            DeviceGreedyStepOutputMode::FullLogits
+            resolved.output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+        assert_eq!(
+            resolved.reuse_mode(),
+            crate::ggml_runtime::GgmlDecodeReuseMode::FreshGraph
+        );
+        assert_eq!(
+            device_greedy_step_output_mode_for_resolved_runtime(resolved),
+            DeviceGreedyStepOutputMode::DeviceTop1
         );
     }
 
     #[test]
-    fn cpu_graph_first_max_oracle_matches_shared_host_mapping() {
-        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default())
-            .expect("cpu graph runner should initialize");
-        let mut arena = runner
-            .start_static_tensor_arena(GgmlCpuGraphConfig::metadata_context_bytes(1))
-            .expect("static arena should initialize");
-        let reverse_indices = arena
-            .new_tensor_1d_i32(4, "device_greedy_reverse_indices")
-            .expect("reverse-index allocation should succeed");
-        arena
-            .set_i32_slice(
-                reverse_indices,
-                &first_max_argmax_reverse_indices(4).expect("reverse indices"),
-                "device_greedy_reverse_indices",
-            )
-            .expect("reverse indices upload should succeed");
+    fn device_top1_token_id_rejects_out_of_range_values() {
+        assert_eq!(device_top1_token_id(2, 4).expect("in-range token"), 2);
+        assert!(device_top1_token_id(-1, 4).is_err());
+        assert!(device_top1_token_id(4, 4).is_err());
+    }
 
-        let mut graph = runner.start_graph();
-        let logits = graph
-            .new_tensor_2d_f32(4, 1, "device_greedy_logits")
-            .expect("logits allocation should succeed");
-        graph.set_input(logits).expect("logits input");
-        let top1 = graph
-            .top1_argmax_first_max_reversed(logits, arena.graph_tensor(reverse_indices))
-            .expect("first-max graph should build");
-        graph.set_output(top1).expect("top1 output");
-        graph
-            .set_f32_slice(logits, &[1.0, 5.0, 5.0, 2.0], "device_greedy_logits")
-            .expect("logits upload");
-        let reversed = graph.compute_output_i32(top1, 1).expect("top1 compute")[0];
-        assert_eq!(
-            first_max_token_id_from_reversed_argmax(reversed, 4).expect("mapped token"),
-            1
+    #[test]
+    fn unproven_gpu_lanes_keep_full_device_and_complete_outputs() {
+        use crate::ggml_runtime::GgmlDecodeReuseMode;
+
+        for provider in [
+            crate::device::execution_route::ExecutionProvider::Cuda,
+            crate::device::execution_route::ExecutionProvider::Vulkan,
+            crate::device::execution_route::ExecutionProvider::Hip,
+            crate::device::execution_route::ExecutionProvider::Metal,
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact_preference(provider)),
+                AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert!(
+                resolved.backend().is_gpu_class(),
+                "unproven {provider:?} must keep the selected GPU lane, not fall back to CPU"
+            );
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(resolved.reuse_mode(), GgmlDecodeReuseMode::FreshGraph);
+            assert_eq!(
+                device_greedy_step_output_mode_for_resolved_runtime(resolved),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+
+            let scores = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact_preference(provider)),
+                AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::CompleteScores,
+            );
+            assert!(scores.backend().is_gpu_class());
+            assert_eq!(scores.output_plan(), GgmlDecodeOutputPlan::CompleteScores);
+        }
+    }
+
+    #[test]
+    fn logits_consumers_force_full_logits_even_on_proven_cpu() {
+        let cpu = ResolvedFamilyRuntimeInput::resolve(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
         );
+        assert_eq!(cpu.output_plan(), GgmlDecodeOutputPlan::NativeFirstMaxToken);
+
+        for consumers in [
+            GgmlDecodeLogitsConsumers::none().with_phrase_bias(true),
+            GgmlDecodeLogitsConsumers::none().with_timestamps(true),
+            GgmlDecodeLogitsConsumers::none().with_suppression(true),
+            GgmlDecodeLogitsConsumers::none().with_debug_logits(true),
+            GgmlDecodeLogitsConsumers::none().with_host_visible(true),
+        ] {
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+                Some(RequestBackendPreference::CpuOnly),
+                AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+                consumers,
+            );
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Cpu);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(
+                device_greedy_step_output_mode_for_resolved_runtime(resolved),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+        }
+    }
+
+    #[test]
+    fn xasr_and_sensevoice_host_oracles_do_not_enter_native_first_max() {
+        for adapter in [
+            crate::arch::XASR_ZIPFORMER_GGML_ADAPTER_ID,
+            crate::arch::SENSEVOICE_GGML_ADAPTER_ID,
+        ] {
+            assert_eq!(
+                decode_output_contract_for_adapter(adapter),
+                GgmlDecodeOutputContract::FullLogits
+            );
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(RequestBackendPreference::CpuOnly),
+                AutoGpuPolicy::AllBackends,
+                decode_output_contract_for_adapter(adapter),
+            );
+            assert_eq!(resolved.backend(), GgmlCpuGraphBackend::Cpu);
+            assert_eq!(resolved.output_plan(), GgmlDecodeOutputPlan::FullLogits);
+            assert_eq!(
+                device_greedy_step_output_mode_for_resolved_runtime(resolved),
+                DeviceGreedyStepOutputMode::FullLogits
+            );
+        }
+    }
+
+    #[test]
+    fn untested_discrete_gpu_cannot_activate_compact_without_hardware() {
+        use crate::device::execution_route::enumerate_compute_devices_from_ggml;
+        use crate::ggml_runtime::ggml_available_devices;
+
+        let inventory = enumerate_compute_devices_from_ggml(&ggml_available_devices());
+        for provider in [
+            crate::device::execution_route::ExecutionProvider::Cuda,
+            crate::device::execution_route::ExecutionProvider::Vulkan,
+            crate::device::execution_route::ExecutionProvider::Hip,
+        ] {
+            let present = inventory.iter().any(|device| device.provider == provider);
+            let resolved = ResolvedFamilyRuntimeInput::resolve_with_output_contract(
+                Some(exact_preference(provider)),
+                AutoGpuPolicy::AllBackends,
+                GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            );
+            assert_eq!(
+                resolved.output_plan(),
+                GgmlDecodeOutputPlan::FullLogits,
+                "{provider:?} compact stays unactivatable (hardware present={present})"
+            );
+            assert_ne!(
+                resolved.output_plan(),
+                GgmlDecodeOutputPlan::NativeFirstMaxToken
+            );
+        }
+    }
+
+    fn resolve_consumers(consumers: GgmlDecodeLogitsConsumers) -> ResolvedFamilyRuntimeInput {
+        ResolvedFamilyRuntimeInput::resolve_with_output_contract_and_consumers(
+            Some(RequestBackendPreference::CpuOnly),
+            AutoGpuPolicy::AllBackends,
+            GgmlDecodeOutputContract::NativeFirstMaxTokenOrFullLogits,
+            consumers,
+        )
+    }
+
+    #[test]
+    fn shipped_combiner_wires_whisper_suppression_and_forces_full_logits() {
+        let whisper = decode_logits_consumers_for_request(
+            crate::arch::WHISPER_GGML_ADAPTER_ID,
+            false,
+            false,
+            false,
+        );
+        assert!(whisper.requires_complete_logits());
+        assert_eq!(
+            resolve_consumers(whisper).output_plan(),
+            GgmlDecodeOutputPlan::FullLogits
+        );
+
+        let qwen = decode_logits_consumers_for_request(
+            crate::arch::QWEN3_ASR_GGML_ADAPTER_ID,
+            false,
+            false,
+            false,
+        );
+        assert!(!qwen.requires_complete_logits());
+        assert_eq!(
+            resolve_consumers(qwen).output_plan(),
+            GgmlDecodeOutputPlan::NativeFirstMaxToken
+        );
+    }
+
+    #[test]
+    fn shipped_combiner_forces_full_logits_for_each_request_consumer() {
+        let adapter = crate::arch::QWEN3_ASR_GGML_ADAPTER_ID;
+        for consumers in [
+            decode_logits_consumers_for_request(adapter, true, false, false),
+            decode_logits_consumers_for_request(adapter, false, true, false),
+            decode_logits_consumers_for_request(adapter, false, false, true),
+            decode_logits_consumers_for_request(
+                crate::arch::WHISPER_GGML_ADAPTER_ID,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            assert!(consumers.requires_complete_logits());
+            assert_eq!(
+                resolve_consumers(consumers).output_plan(),
+                GgmlDecodeOutputPlan::FullLogits
+            );
+        }
     }
 }

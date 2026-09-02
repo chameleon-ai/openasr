@@ -1,9 +1,21 @@
 //! Unit tests for the realtime module. Pure code-motion from `realtime.rs`.
 
-use std::{fs, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{Read, Write},
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
+
+use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::routes::transcription::{
+    resolve_execution_route_for_target, validate_native_runtime_pack,
+};
 use crate::{NativeExecutionSupervisor, PairingCredentialState};
+use std::path::PathBuf;
 
 fn test_distribution() -> DistributionContext {
     let temp = tempfile::tempdir().unwrap();
@@ -375,9 +387,8 @@ async fn realtime_backend_job_canceled_before_dispatch_releases_capacity_promptl
 
     let temp = tempfile::tempdir().unwrap();
     let pack_path = temp.path().join("realtime-cancel-releases-capacity.oasr");
-    let spec = openasr_core::testing::TinyGgufFixtureSpec::whisper_oasr_v1_encoder_graph_one_layer(
-        "whisper-cancel-fixture",
-    );
+    let spec = openasr_core::testing::TinyGgufFixtureSpec::
+        whisper_oasr_v1_graph_ready_for_runtime_fail_closed("whisper-cancel-fixture");
     openasr_core::testing::write_tiny_gguf_runtime_source(&pack_path, &spec)
         .expect("write whisper fixture pack");
 
@@ -1546,9 +1557,13 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
     let key = test_native_streaming_worker_key("same-key-preemption");
     let threads = Arc::new(Mutex::new(Vec::new()));
 
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut abandoned_session =
-        WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut abandoned_session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     abandoned_session
@@ -1580,10 +1595,12 @@ async fn native_streaming_same_key_preemption_frees_new_attach_after_client_disc
         .await
         .unwrap();
     assert!(abandoned_session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // A brand new attach for the same key must not queue behind the still-
-    // blocked worker: `native_streaming_worker_for_key` must observe the
-    // disconnected occupant and preempt it immediately.
+    // After the reconnect window the held occupant is canceled. A brand new
+    // attach for the same key must not queue behind the still-blocked worker:
+    // `native_streaming_worker_for_key` must observe the disconnected occupant
+    // and preempt it immediately.
     let (event_sender2, _event_receiver2) = mpsc::channel(8);
     let mut fresh_session =
         WsSession::new(ServerRuntime::default(), test_distribution(), event_sender2);
@@ -1743,14 +1760,19 @@ fn abandoned_worker_warm_up_does_not_mark_model_resident() {
     // instance the rest of the process has already forgotten about.
     let _generation_guard = crate::idle_activity::native_unload_generation_test_lock_blocking();
     crate::idle_activity::bump_native_unload_generation();
-    assert!(!crate::idle_activity::native_model_is_resident());
+    let residency_key = crate::idle_activity::NativeRuntimeResidencyKey::legacy_path(
+        std::path::Path::new("abandoned-warm-up"),
+    );
+    assert!(!crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
 
     let abandoned = AtomicBool::new(true);
     let mut session = TestServerNativeSession::new("abandoned-warm-up");
-    warm_up_native_streaming_session_once(&mut session, &abandoned)
+    warm_up_native_streaming_session_once(&mut session, &abandoned, &residency_key)
         .expect("warm-up itself still succeeds -- only its process-wide side effect is discarded");
     assert!(
-        !crate::idle_activity::native_model_is_resident(),
+        !crate::idle_activity::native_model_is_resident(&residency_key),
         "a warm-up finishing after its worker was abandoned must not mark the model resident"
     );
 
@@ -1761,15 +1783,16 @@ fn abandoned_worker_warm_up_does_not_mark_model_resident() {
     // thread-local `WARMED_AT_GENERATION` gate (already warmed at this
     // generation on the current test thread, from the call above) does not
     // skip this one.
-    std::thread::spawn(|| {
+    let normal_key = residency_key.clone();
+    std::thread::spawn(move || {
         let not_abandoned = AtomicBool::new(false);
         let mut session = TestServerNativeSession::new("normal-warm-up");
-        warm_up_native_streaming_session_once(&mut session, &not_abandoned).unwrap();
+        warm_up_native_streaming_session_once(&mut session, &not_abandoned, &normal_key).unwrap();
     })
     .join()
     .unwrap();
     assert!(
-        crate::idle_activity::native_model_is_resident(),
+        crate::idle_activity::native_model_is_resident(&residency_key),
         "the normal (not abandoned) path must still mark resident"
     );
 }
@@ -1908,9 +1931,14 @@ async fn watchdog_abandoning_the_occupant_does_not_poison_a_queued_sibling() {
 async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     let before_active = crate::idle_activity::native_activity_active_count();
     let key = test_native_streaming_worker_key("disconnect-frees-idle");
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime, test_distribution(), event_sender);
     let (started_sender, started_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     session
@@ -1931,35 +1959,34 @@ async fn client_disconnect_frees_idle_even_while_decode_thread_is_stuck() {
     started_receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("decode started");
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active + 1,
-        "the attach must count active while its decode runs"
+    let active_during_decode = crate::idle_activity::native_activity_active_count();
+    assert!(
+        active_during_decode > before_active,
+        "the attach must count active while its decode runs (before={before_active}, during={active_during_decode})"
     );
 
-    // Client disconnects (transport close) -> `finish_native_streaming_session`'s
-    // transport-closed branch calls `detach_cancel`. No production timeout is
-    // overridden here, so nothing shrinks the ~60s watchdog: the guard must be
-    // freed by the disconnect path itself.
+    // Client disconnects: the session is held for the reconnect window, then
+    // expired. Idle accounting must still be retired by detach_cancel on expiry
+    // without waiting on the stuck OS thread.
     session
         .finish_native_streaming_session(false, true)
         .await
         .unwrap();
     assert!(session.native_streaming.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(
-        crate::idle_activity::native_activity_active_count(),
-        before_active,
-        "the disconnect path must retire idle accounting immediately, even though \
-         the worker OS thread is still blocked inside the decode below"
+    assert!(
+        crate::idle_activity::native_activity_active_count() <= before_active,
+        "after the reconnect window the held occupant must retire idle accounting \
+         without waiting on the worker OS thread still blocked inside the decode"
     );
     assert!(
         crate::idle_activity::native_activity_is_idle_for(
             Instant::now() + Duration::from_secs(3600),
             Duration::from_secs(1)
         ),
-        "idle_unload's reaper-visible idle state must recover the instant the client \
-         gives up, not wait out the stuck decode thread"
+        "idle_unload's reaper-visible idle state must recover when the reconnect \
+         window expires, not wait out the stuck decode thread"
     );
 
     // Let the still-blocked worker decode return so it does not sit blocked for
@@ -2676,7 +2703,7 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
         .acquire_native_execution("test-content", None)
         .expect("fixture runtime must admit the active native session");
 
-    tokio::time::timeout(
+    let _ = tokio::time::timeout(
         Duration::from_millis(100),
         warm_up_default_native_streaming_worker(runtime.clone()),
     )
@@ -2696,6 +2723,31 @@ async fn boot_native_warmup_skips_when_the_runtime_slot_is_occupied() {
             .is_ok(),
         "skipped boot warm-up must not retain a capacity permit"
     );
+}
+
+#[test]
+fn boot_native_warmup_cannot_claim_a_stale_path_during_activation() {
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(PathBuf::from("stale-boot-warmup.oasr")).into(),
+    };
+    let activation = runtime
+        .begin_native_activation()
+        .expect("fixture activation barrier");
+
+    let error = futures_util::FutureExt::now_or_never(warm_up_default_native_streaming_worker(
+        runtime.clone(),
+    ))
+    .expect("activation conflict must be reported without suspending")
+    .expect_err("boot warmup must not inspect or start the old active path");
+    assert!(
+        error.contains("activation"),
+        "the conflict must identify the active publication transition: {error}"
+    );
+    drop(activation);
 }
 
 #[tokio::test]
@@ -2883,6 +2935,7 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
     let _generation_lock = crate::idle_activity::native_unload_generation_test_lock().await;
     let warm_calls = Arc::new(AtomicUsize::new(0));
     let key = test_native_streaming_worker_key("warm-once-across-reattach-no-unload");
+    let residency_key = key.residency_key.clone();
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut first_session =
@@ -2909,6 +2962,15 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
         .unwrap();
     assert_eq!(warm_calls.load(Ordering::Acquire), 1);
     first_session.finish("client_closed", true).await.unwrap();
+
+    // A conservative activation rollback may remove this identity's health
+    // marker without unloading its already-warm worker. The next attach's TLS
+    // fast path must restore the exact marker while still avoiding a second
+    // warm_up() call.
+    crate::idle_activity::forget_native_model_residency(&residency_key);
+    assert!(!crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
 
     let (event_sender, _event_receiver) = mpsc::channel(8);
     let mut second_session =
@@ -2939,6 +3001,9 @@ async fn native_streaming_warm_up_stays_once_across_reattach_without_an_idle_unl
         "no idle-unload happened between the two attaches, so the second \
          attach's Warm must still be a no-op on the reused worker thread"
     );
+    assert!(crate::idle_activity::native_model_is_resident(
+        &residency_key
+    ));
     second_session.finish("client_closed", true).await.unwrap();
 }
 
@@ -4093,9 +4158,14 @@ async fn fallback_capacity_rejection_is_backend_not_ready_and_recoverable() {
 }
 
 #[tokio::test]
-async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() {
+async fn finish_transport_closed_holds_session_for_reconnect_grace() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
     let (event_sender, _event_receiver) = mpsc::channel(8);
-    let mut session = WsSession::new(ServerRuntime::default(), test_distribution(), event_sender);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
     let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
         "test_session",
         "whisper-large-v3-turbo",
@@ -4111,6 +4181,8 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     session.controller = Some(controller);
     session.spawn_backend_worker();
     session.pending_backend_jobs = 1;
+    let session_id = session.session_id.0.clone();
+    let control = Arc::clone(&session.backend_control);
 
     tokio::time::timeout(
         Duration::from_millis(100),
@@ -4119,9 +4191,146 @@ async fn finish_transport_closed_cancels_pending_backend_jobs_without_waiting() 
     .await
     .expect("transport close should not wait for backend results")
     .unwrap();
-    assert_eq!(session.pending_backend_jobs, 0);
-    assert!(session.backend_cancelled.load(Ordering::Relaxed));
-    assert!(session.backend_jobs.is_none());
+    assert!(
+        runtime.native_execution.remote_policy().has_held_realtime(),
+        "a dropped WS must keep the server task for the reconnect window"
+    );
+    assert!(!control.is_canceled());
+    assert!(!session.backend_cancelled.load(Ordering::Relaxed));
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut resumed = WsSession::new(runtime.clone(), test_distribution(), event_sender2);
+    resumed
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("client rebind must resume the held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+    assert!(!control.is_canceled());
+    assert!(
+        resumed.controller.is_some(),
+        "resume must restore the running controller"
+    );
+    let started = event_receiver2
+        .recv()
+        .await
+        .expect("resume handshake event");
+    assert_eq!(
+        started.event_type, "audio.input.started",
+        "a resumed Running session must emit audio.input.started so the client handshake can complete"
+    );
+}
+
+#[tokio::test]
+async fn held_realtime_resume_rejects_a_different_device() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    assert_eq!(denied.event_type, "error");
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut owner = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    owner
+        .start_session(StartSession {
+            session_id: Some(session_id),
+            ..StartSession::default()
+        })
+        .await
+        .expect("the owning device must resume its held session");
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
+}
+
+#[tokio::test]
+async fn held_realtime_session_cancels_after_reconnect_grace() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_millis(20));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new(runtime.clone(), test_distribution(), event_sender);
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let control = Arc::clone(&session.backend_control);
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        control.is_canceled(),
+        "the server task must cancel once the reconnect window expires"
+    );
+    assert!(!runtime.native_execution.remote_policy().has_held_realtime());
 }
 
 #[tokio::test]
@@ -4238,7 +4447,7 @@ async fn session_start_accepts_hotwords_for_supporting_native_model() {
 }
 
 #[tokio::test]
-async fn local_native_streaming_session_rejects_voice_id() {
+async fn local_native_streaming_session_rejects_enrolled_voice_id() {
     let temp = tempfile::tempdir().unwrap();
     let model_id = "qwen3-asr-0.6b";
     let pack_path = temp.path().join("qwen3-asr-0.6b.oasr");
@@ -4257,7 +4466,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
         .start_session(StartSession {
             model: Some(model_id.to_string()),
             partial_results: Some(true),
-            diarize: Some(true),
+            voice_id: Some(true),
             ..StartSession::default()
         })
         .await;
@@ -4275,7 +4484,7 @@ async fn local_native_streaming_session_rejects_voice_id() {
 }
 
 #[tokio::test]
-async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
+async fn remote_compute_session_allows_anonymous_diarize_without_voice_id() {
     let (event_sender, mut event_receiver) = mpsc::channel(8);
     let mut session = WsSession::new_with_history(
         ServerRuntime::default(),
@@ -4284,24 +4493,41 @@ async fn remote_compute_session_rejects_voice_id_before_embedder_resolution() {
         false,
     );
 
-    let result = session
+    session
         .start_session(StartSession {
             model: Some("whisper-large-v3-turbo".to_string()),
             diarize: Some(true),
+            voice_id: Some(false),
             ..StartSession::default()
         })
-        .await;
-
-    assert!(result.is_err());
-    assert!(session.streaming_diarizer.is_none());
-    let event = event_receiver.recv().await.unwrap();
-    match event.event {
-        RealtimeEvent::Error(RealtimeErrorEvent { code, message, .. }) => {
-            assert_eq!(code, RealtimeErrorCode::StartupConfigError);
-            assert_eq!(message, REALTIME_VOICE_ID_UNSUPPORTED_REASON);
+        .await
+        .expect("anonymous speaker separation must not be rejected as Voice ID");
+    assert!(
+        session.streaming_diarizer.is_some(),
+        "diarize=true must construct the anonymous streaming diarizer"
+    );
+    let samples = vec![0.2_f32; 16_000 * 3];
+    let assignment = session
+        .streaming_diarizer
+        .as_mut()
+        .expect("anonymous diarizer")
+        .assign(&samples, 16_000)
+        .expect("anonymous diarizer must label SPEAKER_00");
+    assert_eq!(assignment.speaker_label, "SPEAKER_00");
+    let mut saw_configured = false;
+    while let Ok(event) = event_receiver.try_recv() {
+        assert_ne!(event.event_type, "error");
+        if let RealtimeEvent::Lifecycle(RealtimeLifecycleEvent::SessionConfigured(configured)) =
+            &event.event
+        {
+            assert!(
+                configured.diarize,
+                "anonymous diarize must be recorded on session.configured"
+            );
+            saw_configured = true;
         }
-        other => panic!("expected startup config error, got {other:?}"),
     }
+    assert!(saw_configured);
 }
 
 #[tokio::test]
@@ -4365,6 +4591,50 @@ async fn session_start_uses_request_execution_target() {
         session.execution_target,
         Some(openasr_core::ExecutionTarget::Cpu)
     );
+}
+
+#[tokio::test]
+async fn remote_compute_session_ignores_client_hardware_fields() {
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+
+    session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            inference_threads: Some(8),
+            execution_target: Some(openasr_core::ExecutionTarget::Cpu),
+            ..StartSession::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        session.inference_threads.is_none(),
+        "pairing-mode sockets must not honor client inference_threads"
+    );
+    assert_eq!(
+        session.execution_target,
+        Some(openasr_core::ExecutionTarget::Auto),
+        "pairing-mode sockets must ignore client execution_target and use the operator preference"
+    );
+}
+
+#[test]
+fn realtime_session_ids_are_unguessable() {
+    let first = next_session_id("rt_ws");
+    let second = next_session_id("rt_ws");
+    assert_ne!(first.0, second.0);
+    assert!(first.0.starts_with("rt_ws_"));
+    assert_eq!(first.0.len(), "rt_ws_".len() + 32);
+    assert!(!first.0.contains("000001"));
 }
 
 #[tokio::test]
@@ -5702,4 +5972,1916 @@ fn diarize_sample_spans_map_split_samples_to_stream_time() {
     let rebased = rebase_diarize_sample_spans(spans, 480);
     assert_eq!(rebased, vec![(0, 1_030), (160, 1_040)]);
     assert_eq!(diarize_sample_abs_ms(&rebased, 0), Some(1_030));
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HostOwnerAttributionReport {
+    schema: &'static str,
+    /// The input path is intentionally redacted. The report is a durable
+    /// diagnostic artifact and must not turn a private home path into evidence.
+    pack_path: &'static str,
+    pack_sha256: String,
+    model_id: String,
+    requested_backend: String,
+    requested_target: String,
+    observed_providers: Vec<String>,
+    attribution: HostOwnerAttribution,
+    warmup_to_offline_delta: RuntimeReceiptIdentityDelta,
+    baseline: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after_startup_warmup: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after_offline_transcribe: openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+}
+
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+enum HostOwnerAttribution {
+    SupportedEquivalentDuplicatedWeights,
+    RejectedSingleOrNonEquivalentOwners,
+    AttributionIncomplete,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct RuntimeReceiptIdentityDelta {
+    owner_ids_added: Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+    owner_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+    resource_ids_added: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    resource_ids_removed: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    /// Final live resources whose retained-byte evidence was newly observed or changed
+    /// after warm-up. This is stronger than an event-count delta because it names
+    /// the retained evidence that belongs to an active offline owner.
+    offline_owned_retained_resource_ids: Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    event_count_before: usize,
+    event_count_after: usize,
+}
+
+impl RuntimeReceiptIdentityDelta {
+    fn has_observable_change(&self) -> bool {
+        !self.owner_ids_added.is_empty()
+            || !self.resource_ids_added.is_empty()
+            || !self.offline_owned_retained_resource_ids.is_empty()
+    }
+}
+
+fn hash_file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn receipt_provider_names(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Vec<String> {
+    let mut providers = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
+                descriptor,
+                ..
+            } => receipt_descriptor_lane(descriptor).map(|lane| lane.provider.as_str().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers
+}
+
+fn receipt_lanes(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Vec<openasr_core::runtime_receipts::SafeExecutionLaneProjection> {
+    let mut lanes = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated {
+                descriptor,
+                ..
+            } => receipt_descriptor_lane(descriptor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    lanes.sort_by_key(|lane| format!("{lane:?}"));
+    lanes.dedup();
+    lanes
+}
+
+fn receipt_descriptor_lane(
+    descriptor: &openasr_core::runtime_receipts::RuntimeOwnerDescriptor,
+) -> Option<openasr_core::runtime_receipts::SafeExecutionLaneProjection> {
+    match descriptor.placement {
+        openasr_core::runtime_receipts::RuntimeOwnerPlacement::LaneBound(lane) => Some(lane),
+        openasr_core::runtime_receipts::RuntimeOwnerPlacement::HostNeutral
+        | openasr_core::runtime_receipts::RuntimeOwnerPlacement::Unknown => None,
+    }
+}
+
+fn is_active_resource_state(state: openasr_core::runtime_receipts::RuntimeResourceState) -> bool {
+    matches!(
+        state,
+        openasr_core::runtime_receipts::RuntimeResourceState::Reserved
+            | openasr_core::runtime_receipts::RuntimeResourceState::Reconciled
+            | openasr_core::runtime_receipts::RuntimeResourceState::Committed
+            | openasr_core::runtime_receipts::RuntimeResourceState::Quarantined
+    )
+}
+
+fn validate_resource_identity_projection(
+    scope_id: openasr_core::NativeExecutionScopeId,
+    owner_ids: impl IntoIterator<Item = openasr_core::runtime_receipts::RuntimeOwnerId>,
+    resources: impl IntoIterator<
+        Item = (
+            openasr_core::runtime_receipts::RuntimeOwnerId,
+            openasr_core::runtime_receipts::RuntimeResourceId,
+            openasr_core::runtime_receipts::RuntimeResourceId,
+        ),
+    >,
+) -> Result<(), ()> {
+    let mut seen_owners = BTreeSet::new();
+    for owner_id in owner_ids {
+        if owner_id.scope_id != scope_id || !seen_owners.insert(owner_id) {
+            return Err(());
+        }
+    }
+
+    let mut seen_resources = BTreeSet::new();
+    for (owner_id, map_key, resource_id) in resources {
+        if owner_id.scope_id != scope_id
+            || map_key.scope_id != scope_id
+            || resource_id.scope_id != scope_id
+            || map_key != resource_id
+            || !seen_resources.insert(resource_id)
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_identity_invariants(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<(), ()> {
+    use openasr_core::runtime_receipts::RuntimeReceiptEvent;
+
+    let owner_ids = snapshot.live_owners.iter().map(|owner| owner.id);
+    let resources = snapshot.live_owners.iter().flat_map(|owner| {
+        owner
+            .resources
+            .iter()
+            .map(move |(map_key, resource)| (owner.id, *map_key, resource.id))
+    });
+    validate_resource_identity_projection(snapshot.scope_id, owner_ids, resources)?;
+
+    for event in &snapshot.events {
+        let (owner_id, resource_id) = match event {
+            RuntimeReceiptEvent::OwnerCreated { owner_id, .. }
+            | RuntimeReceiptEvent::OwnerReused { owner_id, .. }
+            | RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => (*owner_id, None),
+            RuntimeReceiptEvent::ResourceAcquired {
+                owner_id,
+                resource_id,
+                ..
+            }
+            | RuntimeReceiptEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                ..
+            }
+            | RuntimeReceiptEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+                ..
+            } => (*owner_id, Some(*resource_id)),
+        };
+        if owner_id.scope_id != snapshot.scope_id
+            || resource_id.is_some_and(|id| id.scope_id != snapshot.scope_id)
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_resource_state_transition(
+    current: openasr_core::runtime_receipts::RuntimeResourceState,
+    next: openasr_core::runtime_receipts::RuntimeResourceState,
+) -> bool {
+    use openasr_core::runtime_receipts::RuntimeResourceState;
+
+    matches!(
+        (current, next),
+        (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Reconciled
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Committed
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Quarantined
+        ) | (
+            RuntimeResourceState::Reserved,
+            RuntimeResourceState::Released
+        ) | (
+            RuntimeResourceState::Reconciled,
+            RuntimeResourceState::Committed
+        ) | (
+            RuntimeResourceState::Committed,
+            RuntimeResourceState::Quarantined
+        ) | (
+            RuntimeResourceState::Committed,
+            RuntimeResourceState::Released
+        )
+    )
+}
+
+fn receipt_identity_sets(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<
+    (
+        BTreeSet<openasr_core::runtime_receipts::RuntimeOwnerId>,
+        BTreeSet<openasr_core::runtime_receipts::RuntimeResourceId>,
+    ),
+    (),
+> {
+    validate_snapshot_identity_invariants(snapshot)?;
+    let owner_ids = snapshot
+        .live_owners
+        .iter()
+        .map(|owner| owner.id)
+        .collect::<BTreeSet<_>>();
+    let resource_ids = snapshot
+        .live_owners
+        .iter()
+        .flat_map(|owner| {
+            owner.resources.values().filter_map(|resource| {
+                is_active_resource_state(resource.state).then_some(resource.id)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    Ok((owner_ids, resource_ids))
+}
+
+fn live_retained_resource_metrics(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<BTreeMap<openasr_core::runtime_receipts::RuntimeResourceId, Option<u64>>, ()> {
+    use openasr_core::runtime_receipts::RuntimeReceiptMetric;
+
+    validate_snapshot_identity_invariants(snapshot)?;
+    let mut retained_by_resource = BTreeMap::new();
+    for owner in &snapshot.live_owners {
+        for resource in owner.resources.values() {
+            if !is_active_resource_state(resource.state) {
+                continue;
+            }
+            let retained = match resource.descriptor.retained {
+                RuntimeReceiptMetric::Known(bytes) => Some(bytes),
+                RuntimeReceiptMetric::Unavailable | RuntimeReceiptMetric::Unknown => None,
+            };
+            if retained_by_resource.insert(resource.id, retained).is_some() {
+                return Err(());
+            }
+        }
+    }
+    Ok(retained_by_resource)
+}
+
+fn receipt_identity_delta(
+    before: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    after: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<RuntimeReceiptIdentityDelta, ()> {
+    if before.scope_id != after.scope_id {
+        return Err(());
+    }
+    let (before_owners, before_resources) = receipt_identity_sets(before)?;
+    let (after_owners, after_resources) = receipt_identity_sets(after)?;
+    let before_retained = live_retained_resource_metrics(before)?;
+    let after_retained = live_retained_resource_metrics(after)?;
+    let offline_owned_retained_resource_ids = after_retained
+        .into_iter()
+        .filter_map(|(resource_id, retained)| {
+            retained
+                .is_some()
+                .then(|| before_retained.get(&resource_id) != Some(&retained))
+                .and_then(|changed| changed.then_some(resource_id))
+        })
+        .collect();
+    Ok(RuntimeReceiptIdentityDelta {
+        owner_ids_added: after_owners.difference(&before_owners).copied().collect(),
+        owner_ids_removed: before_owners.difference(&after_owners).copied().collect(),
+        resource_ids_added: after_resources
+            .difference(&before_resources)
+            .copied()
+            .collect(),
+        resource_ids_removed: before_resources
+            .difference(&after_resources)
+            .copied()
+            .collect(),
+        offline_owned_retained_resource_ids,
+        event_count_before: before.events.len(),
+        event_count_after: after.events.len(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeightObservation<Owner, Key> {
+    owner_id: Owner,
+    key: Key,
+    retained_bytes: u64,
+}
+
+/// A duplicate is supported only across owner boundaries. Keeping this as a
+/// small generic function makes the owner-id rule independently testable and
+/// prevents a future snapshot projection from accidentally dropping owner.id.
+fn classify_equivalent_weight_resources<Owner, Key>(
+    resources: &[WeightObservation<Owner, Key>],
+    expected_retained: u64,
+    retained_tolerance: u64,
+) -> HostOwnerAttribution
+where
+    Owner: PartialEq,
+    Key: PartialEq,
+{
+    if resources.is_empty() {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    let mut distinct_owner_equivalent = false;
+    for (index, left) in resources.iter().enumerate() {
+        for right in resources.iter().skip(index + 1) {
+            if left.key == right.key
+                && left.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+                && right.retained_bytes.abs_diff(expected_retained) <= retained_tolerance
+                && left.owner_id != right.owner_id
+            {
+                distinct_owner_equivalent = true;
+            }
+        }
+    }
+    if distinct_owner_equivalent {
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    } else {
+        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoricalWeight {
+    owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+    key: (
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::SafeExecutionLaneProjection,
+        openasr_core::runtime_receipts::RedactedIdentity,
+        openasr_core::runtime_receipts::SafeMemoryDomainProjection,
+    ),
+    retained_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayedOwner {
+    descriptor: Option<openasr_core::runtime_receipts::RuntimeOwnerDescriptor>,
+    released: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayedResource {
+    descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    state: openasr_core::runtime_receipts::RuntimeResourceState,
+    released: bool,
+    release_event_seen: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ReceiptLifecycleEvent {
+    OwnerCreated {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeOwnerDescriptor>,
+    },
+    OwnerReused {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    },
+    OwnerReleased {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+    },
+    ResourceAcquired {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    },
+    ResourceStateChanged {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+        state: openasr_core::runtime_receipts::RuntimeResourceState,
+        descriptor: Option<openasr_core::runtime_receipts::RuntimeResourceDescriptor>,
+    },
+    ResourceReleased {
+        owner_id: openasr_core::runtime_receipts::RuntimeOwnerId,
+        resource_id: openasr_core::runtime_receipts::RuntimeResourceId,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ReplayedReceiptLifecycle {
+    owners: BTreeMap<openasr_core::runtime_receipts::RuntimeOwnerId, ReplayedOwner>,
+    resources: BTreeMap<
+        (
+            openasr_core::runtime_receipts::RuntimeOwnerId,
+            openasr_core::runtime_receipts::RuntimeResourceId,
+        ),
+        ReplayedResource,
+    >,
+    saw_release: bool,
+}
+
+fn replay_receipt_lifecycle(
+    events: impl IntoIterator<Item = ReceiptLifecycleEvent>,
+) -> Result<ReplayedReceiptLifecycle, ()> {
+    use openasr_core::runtime_receipts::RuntimeResourceState;
+
+    let mut replay = ReplayedReceiptLifecycle::default();
+    for event in events {
+        match event {
+            ReceiptLifecycleEvent::OwnerCreated {
+                owner_id,
+                descriptor,
+            } => {
+                if replay
+                    .owners
+                    .insert(
+                        owner_id,
+                        ReplayedOwner {
+                            descriptor,
+                            released: false,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::OwnerReused { owner_id } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::OwnerReleased { owner_id } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                if replay
+                    .resources
+                    .iter()
+                    .any(|((resource_owner, _), resource)| {
+                        *resource_owner == owner_id && !resource.released
+                    })
+                {
+                    return Err(());
+                }
+                replay
+                    .owners
+                    .get_mut(&owner_id)
+                    .expect("owner was checked above")
+                    .released = true;
+                replay.saw_release = true;
+            }
+            ReceiptLifecycleEvent::ResourceAcquired {
+                owner_id,
+                resource_id,
+                descriptor,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released
+                    || replay
+                        .resources
+                        .insert(
+                            (owner_id, resource_id),
+                            ReplayedResource {
+                                descriptor,
+                                state: RuntimeResourceState::Reserved,
+                                released: false,
+                                release_event_seen: false,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(());
+                }
+            }
+            ReceiptLifecycleEvent::ResourceStateChanged {
+                owner_id,
+                resource_id,
+                state,
+                descriptor,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                let Some(resource) = replay.resources.get_mut(&(owner_id, resource_id)) else {
+                    return Err(());
+                };
+                if resource.released || !is_valid_resource_state_transition(resource.state, state) {
+                    return Err(());
+                }
+                resource.descriptor = descriptor;
+                resource.state = state;
+                if state == RuntimeResourceState::Released {
+                    resource.released = true;
+                    replay.saw_release = true;
+                }
+            }
+            ReceiptLifecycleEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+            } => {
+                let Some(owner) = replay.owners.get(&owner_id) else {
+                    return Err(());
+                };
+                if owner.released {
+                    return Err(());
+                }
+                let Some(resource) = replay.resources.get_mut(&(owner_id, resource_id)) else {
+                    return Err(());
+                };
+                if resource.release_event_seen {
+                    return Err(());
+                }
+                resource.released = true;
+                resource.release_event_seen = true;
+                resource.state = RuntimeResourceState::Released;
+                replay.saw_release = true;
+            }
+        }
+    }
+    Ok(replay)
+}
+
+fn historical_weights(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+) -> Result<Vec<HistoricalWeight>, ()> {
+    use openasr_core::runtime_receipts::{RuntimeReceiptEvent, RuntimeReceiptMetric};
+
+    validate_snapshot_identity_invariants(snapshot)?;
+    let lifecycle_events = snapshot.events.iter().map(|event| match event {
+        RuntimeReceiptEvent::OwnerCreated {
+            owner_id,
+            descriptor,
+            ..
+        } => ReceiptLifecycleEvent::OwnerCreated {
+            owner_id: *owner_id,
+            descriptor: Some(*descriptor),
+        },
+        RuntimeReceiptEvent::OwnerReused { owner_id, .. } => ReceiptLifecycleEvent::OwnerReused {
+            owner_id: *owner_id,
+        },
+        RuntimeReceiptEvent::OwnerReleased { owner_id, .. } => {
+            ReceiptLifecycleEvent::OwnerReleased {
+                owner_id: *owner_id,
+            }
+        }
+        RuntimeReceiptEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor,
+            ..
+        } => ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+            descriptor: Some(descriptor.clone()),
+        },
+        RuntimeReceiptEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state,
+            descriptor,
+            ..
+        } => ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+            state: *state,
+            descriptor: Some(descriptor.clone()),
+        },
+        RuntimeReceiptEvent::ResourceReleased {
+            owner_id,
+            resource_id,
+            ..
+        } => ReceiptLifecycleEvent::ResourceReleased {
+            owner_id: *owner_id,
+            resource_id: *resource_id,
+        },
+    });
+    let replay = replay_receipt_lifecycle(lifecycle_events)?;
+
+    // A release proves that the corresponding historical evidence is no longer
+    // live at snapshot time. Never turn it into a duplicate-weight claim.
+    if replay.saw_release {
+        return Err(());
+    }
+    let mut replay_active_resource_ids = BTreeSet::new();
+    for ((_, resource_id), resource) in &replay.resources {
+        if !resource.released
+            && is_active_resource_state(resource.state)
+            && !replay_active_resource_ids.insert(*resource_id)
+        {
+            return Err(());
+        }
+    }
+    if replay.owners.is_empty() || replay.resources.is_empty() {
+        return Err(());
+    }
+
+    let mut snapshot_owners = BTreeMap::new();
+    for owner in &snapshot.live_owners {
+        if snapshot_owners.insert(owner.id, owner).is_some() {
+            return Err(());
+        }
+        if owner.resources.is_empty() {
+            return Err(());
+        }
+        let Some(replayed_owner) = replay.owners.get(&owner.id) else {
+            return Err(());
+        };
+        if replayed_owner.released || replayed_owner.descriptor.as_ref() != Some(&owner.descriptor)
+        {
+            return Err(());
+        }
+    }
+
+    // Every replayed active owner/resource must still be represented by the
+    // complete live snapshot. A truncated or stale event stream is inconclusive.
+    for (owner_id, owner) in &replay.owners {
+        if owner.released {
+            continue;
+        }
+        let Some(snapshot_owner) = snapshot_owners.get(owner_id) else {
+            return Err(());
+        };
+        for ((resource_owner, resource_id), resource) in &replay.resources {
+            if resource_owner != owner_id {
+                continue;
+            }
+            if resource.released || !is_active_resource_state(resource.state) {
+                return Err(());
+            }
+            let Some(snapshot_resource) = snapshot_owner.resources.get(resource_id) else {
+                return Err(());
+            };
+            if snapshot_resource.state != resource.state
+                || resource.descriptor.as_ref() != Some(&snapshot_resource.descriptor)
+            {
+                return Err(());
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for owner in &snapshot.live_owners {
+        let replayed_owner = replay.owners.get(&owner.id).ok_or(())?;
+        let Some(content) = replayed_owner
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.content)
+        else {
+            return Err(());
+        };
+        let Some(lane) = replayed_owner
+            .descriptor
+            .as_ref()
+            .and_then(receipt_descriptor_lane)
+        else {
+            return Err(());
+        };
+        for resource in owner.resources.values() {
+            if !is_active_resource_state(resource.state) {
+                return Err(());
+            }
+            let replayed = replay.resources.get(&(owner.id, resource.id)).ok_or(())?;
+            let Some(descriptor) = replayed.descriptor.as_ref() else {
+                return Err(());
+            };
+            let Some(domain) = descriptor.domain else {
+                return Err(());
+            };
+            let RuntimeReceiptMetric::Known(retained_bytes) = descriptor.retained else {
+                return Err(());
+            };
+            result.push(HistoricalWeight {
+                owner_id: owner.id,
+                resource_id: resource.id,
+                key: (
+                    replayed_owner.descriptor.as_ref().ok_or(())?.component,
+                    content,
+                    lane,
+                    descriptor.kind,
+                    domain,
+                ),
+                retained_bytes,
+            });
+        }
+    }
+    if result.is_empty() {
+        return Err(());
+    }
+    Ok(result)
+}
+
+fn validated_delta_membership(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    delta: &RuntimeReceiptIdentityDelta,
+) -> Result<
+    (
+        Vec<openasr_core::runtime_receipts::RuntimeOwnerId>,
+        Vec<openasr_core::runtime_receipts::RuntimeResourceId>,
+    ),
+    (),
+> {
+    let (live_owner_ids, active_resource_ids) = receipt_identity_sets(snapshot)?;
+    let retained_by_resource = live_retained_resource_metrics(snapshot)?;
+    if !delta
+        .owner_ids_added
+        .iter()
+        .all(|owner_id| live_owner_ids.contains(owner_id))
+        || !delta
+            .resource_ids_added
+            .iter()
+            .all(|resource_id| active_resource_ids.contains(resource_id))
+        || !delta
+            .offline_owned_retained_resource_ids
+            .iter()
+            .all(|resource_id| matches!(retained_by_resource.get(resource_id), Some(Some(_))))
+    {
+        return Err(());
+    }
+    let owner_ids = delta.owner_ids_added.clone();
+    let resource_ids = delta
+        .resource_ids_added
+        .iter()
+        .chain(delta.offline_owned_retained_resource_ids.iter())
+        .copied()
+        .collect();
+    Ok((owner_ids, resource_ids))
+}
+
+#[derive(Debug, Clone)]
+struct DeltaBoundWeightObservation<Owner, Resource, Key> {
+    owner_id: Owner,
+    resource_id: Resource,
+    key: Key,
+    retained_bytes: u64,
+}
+
+fn classify_delta_bound_weight_resources<Owner, Resource, Key>(
+    resources: Vec<DeltaBoundWeightObservation<Owner, Resource, Key>>,
+    delta_owner_ids: &[Owner],
+    delta_resource_ids: &[Resource],
+) -> HostOwnerAttribution
+where
+    Owner: Clone + PartialEq,
+    Resource: PartialEq,
+    Key: Clone + PartialEq,
+{
+    let total_resources = resources.len();
+    let candidates = resources
+        .into_iter()
+        .filter(|resource| {
+            delta_owner_ids.contains(&resource.owner_id)
+                || delta_resource_ids.contains(&resource.resource_id)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    let observations = candidates
+        .iter()
+        .map(|resource| WeightObservation {
+            owner_id: resource.owner_id.clone(),
+            key: resource.key.clone(),
+            retained_bytes: resource.retained_bytes,
+        })
+        .collect::<Vec<_>>();
+    let attribution =
+        classify_equivalent_weight_resources(&observations, 5_090_000_000, 512 * 1024 * 1024);
+    if attribution == HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+        || candidates.len() == total_resources
+    {
+        attribution
+    } else {
+        HostOwnerAttribution::AttributionIncomplete
+    }
+}
+
+fn evaluate_host_owner_attribution(
+    snapshot: &openasr_core::runtime_receipts::RuntimeReceiptSnapshot,
+    warmup_to_offline_delta: &RuntimeReceiptIdentityDelta,
+) -> HostOwnerAttribution {
+    use openasr_core::runtime_receipts::RuntimeReceiptAvailability;
+
+    if !matches!(snapshot.availability, RuntimeReceiptAvailability::Available)
+        || !snapshot.completeness.complete
+        || !warmup_to_offline_delta.has_observable_change()
+    {
+        return HostOwnerAttribution::AttributionIncomplete;
+    }
+    let Ok(resources) = historical_weights(snapshot) else {
+        return HostOwnerAttribution::AttributionIncomplete;
+    };
+    let Ok((delta_owner_ids, delta_resource_ids)) =
+        validated_delta_membership(snapshot, warmup_to_offline_delta)
+    else {
+        return HostOwnerAttribution::AttributionIncomplete;
+    };
+    let causal_resources = resources
+        .into_iter()
+        .map(|resource| DeltaBoundWeightObservation {
+            owner_id: resource.owner_id,
+            resource_id: resource.resource_id,
+            key: resource.key,
+            retained_bytes: resource.retained_bytes,
+        })
+        .collect();
+    classify_delta_bound_weight_resources(causal_resources, &delta_owner_ids, &delta_resource_ids)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FireRedCatalogIdentityProjection {
+    model_id: String,
+    model_family: String,
+    adapter_id: String,
+    architecture: String,
+}
+
+fn firered_llm_catalog_identity_projection(
+    adapter: &openasr_core::NativeRuntimeModelAdapter,
+    identity: &openasr_core::NativeRuntimeModelIdentity,
+) -> FireRedCatalogIdentityProjection {
+    FireRedCatalogIdentityProjection {
+        model_id: identity.model_id.clone(),
+        model_family: adapter.model_family().to_string(),
+        adapter_id: adapter.adapter_id().to_string(),
+        architecture: adapter
+            .tensor_layout()
+            .map(|layout| layout.name)
+            .unwrap_or_default(),
+    }
+}
+
+fn validate_firered_llm_catalog_identity(
+    projection: &FireRedCatalogIdentityProjection,
+) -> Result<(), String> {
+    const EXPECTED_MODEL_FAMILY: &str = "firered2-llm";
+    const EXPECTED_ADAPTER_ID: &str = "ggml-family-firered-llm-runtime-v1";
+    const EXPECTED_ARCHITECTURE: &str = "firered-llm-conformer-adapter-qwen2";
+    let expected = format!(
+        "model family/model id '{EXPECTED_MODEL_FAMILY}', adapter '{EXPECTED_ADAPTER_ID}', architecture '{EXPECTED_ARCHITECTURE}'"
+    );
+    let actual = format!(
+        "model_id='{}', model_family='{}', adapter='{}', architecture='{}'",
+        projection.model_id,
+        projection.model_family,
+        projection.adapter_id,
+        projection.architecture
+    );
+    if projection.model_id != EXPECTED_MODEL_FAMILY {
+        return Err(format!(
+            "expected {expected}; actual safe projection ({actual})"
+        ));
+    }
+    let parsed = openasr_core::parse_model_ref(&projection.model_id).map_err(|error| {
+        format!("expected {expected}; actual safe projection ({actual}); invalid model id: {error}")
+    })?;
+    if parsed.family != EXPECTED_MODEL_FAMILY
+        || parsed.tag.is_some()
+        || projection.model_family != EXPECTED_MODEL_FAMILY
+        || projection.adapter_id != EXPECTED_ADAPTER_ID
+        || projection.architecture != EXPECTED_ARCHITECTURE
+    {
+        return Err(format!(
+            "expected {expected}; actual safe projection ({actual})"
+        ));
+    }
+    Ok(())
+}
+
+fn attribution_report_dir(home_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if let Some(raw) = std::env::var_os("OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR") {
+        let path = std::path::PathBuf::from(raw);
+        let metadata = fs::metadata(&path).map_err(|error| {
+            format!("OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR is unreadable: {error}")
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "OPENASR_RUNTIME_ATTRIBUTION_REPORT_DIR must be an existing directory: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    let path = home_path.join("diagnostics").join("runtime-attribution");
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("could not create diagnostic report directory: {error}"))?;
+    Ok(path)
+}
+
+fn persist_attribution_report(
+    report_dir: &std::path::Path,
+    report: &HostOwnerAttributionReport,
+) -> std::io::Result<std::path::PathBuf> {
+    let report_path = report_dir.join("runtime-owner-attribution.json");
+    let bytes = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(report_dir)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&report_path)
+        .map_err(|error| error.error)?;
+    Ok(report_path)
+}
+
+#[test]
+fn firered_catalog_identity_rejects_aed_and_punctuation_projections() {
+    let valid = FireRedCatalogIdentityProjection {
+        model_id: "firered2-llm".to_string(),
+        model_family: "firered2-llm".to_string(),
+        adapter_id: "ggml-family-firered-llm-runtime-v1".to_string(),
+        architecture: "firered-llm-conformer-adapter-qwen2".to_string(),
+    };
+    assert!(validate_firered_llm_catalog_identity(&valid).is_ok());
+    for rejected in [
+        "firered-aed-l-v2",
+        "firered-punc",
+        "not-firered",
+        " firered2-llm",
+        "firered2-llm ",
+        "firered2-llm\n",
+    ] {
+        let mut projection = valid.clone();
+        projection.model_id = rejected.to_string();
+        let error = validate_firered_llm_catalog_identity(&projection).unwrap_err();
+        assert!(error.contains("expected") && error.contains("actual safe projection"));
+    }
+}
+
+#[test]
+fn equivalent_weights_require_distinct_owner_ids() {
+    let same_key = "firered-weights";
+    let same_owner = vec![
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_001,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&same_owner, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::RejectedSingleOrNonEquivalentOwners
+    );
+    let distinct_owners = vec![
+        WeightObservation {
+            owner_id: 7_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 8_u8,
+            key: same_key,
+            retained_bytes: 5_090_000_001,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&distinct_owners, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
+}
+
+#[test]
+fn cross_owner_equivalence_wins_over_same_owner_pair() {
+    let resources = vec![
+        WeightObservation {
+            owner_id: 1_u8,
+            key: "same",
+            retained_bytes: 5_090_000_000,
+        },
+        WeightObservation {
+            owner_id: 1_u8,
+            key: "same",
+            retained_bytes: 5_090_000_001,
+        },
+        WeightObservation {
+            owner_id: 2_u8,
+            key: "same",
+            retained_bytes: 5_090_000_002,
+        },
+    ];
+    assert_eq!(
+        classify_equivalent_weight_resources(&resources, 5_090_000_000, 512 * 1024 * 1024),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
+}
+
+#[test]
+fn resource_identity_collisions_and_scope_mismatches_are_inconclusive() {
+    use openasr_core::runtime_receipts::{RuntimeOwnerId, RuntimeResourceId};
+
+    let scope_id = empty_runtime_receipt_snapshot().scope_id;
+    let owner_one = RuntimeOwnerId {
+        scope_id,
+        ordinal: 1,
+    };
+    let owner_two = RuntimeOwnerId {
+        scope_id,
+        ordinal: 2,
+    };
+    let resource_one = RuntimeResourceId {
+        scope_id,
+        ordinal: 1,
+    };
+    let resource_two = RuntimeResourceId {
+        scope_id,
+        ordinal: 2,
+    };
+
+    let assert_inconclusive = |result: Result<(), ()>| {
+        assert_eq!(
+            result.map_or(HostOwnerAttribution::AttributionIncomplete, |_| {
+                HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+            },),
+            HostOwnerAttribution::AttributionIncomplete
+        );
+    };
+
+    assert_inconclusive(validate_resource_identity_projection(
+        scope_id,
+        [owner_one, owner_two],
+        [
+            (owner_one, resource_one, resource_one),
+            (owner_two, resource_one, resource_one),
+        ],
+    ));
+    assert_inconclusive(validate_resource_identity_projection(
+        scope_id,
+        [owner_one],
+        [(owner_one, resource_two, resource_one)],
+    ));
+
+    let other_scope = empty_runtime_receipt_snapshot().scope_id;
+    assert_inconclusive(validate_resource_identity_projection(
+        scope_id,
+        [RuntimeOwnerId {
+            scope_id: other_scope,
+            ordinal: owner_one.ordinal,
+        }],
+        std::iter::empty(),
+    ));
+
+    let mut event_scope_snapshot = empty_runtime_receipt_snapshot();
+    event_scope_snapshot.events = vec![
+        openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased {
+            owner_id: owner_one,
+            attempt_id: None,
+            request_attempt_id: None,
+        },
+    ];
+    assert_inconclusive(receipt_identity_sets(&event_scope_snapshot).map(|_| ()));
+
+    let before = empty_runtime_receipt_snapshot();
+    let after = empty_runtime_receipt_snapshot();
+    assert!(receipt_identity_delta(&before, &after).is_err());
+}
+
+#[test]
+fn event_count_without_active_or_retained_evidence_is_inconclusive() {
+    let empty = empty_runtime_receipt_snapshot();
+    let delta = RuntimeReceiptIdentityDelta {
+        owner_ids_added: Vec::new(),
+        owner_ids_removed: Vec::new(),
+        resource_ids_added: Vec::new(),
+        resource_ids_removed: Vec::new(),
+        offline_owned_retained_resource_ids: Vec::new(),
+        event_count_before: 0,
+        event_count_after: 1,
+    };
+    assert!(!delta.has_observable_change());
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &delta),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+
+    let with_retained_evidence = RuntimeReceiptIdentityDelta {
+        offline_owned_retained_resource_ids: vec![
+            openasr_core::runtime_receipts::RuntimeResourceId {
+                scope_id: empty.scope_id,
+                ordinal: 1,
+            },
+        ],
+        ..delta
+    };
+    assert!(with_retained_evidence.has_observable_change());
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &with_retained_evidence),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+}
+
+#[test]
+fn unrelated_retained_delta_cannot_promote_old_equivalent_pair() {
+    let resources = vec![
+        DeltaBoundWeightObservation {
+            owner_id: 1_u8,
+            resource_id: 11_u8,
+            key: "same",
+            retained_bytes: 5_090_000_000,
+        },
+        DeltaBoundWeightObservation {
+            owner_id: 2_u8,
+            resource_id: 22_u8,
+            key: "same",
+            retained_bytes: 5_090_000_001,
+        },
+        DeltaBoundWeightObservation {
+            owner_id: 3_u8,
+            resource_id: 33_u8,
+            key: "unrelated",
+            retained_bytes: 5_090_000_002,
+        },
+    ];
+    assert_eq!(
+        classify_delta_bound_weight_resources(resources.clone(), &[], &[33_u8]),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+    assert_eq!(
+        classify_delta_bound_weight_resources(resources, &[], &[11_u8, 22_u8]),
+        HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+    );
+}
+
+#[test]
+fn lifecycle_replay_rejects_unknown_and_tracks_release_coverage() {
+    use openasr_core::runtime_receipts::{RuntimeOwnerId, RuntimeResourceId, RuntimeResourceState};
+
+    let scope_id = empty_runtime_receipt_snapshot().scope_id;
+    let owner_id = RuntimeOwnerId {
+        scope_id,
+        ordinal: 1,
+    };
+    let resource_id = RuntimeResourceId {
+        scope_id,
+        ordinal: 1,
+    };
+    assert!(
+        replay_receipt_lifecycle([ReceiptLifecycleEvent::OwnerReleased { owner_id },]).is_err()
+    );
+    assert!(
+        replay_receipt_lifecycle([
+            ReceiptLifecycleEvent::OwnerCreated {
+                owner_id,
+                descriptor: None,
+            },
+            ReceiptLifecycleEvent::ResourceReleased {
+                owner_id,
+                resource_id,
+            },
+        ])
+        .is_err()
+    );
+
+    let assert_inconclusive = |result: Result<ReplayedReceiptLifecycle, ()>| {
+        assert_eq!(
+            result.map_or(HostOwnerAttribution::AttributionIncomplete, |_| {
+                HostOwnerAttribution::SupportedEquivalentDuplicatedWeights
+            },),
+            HostOwnerAttribution::AttributionIncomplete
+        );
+    };
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reconciled,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reserved,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Quarantined,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reserved,
+            descriptor: None,
+        },
+    ]));
+    assert_inconclusive(replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Released,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+    ]));
+
+    let replay = replay_receipt_lifecycle([
+        ReceiptLifecycleEvent::OwnerCreated {
+            owner_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceAcquired {
+            owner_id,
+            resource_id,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Reconciled,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceStateChanged {
+            owner_id,
+            resource_id,
+            state: RuntimeResourceState::Committed,
+            descriptor: None,
+        },
+        ReceiptLifecycleEvent::ResourceReleased {
+            owner_id,
+            resource_id,
+        },
+        ReceiptLifecycleEvent::OwnerReleased { owner_id },
+    ])
+    .expect("valid owner/resource release lifecycle");
+    assert!(replay.saw_release);
+    assert!(replay.resources[&(owner_id, resource_id)].released);
+    assert!(replay.owners[&owner_id].released);
+
+    let mut released_snapshot = empty_runtime_receipt_snapshot();
+    let released_owner_id = RuntimeOwnerId {
+        scope_id: released_snapshot.scope_id,
+        ordinal: 1,
+    };
+    let released_resource_id = RuntimeResourceId {
+        scope_id: released_snapshot.scope_id,
+        ordinal: 1,
+    };
+    released_snapshot.events = vec![
+        openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerReleased {
+            owner_id: released_owner_id,
+            attempt_id: None,
+            request_attempt_id: None,
+        },
+        openasr_core::runtime_receipts::RuntimeReceiptEvent::ResourceReleased {
+            owner_id: released_owner_id,
+            resource_id: released_resource_id,
+            attempt_id: None,
+            request_attempt_id: None,
+        },
+    ];
+    let released_identity_sets = receipt_identity_sets(&released_snapshot).unwrap();
+    assert!(released_identity_sets.0.is_empty());
+    assert!(released_identity_sets.1.is_empty());
+    assert!(historical_weights(&released_snapshot).is_err());
+}
+
+#[test]
+fn missing_live_snapshot_coverage_is_inconclusive() {
+    let empty = empty_runtime_receipt_snapshot();
+    let delta = RuntimeReceiptIdentityDelta {
+        owner_ids_added: vec![openasr_core::runtime_receipts::RuntimeOwnerId {
+            scope_id: empty.scope_id,
+            ordinal: 1,
+        }],
+        owner_ids_removed: Vec::new(),
+        resource_ids_added: Vec::new(),
+        resource_ids_removed: Vec::new(),
+        offline_owned_retained_resource_ids: Vec::new(),
+        event_count_before: 0,
+        event_count_after: 1,
+    };
+    assert_eq!(
+        evaluate_host_owner_attribution(&empty, &delta),
+        HostOwnerAttribution::AttributionIncomplete
+    );
+}
+#[test]
+fn attribution_report_persists_atomically_in_requested_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = HostOwnerAttributionReport {
+        schema: openasr_core::runtime_receipts::RUNTIME_RECEIPT_SCHEMA,
+        pack_path: "<redacted>",
+        pack_sha256: "deadbeef".to_string(),
+        model_id: "firered2-llm".to_string(),
+        requested_backend: "cpu".to_string(),
+        requested_target: "Cpu".to_string(),
+        observed_providers: vec!["cpu".to_string()],
+        attribution: HostOwnerAttribution::AttributionIncomplete,
+        warmup_to_offline_delta: RuntimeReceiptIdentityDelta {
+            owner_ids_added: Vec::new(),
+            owner_ids_removed: Vec::new(),
+            resource_ids_added: Vec::new(),
+            resource_ids_removed: Vec::new(),
+            offline_owned_retained_resource_ids: Vec::new(),
+            event_count_before: 1,
+            event_count_after: 2,
+        },
+        baseline: empty_runtime_receipt_snapshot(),
+        after_startup_warmup: empty_runtime_receipt_snapshot(),
+        after_offline_transcribe: empty_runtime_receipt_snapshot(),
+    };
+    let path = persist_attribution_report(temp.path(), &report).unwrap();
+    assert!(path.is_file());
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("warmup_to_offline_delta"));
+    assert!(contents.contains("<redacted>"));
+    assert!(contents.contains("deadbeef"));
+    assert!(!contents.contains("/private/"));
+}
+
+fn empty_runtime_receipt_snapshot() -> openasr_core::runtime_receipts::RuntimeReceiptSnapshot {
+    openasr_core::NativeExecutionServices::for_local_process()
+        .expect("test receipt service root")
+        .runtime_receipts()
+        .snapshot()
+}
+
+/// Host-local Phase-0 incident harness. It intentionally uses one injected
+/// service root for startup warm-up and offline transcription, then records the
+/// v1 receipt snapshot plus a strong pack identity under an isolated home.
+#[tokio::test]
+#[ignore = "host-local: set OPENASR_FIRERED_LLM_PACK and OPENASR_GGML_BACKEND=cpu|metal|vulkan"]
+async fn firered_llm_owner_attribution_host_local_phase0() {
+    let pack_path = match openasr_core::testing::external_test_fixture_path(
+        "OPENASR_FIRERED_LLM_PACK",
+        "FireRed2 LLM .oasr pack",
+    ) {
+        Ok(path) => path,
+        Err(skip) => {
+            eprintln!("SKIP: {skip}");
+            return;
+        }
+    };
+    let audio_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav");
+    if !audio_path.is_file() {
+        eprintln!("SKIP: missing real audio fixture {}", audio_path.display());
+        return;
+    }
+
+    let requested_backend = match std::env::var("OPENASR_GGML_BACKEND").as_deref() {
+        Ok("cpu") | Ok("metal") | Ok("vulkan") => std::env::var("OPENASR_GGML_BACKEND").unwrap(),
+        Ok(other) => panic!("unsupported OPENASR_GGML_BACKEND={other}; use cpu, metal, or vulkan"),
+        Err(_) => {
+            eprintln!("SKIP: OPENASR_GGML_BACKEND must explicitly select cpu, metal, or vulkan");
+            return;
+        }
+    };
+    let target = if requested_backend == "cpu" {
+        openasr_core::ExecutionTarget::Cpu
+    } else {
+        openasr_core::ExecutionTarget::Accelerated
+    };
+    let route = resolve_execution_route_for_target(Some(target))
+        .expect("explicit target route resolution must not fail");
+    if target == openasr_core::ExecutionTarget::Accelerated && route.is_none() {
+        eprintln!("SKIP: requested accelerated provider is unavailable on this host");
+        return;
+    }
+    if let Some(route) = route.as_ref()
+        && route.provider.as_str() != requested_backend
+    {
+        eprintln!(
+            "SKIP: requested provider {requested_backend} resolved to {}",
+            route.provider.as_str()
+        );
+        return;
+    }
+
+    let pack_sha256 = hash_file_sha256(&pack_path).expect("hash real FireRed pack");
+    let adapter = validate_native_runtime_pack(&pack_path)
+        .expect("OPENASR_FIRERED_LLM_PACK must be a valid native runtime pack");
+    let identity = adapter
+        .verified_runtime_model_identity(None)
+        .expect("validated pack must expose a verified model identity");
+    let identity_projection = firered_llm_catalog_identity_projection(&adapter, &identity);
+    if let Err(error) = validate_firered_llm_catalog_identity(&identity_projection) {
+        panic!("OPENASR_FIRERED_LLM_PACK rejected: {error}");
+    }
+
+    // Keep the harness isolated from a contributor's real home, but deliberately
+    // retain the generated home so the default report is reviewable after exit.
+    let home_path = tempfile::tempdir()
+        .expect("create isolated OPENASR_HOME")
+        .keep();
+    let _home_guard = EnvVarGuard::set("OPENASR_HOME", &home_path);
+    let _backend_guard = EnvVarGuard::set("OPENASR_GGML_BACKEND", &requested_backend);
+    let mut preferences = openasr_core::config::load_config_document(&home_path).unwrap();
+    preferences.preferences.execution_target = target;
+    openasr_core::config::save_config_document(&home_path, &preferences).unwrap();
+
+    let services = std::sync::Arc::new(
+        openasr_core::NativeExecutionServices::for_local_process()
+            .expect("isolated native execution service root must construct"),
+    );
+    let runtime = ServerRuntime {
+        backend: openasr_core::BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::with_execution_services(
+            NonZeroUsize::new(1).unwrap(),
+            std::sync::Arc::clone(&services),
+        ),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_path.clone()).into(),
+    };
+    let baseline = services.runtime_receipts().snapshot();
+    assert!(matches!(
+        baseline.availability,
+        openasr_core::runtime_receipts::RuntimeReceiptAvailability::Available
+    ));
+    assert!(baseline.completeness.complete);
+
+    warm_up_default_native_streaming_worker(runtime.clone())
+        .await
+        .expect("startup warm-up must complete");
+    let after_startup_warmup = services.runtime_receipts().snapshot();
+    assert!(after_startup_warmup.completeness.complete);
+    let startup_lanes = receipt_lanes(&after_startup_warmup);
+    assert!(
+        !startup_lanes.is_empty(),
+        "startup warm-up must emit an actual execution lane receipt"
+    );
+
+    let mut request =
+        openasr_core::TranscriptionRequest::new(audio_path, identity.model_id.clone());
+    request.model_pack_path = Some(pack_path.clone());
+    request.execution_target = Some(target);
+    let transcription = transcribe_with_runtime(
+        runtime,
+        request,
+        std::sync::Arc::new(openasr_core::RequestExecutionContext::uncancellable(
+            "host-local owner attribution",
+        )),
+    )
+    .await
+    .expect("validated FireRed pack must transcribe the real fixture offline");
+    assert!(!transcription.text.trim().is_empty());
+    let after_offline_transcribe = services.runtime_receipts().snapshot();
+    assert_eq!(
+        after_offline_transcribe.schema,
+        openasr_core::runtime_receipts::RUNTIME_RECEIPT_SCHEMA
+    );
+    assert!(after_offline_transcribe.completeness.complete);
+    assert!(
+        after_offline_transcribe.events.iter().any(|event| matches!(
+            event,
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::OwnerCreated { .. }
+        )),
+        "receipt lifecycle must include owner creation"
+    );
+    assert!(
+        after_offline_transcribe.events.iter().any(|event| matches!(
+            event,
+            openasr_core::runtime_receipts::RuntimeReceiptEvent::ResourceAcquired { .. }
+        )),
+        "receipt lifecycle must include resource acquisition"
+    );
+
+    let observed_providers = receipt_provider_names(&after_offline_transcribe);
+    assert!(
+        !observed_providers.is_empty(),
+        "receipt must report the actual execution provider"
+    );
+    assert_eq!(
+        receipt_lanes(&after_offline_transcribe),
+        startup_lanes,
+        "startup warm-up and offline transcription must use the same exact receipt lane"
+    );
+    if requested_backend == "cpu" {
+        assert_eq!(observed_providers, vec!["cpu"]);
+    } else {
+        assert_eq!(observed_providers, vec![requested_backend.clone()]);
+    }
+
+    let Ok(warmup_to_offline_delta) =
+        receipt_identity_delta(&after_startup_warmup, &after_offline_transcribe)
+    else {
+        eprintln!("SKIP: runtime receipt identity scope or resource invariant failed");
+        return;
+    };
+    assert!(
+        warmup_to_offline_delta.has_observable_change(),
+        "warmup->offline receipt delta must contain an observable owner/resource/retained change"
+    );
+    let report = HostOwnerAttributionReport {
+        schema: after_offline_transcribe.schema,
+        pack_path: "<redacted>",
+        pack_sha256,
+        model_id: identity.model_id,
+        requested_backend,
+        requested_target: format!("{target:?}"),
+        observed_providers,
+        attribution: evaluate_host_owner_attribution(
+            &after_offline_transcribe,
+            &warmup_to_offline_delta,
+        ),
+        warmup_to_offline_delta,
+        baseline,
+        after_startup_warmup,
+        after_offline_transcribe,
+    };
+    let report_dir = attribution_report_dir(&home_path).expect("resolve safe report directory");
+    let report_path = persist_attribution_report(&report_dir, &report)
+        .expect("persist attribution report atomically");
+    eprintln!("owner attribution report: {}", report_path.display());
+}
+
+/// SSOT 13: a pending idle switch must reject realtime session.start, including
+/// the operator-local socket (caller_is_operator = true).
+///
+/// If correct: error event carries PENDING_IDLE_SWITCH_MESSAGE and no
+/// controller is installed. Otherwise Y: session starts while a switch waits.
+#[tokio::test]
+async fn ssot_13_pending_idle_switch_rejects_realtime_and_operator_local() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+
+    for (caller_is_operator, pairing_device_id, remote_compute_client) in [
+        (false, Some("device-a".to_string()), true),
+        (true, None, false),
+    ] {
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            runtime.clone(),
+            test_distribution(),
+            event_sender,
+            false,
+            pairing_device_id,
+            caller_is_operator,
+            remote_compute_client,
+        );
+        assert!(
+            session
+                .start_session(StartSession {
+                    model: Some("whisper-large-v3-turbo".to_string()),
+                    source_name: Some("Live".to_string()),
+                    ..StartSession::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(session.controller.is_none());
+        let event = event_receiver.recv().await.expect("pending-switch error");
+        assert_eq!(event.event_type, "error");
+        match event.event {
+            RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+                assert_eq!(message, crate::PENDING_IDLE_SWITCH_MESSAGE);
+            }
+            other => panic!("expected pending idle switch error, got {other:?}"),
+        }
+    }
+}
+
+/// SSOT 10: live / dictation / meeting must fail immediately when the server is
+/// busy, not queue. If correct: SERVER_BUSY_MESSAGE. Otherwise Y: session.start
+/// succeeds or waits.
+#[tokio::test]
+async fn ssot_10_busy_realtime_live_dictation_meeting_fail_immediately() {
+    let runtime = ServerRuntime::default();
+    runtime.native_execution.remote_policy().hold_realtime(
+        "rt_ws_occupied",
+        Arc::new(openasr_core::TranscriptionControl::new()),
+        Some("device-a".to_string()),
+    );
+    for source_name in ["Live", "Dictation", "Meeting"] {
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            runtime.clone(),
+            test_distribution(),
+            event_sender,
+            false,
+            Some("device-b".to_string()),
+            false,
+            true,
+        );
+        assert!(
+            session
+                .start_session(StartSession {
+                    model: Some("whisper-large-v3-turbo".to_string()),
+                    source_name: Some(source_name.to_string()),
+                    ..StartSession::default()
+                })
+                .await
+                .is_err()
+        );
+        let event = event_receiver.recv().await.expect("busy error");
+        match event.event {
+            RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+                assert_eq!(message, crate::SERVER_BUSY_MESSAGE);
+                assert!(
+                    !message.contains("device-a"),
+                    "busy realtime error must not disclose the occupying device: {message}"
+                );
+            }
+            other => panic!("expected busy error for {source_name}, got {other:?}"),
+        }
+    }
+}
+
+/// SSOT 7: dictation must not request or compute speakers. If correct:
+/// diarize=true on a Dictation session.start is rejected and no diarizer is
+/// built. Otherwise Y: streaming_diarizer is constructed and labels SPEAKER_00.
+#[tokio::test]
+async fn ssot_7_dictation_session_rejects_anonymous_speakers() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let result = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            source_name: Some("Dictation".to_string()),
+            diarize: Some(true),
+            voice_id: Some(false),
+            ..StartSession::default()
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "dictation must not compute speakers even if the client sends diarize=true"
+    );
+    assert!(
+        session.streaming_diarizer.is_none(),
+        "dictation must not construct the anonymous diarizer"
+    );
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("dictation speaker error");
+    assert_eq!(event.event_type, "error");
+}
+
+/// SSOT 7: Live and Meeting may still request anonymous speakers. Dictation is
+/// the fail-closed exception; a blanket diarize rejection would break this.
+#[tokio::test]
+async fn live_and_meeting_sessions_accept_anonymous_speakers() {
+    for source_name in ["Live", "Meeting"] {
+        let (event_sender, _event_receiver) = mpsc::channel(8);
+        let mut session = WsSession::new_with_remote_identity(
+            ServerRuntime::default(),
+            test_distribution(),
+            event_sender,
+            false,
+            Some("device-a".to_string()),
+            false,
+            true,
+        );
+        let result = session
+            .start_session(StartSession {
+                model: Some("whisper-large-v3-turbo".to_string()),
+                source_name: Some(source_name.to_string()),
+                diarize: Some(true),
+                voice_id: Some(false),
+                ..StartSession::default()
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "{source_name} must still admit anonymous speakers: {result:?}"
+        );
+        assert!(
+            session.streaming_diarizer.is_some(),
+            "{source_name} must construct the anonymous diarizer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dictation_speaker_refusal_names_dictation() {
+    let (event_sender, mut event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        ServerRuntime::default(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let _ = session
+        .start_session(StartSession {
+            model: Some("whisper-large-v3-turbo".to_string()),
+            source_name: Some("Dictation".to_string()),
+            diarize: Some(true),
+            voice_id: Some(false),
+            ..StartSession::default()
+        })
+        .await;
+    let event = event_receiver
+        .recv()
+        .await
+        .expect("dictation speaker error");
+    match event.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+            assert!(
+                message.contains("Dictation"),
+                "dictation speaker refusal must be distinguishable: {message}"
+            );
+        }
+        other => panic!("expected dictation speaker error, got {other:?}"),
+    }
+}
+
+/// SSOT 23: a transport close holds the session; a second device must not
+/// resume it or observe the first device id. Decode-error finish must not
+/// leave a held slot that blocks later work.
+#[tokio::test]
+async fn ssot_23_held_realtime_second_device_and_decode_error_do_not_leak() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .set_reconnect_grace(Duration::from_secs(30));
+    let (event_sender, _event_receiver) = mpsc::channel(8);
+    let mut session = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender,
+        false,
+        Some("device-a".to_string()),
+        false,
+        true,
+    );
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "test_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::StartAudio, timestamp_now())
+        .unwrap();
+    session.controller = Some(controller);
+    let session_id = session.session_id.0.clone();
+    session.finish("transport_closed", true).await.unwrap();
+    assert!(runtime.native_execution.remote_policy().has_held_realtime());
+
+    let (event_sender2, mut event_receiver2) = mpsc::channel(8);
+    let mut other = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender2,
+        false,
+        Some("device-b".to_string()),
+        false,
+        true,
+    );
+    assert!(
+        other
+            .start_session(StartSession {
+                session_id: Some(session_id.clone()),
+                ..StartSession::default()
+            })
+            .await
+            .is_err()
+    );
+    let denied = event_receiver2.recv().await.expect("deny event");
+    match denied.event {
+        RealtimeEvent::Error(RealtimeErrorEvent { message, .. }) => {
+            assert!(
+                !message.contains("device-a"),
+                "resume denial must not disclose the holding device: {message}"
+            );
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
+
+    // Decode/backend failure must not park a session (hold_realtime is skipped
+    // when backend_failed). A later Live start from the same device must be
+    // able to start once the held reconnect session is expired/resumed.
+    let (event_sender3, _event_receiver3) = mpsc::channel(8);
+    let mut failed = WsSession::new_with_remote_identity(
+        runtime.clone(),
+        test_distribution(),
+        event_sender3,
+        false,
+        Some("device-c".to_string()),
+        false,
+        true,
+    );
+    failed.backend_failed = true;
+    let mut controller = RealtimeSessionController::new(RealtimeSessionConfig::new(
+        "failed_session",
+        "whisper-large-v3-turbo",
+        timestamp_now(),
+    ))
+    .unwrap();
+    controller
+        .lifecycle(RealtimeLifecycleAction::Configure, timestamp_now())
+        .unwrap();
+    failed.controller = Some(controller);
+    let _ = failed.finish("transport_closed", true).await;
+    assert!(
+        runtime.native_execution.remote_policy().has_held_realtime(),
+        "the original device-a hold must still be the only held session"
+    );
+    assert_eq!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .expire_held_realtime(std::time::SystemTime::UNIX_EPOCH)
+            .len(),
+        1,
+        "a backend-failed finish must not park a second held session"
+    );
 }

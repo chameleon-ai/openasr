@@ -20,8 +20,9 @@ use std::sync::Arc;
 
 use crate::ggml_runtime::{
     GgmlCpuGraphBackend, GgmlCpuGraphBuilder, GgmlCpuGraphConfig, GgmlCpuGraphError,
-    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlFlashAttentionPrecision, GgmlKvElementType,
-    GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor, GgmlStaticTensorArena,
+    GgmlCpuGraphRunner, GgmlCpuTensor, GgmlDecodeReuseMode, GgmlFlashAttentionPrecision,
+    GgmlKvElementType, GgmlPersistentGraphSession, GgmlRopeExtParams, GgmlStaticTensor,
+    GgmlStaticTensorArena,
 };
 use crate::nn::attn::{
     AttentionHeadLayout, AttentionReshapeSteps, STANDARD_HEAD_PERMUTE_AXES,
@@ -35,19 +36,12 @@ use crate::nn::norm::{
     AffineLayerNormSteps, RmsNormSteps, apply_affine_layer_norm, apply_rms_norm,
 };
 
-/// Reused decode graphs with in-place resident KV are only correct on the
-/// single-backend GPU path. CPU direct execution mis-recomputes reused graphs
-/// with in-place KV writes, and the multi-backend scheduler drops refreshed
-/// per-token inputs.
-pub(crate) fn reusable_decode_graph_supported(
-    backend: GgmlCpuGraphBackend,
-    uses_scheduler: bool,
-) -> bool {
-    backend.is_gpu_class() && !uses_scheduler
-}
-
-pub(crate) fn reusable_decode_graph_supported_for_runner(runner: &GgmlCpuGraphRunner) -> bool {
-    reusable_decode_graph_supported(runner.backend_kind(), runner.uses_scheduler())
+/// Persistent in-place KV graph reuse is authorized only by the immutable
+/// planner `reuse_mode`. GPU class is a placement category, not proof of
+/// reuse correctness; CPU/scheduler mechanical limits live in planner-internal
+/// evidence. Production reuse evidence is Unknown, so every lane is FreshGraph.
+pub(crate) fn reusable_decode_graph_supported(reuse_mode: GgmlDecodeReuseMode) -> bool {
+    reuse_mode == GgmlDecodeReuseMode::ReusableGraph
 }
 
 /// Return a zero-copy `[hidden_size, 1]` view of the final token in a
@@ -591,7 +585,7 @@ where
             .cpy(src, dst)
             .map_err(|source| map_err(step, source))?;
         graph
-            .add_side_effect_root(write)
+            .add_kv_write_root(write)
             .map_err(|source| map_err(step, source))?;
     }
     Ok(())
@@ -931,10 +925,10 @@ where
     )?;
     let (self_k_source, self_v_source) = if let Some(row_indices) = self_kv.row_indices {
         let k = graph
-            .set_rows(self_kv.key, k, row_indices)
+            .set_kv_rows(self_kv.key, k, row_indices)
             .map_err(|source| map_err("decoder_self_k_set_rows", source))?;
         let v = graph
-            .set_rows(self_kv.value, v, row_indices)
+            .set_kv_rows(self_kv.value, v, row_indices)
             .map_err(|source| map_err("decoder_self_v_set_rows", source))?;
         (k, v)
     } else {
@@ -1556,6 +1550,7 @@ pub(crate) struct LlmReusableDecodeGraph {
     pub attention_mask: GgmlCpuTensor<'static>,
     pub state: GgmlCpuTensor<'static>,
     pub top1: Option<GgmlCpuTensor<'static>>,
+    pub fused_logits: Option<GgmlCpuTensor<'static>>,
 }
 
 impl LlmReusableDecodeGraph {
@@ -1572,6 +1567,7 @@ impl LlmReusableDecodeGraph {
         attention_mask: GgmlCpuTensor<'static>,
         state: GgmlCpuTensor<'static>,
         top1: Option<GgmlCpuTensor<'static>>,
+        fused_logits: Option<GgmlCpuTensor<'static>>,
     ) -> Self {
         Self {
             session,
@@ -1585,6 +1581,7 @@ impl LlmReusableDecodeGraph {
             attention_mask,
             state,
             top1,
+            fused_logits,
         }
     }
 
@@ -2080,10 +2077,10 @@ where
     // for its `mul_mat` RHS. Materializing Q here would copy q_width floats per
     // layer per decoded token without changing any value the kernels read.
     let k_full = graph
-        .set_rows(kv.key_history, k_new, kv.row_indices)
+        .set_kv_rows(kv.key_history, k_new, kv.row_indices)
         .map_err(|source| map_err("llm_k_set_rows", source))?;
     let v_full = graph
-        .set_rows(kv.value_history, v_new, kv.row_indices)
+        .set_kv_rows(kv.value_history, v_new, kv.row_indices)
         .map_err(|source| map_err("llm_v_set_rows", source))?;
     let (k_full, v_full) = expand_attention_kv(
         graph,
@@ -2584,30 +2581,12 @@ mod tests {
     use crate::ggml_runtime::{GgmlCpuGraphConfig, GgmlCpuGraphRunner};
 
     #[test]
-    fn reusable_decode_graph_support_requires_gpu_class_without_scheduler() {
+    fn reusable_decode_graph_support_requires_reusable_mode() {
         assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Cpu,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Cpu,
-            true
+            GgmlDecodeReuseMode::FreshGraph
         ));
         assert!(reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Metal,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Metal,
-            true
-        ));
-        assert!(reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Gpu,
-            false
-        ));
-        assert!(!reusable_decode_graph_supported(
-            GgmlCpuGraphBackend::Gpu,
-            true
+            GgmlDecodeReuseMode::ReusableGraph
         ));
     }
 

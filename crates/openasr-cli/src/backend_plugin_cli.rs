@@ -3,10 +3,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use openasr_core::{
     CatalogBackendVendor, PullProgress, activate_installed_backend_pack_auto,
-    backend_plugin_status, deactivate_backend_pack, describe_backend_provider, gc_backend_store,
+    backend_plugin_status, clear_backend_qualification, deactivate_backend_pack,
+    describe_backend_provider, gc_backend_store, import_backend_provider_from_local_path,
     install_and_activate_backend_pack, install_and_activate_backend_provider,
-    install_backend_pack_from_catalog, installed_backend_protected_bytes, load_model_catalog,
-    openasr_home, prepare_backend_provider_for_live_device, resolve_catalog_backend_pull,
+    install_backend_pack_from_catalog, installed_backend_protected_bytes,
+    list_installed_backend_packs, load_model_catalog, openasr_home,
+    prepare_backend_pack_for_qualification, prepare_backend_provider_for_live_device,
+    resolve_catalog_backend_pull, sha256_file, uninstall_backend_library_vendor,
 };
 use serde_json::json;
 
@@ -43,9 +46,12 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
         BackendPluginCommand::Install { backend_id } => {
             let catalog = load_backend_catalog(&home)?;
             let requested = resolve_catalog_backend_pull(&catalog, &backend_id)?;
-            let device_target = match requested.targets.as_slice() {
-                [target] => target.clone(),
-                _ => anyhow::bail!("install-only requires one target-scoped backend pack"),
+            let device_target = match (requested.vendor, requested.targets.as_slice()) {
+                (_, [target]) => Some(target.clone()),
+                (CatalogBackendVendor::Vulkan, []) => None,
+                _ => anyhow::bail!(
+                    "install-only requires one target-scoped pack or one generic Vulkan pack"
+                ),
             };
             let installed =
                 install_backend_pack_from_catalog(&catalog, &backend_id, &home, print_progress)?;
@@ -88,6 +94,32 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
                 Err(error) => return provider_failure(error),
             }
         }
+        BackendPluginCommand::PrepareQualification {
+            backend_id,
+            device_target,
+            scope,
+        } => {
+            let catalog = load_backend_catalog(&home)?;
+            let (_, catalog_sha256) = sha256_file(home.join("catalog.json"))
+                .context("Could not hash the verified cached qualification catalog")?;
+            let prepared = prepare_backend_pack_for_qualification(
+                &catalog,
+                &backend_id,
+                device_target.as_deref(),
+                &catalog_sha256,
+                &scope,
+                &home,
+                print_progress,
+            )?;
+            println!("{}", serde_json::to_string(&prepared)?);
+        }
+        BackendPluginCommand::ClearQualification { scope } => {
+            clear_backend_qualification(&home, &scope)?;
+            println!(
+                "{}",
+                json!({"schema_version": 1, "event": "qualification_cleared"})
+            );
+        }
         BackendPluginCommand::Deactivate => {
             deactivate_backend_pack(&home)?;
             println!("{}", json!({"schema_version": 1, "event": "deactivated"}));
@@ -103,6 +135,53 @@ pub(crate) fn backend_plugin_command(command: BackendPluginCommand) -> Result<()
             )?;
             println!("{}", serde_json::to_string(&report)?);
         }
+        BackendPluginCommand::List => {
+            let packs = list_installed_backend_packs(&home)?;
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "event": "listed",
+                    "packs": packs.iter().map(|pack| json!({
+                        "backend_id": pack.backend_id,
+                        "vendor": pack.vendor,
+                        "version": pack.version,
+                        "artifact_fingerprint": pack.artifact_fingerprint,
+                        "host_abi_fingerprint": pack.host_abi.fingerprint,
+                        "size_bytes": pack.files.iter().map(|file| file.size_bytes).sum::<u64>(),
+                    })).collect::<Vec<_>>(),
+                })
+            );
+        }
+        BackendPluginCommand::Uninstall { provider } => {
+            let report = uninstall_backend_library_vendor(&home, provider_vendor(&provider))?;
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "event": "uninstalled",
+                    "provider": provider,
+                    "removed_pack_directories": report.removed_pack_directories,
+                    "reclaimed_bytes": report.reclaimed_bytes,
+                })
+            );
+        }
+        BackendPluginCommand::Import { provider, path } => {
+            let catalog = load_backend_catalog(&home)?;
+            match import_backend_provider_from_local_path(
+                &catalog,
+                provider_vendor(&provider),
+                &path,
+                &home,
+                print_progress,
+            ) {
+                Ok(prepared) => println!(
+                    "{}",
+                    terminal_record("imported", serde_json::to_value(prepared)?)
+                ),
+                Err(error) => return provider_failure(error),
+            }
+        }
     }
     Ok(())
 }
@@ -117,6 +196,7 @@ fn provider_vendor(provider: &str) -> CatalogBackendVendor {
     match provider {
         "cuda" => CatalogBackendVendor::Cuda,
         "hip" => CatalogBackendVendor::Hip,
+        "vulkan" => CatalogBackendVendor::Vulkan,
         _ => unreachable!("clap validates provider"),
     }
 }

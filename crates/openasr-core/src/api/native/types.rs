@@ -313,6 +313,18 @@ pub struct NativeAsrRequestOptions {
     /// `arch::SpeakerSegmentationSource`, and whether the turns can be matched
     /// to known people additionally depends on an installed speaker embedder.
     pub voice_id: bool,
+    /// Anonymous speaker separation without enrolled-person matching. Remote
+    /// compute carries this across the native offline round-trip so file
+    /// `diarize=true` does not collapse to `SpeakerPlan::Off`.
+    pub anonymous_diarize: bool,
+    /// Exact speaker-count hint for the external clustering path. Carried with
+    /// the Voice ID / anonymous-diarize flags so the server rebuild does not
+    /// drop `speakers`.
+    pub diarize_speakers: Option<u8>,
+    /// Opt-in per-speaker embeddings. Carried across the native offline
+    /// round-trip so the server rebuild does not drop
+    /// `return_speaker_embeddings`.
+    pub return_speaker_embeddings: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
@@ -353,6 +365,21 @@ impl NativeAsrRequestOptions {
 
     pub fn with_voice_id(mut self, voice_id: bool) -> Self {
         self.voice_id = voice_id;
+        self
+    }
+
+    pub fn with_anonymous_diarize(mut self, anonymous_diarize: bool) -> Self {
+        self.anonymous_diarize = anonymous_diarize;
+        self
+    }
+
+    pub fn with_diarize_speakers(mut self, diarize_speakers: Option<u8>) -> Self {
+        self.diarize_speakers = diarize_speakers;
+        self
+    }
+
+    pub fn with_return_speaker_embeddings(mut self, return_speaker_embeddings: bool) -> Self {
+        self.return_speaker_embeddings = return_speaker_embeddings;
         self
     }
 
@@ -406,6 +433,10 @@ pub struct NativeAsrOfflineRequest {
     /// not exposed as a multipart/per-job option.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference carried across the server's
+    /// native offline adapter round-trip.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Cancel/pause/resume control and request id for this decode -- same
     /// "explicit, never TLS" contract as
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
@@ -435,6 +466,7 @@ impl NativeAsrOfflineRequest {
             source_container: None,
             prepared_samples: None,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
@@ -456,6 +488,15 @@ impl NativeAsrOfflineRequest {
         preference: crate::config::VoiceIdSegmenterPreference,
     ) -> Self {
         self.voice_id_segmenter = preference;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
         self
     }
 
@@ -526,6 +567,9 @@ pub struct NativeAsrSessionContext {
     pub session_id: RealtimeSessionId,
     pub trace_id: Option<String>,
     pub request_id: Option<String>,
+    request_attempt_id: Option<crate::RequestAttemptId>,
+    native_execution_receipt: Option<crate::NativeExecutionReceiptCollector>,
+    activation_reservation_context: Option<crate::ActivationReservationContext>,
 }
 
 impl NativeAsrSessionContext {
@@ -534,6 +578,9 @@ impl NativeAsrSessionContext {
             session_id: RealtimeSessionId(session_id.into()),
             trace_id: None,
             request_id: None,
+            request_attempt_id: None,
+            native_execution_receipt: None,
+            activation_reservation_context: None,
         }
     }
 
@@ -542,6 +589,9 @@ impl NativeAsrSessionContext {
             session_id,
             trace_id: None,
             request_id: None,
+            request_attempt_id: None,
+            native_execution_receipt: None,
+            activation_reservation_context: None,
         }
     }
 
@@ -553,6 +603,51 @@ impl NativeAsrSessionContext {
     pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
         self.request_id = request_id;
         self
+    }
+
+    pub fn with_request_attempt_id(mut self, attempt_id: crate::RequestAttemptId) -> Self {
+        self.request_attempt_id = Some(attempt_id);
+        if let Some(receipt) = self.native_execution_receipt.as_ref() {
+            receipt.bind_request_attempt(attempt_id);
+        }
+        self
+    }
+
+    pub fn request_attempt_id(&self) -> Option<crate::RequestAttemptId> {
+        self.request_attempt_id
+    }
+
+    /// Attach the explicit request-local receipt authority used by strict
+    /// warm-up and activation evidence. Ordinary sessions leave this absent.
+    pub fn with_native_execution_receipt(
+        mut self,
+        receipt: crate::NativeExecutionReceiptCollector,
+    ) -> Self {
+        if let Some(attempt_id) = self.request_attempt_id {
+            receipt.bind_request_attempt(attempt_id);
+        }
+        self.native_execution_receipt = Some(receipt);
+        self
+    }
+
+    pub(crate) fn native_execution_receipt(
+        &self,
+    ) -> Option<crate::NativeExecutionReceiptCollector> {
+        self.native_execution_receipt.clone()
+    }
+
+    pub fn with_activation_reservation_context(
+        mut self,
+        context: crate::ActivationReservationContext,
+    ) -> Self {
+        self.activation_reservation_context = Some(context);
+        self
+    }
+
+    pub(crate) const fn activation_reservation_context(
+        &self,
+    ) -> Option<crate::ActivationReservationContext> {
+        self.activation_reservation_context
     }
 }
 
