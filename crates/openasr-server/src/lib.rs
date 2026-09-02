@@ -1496,7 +1496,11 @@ impl From<Option<PathBuf>> for ActiveRuntimeSlot {
 
 impl ActiveRuntimeSlot {
     /// Constructs the daemon's startup state from durable requested intent.
-    /// The path is not returned by [`Self::current`] until reactivation passes.
+    ///
+    /// [`Self::current`] stays empty until reactivation attests the live
+    /// runtime. [`Self::served_pack_path`] still returns this path: served
+    /// identity is the verified pack this process will run, not whether
+    /// weights are resident. Idle unload must not clear it.
     pub fn requested(path: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(ActiveRuntimeSlotState {
@@ -1526,6 +1530,13 @@ impl ActiveRuntimeSlot {
         self.current_snapshot().map(|snapshot| snapshot.path)
     }
 
+    /// Pack this process is serving. Prefers the attested live binding, then
+    /// the launch/durable requested path. Distinct from residency: idle unload
+    /// clears warm markers, not this path. Empty only when no pack is bound.
+    pub fn served_pack_path(&self) -> Option<PathBuf> {
+        self.served_snapshot().map(|snapshot| snapshot.path)
+    }
+
     pub(crate) fn current_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
         let state = self.lock_read();
         state.active.as_ref().map(|binding| ActiveRuntimeSnapshot {
@@ -1535,13 +1546,34 @@ impl ActiveRuntimeSlot {
         })
     }
 
+    pub(crate) fn served_snapshot(&self) -> Option<ActiveRuntimeSnapshot> {
+        let state = self.lock_read();
+        if let Some(binding) = state.active.as_ref() {
+            return Some(ActiveRuntimeSnapshot {
+                generation: state.generation,
+                path: binding.path.clone(),
+                residency_key: binding.residency_key(),
+            });
+        }
+        state
+            .requested_path
+            .as_ref()
+            .map(|path| ActiveRuntimeSnapshot {
+                generation: state.generation,
+                path: path.clone(),
+                residency_key: idle_activity::NativeRuntimeResidencyKey::legacy_path(path),
+            })
+    }
+
     fn snapshot_is_current(&self, snapshot: &ActiveRuntimeSnapshot) -> bool {
         let state = self.lock_read();
-        state.generation == snapshot.generation
-            && state
-                .active
-                .as_ref()
-                .is_some_and(|binding| binding.path == snapshot.path)
+        if state.generation != snapshot.generation {
+            return false;
+        }
+        if let Some(binding) = state.active.as_ref() {
+            return binding.path == snapshot.path;
+        }
+        state.requested_path.as_ref() == Some(&snapshot.path)
     }
 
     pub fn requested_path(&self) -> Option<PathBuf> {
@@ -1821,7 +1853,7 @@ impl ServerRuntime {
         match self.backend {
             BackendKind::Mock => Ok(()),
             BackendKind::Native => {
-                let Some(model_pack_path) = self.model_pack_path.current() else {
+                let Some(model_pack_path) = self.model_pack_path.served_pack_path() else {
                     return Ok(());
                 };
                 let _ = validate_native_runtime_pack(&model_pack_path)?;
@@ -1832,11 +1864,12 @@ impl ServerRuntime {
 
     /// Whether a native model pack is currently bound (surfaced by `/health` so
     /// clients can distinguish "daemon not reachable" from "daemon ready, no
-    /// model installed" without racing a separate models-list call).
+    /// model installed" without racing a separate models-list call). Bound
+    /// means this process has a served identity, not that weights are resident.
     fn has_model_bound(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => self.model_pack_path.is_some(),
+            BackendKind::Native => self.model_pack_path.served_pack_path().is_some(),
         }
     }
 
@@ -1955,13 +1988,12 @@ impl ServerRuntime {
     fn model_is_resident(&self) -> bool {
         match self.backend {
             BackendKind::Mock => true,
-            BackendKind::Native => {
-                self.model_pack_path
-                    .current_snapshot()
-                    .is_some_and(|snapshot| {
-                        idle_activity::native_model_is_resident(snapshot.residency_key())
-                    })
-            }
+            BackendKind::Native => self
+                .model_pack_path
+                .served_snapshot()
+                .is_some_and(|snapshot| {
+                    idle_activity::native_model_is_resident(snapshot.residency_key())
+                }),
         }
     }
 }
@@ -2716,10 +2748,9 @@ async fn models(
             .map(|card| served_model_item(card.id, None))
             .collect(),
         BackendKind::Native => {
-            // No model bound is a normal fresh-install state, not an error:
-            // report an empty model list rather than fail-closed here (the
-            // transcription path is the fail-closed boundary for "no model").
-            match runtime.model_pack_path.current() {
+            // Empty list is the no-pack state, not an error. Re-verify the
+            // served pack on every read so listing cannot follow a config string.
+            match runtime.model_pack_path.served_pack_path() {
                 None => Vec::new(),
                 Some(model_pack_path) => {
                     let adapter = validate_native_runtime_pack(&model_pack_path)
@@ -2781,7 +2812,7 @@ async fn capabilities(
     let transcription = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
-            .current()
+            .served_pack_path()
             .as_deref()
             .map(native_runtime_transcription_capabilities_for_path)
             .unwrap_or_else(|| TranscriptionBackendCapabilities::for_backend_kind(runtime.backend))
@@ -2818,7 +2849,7 @@ pub(crate) fn realtime_capabilities_for_runtime(
     let mut capabilities = if runtime.backend == BackendKind::Native {
         runtime
             .model_pack_path
-            .current()
+            .served_pack_path()
             .as_deref()
             .map(cached_native_realtime_capabilities_for_path)
             .unwrap_or_else(|| RealtimeBackendCapabilities::for_backend_kind(runtime.backend))
@@ -3191,6 +3222,9 @@ pub(crate) enum ApiError {
     NotFound(String),
     Conflict(String),
     Forbidden(String),
+    /// HTTP 403 with `error.type = authorization_error`. Distinct from
+    /// [`Self::Forbidden`], which stays `openasr_error` (pause/cancel).
+    Authorization(String),
     Busy(String),
     Catalog(CatalogError),
     Config(openasr_core::ConfigError),
@@ -3254,9 +3288,10 @@ impl std::fmt::Display for ApiError {
         match self {
             Self::BadRequest(message) | Self::Format(message) => f.write_str(message),
             Self::NotFound(message) => f.write_str(message),
-            Self::Conflict(message) | Self::Forbidden(message) | Self::Busy(message) => {
-                f.write_str(message)
-            }
+            Self::Conflict(message)
+            | Self::Forbidden(message)
+            | Self::Authorization(message)
+            | Self::Busy(message) => f.write_str(message),
             Self::Catalog(error) => write!(f, "Could not load model catalog: {error}"),
             Self::Config(error) => write!(f, "Could not read or update OpenASR config: {error}"),
             Self::Home(error) => write!(f, "Could not resolve OpenASR home: {error}"),
@@ -3298,81 +3333,87 @@ impl std::fmt::Display for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::BadRequest(message) | Self::Format(message) => (StatusCode::BAD_REQUEST, message),
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-            Self::Conflict(message) => (StatusCode::CONFLICT, message),
-            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
-            Self::Busy(message) => (StatusCode::TOO_MANY_REQUESTS, message),
-            Self::Catalog(error) => {
-                let status = if matches!(
-                    &error,
-                    CatalogError::InvalidPullReference(_)
-                        | CatalogError::UnknownModel { .. }
-                        | CatalogError::AmbiguousModelRef { .. }
-                        | CatalogError::UnknownQuant { .. }
-                        | CatalogError::ConflictingQuant { .. }
-                ) {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (status, format!("Could not load model catalog: {error}"))
-            }
-            Self::Config(error) => (
-                config_error_status(&error),
-                format!("Could not read or update OpenASR config: {error}"),
-            ),
-            Self::Home(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not resolve OpenASR home: {error}"),
-            ),
-            Self::History(error) => {
-                let status = if matches!(
-                    error,
-                    DaemonHistoryStoreError::InvalidId { .. }
-                        | DaemonHistoryStoreError::InvalidRecord { .. }
-                ) {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                };
-                (
-                    status,
-                    format!("Could not update transcription history: {error}"),
-                )
-            }
-            Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, message)
-            }
-            Self::MultipartRejection(error) => (
-                StatusCode::BAD_REQUEST,
-                format!("Could not read multipart form: {error}"),
-            ),
-            Self::Multipart(error) => {
-                let status = error.status();
-                let message = multipart_error_message(&error);
-                (status, message)
-            }
-            Self::AudioPreparation(error) => (
-                StatusCode::BAD_REQUEST,
-                format!("Could not prepare uploaded audio for transcription: {error}"),
-            ),
-            Self::ModelSessionCapacity(error) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
-                    error.model_identity, error.limit,
-                ),
-            ),
-            Self::Backend(error) => {
-                let status = match &error {
+        let (status, message, error_type) = match self {
+            Self::Authorization(message) => (StatusCode::FORBIDDEN, message, "authorization_error"),
+            other => {
+                let (status, message) = match other {
+                    Self::BadRequest(message) | Self::Format(message) => {
+                        (StatusCode::BAD_REQUEST, message)
+                    }
+                    Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+                    Self::Conflict(message) => (StatusCode::CONFLICT, message),
+                    Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
+                    Self::Busy(message) => (StatusCode::TOO_MANY_REQUESTS, message),
+                    Self::Catalog(error) => {
+                        let status = if matches!(
+                            &error,
+                            CatalogError::InvalidPullReference(_)
+                                | CatalogError::UnknownModel { .. }
+                                | CatalogError::AmbiguousModelRef { .. }
+                                | CatalogError::UnknownQuant { .. }
+                                | CatalogError::ConflictingQuant { .. }
+                        ) {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        (status, format!("Could not load model catalog: {error}"))
+                    }
+                    Self::Config(error) => (
+                        config_error_status(&error),
+                        format!("Could not read or update OpenASR config: {error}"),
+                    ),
+                    Self::Home(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not resolve OpenASR home: {error}"),
+                    ),
+                    Self::History(error) => {
+                        let status = if matches!(
+                            error,
+                            DaemonHistoryStoreError::InvalidId { .. }
+                                | DaemonHistoryStoreError::InvalidRecord { .. }
+                        ) {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        };
+                        (
+                            status,
+                            format!("Could not update transcription history: {error}"),
+                        )
+                    }
+                    Self::JobStore(message) | Self::RequestAttemptIdentity(message) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, message)
+                    }
+                    Self::MultipartRejection(error) => (
+                        StatusCode::BAD_REQUEST,
+                        format!("Could not read multipart form: {error}"),
+                    ),
+                    Self::Multipart(error) => {
+                        let status = error.status();
+                        let message = multipart_error_message(&error);
+                        (status, message)
+                    }
+                    Self::AudioPreparation(error) => (
+                        StatusCode::BAD_REQUEST,
+                        format!("Could not prepare uploaded audio for transcription: {error}"),
+                    ),
+                    Self::ModelSessionCapacity(error) => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "Model '{}' is at its concurrent native session limit ({}). Retry when an existing request finishes, or increase --max-native-sessions-per-model if this host has enough memory.",
+                            error.model_identity, error.limit,
+                        ),
+                    ),
+                    Self::Backend(error) => {
+                        let status = match &error {
                     openasr_core::BackendError::VoiceIdUnsupportedForRealtime { .. }
                     | openasr_core::BackendError::DiarizationNotSupported { .. }
                     | openasr_core::BackendError::DiarizationSegmenterUnavailable
                     | openasr_core::BackendError::ExternalDiarizationFailed { .. }
                     | openasr_core::BackendError::VoiceIdIdentityFailed(_)
                     | openasr_core::BackendError::DiarizeSpeakersRequiresDiarization
+                    | openasr_core::BackendError::SpeakerEmbeddingsRequireDiarization
                     | openasr_core::BackendError::PhraseBiasNotSupported { .. }
                     | openasr_core::BackendError::AdapterNotSupported { .. }
                     | openasr_core::BackendError::PhraseBiasUnsupportedByModel { .. }
@@ -3408,36 +3449,51 @@ impl IntoResponse for ApiError {
                     // from the 400 fail-closed refusals and the 5xx faults.
                     openasr_core::BackendError::TranscriptionCanceled => StatusCode::CONFLICT,
                 };
-                (status, format!("Could not transcribe audio: {error}"))
-            }
-            Self::BackendJoin(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not transcribe audio: backend task failed: {error}"),
-            ),
-            Self::Pull(error) => {
-                let status = match &error {
-                    PullError::InvalidTarget { .. }
-                    | PullError::NonHttpsUrl { .. }
-                    | PullError::NotInstalled { .. } => StatusCode::BAD_REQUEST,
-                    PullError::LockHeld { .. } => StatusCode::CONFLICT,
-                    PullError::InsufficientSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                        (status, format!("Could not transcribe audio: {error}"))
+                    }
+                    Self::BackendJoin(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not transcribe audio: backend task failed: {error}"),
+                    ),
+                    Self::Pull(error) => {
+                        let status = match &error {
+                            PullError::InvalidTarget { .. }
+                            | PullError::NonHttpsUrl { .. }
+                            | PullError::NotInstalled { .. } => StatusCode::BAD_REQUEST,
+                            PullError::LockHeld { .. } => StatusCode::CONFLICT,
+                            PullError::InsufficientSpace { .. } => StatusCode::INSUFFICIENT_STORAGE,
+                            _ => StatusCode::INTERNAL_SERVER_ERROR,
+                        };
+                        (status, format!("Could not pull model pack: {error}"))
+                    }
+                    Self::Registry(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not load model registry: {error}"),
+                    ),
+                    Self::Serialize(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not render transcription response: {error}"),
+                    ),
+                    Self::TempFile(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not prepare uploaded audio for transcription: {error}"),
+                    ),
+                    Self::InsufficientDiskSpace(message) => {
+                        (StatusCode::INSUFFICIENT_STORAGE, message)
+                    }
+                    Self::Authorization(_) => unreachable!("Authorization is selected by variant"),
                 };
-                (status, format!("Could not pull model pack: {error}"))
+                let error_type = match status {
+                    StatusCode::BAD_REQUEST => "invalid_request_error",
+                    StatusCode::CONFLICT => "conflict_error",
+                    StatusCode::NOT_FOUND => "not_found_error",
+                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+                    StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
+                    StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
+                    _ => "openasr_error",
+                };
+                (status, message, error_type)
             }
-            Self::Registry(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not load model registry: {error}"),
-            ),
-            Self::Serialize(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not render transcription response: {error}"),
-            ),
-            Self::TempFile(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not prepare uploaded audio for transcription: {error}"),
-            ),
-            Self::InsufficientDiskSpace(message) => (StatusCode::INSUFFICIENT_STORAGE, message),
         };
 
         // Log every failed request to stderr (captured in daemon.log by the
@@ -3452,15 +3508,7 @@ impl IntoResponse for ApiError {
             Json(ErrorResponse {
                 error: ErrorBody {
                     message,
-                    r#type: match status {
-                        StatusCode::BAD_REQUEST => "invalid_request_error",
-                        StatusCode::CONFLICT => "conflict_error",
-                        StatusCode::NOT_FOUND => "not_found_error",
-                        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-                        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
-                        StatusCode::INSUFFICIENT_STORAGE => "insufficient_storage_error",
-                        _ => "openasr_error",
-                    },
+                    r#type: error_type,
                     param: None,
                     code: None,
                 },
@@ -3555,3 +3603,7 @@ pub mod testing;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ssot_redteam_tests.rs"]
+mod ssot_redteam_tests;

@@ -44,6 +44,17 @@ pack that is being served.
   no `created` field).
 - `POST /v1/audio/transcriptions` -- OpenAI-compatible transcription
   (multipart form).
+- `POST /v1/audio/precise-timeline` -- OpenASR-native forced alignment
+  (multipart form). Does not run ASR. Accepts source `file` plus exactly one
+  of `transcript` (plain text) or `transcript_json` (timed verbose/json body).
+  Optional: `language`, `word_timestamps` (default true), `execution_target`,
+  `response_format` (`verbose_json` default; `json`/`text`/`srt`/`vtt`/`markdown`).
+  SRT/VTT reuse the shared subtitle exporter. Missing Forced Aligner pack,
+  unsupported language (tag `ja`/`jp`/`ko`/`kr` or hiragana/katakana/hangul
+  in the text), empty normalized text, audio past the timestamp grid, a
+  prompt past decoder context (`llm_max_positions`), or a degenerate
+  alignment fail closed. Paired device tokens may call this compute route;
+  it is not operator-only. The server never downloads the pack.
 - `POST /v1/audio/translations` -- OpenAI-compatible X->English speech
   translation (non-streaming; model families without a translate task reject
   it explicitly).
@@ -82,13 +93,16 @@ Behavior of each OpenAI `audio/transcriptions` request parameter:
 
 - `json`: `{"text", "segments":[{"start","end","text",...}]}` -- OpenAI's
   `json` plus a `segments` extension.
-- `verbose_json`: `{"language" (English name, when reported), "duration"
-  (last segment end, seconds), "text", "segments":[{"id","start","end",
-  "text", "words":[...] when word timing was requested, "speaker"/
-  "speaker_label"/"speaker_profile_id" when diarizing}], "words":[flattened
-  per-word timing] when word timing was requested}`.
+- `verbose_json`: language (English name, when reported), duration (last
+  segment end, seconds), text, segments (`id`, `start`, `end`, `text`,
+  `words` when word timing was requested, `speaker` / `speaker_label` /
+  `speaker_profile_id` when diarizing), flattened top-level `words` when
+  word timing was requested. When `return_speaker_embeddings=true`, also
+  `speaker_embeddings` (label-to-vector map) and sibling
+  `speaker_embedding_space`.
   Not produced: `task`, `usage`, and per-segment decoder internals
   (`seek`, `tokens`, `avg_logprob`, `compression_ratio`, `no_speech_prob`).
+  Plain `json` never includes `speaker_embeddings` / `speaker_embedding_space`.
 - `text`, `srt`, `vtt`: plain bodies, same as OpenAI. `markdown` (extension)
   renders a `# Transcript` document.
 
@@ -122,8 +136,10 @@ OpenAI-style envelope with every key clients expect:
 ```
 
 Statuses: 400 (invalid/unsupported/fail-closed refusals, including
-model-not-loaded), 401 (missing/bad API key when keys exist), 404, 409
-(canceled), 413 (upload too large), 429/503 (busy), 507 (disk full).
+model-not-loaded), 401 (missing/bad API key when keys exist), 403
+(`authorization_error` when a remote-compute device token requests
+`return_speaker_embeddings`), 404, 409 (canceled), 413 (upload too large),
+429/503 (busy), 507 (disk full).
 Messages are self-describing; surface them verbatim.
 
 ## Streaming (OpenASR SSE, not OpenAI events)
@@ -163,6 +179,16 @@ Multipart form fields beyond the OpenAI set (all optional, all validated --
 unsupported combinations fail closed with explicit errors):
 
 - `task` (`transcribe`|`translate`), `diarize`, `speakers`, `punctuate`
+- `return_speaker_embeddings` (opt-in; requires `diarize=true` and
+  `response_format=verbose_json`). Default requests omit embeddings.
+  When set, `verbose_json` adds a WhisperX/Speakr-compatible
+  `speaker_embeddings` map (`SPEAKER_00` -> vector) plus a sibling
+  `speaker_embedding_space` object (`model_id`, `pack_fingerprint`,
+  `dim`, `normalization: "l2"`). These are biometric-derived data and
+  are returned only on an explicit request. A remote-compute device
+  token requesting this field is rejected with HTTP 403
+  `authorization_error`; operator and loopback clients are not
+  restricted. Streaming (`?stream=true`) rejects the field with 400.
 - `hotword`/`phrase_bias` (repeatable) + `hotword_boost`/`phrase_bias_boost`
 - Long-form segmentation: `segment_mode` (`off|auto|fixed|energy|vad`),
   `chunk_seconds`, `segment_overlap_seconds`, `vad_threshold_db`,

@@ -54,8 +54,8 @@ pub use native_model_id::{
     NativeRuntimeModelIdSource, NativeRuntimeModelIdentity, NativeRuntimeModelIdentityError,
 };
 pub use native_transcribe::{
-    describe_native_runtime_model_mismatch, native_runtime_model_refs_match,
-    refine_existing_transcription_timeline,
+    align_plain_transcript_to_audio, describe_native_runtime_model_mismatch,
+    native_runtime_model_refs_match, refine_existing_transcription_timeline,
 };
 pub use request_execution_context::{
     RequestAttemptId, RequestAttemptIdError, RequestExecutionContext,
@@ -67,8 +67,8 @@ pub use transcription_control::{
 pub use transcription_progress::{
     LegacyNativeTranscriptionProgress, NativeTranscriptionPhase, NativeTranscriptionProgress,
     ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter, ProgressSegmenterKind,
-    TranscriptionStage, duration_weighted_fraction, native_transcription_progress,
-    native_transcription_progress_for_id,
+    TranscriptionStage, duration_weighted_fraction, native_active_transcription_ids,
+    native_transcription_progress, native_transcription_progress_for_id,
 };
 
 #[derive(Debug, Clone)]
@@ -1500,6 +1500,7 @@ fn native_offline_request_to_transcription_request(
     request: NativeAsrOfflineRequest,
 ) -> TranscriptionRequest {
     let segmenter = request.voice_id_segmenter;
+    let embedder = request.voice_id_embedder;
     let mut converted = TranscriptionRequest::new(request.input_path, model_pack.id.clone())
         .with_model_pack_path(Some(model_pack.root.clone()))
         .with_language(request.options.language)
@@ -1513,6 +1514,7 @@ fn native_offline_request_to_transcription_request(
         .with_voice_id(request.options.voice_id)
         .with_anonymous_diarize(request.options.anonymous_diarize)
         .with_diarize_speakers(request.options.diarize_speakers)
+        .with_return_speaker_embeddings(request.options.return_speaker_embeddings)
         .with_longform(request.longform)
         .with_display_file_name(request.display_file_name)
         .with_source(request.source)
@@ -1522,6 +1524,7 @@ fn native_offline_request_to_transcription_request(
         .with_execution_context(request.execution_context)
         .with_serve_batch_max_native_sessions(request.serve_batch_max_native_sessions);
     converted.voice_id_segmenter = segmenter;
+    converted.voice_id_embedder = embedder;
     converted
 }
 
@@ -2117,6 +2120,56 @@ mod tests {
         assert!(!rebuilt.voice_id);
         assert!(rebuilt.anonymous_diarize);
         assert_eq!(rebuilt.diarize_speakers, Some(3));
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_voice_id_embedder() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav"))
+                .with_voice_id_embedder(crate::config::VoiceIdEmbedderPreference::WeSpeaker),
+        );
+        assert_eq!(
+            rebuilt.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::WeSpeaker
+        );
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert_eq!(
+            rebuilt_default.voice_id_embedder,
+            crate::config::VoiceIdEmbedderPreference::ReDimNet2
+        );
+    }
+
+    #[test]
+    fn native_offline_request_conversion_preserves_return_speaker_embeddings() {
+        let pack =
+            NativeAsrModelPackRef::new("moonshine-tiny", "moonshine", PathBuf::from("/tmp/pack"));
+        let rebuilt = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")).with_options(
+                NativeAsrRequestOptions::new()
+                    .with_anonymous_diarize(true)
+                    .with_return_speaker_embeddings(true),
+            ),
+        );
+        assert!(rebuilt.anonymous_diarize);
+        assert!(rebuilt.return_speaker_embeddings);
+
+        let rebuilt_default = native_offline_request_to_transcription_request(
+            &pack,
+            ExecutionTarget::Auto,
+            NativeAsrOfflineRequest::new(PathBuf::from("/tmp/audio.wav")),
+        );
+        assert!(!rebuilt_default.return_speaker_embeddings);
     }
 
     fn write_mono_pcm16_wav(path: &Path, sample_rate_hz: u32, frames: u32) {
@@ -3753,6 +3806,7 @@ mod tests {
                     .with_voice_id(true)
                     .with_anonymous_diarize(true)
                     .with_diarize_speakers(Some(2))
+                    .with_return_speaker_embeddings(true)
                     .with_word_timestamps(true),
             )
             .with_voice_id_segmenter(crate::config::VoiceIdSegmenterPreference::Segmentation3_0)
@@ -3787,6 +3841,7 @@ mod tests {
         assert!(converted.voice_id);
         assert!(converted.anonymous_diarize);
         assert_eq!(converted.diarize_speakers, Some(2));
+        assert!(converted.return_speaker_embeddings);
         assert_eq!(converted.longform, Some(longform));
         assert_eq!(converted.display_file_name.as_deref(), Some("meeting.wav"));
     }

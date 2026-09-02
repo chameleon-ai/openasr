@@ -521,6 +521,15 @@ fn remote_transcription_multipart_body() -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
+fn remote_precise_timeline_multipart_body() -> (String, Vec<u8>) {
+    let boundary = "openasr-loopback-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.wav\"\r\nContent-Type: audio/wav\r\n\r\nnot a real wav\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcript\"\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    )
+    .into_bytes();
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
 async fn connect_loopback_realtime_websocket(
     server: &LoopbackTlsServer,
     bearer_token: &str,
@@ -1057,6 +1066,44 @@ async fn loopback_tls_pairing_device_transcription_skips_server_history() {
 }
 
 #[tokio::test]
+async fn loopback_tls_pairing_device_can_call_precise_timeline() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_loopback_pairing_server(temp.path()).await;
+    let credential = approve_loopback_pairing(&server).await;
+    let bearer_auth = bearer_auth_header(&credential.bearer_token);
+
+    let (content_type, body) = remote_precise_timeline_multipart_body();
+    let response = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &content_type),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        400,
+        "device tokens may call forced alignment; invalid WAV is 400 not 401/403: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let device_history = https_request(
+        server.addr,
+        "GET",
+        "/v1/history",
+        &[("Authorization", bearer_auth.as_str())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(device_history.status, 403);
+}
+
+#[tokio::test]
 async fn loopback_tls_pairing_device_reads_bound_models_not_installed_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let server = spawn_loopback_pairing_server(temp.path()).await;
@@ -1177,6 +1224,21 @@ async fn loopback_tls_revoked_pairing_device_cannot_access_remote_compute() {
     )
     .await;
     assert_eq!(transcription.status, 401);
+
+    let (align_content_type, align_body) = remote_precise_timeline_multipart_body();
+    let align = https_request(
+        server.addr,
+        "POST",
+        "/v1/audio/precise-timeline",
+        &[
+            ("Authorization", bearer_auth.as_str()),
+            ("X-OpenASR-Remote-Compute", "client"),
+            ("Content-Type", &align_content_type),
+        ],
+        align_body,
+    )
+    .await;
+    assert_eq!(align.status, 401);
 
     let error =
         match try_connect_loopback_realtime_websocket(&server, &credential.bearer_token).await {
@@ -1387,6 +1449,12 @@ fn operator_only_paths_cover_history_config_and_model_mutations() {
         &Method::POST,
         "/v1/audio/translations"
     ));
+    // Forced alignment is a compute capability (SSOT remote-compute §1/§2/§4.24),
+    // not an operator mutation. Paired device tokens may call it.
+    assert!(!is_operator_only_path(
+        &Method::POST,
+        "/v1/audio/precise-timeline"
+    ));
     assert!(!is_operator_only_path(&Method::GET, "/v1/models/pull/job1"));
 }
 
@@ -1490,6 +1558,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
+        voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker,
         ..Default::default()
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
@@ -1499,6 +1568,10 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     assert_eq!(
         request.voice_id_segmenter,
         openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0
+    );
+    assert_eq!(
+        request.voice_id_embedder,
+        openasr_core::config::VoiceIdEmbedderPreference::WeSpeaker
     );
 
     request.inference_threads = Some(2);
@@ -1831,6 +1904,93 @@ async fn scheduled_idle_switch_waits_while_native_slot_is_occupied() {
     assert!(
         idle_switch_slot_is_clear(&runtime),
         "dropping the permit must clear the native slot so idle-switch can apply"
+    );
+}
+
+#[test]
+fn try_acquire_native_execution_rejects_pending_idle_switch() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let error = runtime
+        .acquire_native_execution("native:whisper-tiny@pending-switch", None)
+        .expect_err("pending idle switch must reject new native slots");
+    assert!(
+        matches!(error, ApiError::Conflict(ref message) if message == PENDING_IDLE_SWITCH_MESSAGE),
+        "expected pending-idle-switch conflict, got {error}"
+    );
+}
+
+#[test]
+fn try_acquire_native_execution_succeeds_when_no_idle_switch_is_pending() {
+    let runtime = ServerRuntime::default();
+    runtime
+        .acquire_native_execution("native:whisper-tiny@idle", None)
+        .expect("idle runtime must admit a native slot");
+}
+
+#[tokio::test]
+async fn apply_pending_idle_switch_if_idle_rebounds_to_the_bound_pack() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let pack_a = write_installed_pack_ref(
+        &home,
+        "whisper-tiny",
+        "whisper-tiny:q4",
+        "q4_0",
+        "q4",
+        "whisper-tiny",
+    );
+    let pack_b = write_installed_pack_ref(
+        &home,
+        "whisper-base",
+        "whisper-base:q4",
+        "q4_0",
+        "q4",
+        "whisper-base",
+    );
+    let pack_a_installed = installed_pack_by_pull(&home, "whisper-tiny:q4");
+    persist_default_pack(
+        &home,
+        &pack_a_installed,
+        QuantPreference::pinned(&pack_a_installed.quant),
+    )
+    .unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack_a.clone()).into(),
+    };
+    runtime
+        .model_pack_path
+        .set_activation_probe_failpoint(Some(activation_probe_ok()));
+    runtime
+        .native_execution
+        .remote_policy()
+        .request_idle_switch("whisper-base:q4");
+    let dist = DistributionContext::new(DistributionRuntime {
+        openasr_home: Some(home),
+        catalog_url: None,
+        catalog_local_override: None,
+    });
+    apply_pending_idle_switch_if_idle(&runtime, &dist);
+    assert!(
+        runtime
+            .native_execution
+            .remote_policy()
+            .pending_idle_switch()
+            .is_none(),
+        "idle apply must consume the pending switch"
+    );
+    assert_eq!(
+        runtime.model_pack_path.current().as_deref(),
+        Some(pack_b.as_path()),
+        "idle apply must rebind onto the requested pack"
     );
 }
 
@@ -2817,6 +2977,11 @@ async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
         runtime.model_pack_path.requested_path().as_deref(),
         Some(pack_path.as_path())
     );
+    assert_eq!(
+        runtime.model_pack_path.served_pack_path().as_deref(),
+        Some(pack_path.as_path()),
+        "served identity must be available from launch intent before attestation"
+    );
 
     let reactivation = realtime::spawn_boot_native_warmup(runtime.clone(), home.clone());
     tokio::time::timeout(std::time::Duration::from_secs(30), reactivation)
@@ -2843,6 +3008,242 @@ async fn boot_reactivation_attests_v2_before_publishing_active_runtime() {
             .runtime_receipts()
             .reconcile_live_leases_quiescent(services.memory_broker()),
         openasr_core::runtime_receipts::LeaseReceiptShadow::Matched
+    );
+}
+
+async fn issue_376_get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    use axum::body::{Body, to_bytes};
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 64).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("json response"),
+    )
+}
+
+fn issue_376_realtime_handshake_accepts(runtime: &ServerRuntime, model_id: &str) {
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("served pack for realtime handshake");
+    let adapter = validate_native_runtime_pack(snapshot.path()).expect("verify served pack");
+    validate_native_request_model(&adapter, model_id)
+        .expect("session.start identity must match the served pack");
+    let key = native_model_session_key(&adapter).expect("native session key");
+    let admitted = runtime
+        .acquire_native_execution_for_snapshot(
+            &snapshot,
+            &key,
+            None,
+            NativeAdmissionKind::Realtime,
+            None,
+        )
+        .expect("session.start admission must accept the served snapshot");
+    drop(admitted);
+}
+
+#[tokio::test]
+async fn issue_376_requested_launch_pack_lists_verified_identity_before_attestation() {
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: ActiveRuntimeSlot::requested(Some(pack.path.clone())),
+    };
+    assert!(
+        runtime.model_pack_path.current().is_none(),
+        "attestation must not have published the live pointer yet"
+    );
+
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(temp.path().to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, models) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"].as_array().unwrap().len(), 1);
+    assert_eq!(models["data"][0]["id"], "moonshine-tiny");
+
+    let (status, default) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default["default_model"], "moonshine-tiny");
+    assert_eq!(
+        default["activation"], "committed",
+        "served launch path must count as the bound default before attestation"
+    );
+
+    let (status, health) = issue_376_get_json(app.clone(), "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+    assert_eq!(
+        health["model_resident"], false,
+        "launch identity must not be conflated with residency"
+    );
+
+    let (status, capabilities) = issue_376_get_json(app, "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities["object"], "capabilities");
+    assert!(
+        capabilities["transcription"].is_object(),
+        "capabilities must be derived from the served pack: {capabilities}"
+    );
+
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+}
+
+#[tokio::test]
+async fn issue_376_idle_unload_keeps_served_identity_on_models_default_and_realtime_handshake() {
+    let _generation_lock = idle_activity::native_unload_generation_test_lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let pack = write_valid_installed_pack_for_test(temp.path(), "moonshine-tiny", "q8_0", "q8");
+    persist_default_pack(temp.path(), &pack, QuantPreference::pinned(&pack.quant)).unwrap();
+    let runtime = ServerRuntime {
+        backend: BackendKind::Native,
+        native_execution: NativeExecutionSupervisor::default(),
+        ffmpeg_bin: None,
+        ffmpeg_bin_explicit: false,
+        model_pack_path: Some(pack.path.clone()).into(),
+    };
+    let snapshot = runtime
+        .model_pack_path
+        .served_snapshot()
+        .expect("bound pack");
+    idle_activity::mark_native_model_warm(snapshot.residency_key());
+    assert!(runtime.model_is_resident());
+
+    let app = app_with_runtime_and_distribution(
+        runtime.clone(),
+        DistributionRuntime {
+            openasr_home: Some(temp.path().to_path_buf()),
+            catalog_url: None,
+            catalog_local_override: None,
+        },
+    );
+
+    let (status, models_before) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models_before["data"][0]["id"], "moonshine-tiny");
+    let (status, default_before) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_before["default_model"], "moonshine-tiny");
+    assert_eq!(default_before["activation"], "committed");
+    let (status, capabilities_before) = issue_376_get_json(app.clone(), "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+
+    idle_activity::bump_native_unload_generation();
+    runtime
+        .native_execution
+        .execution_services()
+        .unload_idle_native_model_runtime_caches();
+    assert!(
+        !runtime.model_is_resident(),
+        "idle unload must evict residency"
+    );
+    assert_eq!(
+        runtime.model_pack_path.served_pack_path().as_deref(),
+        Some(pack.path.as_path()),
+        "idle unload must not clear served identity"
+    );
+
+    let (status, models_after) = issue_376_get_json(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models_after, models_before);
+    let (status, default_after) = issue_376_get_json(app.clone(), "/v1/models/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_after["default_model"], "moonshine-tiny");
+    assert_eq!(default_after["activation"], "committed");
+    let (status, health) = issue_376_get_json(app.clone(), "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["model_installed"], true);
+    assert_eq!(health["model_resident"], false);
+    let (status, capabilities_after) = issue_376_get_json(app, "/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(capabilities_after, capabilities_before);
+    issue_376_realtime_handshake_accepts(&runtime, "moonshine-tiny");
+}
+
+#[test]
+fn issue_376_session_start_and_transcription_admit_from_served_snapshot() {
+    let start = include_str!("realtime/ws_session.rs")
+        .split("pub(crate) async fn start_native_streaming_session")
+        .nth(1)
+        .expect("start_native_streaming_session")
+        .split("\n    pub(crate)")
+        .next()
+        .expect("start_native_streaming_session body");
+    assert!(
+        start.contains("served_snapshot()"),
+        "session.start must admit the served pack, not only the attested live pointer: {start}"
+    );
+    assert!(
+        !start.contains("current_snapshot()"),
+        "session.start must not fall back to current_snapshot: {start}"
+    );
+
+    let native_arm = include_str!("routes/transcription.rs")
+        .split("pub(crate) async fn transcribe_with_runtime")
+        .nth(1)
+        .expect("transcribe_with_runtime")
+        .split("BackendKind::Native =>")
+        .nth(1)
+        .expect("native transcription arm");
+    assert!(
+        native_arm.contains("served_snapshot()"),
+        "native transcription must admit the served pack: {native_arm}"
+    );
+
+    let served = include_str!("lib.rs")
+        .split("pub(crate) fn served_snapshot")
+        .nth(1)
+        .expect("served_snapshot")
+        .split("fn snapshot_is_current")
+        .next()
+        .expect("served_snapshot body");
+    assert_eq!(
+        served.matches("lock_read()").count(),
+        1,
+        "served_snapshot must observe active and requested under one lock: {served}"
+    );
+    assert!(
+        !served.contains("current_snapshot()"),
+        "served_snapshot must not re-enter current_snapshot across a second lock: {served}"
+    );
+}
+
+#[test]
+fn idle_unload_reaper_does_not_clear_served_identity() {
+    let source = include_str!("idle_activity.rs");
+    let spawn = source
+        .split("pub(crate) fn spawn_idle_unload_reaper")
+        .nth(1)
+        .expect("spawn_idle_unload_reaper")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("reaper body");
+    assert!(
+        spawn.contains("unload_idle_native_model_runtime_caches")
+            && spawn.contains("bump_native_unload_generation"),
+        "reaper must evict residency, not served identity: {spawn}"
+    );
+    assert!(
+        !spawn.contains("clear_active") && !spawn.contains("clear_active_native_model"),
+        "idle unload must not clear served identity: {spawn}"
     );
 }
 
@@ -3464,6 +3865,33 @@ fn transcription_canceled_backend_error_maps_to_409() {
     let response =
         ApiError::Backend(openasr_core::BackendError::TranscriptionCanceled).into_response();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn speaker_embeddings_authorization_is_403_authorization_error() {
+    let response =
+        ApiError::Authorization("Speaker embeddings are biometric-derived data.".to_string())
+            .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "authorization_error");
+}
+
+#[tokio::test]
+async fn pause_forbidden_stays_openasr_error_not_authorization_error() {
+    let response = ApiError::Forbidden(
+        "Only the device that started this transcription can control it.".to_string(),
+    )
+    .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 64)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "openasr_error");
 }
 
 #[test]

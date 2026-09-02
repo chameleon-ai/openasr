@@ -469,7 +469,7 @@ fn realtime_phrase_bias_rejection_message(
     capability: openasr_core::api::backend::BackendFeatureCapability,
 ) -> String {
     if runtime.backend == openasr_core::BackendKind::Native
-        && let Some(path) = runtime.model_pack_path.current()
+        && let Some(path) = runtime.model_pack_path.served_pack_path()
         && let Some(adapter) = native_runtime_model_adapter_for_path(&path)
     {
         return format!(
@@ -987,7 +987,24 @@ impl WsSession {
         }
         // Anonymous speaker separation (SPEAKER_00) is independent of enrolled
         // Voice ID matching and does not require the speaker-identity stage.
+        // Dictation is single-speaker text: reject the request instead of
+        // computing labels and hiding them later.
+        let source_name = session
+            .source_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         let anonymous_diarize = session.diarize.unwrap_or(false);
+        if anonymous_diarize && source_name.as_deref() == Some(DICTATION_SOURCE_NAME) {
+            self.emit_error(
+                RealtimeErrorCode::StartupConfigError,
+                DICTATION_SPEAKERS_UNSUPPORTED_MESSAGE,
+                false,
+            )
+            .await?;
+            return Err(());
+        }
         self.required_stage_readiness = RequiredStageReadinessBarrier::for_session(false);
         if anonymous_diarize && let Err(message) = self.attach_anonymous_streaming_diarizer() {
             self.emit_error(RealtimeErrorCode::StartupConfigError, &message, false)
@@ -1047,12 +1064,6 @@ impl WsSession {
             }
         };
 
-        let source_name = session
-            .source_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
         let use_native_streaming =
             should_use_native_streaming_session(source_name.as_deref(), capabilities);
         let effective_partial_results = effective_session_partial_results(
@@ -1203,7 +1214,7 @@ impl WsSession {
         partial_results: bool,
         word_timestamps: bool,
     ) -> Result<(), ()> {
-        let Some(active_model) = self.runtime.model_pack_path.current_snapshot() else {
+        let Some(active_model) = self.runtime.model_pack_path.served_snapshot() else {
             self.emit_error(
                 RealtimeErrorCode::StartupConfigError,
                 "Native realtime streaming requires an explicit local runtime pack path.",

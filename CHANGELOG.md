@@ -7,11 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- API: `POST /v1/audio/transcriptions` and `/v1/audio/translations` accept
+  opt-in `return_speaker_embeddings=true` with `diarize=true` and
+  `response_format=verbose_json`. The response then includes a WhisperX/Speakr
+  `speaker_embeddings` map plus sibling `speaker_embedding_space` metadata
+  copied from already-computed diarization centroids. Default requests omit
+  both fields. Remote-compute device tokens requesting the field receive HTTP
+  403 `authorization_error`; operator and loopback clients are unrestricted.
 - Subtitles: transcription results now keep readable paragraphs separate from
   short subtitle cues. JSON responses expose `subtitle_cues` and
   `timeline_quality`; SRT/VTT render the cue view. The server also provides
   `POST /v1/audio/precise-timeline` to refine an existing transcript against
-  its source audio when the Qwen3 Forced Aligner capability pack is installed.
+  its source audio, or to force-align a user-supplied plain-text manuscript
+  (`transcript` form field) onto the audio, when the Qwen3 Forced Aligner
+  capability pack is installed. `openasr align` is the matching CLI.
+- Forced alignment of an external transcript fails closed when the aligner
+  pack is missing, the language is Japanese/Korean, the normalized text is
+  empty, the audio exceeds the aligner's timestamp grid, or the resulting
+  timeline is degenerate (collapsed bins / zero-duration words).
 - CLI: `openasr bench-receipt short-audio` writes a machine-readable receipt
   for a measured short-audio run, binding the report to the selected pack,
   source audio, runtime settings, and recorded measurements.

@@ -31,6 +31,7 @@ pub(super) fn transcribe_many(
     output_dir: &Path,
     skipped: usize,
     options: &TranscribeCommandOptions<'_>,
+    voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference,
 ) -> Result<()> {
     ensure_batch_output_dir(output_dir)?;
     let longform = if prepared_run.backend_kind == BackendKind::Native {
@@ -48,6 +49,7 @@ pub(super) fn transcribe_many(
         ffmpeg_bin_explicit: prepared_run.ffmpeg_bin_explicit,
         longform,
         diarize: options.diarize,
+        voice_id_embedder,
         speakers: options.speakers,
         language: options.language.clone(),
         task: options.task,
@@ -168,6 +170,7 @@ fn batch_item_transcription_request(
                 .map(str::to_string),
         )
         .with_voice_id(context.diarize)
+        .with_voice_id_embedder(context.voice_id_embedder)
         .with_diarize_speakers(context.speakers)
         // Match single-file `transcribe`: SRT/VTT export requests a precise
         // timeline under TimelinePrecisionPolicy::Auto.
@@ -712,6 +715,7 @@ pub(super) async fn serve(
             ),
             ffmpeg_bin,
             ffmpeg_bin_explicit,
+            // Launch path is served identity; current() waits for attestation.
             model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
                 model_source.model_pack_path,
             ),
@@ -1459,6 +1463,145 @@ pub(super) fn write_rendered_output_atomic(rendered: &str, output: &Path) -> Res
     })
 }
 
+pub(super) fn align_plain_transcript_command(
+    native_execution_services: &Arc<NativeExecutionServices>,
+    options: AlignCommandOptions<'_>,
+) -> Result<()> {
+    let dash = Path::new("-");
+    if options.audio == dash && options.transcript == dash {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "audio and --transcript cannot both be '-' (stdin)".to_string(),
+        )
+        .into());
+    }
+
+    let home = openasr_home()?;
+    let config = load_config(&home)?;
+    let backend = resolve_backend(options.backend_kind, &config)?;
+    if backend != BackendKind::Native {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "openasr align requires the native backend.".to_string(),
+        )
+        .into());
+    }
+
+    let needs_subtitle_export = options
+        .formats
+        .iter()
+        .any(|format| matches!(format, ResponseFormat::Srt | ResponseFormat::Vtt));
+    ensure_cli_word_timestamps_pack_installed(
+        native_execution_services,
+        backend,
+        None,
+        false,
+        Some(WordTimestampsMode::Aligned),
+        needs_subtitle_export,
+        &options.consent,
+    )?;
+
+    let execution_target = parse_align_execution_target(options.execution_target)?;
+    let audio_pathbuf = options.audio.to_path_buf();
+    let stdin_audio = crate::maybe_read_stdin_to_temp(std::slice::from_ref(&audio_pathbuf))?;
+    let audio_path = match &stdin_audio {
+        Some(temp) => temp.path().to_path_buf(),
+        None => audio_pathbuf,
+    };
+    let transcript_text = read_align_transcript(options.transcript)?;
+
+    let ffmpeg_bin = resolve_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &config);
+    let ffmpeg_bin_explicit =
+        resolve_explicit_ffmpeg_bin(options.runtime_paths.ffmpeg_bin.clone(), &config).is_some();
+    let prepared = openasr_core::prepare_audio_input(
+        &audio_path,
+        &audio_preparation_options(backend, ffmpeg_bin, ffmpeg_bin_explicit),
+    )
+    .map_err(|error| consent::CliExit::new(consent::ExitCode::InputError, error.to_string()))?;
+    print_audio_input_notes(prepared.original());
+    print_audio_preparation_notes(&prepared);
+
+    let samples = if let Some(shared) = prepared.shared_samples() {
+        shared
+    } else {
+        Arc::new(
+            openasr_core::load_native_wav_16khz_mono_f32_v0(
+                prepared.path(),
+                "openasr align",
+                "openasr align audio",
+            )
+            .map_err(|error| {
+                consent::CliExit::new(consent::ExitCode::InputError, error.to_string())
+            })?,
+        )
+    };
+    if samples.is_empty() {
+        return Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            "Audio decoded to zero samples; cannot align transcript.".to_string(),
+        )
+        .into());
+    }
+
+    configure_native_cpu_inference_threads();
+    let transcription = openasr_core::align_plain_transcript_to_audio(
+        transcript_text,
+        samples.as_slice(),
+        native_execution_services,
+        execution_target,
+        options.language.as_deref(),
+        options.keep_word_timestamps,
+    )
+    .map_err(|error| consent::CliExit::new(consent::ExitCode::RuntimeFailed, error.to_string()))?;
+    write_rendered_formats(
+        &transcription,
+        options.formats,
+        &audio_path,
+        options.output,
+        false,
+    )?;
+    Ok(())
+}
+
+fn read_align_transcript(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .lock()
+            .read_to_string(&mut buf)
+            .map_err(|error| {
+                consent::CliExit::new(
+                    consent::ExitCode::InputError,
+                    format!("Could not read transcript from stdin: {error}"),
+                )
+            })?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).map_err(|error| {
+        consent::CliExit::new(
+            consent::ExitCode::InputError,
+            format!("Could not read transcript {}: {error}", path.display()),
+        )
+        .into()
+    })
+}
+
+fn parse_align_execution_target(raw: Option<&str>) -> Result<openasr_core::ExecutionTarget> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("auto") => Ok(openasr_core::ExecutionTarget::Auto),
+        Some("cpu") => Ok(openasr_core::ExecutionTarget::Cpu),
+        Some("accelerated") => Ok(openasr_core::ExecutionTarget::Accelerated),
+        Some(other) => Err(consent::CliExit::new(
+            consent::ExitCode::InputError,
+            format!(
+                "Unsupported --execution-target '{other}'. Use one of: auto, cpu, accelerated."
+            ),
+        )
+        .into()),
+    }
+}
+
 pub(super) fn parse_response_format(value: &str) -> Result<ResponseFormat, String> {
     ResponseFormat::from_str(value)
 }
@@ -1527,6 +1670,7 @@ mod tests {
             ffmpeg_bin_explicit: false,
             longform: None,
             diarize: false,
+            voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
             speakers: None,
             language: None,
             task: None,
@@ -1555,6 +1699,7 @@ mod tests {
                 ffmpeg_bin_explicit: false,
                 longform: None,
                 diarize: false,
+                voice_id_embedder: openasr_core::config::VoiceIdEmbedderPreference::ReDimNet2,
                 speakers: None,
                 language: None,
                 task: None,

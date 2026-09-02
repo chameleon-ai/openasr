@@ -321,6 +321,10 @@ pub struct NativeAsrRequestOptions {
     /// the Voice ID / anonymous-diarize flags so the server rebuild does not
     /// drop `speakers`.
     pub diarize_speakers: Option<u8>,
+    /// Opt-in per-speaker embeddings. Carried across the native offline
+    /// round-trip so the server rebuild does not drop
+    /// `return_speaker_embeddings`.
+    pub return_speaker_embeddings: bool,
     pub partial_results: bool,
     pub word_timestamps: bool,
     /// Opt-in `--word-timestamps=aligned` / `word_aligned` refinement tier;
@@ -374,6 +378,11 @@ impl NativeAsrRequestOptions {
         self
     }
 
+    pub fn with_return_speaker_embeddings(mut self, return_speaker_embeddings: bool) -> Self {
+        self.return_speaker_embeddings = return_speaker_embeddings;
+        self
+    }
+
     pub fn with_partial_results(mut self, partial_results: bool) -> Self {
         self.partial_results = partial_results;
         self
@@ -424,6 +433,10 @@ pub struct NativeAsrOfflineRequest {
     /// not exposed as a multipart/per-job option.
     #[doc(hidden)]
     pub voice_id_segmenter: crate::config::VoiceIdSegmenterPreference,
+    /// Persisted speaker-embedder preference carried across the server's
+    /// native offline adapter round-trip.
+    #[doc(hidden)]
+    pub voice_id_embedder: crate::config::VoiceIdEmbedderPreference,
     /// Cancel/pause/resume control and request id for this decode -- same
     /// "explicit, never TLS" contract as
     /// [`crate::TranscriptionRequest::execution_context`], which this carries
@@ -453,6 +466,7 @@ impl NativeAsrOfflineRequest {
             source_container: None,
             prepared_samples: None,
             voice_id_segmenter: crate::config::VoiceIdSegmenterPreference::Auto,
+            voice_id_embedder: crate::config::VoiceIdEmbedderPreference::ReDimNet2,
             execution_context: Arc::new(crate::RequestExecutionContext::uncancellable(
                 "NativeAsrOfflineRequest::new()'s pre-opt-in default; a caller needing \
                  cancellation attaches a real context via with_execution_context",
@@ -474,6 +488,15 @@ impl NativeAsrOfflineRequest {
         preference: crate::config::VoiceIdSegmenterPreference,
     ) -> Self {
         self.voice_id_segmenter = preference;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_voice_id_embedder(
+        mut self,
+        preference: crate::config::VoiceIdEmbedderPreference,
+    ) -> Self {
+        self.voice_id_embedder = preference;
         self
     }
 
