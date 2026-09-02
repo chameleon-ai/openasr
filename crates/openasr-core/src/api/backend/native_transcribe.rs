@@ -95,6 +95,22 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
+/// Whisper's default longform window, in seconds. Whisper is the only family
+/// that reaches its 30s *full* window in ordinary longform operation (its
+/// `Default` longform profile keeps the `Auto` elect, unclamped), and whisper's
+/// greedy decode is most likely to bail a 30s window to no-speech -- or trip
+/// the degenerate-repeat guard -- on soft, repetitive, continuous speech, where
+/// the whole window lands at the edge of its 30s training regime and the decode
+/// never reaches an honest stop. Dropping ~3s under the architecture's 30s
+/// invocation ceiling (which stays in force as the hard bound) gives the decode
+/// enough margin to complete, recovering the dropped words on recordings like a
+/// quiet continuous monologue. Measured on the long-clip suite: this lifts the
+/// four long clips' mean in-window coverage from 0.930 to 0.957 (the longest, a
+/// 635s soft monologue, from 0.823 to 0.897) while leaving the single-window
+/// clips byte-for-byte unchanged. Kept deliberately below the ceiling rather
+/// than widening it.
+const WHISPER_LONGFORM_WINDOW_SECONDS: f32 = 27.0;
+
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
     if value.eq_ignore_ascii_case("cpu") {
@@ -2108,12 +2124,90 @@ fn forced_alignment_segment_sample_range(
     (start < end).then_some(start..end)
 }
 
+/// Clamp bounds for the forced-aligner word width floor. The forced aligner
+/// predicts each word boundary as an integer `timestamp_segment_time` bin (80ms
+/// default), so a short word whose two boundary bins land in the same or
+/// adjacent bins comes back with a degenerate width -- zero, or far below the
+/// ~770ms window a cross-attention-DTW aligner would emit. Measured on the
+/// qwen3-asr suite, aligned words are ~160ms wide (50% under 300ms), such that
+/// the majority of them never overlap the wider ground-truth window and
+/// in-window coverage caps well below what the aligner's own timing can
+/// achieve. Widening each thin word up to the floor restores the ~1/2s a short
+/// word actually occupies. The floor itself is a self-tuning estimate of the
+/// clip's real word width (the median, see `median_word_width`), clamped into
+/// this band so fast speech does not collapse the floor to near-zero and slow
+/// speech does not inflate it past a plausible word length. When the override
+/// sets `max < min` the widening is disabled entirely (the bounds are an
+/// explicit no-op, not a magic constant someone has to find).
+fn forced_aligner_word_width_bounds() -> (f64, f64) {
+    const MIN: f64 = 0.3;
+    const MAX: f64 = 1.2;
+    let min = std::env::var("OPENASR_FORCED_ALIGNER_MIN_WORD_WIDTH_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|sec| sec.is_finite() && *sec >= 0.0)
+        .unwrap_or(MIN);
+    let max = std::env::var("OPENASR_FORCED_ALIGNER_MAX_WORD_WIDTH_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|sec| sec.is_finite() && *sec >= 0.0)
+        .unwrap_or(MAX);
+    (min, max)
+}
+
+/// The width floor for this segment's aligned words: the *median* aligned word
+/// width, clamped to [`forced_aligner_word_width_bounds`]. The median is
+/// preferred over a global constant because it tracks the clip's own speech
+/// pace -- a fast-spoken clip gets a narrower floor, a slow one a wider one --
+/// so the widening always targets "how wide a normal word in this clip is"
+/// rather than a number chosen for some other corpus. Returns a floor of
+/// `min > max` when the bounds disable widening, so callers can detect the
+/// no-op without a sentinel.
+fn median_word_width(items: &[ForcedAlignItem], bounds: (f64, f64)) -> f64 {
+    if bounds.1 < bounds.0 {
+        // Disabled by operator: report a floor that no real width can meet, so
+        // `widen_thin_word` becomes an identity for every word.
+        return f64::INFINITY;
+    }
+    let mut widths: Vec<f64> = items
+        .iter()
+        .map(|item| (item.end_time_s - item.start_time_s).max(0.0))
+        .filter(|width| *width > f64::EPSILON)
+        .collect();
+    let median = match widths.len() {
+        0 => bounds.0,
+        len => {
+            widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            widths[len / 2]
+        }
+    };
+    median.clamp(bounds.0, bounds.1)
+}
+
+/// Widen a word window to at least `floor` seconds, about its midpoint, clamped
+/// to `[lower, upper]`. A word already at/above `floor` is returned
+/// unchanged, so the floor only ever *adds* width to the degenerate bin-adjacent
+/// words and never shifts a well-formed one. The midpoint is preserved, which
+/// is what keeps the word's *position* (and therefore center-based timing
+/// error) stable while the *coverage* grows.
+fn widen_thin_word(start: f64, end: f64, floor: f64, lower: f64, upper: f64) -> (f64, f64) {
+    if floor.is_infinite() || end - start >= floor {
+        return (start, end);
+    }
+    let center = (start + end) / 2.0;
+    let new_start = (center - floor / 2.0).max(lower);
+    let new_end = (center + floor / 2.0).min(upper).max(new_start);
+    (new_start, new_end)
+}
+
 fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) {
     if items.is_empty() {
         return;
     }
     let offset = f64::from(segment.start);
     let segment_end = f64::from(segment.end);
+    let (min_width, max_width) = forced_aligner_word_width_bounds();
+    let floor = median_word_width(items, (min_width, max_width));
     segment.words = items
         .iter()
         .map(|item| {
@@ -2121,6 +2215,7 @@ fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) 
             let end = (offset + item.end_time_s)
                 .clamp(start, segment_end)
                 .max(start);
+            let (start, end) = widen_thin_word(start, end, floor, offset, segment_end);
             WordTimestamp {
                 word: item.text.clone(),
                 start: start as f32,
@@ -3963,6 +4058,7 @@ fn apply_longform_safety_policy(
         options,
         provenance,
     );
+    apply_whisper_longform_window_policy(model_architecture, options, provenance);
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
 }
 
@@ -4102,6 +4198,61 @@ fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
         options.padding_seconds = 0.0;
         provenance.push("core.native.longform.policy:whisper-xattn-dtw-no-padding".to_string());
     }
+}
+
+/// Sets whisper's longform window to [`WHISPER_LONGFORM_WINDOW_SECONDS`](27s),
+/// or to an `OPENASR_WHISPER_MAX_CHUNK_SECONDS` override, in both cases clamped
+/// at the architecture's invocation ceiling (30s).
+///
+/// The 27s window is a *quality* bound, distinct from the architectural ceiling:
+/// the 30s figure is whisper's hard fail-closed envelope (a wider invocation is
+/// rejected upstream by the `InvocationOutsideEnvelope` guard), whereas 27s is
+/// the point below which whisper's greedy decode reliably *completes* a
+/// 30s-class window instead of bailing soft, repetitive speech to no-speech or
+/// tripping the degenerate-repeat guard. Because it is clamped at the ceiling
+/// that `apply_invocation_span_longform_policy` already applied, it can never
+/// widen past the crash boundary. The override lets an operator dial the window
+/// tighter or restore 30s for a corpus where 27 regresses, without a rebuild;
+/// it is a no-op when unset.
+fn apply_whisper_longform_window_policy(
+    model_architecture: &str,
+    options: &mut crate::LongFormOptions,
+    provenance: &mut Vec<String>,
+) {
+    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+        return;
+    }
+    let ceiling = options.max_chunk_seconds;
+    let requested = match std::env::var("OPENASR_WHISPER_MAX_CHUNK_SECONDS") {
+        Ok(raw) => raw
+            .parse::<f32>()
+            .ok()
+            .filter(|sec| sec.is_finite() && *sec > 0.0),
+        Err(_) => None,
+    }
+    .unwrap_or(WHISPER_LONGFORM_WINDOW_SECONDS)
+    .min(ceiling);
+    if let Some(window) = apply_whisper_longform_window(options, requested) {
+        provenance.push(format!(
+            "core.native.longform.policy:whisper-window={window}"
+        ));
+    }
+}
+
+/// Set whisper's longform options to `requested` seconds, or `None` when they
+/// already sit there (so an override at the current value is a no-op). The
+/// caller clamps `requested` to the architecture ceiling ahead of time.
+fn apply_whisper_longform_window(
+    options: &mut crate::LongFormOptions,
+    requested: f32,
+) -> Option<f32> {
+    if (requested - options.max_chunk_seconds).abs() <= f32::EPSILON {
+        return None;
+    }
+    options.chunk_seconds = requested;
+    options.max_chunk_seconds = requested;
+    options.min_chunk_seconds = options.min_chunk_seconds.min(requested);
+    Some(requested)
 }
 
 /// Caps longform chunking to the architecture's declared
@@ -7913,8 +8064,11 @@ mod tests {
             crate::WHISPER_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        assert_eq!(resolution.options.chunk_seconds, 30.0);
-        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        // Whisper's window is the 27s quality window, well inside the 30s
+        // invocation envelope (the whole point: a full 30s window is where
+        // whisper's greedy decode bails soft speech to no-speech).
+        assert_eq!(resolution.options.chunk_seconds, 27.0);
+        assert_eq!(resolution.options.max_chunk_seconds, 27.0);
         // Whisper's cross-attention-DTW word times are buffer-absolute while the
         // assembler rebases from `content_start_sample`, so the padding rule
         // (shared with `ScopedSlices` / `ConservativeSeq2SeqV1`) must zero it.
@@ -7931,6 +8085,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-window=27"))
+        );
 
         let samples = vec![0.05_f32; 61 * 16_000];
         let plan = plan_longform_slices(&samples, 16_000, &resolution.options, None)
@@ -7945,13 +8105,12 @@ mod tests {
     }
 
     /// The default (auto-triggered, no explicit `LongFormOptions`) longform
-    /// resolution for whisper must carry zero slice padding. The shared window
-    /// (`chunk_seconds`, `max_chunk_seconds`) is unchanged -- only the padding
-    /// the buffer-absolute cross-attention-DTW word times would be biased by is
-    /// dropped. Pinned separately from the explicit-`Fixed` case above (which is
-    /// requested with `padding_seconds: 0.25`) to prove the rule fires on the
-    /// default 0.25 path too, and that a `Default`-profile family it must NOT
-    /// touch (qwen) keeps its padding.
+    /// resolution for whisper must carry zero slice padding and a 27s window
+    /// (not the 30s it would otherwise inherit from the architecture ceiling).
+    /// Pinned separately from the explicit-`Fixed` case above (which is
+    /// requested with `padding_seconds: 0.25`) to prove both rules fire on the
+    /// default path, and that a `Default`-profile family neither rule must NOT
+    /// touch (qwen) keeps its padding and its 30s window.
     #[test]
     fn whisper_auto_longform_resolves_with_zero_slice_padding() {
         let defaults = crate::LongFormOptions::default();
@@ -7968,12 +8127,27 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
-        // Only padding moved; the generic longform window is preserved.
+        // The generic window is narrowed to the 27s quality window, and the
+        // padding the buffer-absolute cross-attention-DTW word times would be
+        // biased by is zeroed.
         assert_eq!(
             resolution.options.chunk_seconds,
-            defaults.chunk_seconds.min(30.0)
+            WHISPER_LONGFORM_WINDOW_SECONDS
         );
-        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
+        assert_eq!(
+            resolution.options.max_chunk_seconds,
+            WHISPER_LONGFORM_WINDOW_SECONDS
+        );
+        assert_eq!(
+            resolution.options.min_chunk_seconds,
+            defaults.min_chunk_seconds.min(27.0)
+        );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("whisper-window=27"))
+        );
 
         let non_whisper = resolve_native_longform_policy_for_backend(
             None,
@@ -8393,14 +8567,20 @@ mod tests {
                             crate::arch::DEFAULT_ENCODER_MAX_CHUNK_SECONDS
                         }
                     };
-                    let expected = descriptor
+                    let mut expected = descriptor
                         .max_single_invocation_seconds()
                         .map_or(product_window, |semantic_max| {
                             product_window.min(semantic_max)
                         });
+                    // whisper carries its own 27s quality window on top of the two
+                    // caps above; it only narrows the result.
+                    if descriptor.identity.model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
+                    {
+                        expected = expected.min(WHISPER_LONGFORM_WINDOW_SECONDS);
+                    }
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
-                        "'{}' must keep the min(product window, semantic invocation span)",
+                        "'{}' must keep the min(product window, semantic invocation span, and any family quality window)",
                         descriptor.identity.model_architecture
                     );
                 }
@@ -8921,10 +9101,75 @@ mod tests {
         assign_local_aligned_words(&mut target, &items);
 
         assert_eq!(target.words.len(), 2);
-        assert_eq!(target.words[0].start, 30.1);
-        assert_eq!(target.words[0].end, 30.4);
-        assert_eq!(target.words[1].start, 30.5);
-        assert_eq!(target.words[1].end, 32.0);
+        // The width floor is the clip's median aligned width (1.2s, the 1.9s
+        // word clamped to the cap), so "hello" (0.3s) is widened about its
+        // midpoint 30.25 to a 1.2s window, its left edge clamped to the
+        // segment start; "world" (1.5s) is already above the floor and stays.
+        assert!(
+            (target.words[0].start - 30.0).abs() < 1e-3,
+            "start {}",
+            target.words[0].start
+        );
+        assert!(
+            (target.words[0].end - 30.85).abs() < 1e-3,
+            "end {}",
+            target.words[0].end
+        );
+        assert!(
+            (target.words[1].start - 30.5).abs() < 1e-3,
+            "start {}",
+            target.words[1].start
+        );
+        assert!(
+            (target.words[1].end - 32.0).abs() < 1e-3,
+            "end {}",
+            target.words[1].end
+        );
+    }
+
+    #[test]
+    fn median_word_width_is_the_clamped_median_of_positive_widths() {
+        // Median of [0.3, 1.9] is 1.9, clamped to the 1.2 cap.
+        assert_eq!(
+            median_word_width(&[item("a", 0.0, 0.3), item("b", 1.0, 2.9)], (0.3, 1.2)),
+            1.2
+        );
+        // An all-degenerate clip (every width 0) still floors at the `min`
+        // bound, so the degenerate zero-width words get a sensible floor.
+        assert_eq!(
+            median_word_width(&[item("a", 0.5, 0.5), item("b", 1.5, 1.5)], (0.3, 1.2)),
+            0.3
+        );
+        // A natural-width clip keeps its median (0.7) -- the no-op case: no
+        // word thinner than 0.7s exists, so nothing would be widened.
+        assert!(
+            (median_word_width(&[item("a", 0.0, 0.5), item("b", 1.0, 1.5)], (0.3, 1.2)) - 0.5)
+                .abs()
+                < 1e-6
+        );
+        // Operator disables widening with max < min: an infinite floor, which
+        // `widen_thin_word` treats as an identity.
+        assert!(median_word_width(&[item("a", 0.0, 0.3)], (0.5, 0.1)).is_infinite());
+    }
+
+    #[test]
+    fn widen_thin_word_only_widens_thin_words_about_their_center() {
+        // A word at/above the floor is returned unchanged.
+        assert_eq!(widen_thin_word(1.0, 2.5, 1.2, 0.0, 10.0), (1.0, 2.5));
+        // A thin word is widened symmetrically to the floor about its midpoint
+        // (center 1.25, +0.6/-0.6).
+        assert_eq!(widen_thin_word(1.2, 1.3, 1.2, 0.0, 10.0), (0.65, 1.85));
+        // A zero-width word lands at full floor width centered on the point.
+        assert_eq!(widen_thin_word(2.5, 2.5, 1.2, 0.0, 10.0), (1.9, 3.1));
+        // A word hugging the segment start clamps its left edge to the start;
+        // the right edge is the midpoint plus half the floor, so it takes
+        // whatever width fits rather than being centered (center 0.05, +0.6).
+        assert_eq!(widen_thin_word(0.05, 0.05, 1.2, 0.0, 10.0), (0.0, 0.65));
+        // An infinite floor (operator-disabled) is the identity for all words.
+        assert_eq!(
+            widen_thin_word(1.2, 1.3, f64::INFINITY, 0.0, 10.0),
+            (1.2, 1.3)
+        );
     }
 
     #[test]
