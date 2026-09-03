@@ -6248,6 +6248,7 @@ fn whisper_cross_attention_word_timestamps(
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
+                    f32::INFINITY,
                 ) {
                     block_words = whisper_cap_dtw_word_spans(block_words, seconds_per_frame);
                     words.extend(block_words);
@@ -6339,6 +6340,7 @@ fn whisper_cross_attention_word_timestamps(
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
+                    f32::INFINITY,
                 )
                 .map_err(|error| {
                     WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
@@ -6372,6 +6374,7 @@ fn whisper_cross_attention_word_timestamps(
         &decode_text,
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
+        f32::INFINITY,
     )
     .map_err(
         |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
