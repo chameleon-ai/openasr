@@ -115,6 +115,7 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
         decode_text_token_ids,
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
+        f32::INFINITY,
     )
 }
 
@@ -125,6 +126,15 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
 /// midpoint/no-lead fold (`0.5`, `0.0`) is the default behavior: a word owns
 /// the audio up to halfway into each neighbour, with no correction between
 /// where the model's attention centers the token and when it is spoken.
+///
+/// `max_edge_word_span` clamps how far the *first* word's start may precede its
+/// own center and the *last* word's end may follow its own center (each bound is
+/// capped at `max_edge_word_span / 2` from the edge word's center). The fold
+/// otherwise anchors the first word's start to `segment_start` and the last
+/// word's end to `segment_end`; when those edges sit in leading/trailing
+/// silence far from the edge word's center, that anchor smears the word across
+/// the whole gap. `f32::INFINITY` disables the clamp and reproduces the
+/// historical anchor exactly.
 pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     token_times: &[Seq2SeqTokenTime],
     segment_start: f32,
@@ -133,6 +143,7 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, E>,
     boundary_fraction: f32,
     onset_lead: f32,
+    max_edge_word_span: f32,
 ) -> Result<Vec<WordTimestamp>, E> {
     let (segment_start, segment_end) = sanitize_segment_span(segment_start, segment_end);
 
@@ -226,6 +237,7 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
         segment_end,
         boundary_fraction,
         onset_lead,
+        max_edge_word_span,
     ))
 }
 
@@ -272,6 +284,7 @@ fn word_centers_to_timestamps(
     segment_end: f32,
     boundary_fraction: f32,
     onset_lead: f32,
+    max_edge_word_span: f32,
 ) -> Vec<WordTimestamp> {
     if words.is_empty() {
         return Vec::new();
@@ -295,10 +308,41 @@ fn word_centers_to_timestamps(
         last_center = word.center_seconds;
     }
 
+    // The first word's start and the last word's end are anchored to the
+    // segment edges by construction. When those edges fall inside
+    // leading/trailing silence (common on chunks whose middle speech was
+    // collapsed, or where the first word's speech is a few seconds in), the
+    // anchor smears the word across the whole gap. `max_edge_word_span / 2`
+    // bounds how far an edge word's window may extend away from its own
+    // center; a word whose center sits at the edge is unaffected.
+    let half_span = if max_edge_word_span.is_finite() {
+        (max_edge_word_span / 2.0).max(0.0)
+    } else {
+        f32::INFINITY
+    };
+
     let mut timestamps = Vec::with_capacity(words.len());
+    let first_center = words
+        .first()
+        .map(|w| w.center_seconds)
+        .unwrap_or(segment_start);
+    let last_center = words
+        .last()
+        .map(|w| w.center_seconds)
+        .unwrap_or(segment_end);
+    let first_min_start = if half_span.is_finite() {
+        (first_center - half_span).max(segment_start)
+    } else {
+        segment_start
+    };
+    let last_max_end = if half_span.is_finite() {
+        (last_center + half_span).min(segment_end)
+    } else {
+        segment_end
+    };
     for (index, word) in words.iter().enumerate() {
         let start = if index == 0 {
-            segment_start
+            first_min_start
         } else {
             boundary(
                 words[index - 1].center_seconds,
@@ -307,7 +351,7 @@ fn word_centers_to_timestamps(
             )
         };
         let end = if index + 1 == words.len() {
-            segment_end
+            last_max_end
         } else {
             boundary(
                 word.center_seconds,
@@ -417,6 +461,7 @@ mod tests {
             &pieces,
             MIDPOINT_BOUNDARY_FRACTION,
             NO_ONSET_LEAD,
+            f32::INFINITY,
         )
         .unwrap();
 
@@ -430,6 +475,117 @@ mod tests {
         // 0.7; " rocks" came from a token with no captured probability.
         assert!((words[0].confidence.unwrap() - 0.7).abs() < 1e-6);
         assert_eq!(words[1].confidence, None);
+    }
+
+    #[test]
+    fn edge_word_clamp_binds_words_to_their_center_when_they_sit_far_from_the_edge() {
+        // Segment [0, 2s] with two words whose centers are near the far ends
+        // and a big gap between them. Without the clamp the first word's
+        // start stays anchored at 0.0 and the last word's end stays anchored
+        // at 2.0, so each spans a full second of leading/trailing silence.
+        // With max_edge_word_span = 0.2 each edge word is bounded to 0.1s on
+        // either side of its own center.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "you",
+                        2 => " deserve",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 0.3,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 1.7,
+                probability: None,
+            },
+        ];
+
+        let clamped = seq2seq_word_timestamps_from_token_times(
+            &token_times,
+            0.0,
+            2.0,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+            0.5,
+            0.0,
+            0.2,
+        )
+        .unwrap();
+        assert_eq!(clamped.len(), 2);
+        // First word: start is max(0.0, 0.3 - 0.1) = 0.2, not 0.0.
+        assert!((clamped[0].start - 0.2).abs() < 1e-6);
+        // Last word: end is min(2.0, 1.7 + 0.1) = 1.8, not 2.0.
+        assert!((clamped[1].end - 1.8).abs() < 1e-6);
+        // Timeline stays monotone and non-overlapping.
+        assert!(clamped[0].end <= clamped[1].start);
+
+        let unclamped = seq2seq_word_timestamps_from_token_times(
+            &token_times,
+            0.0,
+            2.0,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+            0.5,
+            0.0,
+            f32::INFINITY,
+        )
+        .unwrap();
+        assert!((unclamped[0].start - 0.0).abs() < 1e-6);
+        assert!((unclamped[1].end - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_word_clamp_is_noop_when_the_edge_word_center_is_at_the_edge() {
+        // When the first word's center coincides with the segment start the
+        // clamp has nothing to trim: the word still starts at the band edge.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "hi",
+                        2 => " there",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 0.0,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 1.0,
+                probability: None,
+            },
+        ];
+        let words = seq2seq_word_timestamps_from_token_times(
+            &token_times,
+            0.0,
+            2.0,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+            0.5,
+            0.0,
+            0.2,
+        )
+        .unwrap();
+        assert_eq!(words.len(), 2);
+        // First word's center is at 0.0, so max(0.0, 0.0 - 0.1) = 0.0.
+        assert!((words[0].start - 0.0).abs() < 1e-6);
+        // Last word's center is at 1.0, so min(2.0, 1.0 + 0.1) = 1.1.
+        assert!((words[1].end - 1.1).abs() < 1e-6);
     }
 
     #[test]

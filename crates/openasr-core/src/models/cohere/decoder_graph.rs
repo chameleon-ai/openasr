@@ -588,6 +588,7 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         decode_text,
         COHERE_DTW_BOUNDARY_FRACTION,
         onset_lead,
+        COHERE_DTW_MAX_WORD_SPAN_SECONDS,
     )?;
     // `word_centers_to_timestamps` anchors the first word's start to
     // `segment_start` (the band start) and the last word's end to
@@ -674,6 +675,7 @@ fn cohere_peak_fallback_word_timestamps<E>(
         decode_text,
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
+        COHERE_DTW_MAX_WORD_SPAN_SECONDS,
     )
 }
 
@@ -5195,23 +5197,24 @@ mod tests {
         assert_eq!(words[0].word, "hi");
         assert_eq!(words[1].word, "there");
         // The DTW center fold anchors the first word's start to the band start
-        // (frame 0 here) and the last word's end to the band end (frame 12),
-        // rather than starting the first word at its token's attention peak as
-        // the old span-tiling did.
+        // (frame 0 here). In this synthetic setup both centers collapse to the
+        // band start after onset-lead, so the first word's window degenerates
+        // to a point at 0.0.
         assert!(
             (words[0].start - 0.0).abs() < 1e-3,
             "first word must start at the band start, got {words:?}"
         );
+        // The last word's end is no longer pinned to the segment end; the edge
+        // clamp bounds it to `last_center + COHERE_DTW_MAX_WORD_SPAN_SECONDS/2`.
+        // Here both centers are 0.0 so the last word ends at 0.75s instead of
+        // stretching the full band end at 0.96s.
+        let expected_last_end = COHERE_DTW_MAX_WORD_SPAN_SECONDS / 2.0;
         assert!(
-            (words[1].end - frames as f32 * seconds_per_frame).abs() < 1e-3,
-            "last word must end at the band end, got {words:?}"
+            (words[1].end - expected_last_end).abs() < 1e-3,
+            "last word must end within COHERE_DTW_MAX_WORD_SPAN_SECONDS/2 of its center, got {words:?}"
         );
-        // The boundary before the second word falls before that word's center
-        // (frame 9): the fold puts a word's start before its peak, not after.
-        assert!(
-            words[1].start > words[0].end - 1e-6
-                && words[1].end > frames as f32 * seconds_per_frame * 8.0 / 10.0
-        );
+        // The timeline stays monotone and non-overlapping.
+        assert!(words[1].start >= words[0].end - 1e-6);
     }
 
     #[test]
