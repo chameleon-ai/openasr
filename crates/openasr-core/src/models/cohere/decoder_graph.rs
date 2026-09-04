@@ -30,7 +30,8 @@ use crate::models::device_greedy_token::{
 };
 use crate::models::seq2seq_decoder_state::Seq2SeqDecoderState;
 use crate::models::seq2seq_dtw_alignment::{
-    dtw_align_token_frames, speech_band_from_rows, token_text_carries_speech,
+    DTW_SPEECH_BAND_MARGIN_FRAMES, dtw_align_token_frames, speech_band_from_rows,
+    token_text_carries_speech,
 };
 use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeError, Seq2SeqGreedyDecodeStepExecutor, Seq2SeqGreedyDecodeStepInput,
@@ -179,6 +180,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     phrase_bias: Option<&PhraseBiasConfig>,
     word_timestamps: bool,
     audio_duration_seconds: f32,
+    audio_onset_seconds: f32,
     control: &Arc<crate::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
@@ -267,6 +269,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 metadata,
                 &decode.generated_probabilities,
                 audio_duration_seconds,
+                audio_onset_seconds,
                 &decode_text_token_ids,
             )
             .map_err(|error| CohereDecoderGraphError::InvalidInput {
@@ -350,6 +353,7 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     metadata: CohereTranscribeExecutionMetadata,
     generated_probabilities: &[f32],
     duration: f32,
+    audio_onset_seconds: f32,
     decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
 ) -> Result<Vec<WordTimestamp>, E> {
     let frame_count = token_alignments
@@ -533,6 +537,50 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         eprintln!(
             "cohere cross band=({band_start},{band_end}) frames={frame_count} spf={seconds_per_frame}"
         );
+    }
+    // `speech_band_from_rows` brackets the band on the post-sink-substitution
+    // per-token peaks. When the leading content token's own dominant frame is
+    // the shared sink, the substitution moves that token's peak to its
+    // next-strongest frame, and the band's earliest bound collapses to a later
+    // word: the band start then sits far past the first word, and the DTW's
+    // entry frame (which anchors the first word's center) inherits that lateness
+    // (measured up to ~4.4s on rye's lead). The tell-tale of that displacement
+    // is the first content token's *raw* (unmasked) peak landing far short of
+    // the band start -- a genuine leading word whose peak the strip hid. When
+    // that holds, the band start is pulled back to the chunk's measured audio
+    // onset (`audio_onset_seconds`), which for a stripped lead sits at or before
+    // the hidden peak. When the first token's raw peak is already inside the
+    // band, the band reflects real attention and is left untouched (the onset
+    // would only push the first word earlier through lead-in room tone). A
+    // non-finite onset or a window with no sink strip likewise leaves the band
+    // as computed.
+    let first_content_raw_peak = is_content.iter().position(|&flag| flag).and_then(|index| {
+        let row = &full_window[index];
+        row.iter()
+            .enumerate()
+            .filter(|&(_, value)| value.is_finite() && *value > 0.0)
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(frame, _)| frame)
+    });
+    let onset_frame = (audio_onset_seconds / seconds_per_frame).floor() as usize;
+    let first_peak_displaced = first_content_raw_peak
+        .is_some_and(|first_peak| first_peak + DTW_SPEECH_BAND_MARGIN_FRAMES < band_start);
+    let band_start = if stripped_sinks.is_some()
+        && audio_onset_seconds.is_finite()
+        && first_peak_displaced
+        && onset_frame < band_start
+    {
+        if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+            eprintln!(
+                "cohere cross first-token disp: band={band_start} onset={onset_frame} -> anchor {onset_frame}"
+            );
+        }
+        onset_frame
+    } else {
+        band_start
+    };
+    if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+        eprintln!("cohere cross band after onset-anchor = ({band_start},{band_end})");
     }
     let attention: Vec<Vec<f32>> = dtw_window
         .as_ref()
@@ -5152,7 +5200,7 @@ mod tests {
         )
         .expect("parse metadata");
         let decode_text = |_token_ids: &[u32]| Ok(String::new());
-        let words = cohere_dtw_word_timestamps::<()>(&[], metadata, &[], 1.0, &decode_text)
+        let words = cohere_dtw_word_timestamps::<()>(&[], metadata, &[], 1.0, 0.0, &decode_text)
             .expect("dtw words");
         assert!(words.is_empty(), "no alignments -> no words");
     }
@@ -5190,6 +5238,7 @@ mod tests {
             metadata,
             &[0.99, 0.99],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5509,6 +5558,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5575,6 +5625,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5635,6 +5686,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5691,6 +5743,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5735,6 +5788,7 @@ mod tests {
             metadata,
             &[0.99, 0.99],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5832,6 +5886,7 @@ mod tests {
             metadata,
             &[0.99, 0.99],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5901,6 +5956,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
@@ -5975,6 +6031,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("peak fallback words");
@@ -6035,6 +6092,7 @@ mod tests {
             metadata,
             &vec![0.99; token_ids.len()],
             duration,
+            0.0,
             &decode_text,
         )
         .expect("dtw words");
