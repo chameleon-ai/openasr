@@ -668,6 +668,7 @@ struct SlicePlanItem {
     slice: crate::longform::AudioSlice,
     slice_samples: u64,
     silent: bool,
+    vad_gated: bool,
 }
 
 /// A worker's decoded output for one slice, carried back to the main thread for
@@ -687,6 +688,12 @@ struct DecodedSlice {
 struct ConcurrentSlicePipeline<'a> {
     width: usize,
     slices: Vec<crate::longform::AudioSlice>,
+    /// Per-slice decode gate, aligned with `slices`: `true` when the neural VAD
+    /// found this slice to hold (almost) no speech and it must be skipped instead
+    /// of decoded (a small model loops fluent-but-absent text over silent and
+    /// non-speech audio). `false` for every plan without VAD spans, so the gate
+    /// is inert outside Auto plans that ran a speech-detecting VAD.
+    vad_gated: Vec<bool>,
     plan_audio: &'a PcmBuffer,
     dispatch: &'a GgmlAsrExecutionDispatch,
     execution_services: &'a Arc<NativeExecutionServices>,
@@ -737,6 +744,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
     let ConcurrentSlicePipeline {
         width,
         slices,
+        vad_gated,
         plan_audio,
         dispatch,
         execution_services,
@@ -763,7 +771,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
     // and record which positions actually need a decode worker.
     let mut plan_items: Vec<SlicePlanItem> = Vec::with_capacity(slices.len());
     let mut decode_positions: Vec<usize> = Vec::new();
-    for slice in slices {
+    for (position, slice) in slices.into_iter().enumerate() {
         let slice_samples = slice.duration_samples() as u64;
         let relative_start = slice
             .content_start_sample
@@ -778,7 +786,8 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
                 &chunk[relative_start..relative_end],
                 longform_options.energy_silence_threshold_db,
             );
-        if silent {
+        let gated = vad_gated.get(position).copied().unwrap_or(false);
+        if silent || gated {
             decode_progress.complete_slice(slice_samples);
         } else {
             decode_positions.push(plan_items.len());
@@ -787,6 +796,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
             slice,
             slice_samples,
             silent,
+            vad_gated: gated,
         });
     }
 
@@ -930,6 +940,16 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
     let mut first_error: Option<BackendError> = None;
     for (position, item) in plan_items.into_iter().enumerate() {
         if item.silent {
+            *suppressed_slice_count += 1;
+            assembler.push_slice_result(SliceTranscript {
+                slice: item.slice,
+                text: String::new(),
+                segments: Vec::new(),
+                time_domain: SegmentTimeDomain::AbsoluteOriginal,
+            });
+            continue;
+        }
+        if item.vad_gated {
             *suppressed_slice_count += 1;
             assembler.push_slice_result(SliceTranscript {
                 slice: item.slice,
@@ -3001,6 +3021,28 @@ fn run_native_transcription_impl(
                 runtime_preflight,
                 &execution_plan,
             );
+            // Per-slice neural-VAD hallucination gate, decided once up front so
+            // the concurrent and serial paths skip the exact same slices: a slice
+            // the VAD found to hold (almost) no speech is skipped instead of
+            // decoded, because a small model otherwise fills silent and
+            // non-speech audio (music beds, long pauses) with fluent repetition.
+            // `None` spans (every mode but Auto-identity-with-VAD) gate nothing.
+            let vad_speech_spans = plan.vad_speech_spans.as_deref();
+            let vad_gated: Vec<bool> = plan
+                .slices
+                .iter()
+                .map(|slice| {
+                    vad_speech_spans_overlap_samples(vad_speech_spans, slice)
+                        .is_some_and(|samples| samples < VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES)
+                })
+                .collect();
+            let vad_gated_total = vad_gated.iter().filter(|g| **g).count();
+            if vad_gated_total > 0 {
+                longform_provenance.push(format!(
+                    "core.native.vad.slice-gate:skipped={vad_gated_total}of{}/slices",
+                    vad_gated.len()
+                ));
+            }
             if pipeline_width > 1 {
                 let carry_note = if carry_prompt_mode == LongformPromptCarryMode::Disabled {
                     "carry=disabled"
@@ -3017,6 +3059,7 @@ fn run_native_transcription_impl(
                 run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
                     width: pipeline_width,
                     slices: plan.slices,
+                    vad_gated,
                     plan_audio: &plan_audio,
                     dispatch,
                     execution_services,
@@ -3038,7 +3081,8 @@ fn run_native_transcription_impl(
                     speaker_scope_count: &mut speaker_scope_count,
                 })?;
             } else {
-                for slice in plan.slices {
+                for (slice, &gated) in plan.slices.iter().zip(vad_gated.iter()) {
+                    let slice = slice.clone();
                     if execution_context.control.wait_at_slice_boundary()
                         == super::transcription_control::SliceBoundaryControl::Canceled
                     {
@@ -3059,6 +3103,17 @@ fn run_native_transcription_impl(
                             longform_options.energy_silence_threshold_db,
                         )
                     {
+                        suppressed_slice_count += 1;
+                        assembler.push_slice_result(SliceTranscript {
+                            slice,
+                            text: String::new(),
+                            segments: Vec::new(),
+                            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+                        });
+                        decode_progress.complete_slice(slice_samples);
+                        continue;
+                    }
+                    if gated {
                         suppressed_slice_count += 1;
                         assembler.push_slice_result(SliceTranscript {
                             slice,
@@ -4870,6 +4925,107 @@ fn is_effectively_silent(samples: &[f32], threshold_db: f32) -> bool {
     }
     let db = 20.0 * rms.log10();
     db <= threshold_db
+}
+
+/// Minimum original-timeline VAD speech a slice must contain before the
+/// long-form decode gate will let it through, expressed in samples so the
+/// comparison is independent of the 16 kHz conversion (8000 samples at 16 kHz
+/// is half a second). A slice below this is decoded to nothing. Half a
+/// second is far below any real utterance and far above the sub-frame jitter
+/// the VAD emits, so a genuinely quiet slice that still holds a real word
+/// always clears it. The gate is only reached on plans that carried VAD
+/// speech spans (auto mode with a speech-detecting VAD); every other plan
+/// decodes every slice exactly as before.
+const VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES: usize = 8_000;
+
+/// Original-timeline sample count of neural-VAD speech overlapping one slice
+/// -- or `None` when the plan carries no VAD spans, which is every mode and
+/// every packed (silence-omitting) plan. `None` means "no gate" (decode
+/// normally); a `Some` count below [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`]
+/// means "suppress".
+fn vad_speech_spans_overlap_samples(
+    spans: Option<&[crate::longform::LongFormVadSlice]>,
+    slice: &crate::longform::AudioSlice,
+) -> Option<usize> {
+    let spans = spans?;
+    if spans.is_empty() {
+        return None;
+    }
+    let slice_start = slice.start_sample;
+    let slice_end = slice.end_sample;
+    let mut overlap_samples = 0usize;
+    for span in spans {
+        let overlap_start = span.start_sample.max(slice_start);
+        let overlap_end = span.end_sample.min(slice_end);
+        if overlap_end > overlap_start {
+            overlap_samples = overlap_samples.saturating_add(overlap_end - overlap_start);
+        }
+    }
+    Some(overlap_samples)
+}
+
+#[cfg(test)]
+mod vad_slice_gate_tests {
+    use super::vad_speech_spans_overlap_samples;
+    use crate::longform::{AudioSlice, AudioSliceKind, LongFormVadSlice};
+
+    fn slice(start: usize, end: usize) -> AudioSlice {
+        AudioSlice {
+            index: 0,
+            kind: AudioSliceKind::Fixed,
+            start_sample: start,
+            end_sample: end,
+            content_start_sample: start,
+            content_end_sample: end,
+        }
+    }
+
+    #[test]
+    fn no_spans_means_never_gated() {
+        let slice = slice(0, 16_000);
+        assert_eq!(vad_speech_spans_overlap_samples(None, &slice), None);
+        assert_eq!(
+            vad_speech_spans_overlap_samples(Some(&[]), &slice),
+            None,
+            "an empty span list is the same as no spans: no gate"
+        );
+    }
+
+    #[test]
+    fn a_slice_with_no_vad_speech_overlaps_zero() {
+        let spans = vec![LongFormVadSlice {
+            start_sample: 50_000,
+            end_sample: 60_000,
+        }];
+        let empty_slice = slice(0, 16_000);
+        assert_eq!(
+            vad_speech_spans_overlap_samples(Some(&spans), &empty_slice),
+            Some(0),
+            "a VAD-active plan with silence over this slice reports Some(0), \
+             which the gate turns into a skip"
+        );
+    }
+
+    #[test]
+    fn overlap_counts_only_the_intersection_when_spans_straddle_the_slice() {
+        let spans = vec![
+            // One span ends at the slice start: zero overlap.
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: 10_000,
+            },
+            // One span fully covers slice `[10_000, 30_000)`: 20k overlap.
+            LongFormVadSlice {
+                start_sample: 5_000,
+                end_sample: 40_000,
+            },
+        ];
+        let slice = slice(10_000, 30_000);
+        assert_eq!(
+            vad_speech_spans_overlap_samples(Some(&spans), &slice),
+            Some(20_000)
+        );
+    }
 }
 
 fn append_context_tail(existing: &str, new_text: &str, max_chars: usize) -> String {
@@ -10169,6 +10325,7 @@ mod tests {
             crate::arch::family_auto_gpu_policy_for_model_architecture(family.model_architecture);
         run_concurrent_slice_pipeline(ConcurrentSlicePipeline {
             width,
+            vad_gated: vec![false; slices.len()],
             slices,
             plan_audio: &audio,
             dispatch: &dispatch,

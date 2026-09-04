@@ -134,6 +134,12 @@ pub struct LongFormSlicePlan {
     pub processed_audio: Option<Vec<f32>>,
     pub timeline: TimelineMap,
     pub stats: LongFormSliceStats,
+    /// The neural VAD's speech spans, in original-timeline samples, when the
+    /// winning plan is an identity timeline AND the VAD actually found speech.
+    /// Consumed by the slice decode loop, which uses it to skip decoding slices
+    /// the VAD found to hold no speech. `None` when the provider was absent, the
+    /// timeline is packed (spans would be meaningless), or the VAD saw no speech.
+    pub vad_speech_spans: Option<Vec<LongFormVadSlice>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +149,7 @@ struct LongFormPlanningLayout {
     packed_audio_plan: Option<PackedAudioMaterializationPlan>,
     timeline: TimelineMap,
     selection_provenance: Vec<String>,
+    vad_speech_spans: Option<Vec<LongFormVadSlice>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +236,7 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
             processed_audio: None,
             timeline: TimelineMap::identity(),
             stats: LongFormSliceStats::default(),
+            vad_speech_spans: None,
         });
     }
     let total_samples = samples.len();
@@ -299,6 +307,7 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
         processed_audio: layout.processed_audio,
         timeline: layout.timeline,
         stats,
+        vad_speech_spans: layout.vad_speech_spans,
     })
 }
 
@@ -324,6 +333,7 @@ fn layout_from_identity_slices(slices: Vec<AudioSlice>) -> LongFormPlanningLayou
         packed_audio_plan: None,
         timeline: TimelineMap::identity(),
         selection_provenance: Vec::new(),
+        vad_speech_spans: None,
     }
 }
 
@@ -474,6 +484,7 @@ fn plan_auto_slices(
     }
     check_planning_canceled(canceled)?;
 
+    let mut vad_speech_spans: Option<Vec<LongFormVadSlice>> = None;
     if let Some(provider) = vad_provider
         && provider.provider_kind() != LongFormVadProviderKind::EnergyLike
     {
@@ -481,6 +492,7 @@ fn plan_auto_slices(
             .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
             .map_err(map_vad_provider_error)?;
         check_planning_canceled(canceled)?;
+        vad_speech_spans = Some(vad_spans.clone());
         if let Some(packed_vad_layout) = plan_packed_layout_from_speech_spans(
             samples,
             sample_rate_hz,
@@ -535,11 +547,26 @@ fn plan_auto_slices(
     candidates.sort_by(compare_auto_plan_candidates);
     selection_provenance.extend(auto_selection_provenance(&candidates));
     check_planning_canceled(canceled)?;
+    // Attach the neural VAD's speech spans to the winning layout so the slice
+    // decode loop can skip decoding a slice the VAD found to hold no speech
+    // (e.g. a music bed or silence the coverage-dominance energy guard insists
+    // on keeping). Two guards keep this off the paths it would hurt:
+    //   * a packed timeline remaps processed->original seconds, so these
+    //     original-timeline spans are meaningless there -- skip packed plans;
+    //   * a VAD that saw no speech (all spans empty) cannot gate anything on,
+    //     so carrying it would suppress every slice -- drop all-empty spans.
+    let winning_lays_packed = candidates
+        .first()
+        .is_some_and(|c| layout_uses_packed_timeline(&c.layout));
+    let mut layout_vad_speech_spans = vad_speech_spans
+        .filter(|spans| spans.iter().any(|span| span.end_sample > span.start_sample))
+        .filter(|_| !winning_lays_packed);
     Ok(candidates
         .into_iter()
         .next()
         .map(|mut candidate| {
             candidate.layout.selection_provenance = selection_provenance;
+            candidate.layout.vad_speech_spans = layout_vad_speech_spans.take();
             candidate.layout
         })
         .unwrap_or_else(|| layout_from_identity_slices(vec![full_slice(total_samples)])))
@@ -637,6 +664,7 @@ fn plan_packed_layout_from_speech_spans(
         packed_audio_plan: Some(processed_audio),
         timeline,
         selection_provenance: Vec::new(),
+        vad_speech_spans: None,
     })
 }
 
@@ -2528,6 +2556,77 @@ mod tests {
         }
     }
 
+    /// A VAD provider that reports no speech at all: exercises the "the VAD saw
+    /// nothing, so the decode gate must not run" branch of the span carrying.
+    struct NoSpeechVadProvider;
+
+    impl LongFormVadProvider for NoSpeechVadProvider {
+        fn compute_speech_slices(
+            &self,
+            _samples: &[f32],
+            _sample_rate_hz: u32,
+            _options: &LongFormOptions,
+        ) -> Result<Vec<LongFormVadSlice>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The decode gate (see `api::backend::native_transcribe`) consumes the VAD's
+    /// speech spans to skip decoding slices with no speech. Those spans are only
+    /// carried out of planning when the winning plan is an *identity* timeline
+    /// (processed == original) *and* the VAD actually found some speech. This
+    /// fixture runs Auto mode over audio with speech at both edges and a silent
+    /// middle, mirroring `auto_mode_prefers_vad_provider_for_long_audio`;
+    /// whichever plan wins, the carrying must follow the invariant.
+    #[test]
+    fn auto_identity_plan_carries_vad_spans_for_the_decode_gate() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 1.0;
+        let mut samples = tone(16_000);
+        samples.extend(vec![0.0; 16_000 * 2]);
+        samples.extend(tone(16_000));
+        let plan =
+            plan_longform_slices(&samples, 16_000, &options, Some(&FixedVadProvider)).unwrap();
+        if plan.processed_audio.is_some() {
+            assert!(
+                plan.vad_speech_spans.is_none(),
+                "a packed timeline remaps processed->original seconds, so the \
+                 identity-timeline spans must not be carried: {:?}",
+                plan.stats.provenance
+            );
+        } else {
+            assert!(
+                plan.vad_speech_spans
+                    .as_ref()
+                    .is_some_and(|spans| !spans.is_empty()),
+                "an identity Auto plan with a speech-detecting VAD must carry \
+                 the spans for the decode gate: {:?}",
+                plan.stats.provenance
+            );
+        }
+    }
+
+    /// A VAD that found no speech cannot gate anything on, so carrying its
+    /// (empty) span list would turn every slice into a suppression. The plan
+    /// must therefore carry `None` even on the identity timeline it wins.
+    #[test]
+    fn auto_plan_carries_no_spans_when_the_vad_seen_no_speech() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 1.0;
+        // Continuous tone: no real silence to elide, so a full-coverage
+        // identity plan is among the candidates and (with a VAD that reports
+        // nothing) is not beaten into a packed layout.
+        let samples = tone(16_000 * 4);
+        let plan =
+            plan_longform_slices(&samples, 16_000, &options, Some(&NoSpeechVadProvider)).unwrap();
+        assert!(
+            plan.vad_speech_spans.is_none(),
+            "a VAD that found no speech must carry no spans (the gate would \
+             suppress every slice otherwise): {:?}",
+            plan.stats.provenance
+        );
+    }
+
     #[test]
     fn vad_mode_falls_back_to_energy_when_provider_is_unavailable() {
         let mut options = options_with_mode(LongFormMode::Vad);
@@ -2934,6 +3033,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 20,
@@ -2948,6 +3048,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 20,
@@ -2981,6 +3082,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 120,
@@ -2995,6 +3097,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 120,
@@ -3047,6 +3150,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
         let packed_candidate = AutoPlanCandidate {
@@ -3087,6 +3191,7 @@ mod tests {
                 }),
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
 
@@ -3140,6 +3245,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 9,
@@ -3171,6 +3277,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &samples,
             16_000 * 9,
@@ -3241,6 +3348,7 @@ mod tests {
                 }),
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
         let vad_candidate = AutoPlanCandidate {
@@ -3292,6 +3400,7 @@ mod tests {
                 }),
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
 
@@ -3366,6 +3475,7 @@ mod tests {
                 }),
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
         let vad_candidate = AutoPlanCandidate {
@@ -3425,6 +3535,7 @@ mod tests {
                 }),
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
         };
 
@@ -3471,6 +3582,7 @@ mod tests {
             packed_audio_plan: None,
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
         let quiet_cut = LongFormPlanningLayout {
             slices: vec![
@@ -3495,6 +3607,7 @@ mod tests {
             packed_audio_plan: None,
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
         let loud_penalty = estimate_boundary_penalty(&samples, &loud_cut, 16_000, &options);
         let quiet_penalty = estimate_boundary_penalty(&samples, &quiet_cut, 16_000, &options);
@@ -3540,6 +3653,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
 
         let silent_penalty = elision_penalty_of(&silent_gap_samples, &packed_layout);
@@ -3579,6 +3693,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
 
         // Same shape, but the truncated head/tail are true silence -- must
@@ -3630,6 +3745,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
         let interior_gap_penalty =
             elision_penalty_of(&truncated_both_ends_samples, &interior_gap_layout);
@@ -3683,6 +3799,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
 
         let quiet_penalty = gap_edge_penalty_of(&quiet_edge_gap_samples, &packed_layout, &options);
@@ -3723,6 +3840,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
         let more_seams = LongFormPlanningLayout {
             slices: vec![AudioSlice {
@@ -3758,6 +3876,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
         let fewer_penalty = estimate_seam_penalty(&fewer_seams, 16_000, &options);
         let more_penalty = estimate_seam_penalty(&more_seams, 16_000, &options);
@@ -4320,6 +4439,7 @@ mod tests {
             }),
             timeline: TimelineMap::identity(),
             selection_provenance: Vec::new(),
+            vad_speech_spans: None,
         };
 
         let estimated = estimate_layout_processed_samples(&layout, 16_000 * 40, 16_000, 0.0, 120.0);
@@ -4348,6 +4468,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &tone(16_000),
             16_000,
@@ -4362,6 +4483,7 @@ mod tests {
                 packed_audio_plan: None,
                 timeline: TimelineMap::identity(),
                 selection_provenance: Vec::new(),
+                vad_speech_spans: None,
             },
             &tone(16_000),
             16_000,
