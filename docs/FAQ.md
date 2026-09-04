@@ -77,9 +77,11 @@ do not run inference.
 Yes. `openasr align audio.wav --transcript script.txt -f srt` force-aligns a
 plain-text manuscript onto the audio with the Qwen3-ForcedAligner pack (no ASR).
 The HTTP equivalent is `POST /v1/audio/precise-timeline` with `file` +
-`transcript`. Japanese and Korean fail closed (language tag or script); a
-missing pack, empty normalized text, a prompt past decoder context, or a
-degenerate timeline is an error rather than a fabricated SRT.
+`transcript`. Japanese and Korean fail closed by language tag (`ja`/`ko`)
+or by kana/hangul script. Pure-kanji Japanese cannot be identified as
+Japanese: tagged `ja` it is 400; tagged `en` it follows the CJK character
+tokenizer. A missing pack, empty normalized text, a prompt past decoder
+context, or a degenerate timeline is an error rather than a fabricated SRT.
 See [Known Limitations](KNOWN_LIMITATIONS.md) for normalization rules, the
 400 s timestamp-grid ceiling, and the decoder-context admission.
 
@@ -199,8 +201,10 @@ amd64). The separate macOS/Windows desktop apps ship from
 Yes. `quintinshaw/openasr` on Docker Hub. Images contain the release binary and
 model-registry metadata only — mount a volume at `/data`, then
 `docker exec … openasr pull <model> --yes` before calling the HTTP API. The
-server never auto-pulls. CUDA tags require the NVIDIA Container Toolkit and
-refuse to start if no GPU is visible. Longer guide:
+server never auto-pulls. They do not ship `perf/` bench-suite fixtures or
+baselines, so `openasr bench-suite` inside the container will fail looking for
+those files; run benchmarks from a git checkout. CUDA tags require the NVIDIA
+Container Toolkit and refuse to start if no GPU is visible. Longer guide:
 [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?

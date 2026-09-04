@@ -601,6 +601,7 @@ pub(super) async fn serve(
     no_model: bool,
     max_native_sessions_per_model: std::num::NonZeroUsize,
     security: ServeSecurityOptions,
+    parent_shutdown: Option<parent_watchdog::ParentShutdown>,
 ) -> Result<()> {
     let home = openasr_home()?;
     // Read the config document once: `config` and `idle_unload` (used below
@@ -705,24 +706,26 @@ pub(super) async fn serve(
     // `idle_unload` lives on `Preferences`, on the same document already
     // loaded above as `config_document` -- no second read needed.
     launch_options.idle_unload_after = config_document.preferences.idle_unload.idle_threshold();
-    openasr_server::serve_with_launch_options(
-        addr,
-        openasr_server::ServerRuntime {
-            backend,
-            native_execution: openasr_server::NativeExecutionSupervisor::with_execution_services(
-                max_native_sessions_per_model,
-                native_execution_services,
-            ),
-            ffmpeg_bin,
-            ffmpeg_bin_explicit,
-            // Launch path is served identity; current() waits for attestation.
-            model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
-                model_source.model_pack_path,
-            ),
-        },
-        launch_options,
-    )
-    .await
+    tokio::select! {
+        result = openasr_server::serve_with_launch_options(
+            addr,
+            openasr_server::ServerRuntime {
+                backend,
+                native_execution: openasr_server::NativeExecutionSupervisor::with_execution_services(
+                    max_native_sessions_per_model,
+                    native_execution_services,
+                ),
+                ffmpeg_bin,
+                ffmpeg_bin_explicit,
+                // Launch path is served identity; current() waits for attestation.
+                model_pack_path: openasr_server::ActiveRuntimeSlot::requested(
+                    model_source.model_pack_path,
+                ),
+            },
+            launch_options,
+        ) => result,
+        _ = parent_watchdog::wait_for_shutdown(parent_shutdown) => Ok(()),
+    }
 }
 
 /// True when this `serve` process was launched by the desktop supervisor,
@@ -2524,6 +2527,98 @@ mod tests {
             models_status(app, Some("oasr_sk_test-agent-key")).await,
             StatusCode::OK,
             "non-loopback must not honor a loopback-only API key"
+        );
+    }
+
+    fn align_options<'a>(
+        audio: &'a Path,
+        transcript: &'a Path,
+        language: Option<String>,
+    ) -> AlignCommandOptions<'a> {
+        AlignCommandOptions {
+            audio,
+            transcript,
+            formats: &[ResponseFormat::Text],
+            language,
+            output: None,
+            backend_kind: Some(BackendKind::Native),
+            runtime_paths: RuntimePathOverrides::default(),
+            execution_target: Some("cpu"),
+            keep_word_timestamps: true,
+            consent: crate::consent::PullConsent {
+                assume_yes: false,
+                offline: true,
+            },
+        }
+    }
+
+    #[test]
+    fn align_command_fails_closed_without_forced_aligner_pack() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("transcript.txt");
+        std::fs::write(&transcript, "hello world").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("en".into())),
+        )
+        .expect_err("align without the forced-aligner pack must fail closed")
+        .to_string();
+        assert!(
+            error.to_ascii_lowercase().contains("align")
+                || error.to_ascii_lowercase().contains("pack")
+                || error.to_ascii_lowercase().contains("install"),
+            "missing pack error must mention the aligner pack, got {error}"
+        );
+    }
+
+    #[test]
+    fn align_command_fails_closed_on_empty_transcript() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("empty.txt");
+        std::fs::write(&transcript, "   \n").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("en".into())),
+        )
+        .expect_err("empty manuscript must fail closed")
+        .to_string();
+        assert!(
+            !error.is_empty(),
+            "empty transcript must produce a fail-closed error"
+        );
+    }
+
+    #[test]
+    fn align_command_fails_closed_for_japanese_language_tag() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarRestore::set_os("OPENASR_HOME", temp.path());
+        let _pack = EnvVarRestore::remove("OPENASR_FORCED_ALIGNER_PACK");
+        let audio = sample_wav_fixture_path();
+        let transcript = temp.path().join("ja.txt");
+        std::fs::write(&transcript, "日本語の原稿です").unwrap();
+        let error = align_plain_transcript_command(
+            &test_native_execution_services(),
+            align_options(&audio, &transcript, Some("ja".into())),
+        )
+        .expect_err("ja-tagged manuscript must fail closed")
+        .to_string();
+        let lower = error.to_ascii_lowercase();
+        assert!(
+            lower.contains("japan")
+                || lower.contains("ja")
+                || lower.contains("align")
+                || lower.contains("pack")
+                || lower.contains("language"),
+            "ja fail-closed error must be observable, got {error}"
         );
     }
 }

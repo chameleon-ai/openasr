@@ -57,6 +57,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core: `openasr pull` skips the network fetch when the installed
+  content-addressed object already matches the catalog SHA-256, then
+  re-verifies the pack contract and refreshes the install record. A catalog
+  filename alone is not identity; an unsealed object whose bytes do not hash
+  to the catalog digest is fetched again. `KNOWN_LIMITATIONS` no longer
+  claims that pull always re-downloads.
+- Docs: published Docker images are runtime-only (binary + model-registry
+  metadata). They do not include `perf/` bench-suite fixtures or baselines;
+  run `openasr bench-suite` from a git checkout.
 - Core: `--diarize` / Voice ID now installs the native execution broker
   before Stream-VAD and ReDimNet admission. 0.1.37 failed closed with
   `could not load the vendored FireRed Stream-VAD` because those weights
@@ -135,6 +144,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Windows: `openasr.exe` no longer imports `mfplat.dll` / `mfreadwrite.dll` at
+  load time. Since 0.1.37 the HE-AAC path made every start fail with
+  `STATUS_DLL_NOT_FOUND` (exit `0xC0000135`, no message) on Windows N/KN
+  editions and on Windows Server without the Media Foundation feature. The
+  Media Foundation entry points are now resolved at run time from System32,
+  so the process starts everywhere and only a file that needs the system
+  decoder fails, with an error that names the missing feature.
+- macOS: starting system-audio capture now reports a typed error instead of
+  aborting the whole app when Core Audio or an Objective-C exception escapes
+  process-tap setup. The same failure is fail-closed in the IOProc: a panic
+  or foreign exception stops capture with `capture_backend_failed` rather
+  than taking down the process.
+- CLI: `openasr serve --parent-pid` now shuts down through the same path as
+  Ctrl-C / SIGTERM instead of calling `process::exit`. ggml Metal backends
+  drop before process teardown, so the daemon no longer aborts in
+  `ggml-metal-device.m` (`GGML_ASSERT` on residency sets) after the parent
+  process disappears.
 - Core: live capture no longer panics when a downsampled mic callback (for
   example 44.1 kHz stereo in 512-frame chunks) leaves the resampler read head
   past the current buffer. The leftover position continues in the next chunk
