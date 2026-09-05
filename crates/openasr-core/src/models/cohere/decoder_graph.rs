@@ -3322,8 +3322,10 @@ const COHERE_DTW_ONSET_LEAD_SECONDS: f32 = 0.20;
 const COHERE_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
 
 /// Rate (in seconds of added lead per extra word/second above the knee) by
-/// which the onset lead grows with band density.
-const COHERE_DTW_LEAD_DENSITY_SLOPE: f32 = 0.10;
+/// which the onset lead grows with band density. A high slope (0.10) added so
+/// much early-shift on densely-spoken bands (rapid conversation, ~3-4 words/s)
+/// that whole runs of words landed past their truth window.
+const COHERE_DTW_LEAD_DENSITY_SLOPE: f32 = 0.01;
 
 /// Upper bound on the density-scaled onset lead. Above this the added lead
 /// outruns the true onset on dense bands as quickly as it helps.
@@ -4815,7 +4817,8 @@ mod tests {
     fn cohere_dtw_onset_lead_grows_with_density_above_the_knee() {
         // Above the knee the lead rises at the configured slope per extra
         // word/second. At 4.0 word/s the excess over the 2.4 knee is 1.6, so
-        // lead = 0.20 + 0.10 * 1.6 = 0.36 -- comfortably below the cap.
+        // lead = baseline + slope * 1.6 (0.216 at the compiled slope 0.01) --
+        // comfortably below the cap.
         let dense = cohere_dtw_onset_lead(10.0, 40);
         let expected =
             COHERE_DTW_ONSET_LEAD_SECONDS + COHERE_DTW_LEAD_DENSITY_SLOPE * 1.6_f32.max(0.0);
@@ -4824,9 +4827,11 @@ mod tests {
 
     #[test]
     fn cohere_dtw_onset_lead_caps_at_max_seconds() {
-        // A very dense band (12 word/s) adds more lead than the cap allows; the
-        // result is exactly the cap, not the unbounded density term.
-        let runaway = cohere_dtw_onset_lead(10.0, 120);
+        // A very dense band (30 word/s) adds more lead than the cap allows; the
+        // result is exactly the cap, not the unbounded density term. The density
+        // is comfortably above the knee regardless of the (small) configured
+        // slope, so the cap holds on any reasonable tuning.
+        let runaway = cohere_dtw_onset_lead(10.0, 300);
         assert_eq!(runaway, COHERE_DTW_ONSET_LEAD_MAX_SECONDS);
     }
 
