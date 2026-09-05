@@ -576,6 +576,34 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
             );
         }
         onset_frame
+    } else if stripped_sinks.is_some()
+        && audio_onset_seconds.is_finite()
+        && onset_frame > band_start
+        && onset_frame.saturating_sub(band_start) >= DTW_SPEECH_BAND_MARGIN_FRAMES
+    {
+        // Counterpart of the displacement case above, for a chunk that opens
+        // with real silence but whose sink-masked first content token still
+        // leaves the band bracketing the chunk front (a residual early-attention
+        // frame, not the stripped sink). The DTW's start-early bias then walks
+        // that leading silence and parks the first word at the silent chunk
+        // start instead of where speech begins (measured up to ~-20s vs the
+        // truth on leading-silent long-form chunks such as `ploomet`). Advancing
+        // the band start to the measured audio onset makes the DTW begin at the
+        // first real energy.
+        //
+        // Two guards keep this inert where it would be wrong. `onset_frame >
+        // band_start` requires the measured onset to sit *ahead* of the band:
+        // a chunk that genuinely opens with speech has onset 0 at/inside the
+        // band, so the advance never touches it (nor a band that legitimately
+        // starts before the onset, e.g. on a stripped leading word). The margin
+        // guard ignores a sub-margin gap that is not a meaningful leading
+        // silence.
+        if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
+            eprintln!(
+                "cohere cross leading-silence advance: band={band_start} onset={onset_frame} -> {onset_frame}"
+            );
+        }
+        onset_frame
     } else {
         band_start
     };
@@ -5988,6 +6016,95 @@ mod tests {
             assert!(pair[0].end - 1e-6 <= pair[1].start, "no overlaps");
         }
         assert!(words.last().is_some_and(|last| last.end <= duration + 1e-3));
+    }
+
+    #[test]
+    fn cohere_dtw_word_timestamps_advances_band_on_measured_leading_silence() {
+        let (_runtime_path, preflight) = write_runtime_ready_preflight();
+        let metadata = super::super::runtime_contract::parse_cohere_transcribe_execution_metadata(
+            &preflight.metadata,
+        )
+        .expect("parse metadata");
+        let spf = 8.0 * metadata.hop_length as f32 / metadata.sample_rate_hz as f32;
+        let frames = 250; // 20.0s window, same shape as the sink-skip test.
+        let duration = (frames as f32) * spf;
+        // Same shared-sink layout as `band_skips_stripped_sink_on_long_window`:
+        // content word 0 peaks at its real frame 30, the rest peak on the
+        // shared sink at frame 3. The band therefore starts at frame 20
+        // (real peak 30 minus the 10-frame margin) and covers the whole
+        // window tail.
+        let rows: Vec<Vec<f32>> = (0..5)
+            .map(|i| {
+                let mut row = vec![0.01_f32; frames];
+                if i > 0 {
+                    row[3] = 0.5;
+                }
+                row[30 + i * 25] = 0.4 + (i == 0) as u8 as f32 * 0.1;
+                row
+            })
+            .collect();
+        let token_ids: Vec<u32> = (10..15).collect();
+        let alignments: Vec<(u32, Vec<f32>)> = rows
+            .iter()
+            .zip(&token_ids)
+            .map(|(row, &id)| (id, row.to_vec()))
+            .collect();
+        let decode_text = |token_ids: &[u32]| {
+            let mut s = String::new();
+            for &id in token_ids {
+                use std::fmt::Write;
+                let _ = write!(s, "w{id} ");
+            }
+            Ok(s.trim_end().to_string())
+        };
+        let probs: Vec<f32> = vec![0.99; token_ids.len()];
+
+        // Case 1: the chunk opens with speech (onset 0.0, the measured value
+        // for a chunk whose first window already carries energy). No leading
+        // silence, so the branch must NOT fire and the band keeps the
+        // sink-skipping start at frame 20. The word fold clamps every start to
+        // the band start, so the first word starts no earlier than frame 20.
+        let at_chunk = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &probs,
+            duration,
+            0.0,
+            &decode_text,
+        )
+        .expect("dtw words");
+        let at_chunk_start = at_chunk[0].start;
+        assert!(
+            at_chunk_start >= (20.0 * spf) - 1e-6,
+            "onset-0 (no leading silence) keeps the sink-skipped band start; first word at {at_chunk_start}s must be >= frame 20 ({:?}s)",
+            20.0 * spf
+        );
+
+        // Case 2: real leading silence. The chunk's audio onset is measured at
+        // frame 40 (3.2s) -- well past the band's frame 20 start and ahead of
+        // the margin, so the band brackets leading silence. The leading-silence
+        // branch must advance the band start to the onset, pushing the first
+        // word to the real speech instead of the silent chunk front.
+        let onset = 40.0 * spf;
+        let advanced = cohere_dtw_word_timestamps::<()>(
+            &alignments,
+            metadata,
+            &probs,
+            duration,
+            onset,
+            &decode_text,
+        )
+        .expect("dtw words");
+        let advanced_start = advanced[0].start;
+        assert!(
+            advanced_start >= (40.0 * spf) - 1e-6,
+            "leading silence must advance the first word to the measured onset; got {advanced_start}s, want >= frame 40 ({:?}s)",
+            40.0 * spf
+        );
+        assert!(
+            advanced_start > at_chunk_start,
+            "the advanced band start must place the first word later (advanced {advanced_start}s > onset-0 {at_chunk_start}s)"
+        );
     }
 
     #[test]
