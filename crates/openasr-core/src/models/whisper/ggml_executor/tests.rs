@@ -1949,3 +1949,33 @@ fn whisper_dtw_onset_lead_tuning_default_matches_constants() {
     assert_eq!(tuning.slope, WHISPER_DTW_LEAD_DENSITY_SLOPE);
     assert_eq!(tuning.maximum, WHISPER_DTW_ONSET_LEAD_MAX_SECONDS);
 }
+
+#[test]
+fn whisper_dtw_lead_silence_advance_fires_only_on_a_leading_leak() {
+    let spf = 0.02_f32; // 1500 frames over a 30s window.
+    let min_gap = WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS; // 0.2s -> 10 frames.
+
+    // A run at the window front whose content onset sits well past the bound
+    // (a leading silence leak) is advanced to that onset.
+    let advance = whisper_dtw_lead_silence_advance_frame(0, Some(55), spf, min_gap); // 1.1s gap.
+    assert_eq!(advance, Some(55));
+
+    // The same onset but on a mid-run decoded `<|start|>` bound is NOT advanced:
+    // the band_start == 0 gate is what keeps a real timestamp (which can mark a
+    // large misalignment) from retargeting the lead word to an unrelated peak.
+    let mid_run = whisper_dtw_lead_silence_advance_frame(300, Some(355), spf, min_gap); // 1.1s gap.
+    assert_eq!(mid_run, None);
+
+    // A window-front onset just over the minimum gap fires; a gap just under it
+    // is normal `<|start|>` jitter, not a leak, so the sub-margin gate keeps it
+    // untouched. (Values are kept clearly off the margin since the exact 0.2s
+    // boundary is an arbitrary f32 knife-edge, not a meaningful threshold.)
+    let over = whisper_dtw_lead_silence_advance_frame(0, Some(11), spf, min_gap); // 0.22s gap.
+    assert_eq!(over, Some(11));
+    let under = whisper_dtw_lead_silence_advance_frame(0, Some(9), spf, min_gap); // 0.18s gap.
+    assert_eq!(under, None);
+
+    // No usable content peak: nothing to advance to.
+    let no_front = whisper_dtw_lead_silence_advance_frame(0, None, spf, min_gap);
+    assert_eq!(no_front, None);
+}
