@@ -3236,8 +3236,16 @@ fn run_native_transcription_impl(
                             }
                         }
                         LongformPromptCarryMode::TokenHistory => {
-                            if let Some(prompt_token_ids) =
-                                carry_context.and_then(|context| context.prompt_token_ids)
+                            // A slice that produced only punctuation
+                            // (".", "¶¶") transcribed near-silence or
+                            // non-speech; forwarding its timestamp/period
+                            // token history into the next prompt
+                            // re-conditions greedy decode onto the same
+                            // collapse, so the carry stays at the last
+                            // slice that actually produced words.
+                            if carry_text_has_meaningful_word(&transcription.text)
+                                && let Some(prompt_token_ids) =
+                                    carry_context.and_then(|context| context.prompt_token_ids)
                             {
                                 rolling_prompt_token_ids = prompt_token_ids;
                             }
@@ -5069,6 +5077,41 @@ fn take_tail_chars(value: &str, max_chars: usize) -> String {
     }
     let total = value.chars().count();
     value.chars().skip(total - max_chars).collect()
+}
+
+/// Whether a slice's transcript holds at least one real word, i.e. an
+/// alphanumeric character somewhere. A near-silence or music-bed slice the
+/// model still "fills" decodes to nothing but punctuation -- ".", "¶¶", the
+/// bracketed `<no_speech>` marker -- which is degenerate non-speech output,
+/// not transcript. Used to gate the longform prompt carry: such a slice must
+/// not update the carry, or its timestamp/period token history re-conditions
+/// the next slice's decode onto the same collapse.
+fn carry_text_has_meaningful_word(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
+#[cfg(test)]
+mod carry_meaningful_word_tests {
+    use super::carry_text_has_meaningful_word;
+
+    #[test]
+    fn punctuation_only_transcripts_are_not_meaningful() {
+        for text in ["", "   ", ".", " . ", ". . .", "¶¶", "¶¶ ¶¶", " . ¶¶ . "] {
+            assert!(!carry_text_has_meaningful_word(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_transcript_with_any_real_word_is_meaningful() {
+        for text in [
+            "Thank you.",
+            "Well . . .",
+            "¶¶ Part One ¶¶",
+            "   3:30",
+        ] {
+            assert!(carry_text_has_meaningful_word(text), "{text:?}");
+        }
+    }
 }
 
 fn build_longform_metadata(
