@@ -95,22 +95,6 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
-/// Whisper's default longform window, in seconds. Whisper is the only family
-/// that reaches its 30s *full* window in ordinary longform operation (its
-/// `Default` longform profile keeps the `Auto` elect, unclamped), and whisper's
-/// greedy decode is most likely to bail a 30s window to no-speech -- or trip
-/// the degenerate-repeat guard -- on soft, repetitive, continuous speech, where
-/// the whole window lands at the edge of its 30s training regime and the decode
-/// never reaches an honest stop. Dropping ~3s under the architecture's 30s
-/// invocation ceiling (which stays in force as the hard bound) gives the decode
-/// enough margin to complete, recovering the dropped words on recordings like a
-/// quiet continuous monologue. Measured on the long-clip suite: this lifts the
-/// four long clips' mean in-window coverage from 0.930 to 0.957 (the longest, a
-/// 635s soft monologue, from 0.823 to 0.897) while leaving the single-window
-/// clips byte-for-byte unchanged. Kept deliberately below the ceiling rather
-/// than widening it.
-const WHISPER_LONGFORM_WINDOW_SECONDS: f32 = 27.0;
-
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
     if value.eq_ignore_ascii_case("cpu") {
@@ -4168,12 +4152,8 @@ fn apply_longform_safety_policy(
 ) {
     apply_invocation_span_longform_policy(model_architecture, options, provenance);
     apply_conservative_seq2seq_longform_safety_policy(model_architecture, options, provenance);
-    apply_whisper_cross_attention_dtw_longform_no_padding_policy(
-        model_architecture,
-        options,
-        provenance,
-    );
-    apply_whisper_longform_window_policy(model_architecture, options, provenance);
+    apply_dtw_buffer_absolute_longform_no_padding_policy(model_architecture, options, provenance);
+    apply_preferred_longform_window_policy(model_architecture, options, provenance);
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
 }
 
@@ -4287,26 +4267,32 @@ fn apply_conservative_seq2seq_longform_safety_policy(
     }
 }
 
-/// Drops slice padding for whisper. Whisper's longform profile is `Default`
-/// (not `ConservativeSeq2SeqV1`), so it escapes the padding rule above, yet it
-/// shares the exact hazard that rule exists for: it derives word times from a
-/// cross-attention DTW that places each frame relative to the buffer the
-/// decoder was actually handed, while the longform assembler re-bases those
-/// slice-relative times from `content_start_sample` (see
-/// `TranscriptAssembler::map_segment_time`). With the default 0.25s slice
-/// padding every word in a padded slice lands ~0.25s late -- the same
-/// left-pad bias the `ScopedSlices` and `ConservativeSeq2SeqV1` policies
-/// already zero out. Whisper timestamps words only, never audio (unlike CTC
-/// / forced-alignment families, whose timestamps ride token times or a
-/// separate alignment pass and so are padding-invariant), and its decode is
-/// buffer-absolute, so zeroing the padding is both necessary and safe. Only
-/// ever narrows, so it composes with the invocation-span cap above.
-fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
+/// Drops slice padding for every family whose word times come from a
+/// cross-attention DTW run over the buffer it actually decoded (see
+/// [`OpenAsrExecutionContract::dtw_word_times_buffer_sensitive`]). Such a
+/// decode places each frame relative to the handed buffer and does not see the
+/// slice-relative rebasing the longform assembler applies from
+/// `content_start_sample` (see `TranscriptAssembler::map_segment_time`), so
+/// any non-zero slice padding biases every word in a padded slice by the
+/// left-pad width -- the same hazard the `ScopedSlices` and
+/// `ConservativeSeq2SeqV1` policies already zero out for their own reasons.
+/// Whisper (a `Default` longform profile) reaches this path, not the
+/// `ConservativeSeq2SeqV1` one; the two can co-occur, in which case the earlier
+/// cap has already zeroed the padding and this only re-confirms it. Families
+/// that timestamp from token or alignment times (CTC, forced alignment) are
+/// padding-invariant and leave the flag `false`. Only ever narrows, so it
+/// composes with the invocation-span cap above.
+fn apply_dtw_buffer_absolute_longform_no_padding_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
 ) {
-    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+    let Some(descriptor) =
+        OpenAsrArchitectureRegistry::with_builtins().find_by_model_architecture(model_architecture)
+    else {
+        return;
+    };
+    if !descriptor.dtw_word_times_buffer_sensitive() {
         return;
     }
     if options.padding_seconds > 0.0 {
@@ -4315,49 +4301,47 @@ fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
     }
 }
 
-/// Sets whisper's longform window to [`WHISPER_LONGFORM_WINDOW_SECONDS`](27s),
-/// or to an `OPENASR_WHISPER_MAX_CHUNK_SECONDS` override, in both cases clamped
-/// at the architecture's invocation ceiling (30s).
+/// Narrows the longform window to the family's preferred quality window, when
+/// it declares one (see
+/// [`OpenAsrExecutionContract::preferred_longform_window_seconds`]), in both
+/// cases clamped at the architecture's invocation ceiling.
 ///
-/// The 27s window is a *quality* bound, distinct from the architectural ceiling:
-/// the 30s figure is whisper's hard fail-closed envelope (a wider invocation is
-/// rejected upstream by the `InvocationOutsideEnvelope` guard), whereas 27s is
-/// the point below which whisper's greedy decode reliably *completes* a
-/// 30s-class window instead of bailing soft, repetitive speech to no-speech or
-/// tripping the degenerate-repeat guard. Because it is clamped at the ceiling
-/// that `apply_invocation_span_longform_policy` already applied, it can never
-/// widen past the crash boundary. The override lets an operator dial the window
-/// tighter or restore 30s for a corpus where 27 regresses, without a rebuild;
-/// it is a no-op when unset.
-fn apply_whisper_longform_window_policy(
+/// Today only whisper declares one (27s). That window is a *quality* bound,
+/// distinct from the architectural ceiling: the 30s figure is whisper's hard
+/// fail-closed envelope (a wider invocation is rejected upstream by the
+/// `InvocationOutsideEnvelope` guard), whereas 27s is the point below which
+/// whisper's greedy decode reliably *completes* a 30s-class window instead of
+/// bailing soft, repetitive speech to no-speech or tripping the
+/// degenerate-repeat guard. Because it is clamped at the ceiling that
+/// `apply_invocation_span_longform_policy` already applied, it can never widen
+/// past the crash boundary; the clamp also guards against any future row that
+/// declares a preferred window above its own ceiling, which would only be able
+/// to *narrow*, never widen past the hard bound. The provenance label is kept
+/// whisper-stable so existing operators' logs and dashboards keep matching.
+fn apply_preferred_longform_window_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
 ) {
-    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+    let Some(preferred) = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .and_then(|descriptor| descriptor.preferred_longform_window_seconds())
+    else {
         return;
-    }
-    let ceiling = options.max_chunk_seconds;
-    let requested = match std::env::var("OPENASR_WHISPER_MAX_CHUNK_SECONDS") {
-        Ok(raw) => raw
-            .parse::<f32>()
-            .ok()
-            .filter(|sec| sec.is_finite() && *sec > 0.0),
-        Err(_) => None,
-    }
-    .unwrap_or(WHISPER_LONGFORM_WINDOW_SECONDS)
-    .min(ceiling);
-    if let Some(window) = apply_whisper_longform_window(options, requested) {
+    };
+    let requested = preferred.min(options.max_chunk_seconds);
+    if let Some(window) = apply_preferred_longform_window(options, requested) {
         provenance.push(format!(
             "core.native.longform.policy:whisper-window={window}"
         ));
     }
 }
 
-/// Set whisper's longform options to `requested` seconds, or `None` when they
-/// already sit there (so an override at the current value is a no-op). The
-/// caller clamps `requested` to the architecture ceiling ahead of time.
-fn apply_whisper_longform_window(
+/// Set the longform options to the family's preferred quality `requested`
+/// seconds, or `None` when they already sit there (so a request at the current
+/// value is a no-op). The caller clamps `requested` to the architecture ceiling
+/// ahead of time, never allowing it to widen past the hard bound.
+fn apply_preferred_longform_window(
     options: &mut crate::LongFormOptions,
     requested: f32,
 ) -> Option<f32> {
@@ -8465,6 +8449,11 @@ mod tests {
             crate::WHISPER_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
+        let preferred = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("whisper")
+            .preferred_longform_window_seconds()
+            .expect("whisper declares a preferred quality window");
         assert_eq!(resolution.options.padding_seconds, 0.0);
         assert!(
             resolution
@@ -8472,20 +8461,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
-        // The generic window is narrowed to the 27s quality window, and the
-        // padding the buffer-absolute cross-attention-DTW word times would be
-        // biased by is zeroed.
-        assert_eq!(
-            resolution.options.chunk_seconds,
-            WHISPER_LONGFORM_WINDOW_SECONDS
-        );
-        assert_eq!(
-            resolution.options.max_chunk_seconds,
-            WHISPER_LONGFORM_WINDOW_SECONDS
-        );
+        // The generic window is narrowed to whisper's declared quality window,
+        // and the padding the buffer-absolute cross-attention-DTW word times
+        // would be biased by is zeroed.
+        assert_eq!(resolution.options.chunk_seconds, preferred);
+        assert_eq!(resolution.options.max_chunk_seconds, preferred);
         assert_eq!(
             resolution.options.min_chunk_seconds,
-            defaults.min_chunk_seconds.min(27.0)
+            defaults.min_chunk_seconds.min(preferred)
         );
         assert!(
             resolution
@@ -8917,11 +8900,11 @@ mod tests {
                         .map_or(product_window, |semantic_max| {
                             product_window.min(semantic_max)
                         });
-                    // whisper carries its own 27s quality window on top of the two
-                    // caps above; it only narrows the result.
-                    if descriptor.identity.model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
-                    {
-                        expected = expected.min(WHISPER_LONGFORM_WINDOW_SECONDS);
+                    // A family's declared preferred quality window (whisper's
+                    // 27s) narrows the result on top of the two caps above; it
+                    // never widens.
+                    if let Some(preferred) = descriptor.preferred_longform_window_seconds() {
+                        expected = expected.min(preferred);
                     }
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
