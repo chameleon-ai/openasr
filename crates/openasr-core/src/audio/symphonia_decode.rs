@@ -592,7 +592,14 @@ where
 /// `process_into_buffer` is what `process()` itself calls internally after
 /// allocating its buffers (see `Resampler::process` in rubato); only the
 /// buffer lifetime moved from per-chunk to per-call.
+///
+/// Non-finite samples (NaN, +/-inf) are refused up front: rubato's
+/// `FftFixedIn` `unwrap`s inside its IFFT on them and would abort the whole
+/// process on a single corrupt decoded frame.
 fn resample_mono_to_16k(input: &[f32], input_rate: u32) -> Option<Vec<f32>> {
+    if input.iter().any(|sample| !sample.is_finite()) {
+        return None;
+    }
     let mut resampler = FftFixedIn::<f32>::new(
         input_rate as usize,
         TARGET_SAMPLE_RATE_HZ as usize,
@@ -726,6 +733,103 @@ mod tests {
             "expected ~{expected} samples, got {}",
             output.len()
         );
+    }
+
+    const PROP_RESAMPLE_RATES_HZ: [u32; 6] = [8_000, 16_000, 22_050, 44_100, 48_000, 96_000];
+
+    fn resample_input_len(kind: u8) -> usize {
+        match kind % 4 {
+            0 => 0,
+            1 => 1,
+            2 => RESAMPLE_CHUNK_FRAMES + 17, // one full FFT chunk plus a remainder
+            _ => 8_192,
+        }
+    }
+
+    fn assert_resample_len(input_len: usize, input_rate_hz: u32, output_len: usize) {
+        let expected = input_len.saturating_mul(16_000) / input_rate_hz.max(1) as usize;
+        // Empty / sub-chunk inputs still flush the FFT delay line, which emits
+        // about two `RESAMPLE_CHUNK_FRAMES` windows (see `RESAMPLE_SUB_CHUNKS`).
+        let tolerance = 2 * RESAMPLE_CHUNK_FRAMES;
+        assert!(
+            output_len.abs_diff(expected) <= tolerance,
+            "expected ~{expected} samples from {input_len} frames at {input_rate_hz} Hz, got {output_len}"
+        );
+    }
+
+    #[test]
+    fn audio_resample_mono_to_16k_discrete_grid_does_not_panic() {
+        for &rate_hz in &PROP_RESAMPLE_RATES_HZ {
+            for kind in 0..4u8 {
+                let len = resample_input_len(kind);
+                let input: Vec<f32> = (0..len)
+                    .map(|index| {
+                        (index as f32 / rate_hz.max(1) as f32 * std::f32::consts::TAU * 440.0).sin()
+                    })
+                    .collect();
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resample_mono_to_16k(&input, rate_hz)
+                }));
+                match caught {
+                    Ok(Some(output)) => {
+                        assert_resample_len(len, rate_hz, output.len());
+                    }
+                    Ok(None) => {}
+                    Err(_) => panic!("rate={rate_hz} len={len}: panicked"),
+                }
+            }
+        }
+    }
+
+    /// Shrunk from `audio_resample_mono_to_16k_random_payload_does_not_panic`:
+    /// `rate=8000`, `len=1`, `head=[-inf]`. rubato `FftFixedIn`'s IFFT path
+    /// `unwrap`s `Err(Imaginary part of first value was non-zero)` on a
+    /// non-finite sample, so the resampler must refuse such input before
+    /// handing it over instead of aborting the process.
+    #[test]
+    fn audio_resample_mono_to_16k_refuses_non_finite_samples() {
+        assert!(resample_mono_to_16k(&[f32::NEG_INFINITY], 8_000).is_none());
+        assert!(resample_mono_to_16k(&[0.0, f32::NAN, 0.0], 48_000).is_none());
+        let mut long = vec![0.25f32; RESAMPLE_CHUNK_FRAMES * 3 + 7];
+        long[RESAMPLE_CHUNK_FRAMES + 1] = f32::INFINITY;
+        assert!(resample_mono_to_16k(&long, 44_100).is_none());
+        assert!(resample_mono_to_16k(&[0.0, 0.5, -0.5], 8_000).is_some());
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 24,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn audio_resample_mono_to_16k_random_payload_does_not_panic(
+            rate_idx in 0..PROP_RESAMPLE_RATES_HZ.len(),
+            kind in 0u8..4,
+            payload in proptest::collection::vec(-1.0f32..1.0, 0..=8_192),
+        ) {
+            let rate_hz = PROP_RESAMPLE_RATES_HZ[rate_idx];
+            let len = resample_input_len(kind);
+            let mut input = payload;
+            input.truncate(len);
+            if input.len() < len {
+                input.resize(len, 0.0);
+            }
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resample_mono_to_16k(&input, rate_hz)
+            }));
+            match caught {
+                Ok(Some(output)) => {
+                    assert_resample_len(input.len(), rate_hz, output.len());
+                }
+                Ok(None) => {}
+                Err(_) => panic!(
+                    "rate={rate_hz} len={} head={:?}: panicked",
+                    input.len(),
+                    &input[..input.len().min(8)]
+                ),
+            }
+        }
     }
 
     /// A minimal webm/mkv EBML header whose size vint is the single byte

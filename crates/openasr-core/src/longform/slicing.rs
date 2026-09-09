@@ -4402,6 +4402,49 @@ mod tests {
     }
 
     #[test]
+    fn packed_window_cannot_exceed_the_chunk_ceiling_when_overlap_adds_on_top() {
+        let mut options = options_with_mode(LongFormMode::Auto);
+        options.chunk_seconds = 30.0;
+        options.min_chunk_seconds = 15.0;
+        options.overlap_seconds = 0.5;
+        let max_chunk_samples = 30 * 16_000;
+        options.max_chunk_seconds = 30.0;
+
+        // span1 is well under the ceiling (left whole by the silence-aware
+        // subdivide). span2 sits just under `chunk_samples` so the packer
+        // opens a window around it that inherits the full overlap tail from
+        // window 1: overlap + span2 = max_chunk_samples + overlap minus a
+        // hair -- strictly past the ceiling before the overlap shrink guard.
+        let span1_end = 25 * 16_000;
+        let span2_len = 30 * 16_000 - 960;
+        let spans = vec![
+            LongFormVadSlice {
+                start_sample: 0,
+                end_sample: span1_end,
+            },
+            LongFormVadSlice {
+                start_sample: span1_end,
+                end_sample: span1_end + span2_len,
+            },
+        ];
+        let windows = pack_processed_spans_into_windows(
+            &spans,
+            16_000,
+            &options,
+            &[],
+            &TimelineMap::identity(),
+        );
+        for window in &windows {
+            assert!(
+                window.end_sample - window.start_sample <= max_chunk_samples,
+                "window [{start}..{end}] exceeds the {max_chunk_samples}-sample ceiling after the packer overlap was added: {windows:#?}",
+                start = window.start_sample,
+                end = window.end_sample
+            );
+        }
+    }
+
+    #[test]
     fn packed_layout_processed_samples_include_window_overlap_cost() {
         let layout = LongFormPlanningLayout {
             slices: vec![
@@ -4881,5 +4924,32 @@ mod tests {
             "true room-tone gaps must still be packed out: {:?}",
             plan.stats.provenance
         );
+    }
+
+    #[test]
+    fn longform_en_zh_fixture_energy_slices_overlap_at_seams() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/longform_en_zh.wav");
+        let samples = crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            path,
+            "longform seam fixture",
+            "longform_en_zh.wav",
+        )
+        .expect("load fixtures/longform_en_zh.wav");
+        let options = LongFormOptions {
+            mode: LongFormMode::Energy,
+            ..LongFormOptions::default()
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.slices.len() >= 2,
+            "69s fixture must slice under the 30s energy window, got {plan:#?}"
+        );
+        for pair in plan.slices.windows(2) {
+            assert!(
+                pair[1].content_start_sample < pair[0].content_end_sample,
+                "consecutive energy slices must re-read the cut: {pair:#?}"
+            );
+        }
     }
 }

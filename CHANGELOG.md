@@ -57,6 +57,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Forced alignment now scores the Qwen3 timestamp-head chosen-bin
+  log-softmax (mean over start/end boundaries) in addition to the existing
+  geometric gates. **External manuscripts** (`openasr align`,
+  `POST /v1/audio/precise-timeline`) stay fail-closed: a geometric or
+  acoustic miss is HTTP 400 / non-zero exit, never
+  `timeline_quality: forced_aligned`. **In-process transcription** (the
+  model just produced the text) degrades instead: the native approximate
+  timeline is kept (`timeline_quality: native_approximate`), and
+  `timeline_degraded_reason` names the cause. CLI prints a warning on
+  stderr and exits 0; HTTP `json` / `verbose_json` include the field for
+  clients to display. Desktop does not yet read the reason.
+  Calibration is Apple M1 CPU graph + shipped `q4_k` only; other
+  backends/quants and near-miss manuscripts (a few wrong words) were
+  not re-scored (`#391`).
 - Core: `openasr pull` skips the network fetch when the installed
   content-addressed object already matches the catalog SHA-256, then
   re-verifies the pack contract and refreshes the install record. A catalog
@@ -144,6 +158,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Long-form: duplicate and isolated fragments at long-audio slice seams
+  are fixed; slice windows and non-seam cue timings are unchanged.
+- Core: invalid GGUF/ggml type ids — out of range or retired slots whose
+  block size is zero — are rejected before any ggml type-trait query. An
+  unknown tensor type can no longer be treated as quantized or used to
+  compute a row size, both of which were undefined behaviour. (#400)
+- Docker: images 0.1.37-0.1.40 exit immediately on `docker run` because the
+  default command binds `0.0.0.0` without device pairing (required since
+  0.1.37). The default command now enables pairing (generating a token into
+  `$OPENASR_HOME/pairing-admin-token` when `OPENASR_PAIRING_ADMIN_TOKEN` is
+  unset) and `--tls-self-signed`. `OPENASR_ALLOW_INSECURE_NON_LOOPBACK` is no
+  longer set in the image; it remains an explicit TLS opt-in for a trusted
+  reverse proxy, and still does not disable pairing.
+- Audio: decoding a file whose decoded frames contain NaN or infinite samples
+  no longer aborts the process inside the resampler; the in-process decoder
+  refuses the input and the normal converter fallback takes over.
 - Windows: `openasr.exe` no longer imports `mfplat.dll` / `mfreadwrite.dll` at
   load time. Since 0.1.37 the HE-AAC path made every start fail with
   `STATUS_DLL_NOT_FOUND` (exit `0xC0000135`, no message) on Windows N/KN

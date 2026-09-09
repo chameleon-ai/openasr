@@ -95,22 +95,6 @@ const DEFAULT_NATIVE_LONGFORM_AUTO_TRIGGER_SECONDS: f32 = 30.0;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_MAX_CHUNK_SECONDS: f32 = DEFAULT_ENCODER_CHUNK_SECONDS;
 const CONSERVATIVE_SEQ2SEQ_LONGFORM_OVERLAP_SECONDS: f32 = 0.0;
 
-/// Whisper's default longform window, in seconds. Whisper is the only family
-/// that reaches its 30s *full* window in ordinary longform operation (its
-/// `Default` longform profile keeps the `Auto` elect, unclamped), and whisper's
-/// greedy decode is most likely to bail a 30s window to no-speech -- or trip
-/// the degenerate-repeat guard -- on soft, repetitive, continuous speech, where
-/// the whole window lands at the edge of its 30s training regime and the decode
-/// never reaches an honest stop. Dropping ~3s under the architecture's 30s
-/// invocation ceiling (which stays in force as the hard bound) gives the decode
-/// enough margin to complete, recovering the dropped words on recordings like a
-/// quiet continuous monologue. Measured on the long-clip suite: this lifts the
-/// four long clips' mean in-window coverage from 0.930 to 0.957 (the longest, a
-/// 635s soft monologue, from 0.823 to 0.897) while leaving the single-window
-/// clips byte-for-byte unchanged. Kept deliberately below the ceiling rather
-/// than widening it.
-const WHISPER_LONGFORM_WINDOW_SECONDS: f32 = 27.0;
-
 fn execution_intent_from_backend_env(raw: Option<&str>) -> Option<ExecutionIntent> {
     let value = raw.map(str::trim).filter(|value| !value.is_empty())?;
     if value.eq_ignore_ascii_case("cpu") {
@@ -159,6 +143,7 @@ fn request_execution_intent_with_backend_env(
         crate::ExecutionTarget::Auto => {
             execution_intent_from_backend_env(backend_env).unwrap_or(ExecutionIntent::Auto)
         }
+        device @ crate::ExecutionTarget::Device(_) => ExecutionIntent::from(device),
     }
 }
 // Stage-weighted progress for the in-flight native file transcription.
@@ -1274,7 +1259,7 @@ fn run_native_transcription_fallible_with_input(
     // re-reads process defaults after the main ASR dispatch completes.
     let request_execution_intent = execution_intent
         .clone()
-        .unwrap_or_else(|| request_execution_intent(request.execution_target));
+        .unwrap_or_else(|| request_execution_intent(request.execution_target.clone()));
     let backend_class = progress_backend_class(&request_execution_intent);
     // Provisional plan: duration and external-diarize are refined inside impl
     // once audio is prepared and the family speaker plan is known. Stages that
@@ -1391,8 +1376,11 @@ fn run_native_transcription_fallible_with_input(
             &request_execution_intent,
             execution_context.as_ref(),
             Some(&progress),
+            crate::subtitle::ForcedAlignmentFailurePolicy::DegradeToApproximate,
         )?;
-        timeline_quality = crate::subtitle::TimelineQuality::ForcedAligned;
+        timeline_quality = refined
+            .timeline_quality
+            .unwrap_or(crate::subtitle::TimelineQuality::ForcedAligned);
         refined
     } else if may_align {
         // Planned align was skipped: drop its weight so overall can finish.
@@ -1751,6 +1739,7 @@ pub fn refine_existing_transcription_timeline(
             "post-hoc timeline refinement has no external request control",
         ),
         Some(&progress),
+        crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
     )?;
     progress.complete_stage_brief(TranscriptionStage::Project);
     Ok(crate::subtitle::project_transcription(
@@ -1777,8 +1766,9 @@ pub fn refine_existing_transcription_timeline(
 ///
 /// Missing pack, unsupported language or Japanese/Korean script, empty
 /// normalized text, audio past the timestamp grid, a prompt past decoder
-/// context, or a degenerate (collapsed) alignment fail closed instead of
-/// returning a fabricated timeline.
+/// context, a degenerate (collapsed) alignment, or an acoustically
+/// unconfident manuscript fail closed instead of returning a fabricated
+/// timeline.
 pub fn align_plain_transcript_to_audio(
     transcript: String,
     prepared_audio_16khz_mono: &[f32],
@@ -1888,6 +1878,7 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
     request_intent: &ExecutionIntent,
     execution_context: &crate::RequestExecutionContext,
     progress: Option<&ProgressReporter>,
+    gate_policy: crate::subtitle::ForcedAlignmentFailurePolicy,
 ) -> Result<Transcription, BackendError> {
     let _abort_callback_guard = execution_context
         .control
@@ -1962,8 +1953,11 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                 session_load_started.elapsed(),
             );
             let mut refined = transcription.clone();
+            // `transcription` stays available after this closure so a
+            // DegradeToApproximate policy can restore the pre-align words.
             let audio_samples = prepared_audio.as_slice().len();
             let mut completed_align_duration_s = 0.0f64;
+            let mut boundary_log_probs = Vec::new();
             for (index, segment) in refined.segments.iter_mut().enumerate() {
                 if execution_context.is_canceled() {
                     return Err(BackendError::TranscriptionCanceled);
@@ -2023,6 +2017,10 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                         alignment_started.elapsed().as_secs_f64() * 1000.0,
                     ),
                 );
+                for item in &items {
+                    boundary_log_probs.push(item.start_log_prob);
+                    boundary_log_probs.push(item.end_log_prob);
+                }
                 assign_local_aligned_words(segment, &items);
                 completed_align_duration_s += segment_duration_s;
                 if let Some(progress) = progress {
@@ -2032,10 +2030,10 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
                     ));
                 }
             }
-            Ok(refined)
+            Ok((refined, boundary_log_probs))
         },
     );
-    let result = match result {
+    let (result, boundary_log_probs) = match result {
         Ok(result) => result,
         Err(error)
             if execution_context.is_canceled()
@@ -2052,12 +2050,21 @@ pub(crate) fn refine_transcription_word_timestamps_with_forced_aligner_policy(
         progress.complete_stage();
     }
     let audio_duration_s = prepared_audio.as_slice().len() as f32 / 16_000.0;
-    crate::subtitle::reject_degenerate_forced_alignment(&result, audio_duration_s).map_err(
-        |mismatch| BackendError::WordTimestampAlignmentFailed {
+    let gate = crate::subtitle::evaluate_forced_alignment_gates(
+        &result,
+        &boundary_log_probs,
+        audio_duration_s,
+    );
+    if let Ok(score) = gate {
+        crate::stage_timing::log_detail_event(
+            "forced_aligner",
+            format_args!("stage=acoustic_confidence mean_log_prob={score:.4}"),
+        );
+    }
+    crate::subtitle::apply_forced_alignment_gate_policy(transcription, result, gate, gate_policy)
+        .map_err(|mismatch| BackendError::WordTimestampAlignmentFailed {
             reason: mismatch.to_string(),
-        },
-    )?;
-    Ok(result)
+        })
 }
 
 /// Converts real ForcedAligner execution milestones into a calibrated share of
@@ -2240,7 +2247,10 @@ fn assign_local_aligned_words(segment: &mut Segment, items: &[ForcedAlignItem]) 
                 word: item.text.clone(),
                 start: start as f32,
                 end: end as f32,
-                confidence: None,
+                confidence: crate::subtitle::chosen_bin_probability(
+                    item.start_log_prob,
+                    item.end_log_prob,
+                ),
             }
         })
         .collect();
@@ -2427,8 +2437,8 @@ fn run_native_transcription_impl(
     )?;
     let emits_punctuation =
         emits_punctuation_for_model_architecture(selected_family.model_architecture);
-    let request_execution_intent =
-        execution_intent.unwrap_or_else(|| request_execution_intent(request.execution_target));
+    let request_execution_intent = execution_intent
+        .unwrap_or_else(|| request_execution_intent(request.execution_target.clone()));
     let execution_plan = resolve_native_execution_plan(
         execution_services.as_ref(),
         &selected_family,
@@ -4142,12 +4152,8 @@ fn apply_longform_safety_policy(
 ) {
     apply_invocation_span_longform_policy(model_architecture, options, provenance);
     apply_conservative_seq2seq_longform_safety_policy(model_architecture, options, provenance);
-    apply_whisper_cross_attention_dtw_longform_no_padding_policy(
-        model_architecture,
-        options,
-        provenance,
-    );
-    apply_whisper_longform_window_policy(model_architecture, options, provenance);
+    apply_dtw_buffer_absolute_longform_no_padding_policy(model_architecture, options, provenance);
+    apply_preferred_longform_window_policy(model_architecture, options, provenance);
     apply_encoder_attention_span_longform_safety_policy(model_architecture, options, provenance);
 }
 
@@ -4261,26 +4267,32 @@ fn apply_conservative_seq2seq_longform_safety_policy(
     }
 }
 
-/// Drops slice padding for whisper. Whisper's longform profile is `Default`
-/// (not `ConservativeSeq2SeqV1`), so it escapes the padding rule above, yet it
-/// shares the exact hazard that rule exists for: it derives word times from a
-/// cross-attention DTW that places each frame relative to the buffer the
-/// decoder was actually handed, while the longform assembler re-bases those
-/// slice-relative times from `content_start_sample` (see
-/// `TranscriptAssembler::map_segment_time`). With the default 0.25s slice
-/// padding every word in a padded slice lands ~0.25s late -- the same
-/// left-pad bias the `ScopedSlices` and `ConservativeSeq2SeqV1` policies
-/// already zero out. Whisper timestamps words only, never audio (unlike CTC
-/// / forced-alignment families, whose timestamps ride token times or a
-/// separate alignment pass and so are padding-invariant), and its decode is
-/// buffer-absolute, so zeroing the padding is both necessary and safe. Only
-/// ever narrows, so it composes with the invocation-span cap above.
-fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
+/// Drops slice padding for every family whose word times come from a
+/// cross-attention DTW run over the buffer it actually decoded (see
+/// [`OpenAsrExecutionContract::dtw_word_times_buffer_sensitive`]). Such a
+/// decode places each frame relative to the handed buffer and does not see the
+/// slice-relative rebasing the longform assembler applies from
+/// `content_start_sample` (see `TranscriptAssembler::map_segment_time`), so
+/// any non-zero slice padding biases every word in a padded slice by the
+/// left-pad width -- the same hazard the `ScopedSlices` and
+/// `ConservativeSeq2SeqV1` policies already zero out for their own reasons.
+/// Whisper (a `Default` longform profile) reaches this path, not the
+/// `ConservativeSeq2SeqV1` one; the two can co-occur, in which case the earlier
+/// cap has already zeroed the padding and this only re-confirms it. Families
+/// that timestamp from token or alignment times (CTC, forced alignment) are
+/// padding-invariant and leave the flag `false`. Only ever narrows, so it
+/// composes with the invocation-span cap above.
+fn apply_dtw_buffer_absolute_longform_no_padding_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
 ) {
-    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+    let Some(descriptor) =
+        OpenAsrArchitectureRegistry::with_builtins().find_by_model_architecture(model_architecture)
+    else {
+        return;
+    };
+    if !descriptor.dtw_word_times_buffer_sensitive() {
         return;
     }
     if options.padding_seconds > 0.0 {
@@ -4289,49 +4301,47 @@ fn apply_whisper_cross_attention_dtw_longform_no_padding_policy(
     }
 }
 
-/// Sets whisper's longform window to [`WHISPER_LONGFORM_WINDOW_SECONDS`](27s),
-/// or to an `OPENASR_WHISPER_MAX_CHUNK_SECONDS` override, in both cases clamped
-/// at the architecture's invocation ceiling (30s).
+/// Narrows the longform window to the family's preferred quality window, when
+/// it declares one (see
+/// [`OpenAsrExecutionContract::preferred_longform_window_seconds`]), in both
+/// cases clamped at the architecture's invocation ceiling.
 ///
-/// The 27s window is a *quality* bound, distinct from the architectural ceiling:
-/// the 30s figure is whisper's hard fail-closed envelope (a wider invocation is
-/// rejected upstream by the `InvocationOutsideEnvelope` guard), whereas 27s is
-/// the point below which whisper's greedy decode reliably *completes* a
-/// 30s-class window instead of bailing soft, repetitive speech to no-speech or
-/// tripping the degenerate-repeat guard. Because it is clamped at the ceiling
-/// that `apply_invocation_span_longform_policy` already applied, it can never
-/// widen past the crash boundary. The override lets an operator dial the window
-/// tighter or restore 30s for a corpus where 27 regresses, without a rebuild;
-/// it is a no-op when unset.
-fn apply_whisper_longform_window_policy(
+/// Today only whisper declares one (27s). That window is a *quality* bound,
+/// distinct from the architectural ceiling: the 30s figure is whisper's hard
+/// fail-closed envelope (a wider invocation is rejected upstream by the
+/// `InvocationOutsideEnvelope` guard), whereas 27s is the point below which
+/// whisper's greedy decode reliably *completes* a 30s-class window instead of
+/// bailing soft, repetitive speech to no-speech or tripping the
+/// degenerate-repeat guard. Because it is clamped at the ceiling that
+/// `apply_invocation_span_longform_policy` already applied, it can never widen
+/// past the crash boundary; the clamp also guards against any future row that
+/// declares a preferred window above its own ceiling, which would only be able
+/// to *narrow*, never widen past the hard bound. The provenance label is kept
+/// whisper-stable so existing operators' logs and dashboards keep matching.
+fn apply_preferred_longform_window_policy(
     model_architecture: &str,
     options: &mut crate::LongFormOptions,
     provenance: &mut Vec<String>,
 ) {
-    if model_architecture != crate::WHISPER_GGML_ARCHITECTURE_ID {
+    let Some(preferred) = OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .and_then(|descriptor| descriptor.preferred_longform_window_seconds())
+    else {
         return;
-    }
-    let ceiling = options.max_chunk_seconds;
-    let requested = match std::env::var("OPENASR_WHISPER_MAX_CHUNK_SECONDS") {
-        Ok(raw) => raw
-            .parse::<f32>()
-            .ok()
-            .filter(|sec| sec.is_finite() && *sec > 0.0),
-        Err(_) => None,
-    }
-    .unwrap_or(WHISPER_LONGFORM_WINDOW_SECONDS)
-    .min(ceiling);
-    if let Some(window) = apply_whisper_longform_window(options, requested) {
+    };
+    let requested = preferred.min(options.max_chunk_seconds);
+    if let Some(window) = apply_preferred_longform_window(options, requested) {
         provenance.push(format!(
             "core.native.longform.policy:whisper-window={window}"
         ));
     }
 }
 
-/// Set whisper's longform options to `requested` seconds, or `None` when they
-/// already sit there (so an override at the current value is a no-op). The
-/// caller clamps `requested` to the architecture ceiling ahead of time.
-fn apply_whisper_longform_window(
+/// Set the longform options to the family's preferred quality `requested`
+/// seconds, or `None` when they already sit there (so a request at the current
+/// value is a no-op). The caller clamps `requested` to the architecture ceiling
+/// ahead of time, never allowing it to widen past the hard bound.
+fn apply_preferred_longform_window(
     options: &mut crate::LongFormOptions,
     requested: f32,
 ) -> Option<f32> {
@@ -5077,12 +5087,7 @@ mod carry_meaningful_word_tests {
 
     #[test]
     fn a_transcript_with_any_real_word_is_meaningful() {
-        for text in [
-            "Thank you.",
-            "Well . . .",
-            "¶¶ Part One ¶¶",
-            "   3:30",
-        ] {
+        for text in ["Thank you.", "Well . . .", "¶¶ Part One ¶¶", "   3:30"] {
             assert!(carry_text_has_meaningful_word(text), "{text:?}");
         }
     }
@@ -5432,6 +5437,7 @@ mod tests {
             &ExecutionIntent::CpuOnly,
             &execution_context,
             None,
+            crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
         )
         .expect("CPU forced alignment");
 
@@ -5445,6 +5451,7 @@ mod tests {
             &exact_intent,
             &execution_context,
             None,
+            crate::subtitle::ForcedAlignmentFailurePolicy::FailClosed,
         )
         .expect("Exact Hybrid forced alignment");
         let observed = telemetry.snapshot();
@@ -5637,6 +5644,17 @@ mod tests {
             ),
             ExecutionIntent::ConstrainedAcceleratedOnly(AcceleratedDeviceConstraint::Provider(
                 ExecutionProvider::Vulkan
+            ))
+        );
+        assert_eq!(
+            request_execution_intent_with_backend_env(
+                Some(crate::ExecutionTarget::Device(
+                    "vulkan:amd-radeon-rx-7900-xtx".to_string()
+                )),
+                Some("cuda")
+            ),
+            ExecutionIntent::Exact(crate::ExactDeviceSelector::PublicId(
+                "vulkan:amd-radeon-rx-7900-xtx".to_string()
             ))
         );
     }
@@ -8431,6 +8449,11 @@ mod tests {
             crate::WHISPER_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
+        let preferred = crate::arch::OpenAsrArchitectureRegistry::with_builtins()
+            .find_by_model_architecture(crate::WHISPER_GGML_ARCHITECTURE_ID)
+            .expect("whisper")
+            .preferred_longform_window_seconds()
+            .expect("whisper declares a preferred quality window");
         assert_eq!(resolution.options.padding_seconds, 0.0);
         assert!(
             resolution
@@ -8438,20 +8461,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
-        // The generic window is narrowed to the 27s quality window, and the
-        // padding the buffer-absolute cross-attention-DTW word times would be
-        // biased by is zeroed.
-        assert_eq!(
-            resolution.options.chunk_seconds,
-            WHISPER_LONGFORM_WINDOW_SECONDS
-        );
-        assert_eq!(
-            resolution.options.max_chunk_seconds,
-            WHISPER_LONGFORM_WINDOW_SECONDS
-        );
+        // The generic window is narrowed to whisper's declared quality window,
+        // and the padding the buffer-absolute cross-attention-DTW word times
+        // would be biased by is zeroed.
+        assert_eq!(resolution.options.chunk_seconds, preferred);
+        assert_eq!(resolution.options.max_chunk_seconds, preferred);
         assert_eq!(
             resolution.options.min_chunk_seconds,
-            defaults.min_chunk_seconds.min(27.0)
+            defaults.min_chunk_seconds.min(preferred)
         );
         assert!(
             resolution
@@ -8883,11 +8900,11 @@ mod tests {
                         .map_or(product_window, |semantic_max| {
                             product_window.min(semantic_max)
                         });
-                    // whisper carries its own 27s quality window on top of the two
-                    // caps above; it only narrows the result.
-                    if descriptor.identity.model_architecture == crate::WHISPER_GGML_ARCHITECTURE_ID
-                    {
-                        expected = expected.min(WHISPER_LONGFORM_WINDOW_SECONDS);
+                    // A family's declared preferred quality window (whisper's
+                    // 27s) narrows the result on top of the two caps above; it
+                    // never widens.
+                    if let Some(preferred) = descriptor.preferred_longform_window_seconds() {
+                        expected = expected.min(preferred);
                     }
                     assert_eq!(
                         resolution.options.max_chunk_seconds, expected,
@@ -9346,6 +9363,8 @@ mod tests {
             text: text.to_string(),
             start_time_s,
             end_time_s,
+            start_log_prob: 0.0,
+            end_log_prob: 0.0,
         }
     }
 
@@ -9436,6 +9455,8 @@ mod tests {
             "end {}",
             target.words[1].end
         );
+        assert_eq!(target.words[0].confidence, Some(1.0));
+        assert_eq!(target.words[1].confidence, Some(1.0));
     }
 
     #[test]

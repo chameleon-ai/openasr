@@ -55,6 +55,32 @@ fn non_loopback_tls_escape_still_requires_authentication() {
     );
 }
 
+#[test]
+fn non_loopback_pairing_with_tls_is_allowed() {
+    let options = ServerLaunchOptions {
+        auth: ServerAuth::pairing("admin-token"),
+        tls: ServerTlsConfig::self_signed(["localhost"]),
+        ..Default::default()
+    };
+    validate_listen_security_with_escape("0.0.0.0:8080".parse().unwrap(), &options, false)
+        .expect("pairing + TLS must allow a non-loopback bind");
+}
+
+#[test]
+fn non_loopback_without_auth_fails_closed_even_with_tls_and_insecure_escape() {
+    let options = ServerLaunchOptions {
+        auth: ServerAuth::disabled(),
+        tls: ServerTlsConfig::self_signed(["localhost"]),
+        ..Default::default()
+    };
+    let err = validate_listen_security_with_escape("0.0.0.0:8080".parse().unwrap(), &options, true)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires device authentication"),
+        "unexpected error: {err:?}"
+    );
+}
+
 fn header_map_with_bearer(token: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
@@ -622,13 +648,14 @@ fn parse_execution_target_field_accepts_supported_targets() {
         parse_execution_target_field("accelerated").unwrap(),
         ExecutionTarget::Accelerated
     );
-    let error = parse_execution_target_field("gpu0")
+    assert_eq!(
+        parse_execution_target_field("vulkan:amd-radeon-rx-7900-xtx").unwrap(),
+        ExecutionTarget::Device("vulkan:amd-radeon-rx-7900-xtx".to_string())
+    );
+    let error = parse_execution_target_field("not a device")
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("Unsupported execution_target 'gpu0'"),
-        "{error}"
-    );
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]
@@ -647,6 +674,12 @@ fn native_execution_target_mapping_preserves_server_request_semantics() {
     );
     assert_eq!(
         native_hardware_target_from_execution_target(Some(ExecutionTarget::Accelerated)),
+        NativeAsrHardwareTarget::Accelerated
+    );
+    assert_eq!(
+        native_hardware_target_from_execution_target(Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))),
         NativeAsrHardwareTarget::Accelerated
     );
 }
@@ -1555,6 +1588,7 @@ async fn default_model_response_reports_installed_not_installed_and_unset() {
 
 #[test]
 fn transcription_preferences_fill_missing_thread_request_only() {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let preferences = Preferences {
         inference_threads: Some(6),
         voice_id_segmenter: openasr_core::config::VoiceIdSegmenterPreference::Segmentation3_0,
@@ -1563,7 +1597,7 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     };
     let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
 
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(6));
     assert_eq!(
         request.voice_id_segmenter,
@@ -1575,8 +1609,57 @@ fn transcription_preferences_fill_missing_thread_request_only() {
     );
 
     request.inference_threads = Some(2);
-    apply_transcription_preferences(&mut request, &preferences);
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
     assert_eq!(request.inference_threads, Some(2));
+}
+
+#[test]
+fn openasr_device_applies_when_preferences_are_absent() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn openasr_device_overrides_saved_execution_target() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let preferences = Preferences {
+        execution_target: ExecutionTarget::Cpu,
+        ..Default::default()
+    };
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    apply_transcription_preferences(&mut request, Some(&preferences)).unwrap();
+    assert_eq!(
+        request.execution_target,
+        Some(ExecutionTarget::Device(
+            "vulkan:amd-radeon-rx-7900-xtx".to_string()
+        ))
+    );
+}
+
+#[test]
+fn request_execution_target_wins_over_openasr_device() {
+    let _guard = OpenasrDeviceEnvGuard::set("vulkan:amd-radeon-rx-7900-xtx");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo")
+        .with_execution_target(Some(ExecutionTarget::Cpu));
+    apply_transcription_preferences(&mut request, None).unwrap();
+    assert_eq!(request.execution_target, Some(ExecutionTarget::Cpu));
+}
+
+#[test]
+fn invalid_openasr_device_is_bad_request_without_preferences() {
+    let _guard = OpenasrDeviceEnvGuard::set("not a device");
+    let mut request = TranscriptionRequest::new("fixtures/jfk.wav", "whisper-large-v3-turbo");
+    let error = apply_transcription_preferences(&mut request, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unsupported execution_target"), "{error}");
 }
 
 #[test]
@@ -1692,6 +1775,7 @@ fn history_retention_last5_prunes_store() {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1733,6 +1817,7 @@ fn history_retention_off_prunes_store_empty() {
                 segments: Vec::new(),
                 subtitle_cues: Vec::new(),
                 timeline_quality: None,
+                timeline_degraded_reason: None,
                 text: format!("transcript {index}"),
             })
             .unwrap();
@@ -1759,6 +1844,7 @@ fn history_retention_off_prunes_store_empty() {
             segments: Vec::new(),
             subtitle_cues: Vec::new(),
             timeline_quality: None,
+            timeline_degraded_reason: None,
             text: "keep me".to_string(),
         })
         .unwrap();
@@ -2071,6 +2157,7 @@ async fn set_default_model_http_returns_conflict_when_native_session_is_busy() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2178,6 +2265,7 @@ async fn set_default_model_http_keeps_previous_selection_when_activation_probe_f
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2397,6 +2485,7 @@ async fn set_default_model_http_keeps_previous_selection_when_persist_fails() {
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2485,6 +2574,7 @@ async fn set_default_model_failure_matrix_preserves_precommit_state() {
     use axum::body::Body;
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2773,6 +2863,7 @@ async fn set_default_model_http_persists_only_after_activation_probe_succeeds() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -2855,6 +2946,7 @@ async fn set_default_model_http_real_probe_attests_plan_lane_and_live_backend() 
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -3382,6 +3474,7 @@ async fn rt377_session_start_claims_id(
     home: &std::path::Path,
     model_id: &str,
 ) -> bool {
+    let _openasr_device = OpenasrDeviceEnvGuard::unset();
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
     let mut session = realtime::WsSession::new(
         runtime,
@@ -4359,6 +4452,129 @@ async fn pull_job_control_ack_sets_flag_without_terminal_state_flip() {
     assert!(distribution.cancel_job("pull-control"));
     assert!(cancel_flag.load(Ordering::SeqCst));
     distribution.clear_active_job("pull-control");
+}
+
+#[test]
+fn next_job_id_is_unique_pull_timestamp_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let first = distribution.next_job_id();
+    let second = distribution.next_job_id();
+    assert_ne!(first, second);
+    for job_id in [&first, &second] {
+        let mut parts = job_id.splitn(3, '-');
+        assert_eq!(parts.next(), Some("pull"), "{job_id}");
+        let timestamp = parts.next().expect(job_id);
+        let seq = parts.next().expect(job_id);
+        assert!(
+            !timestamp.is_empty() && timestamp.chars().all(|c| c.is_ascii_digit()),
+            "{job_id}"
+        );
+        assert!(
+            !seq.is_empty() && seq.chars().all(|c| c.is_ascii_digit()),
+            "{job_id}"
+        );
+    }
+    let first_seq: u64 = first.rsplit('-').next().unwrap().parse().unwrap();
+    let second_seq: u64 = second.rsplit('-').next().unwrap().parse().unwrap();
+    assert_eq!(second_seq, first_seq + 1);
+}
+
+#[test]
+fn notify_job_snapshot_publishes_to_existing_watchers() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    let resolved = resolved_pull_fixture();
+    let snapshot = PullJobSnapshot::queued("pull-notify".to_string(), &resolved, None, false);
+    distribution.insert_job(snapshot).unwrap();
+    let receiver = distribution.subscribe_job("pull-notify").unwrap();
+
+    let mut next = distribution.snapshot("pull-notify").unwrap();
+    next.state = PullJobState::Downloading;
+    next.error = Some("bytes arriving".to_string());
+    distribution.notify_job_snapshot(&next);
+
+    let observed = receiver.borrow().clone();
+    assert_eq!(observed.state, PullJobState::Downloading);
+    assert_eq!(observed.error.as_deref(), Some("bytes arriving"));
+}
+
+#[test]
+fn cancel_job_reports_whether_an_active_worker_was_signaled() {
+    let temp = tempfile::tempdir().unwrap();
+    let distribution = distribution_context_for_test(temp.path());
+    assert!(
+        !distribution.cancel_job("missing-job"),
+        "unknown jobs must not report a successful cancel"
+    );
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    distribution.register_active_job("pull-live", cancel_flag.clone(), pause_flag.clone());
+    assert!(distribution.cancel_job("pull-live"));
+    assert!(cancel_flag.load(Ordering::SeqCst));
+    assert!(!pause_flag.load(Ordering::SeqCst));
+}
+
+#[test]
+fn model_activation_failpoint_labels_are_stable_and_distinct() {
+    let labeled = [
+        (
+            ModelActivationFailpoint::PackVerification,
+            "pack-verification",
+        ),
+        (
+            ModelActivationFailpoint::CandidateResolution,
+            "candidate-resolution",
+        ),
+        (
+            ModelActivationFailpoint::QuoteObservation,
+            "quote-observation",
+        ),
+        (
+            ModelActivationFailpoint::BrokerReservation,
+            "broker-reservation",
+        ),
+        (
+            ModelActivationFailpoint::NativeMaterialization,
+            "native-materialization",
+        ),
+        (
+            ModelActivationFailpoint::FirstComputeAttestation,
+            "first-compute-attestation",
+        ),
+        (ModelActivationFailpoint::Reconciliation, "reconciliation"),
+        (ModelActivationFailpoint::V2StagingWrite, "v2-staging-write"),
+        (ModelActivationFailpoint::V2StagingSync, "v2-staging-sync"),
+        (
+            ModelActivationFailpoint::AtomicBeforeReplace,
+            "atomic-before-replace",
+        ),
+        (
+            ModelActivationFailpoint::AtomicAfterReplace,
+            "atomic-after-replace",
+        ),
+        (
+            ModelActivationFailpoint::DurableCommitBeforeLivePublish,
+            "durable-commit-before-live-publish",
+        ),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for (failpoint, expected) in labeled {
+        let label = failpoint.label();
+        assert_eq!(label, expected);
+        assert!(seen.insert(label), "duplicate failpoint label {label}");
+    }
+}
+
+#[tokio::test]
+async fn spawn_ggml_backend_boot_log_joins_injected_probe_summary() {
+    let handle = spawn_ggml_backend_boot_log(|| "best_backend=Metal cpu_backend=CPU".to_string());
+    let message = handle.await.expect("boot log task");
+    assert_eq!(
+        message,
+        "stage=ggml_backend best_backend=Metal cpu_backend=CPU"
+    );
 }
 
 #[tokio::test]

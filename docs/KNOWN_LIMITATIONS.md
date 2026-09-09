@@ -112,9 +112,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   through external morphological segmenters (`nagisa`/`soynlp`) that have not
   been ported, so an `aligned` request against ja/ko text fails closed with a
   typed error rather than mis-tokenizing. Other families keep their approximate
-  timestamps unchanged. Explicit `aligned` only refines words; the automatic
-  Voice ID path additionally consumes those words to assign each text run to
-  the canonical speaker timeline.
+  timestamps unchanged. If the aligner runs on an **in-process** transcript
+  (the model just produced the text) and the geometric or acoustic gates
+  fail, the request still succeeds: the native approximate timeline is kept,
+  `timeline_quality` stays `native_approximate`, and
+  `timeline_degraded_reason` names the cause. CLI prints a warning and
+  exits 0; HTTP `json` / `verbose_json` include the field. Desktop does
+  not yet read the reason. Explicit `aligned` only
+  refines words; the automatic Voice ID path additionally consumes those
+  words to assign each text run to the canonical speaker timeline.
 - External manuscript alignment (`openasr align` / `POST /v1/audio/precise-timeline`
   with `transcript=`) reuses the same Forced Aligner pack and tokenizer. The
   returned `text` keeps the caller's punctuation and casing. Internally the
@@ -129,8 +135,15 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   are built — the 400 s grid is not a substitute for that budget. A collapsed or
   zero-duration timeline is treated as a severe transcript/audio mismatch;
   pauses longer than 4 s in a correctly aligned manuscript are not. Mismatch
-  detection only rejects geometric degeneration; it does not score semantic
-  agreement between the manuscript and the audio. The server
+  detection also rejects a manuscript whose classify-head chosen-bin
+  log-softmax (mean over start/end boundaries) falls below the calibrated
+  acoustic threshold; see [`docs/forced-align-confidence.md`](forced-align-confidence.md).
+  That score is not a WER / string heuristic. **External manuscripts stay
+  fail-closed** (HTTP 400 / non-zero). The threshold was calibrated on Apple
+  M1 CPU graph + shipped `q4_k` only; other backends and quants have not
+  been re-scored. Near-miss manuscripts (a few substituted words on an
+  otherwise matching script) were not in the calibration set. A theoretically
+  sharp but token-wrong timestamp head can also miss. The server
   never downloads the pack; paired device tokens may call the endpoint (it is a
   compute route, not operator-only). This route is not yet on the file
   FIFO / pause / cancel surface used by `/v1/audio/transcriptions`; a request
@@ -142,11 +155,13 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   the hiragana/katakana/hangul script guard. CLI `align`
   is itself consent to install the pack unless `--offline`.
 - Hardware execution target selection is generic: Desktop/server requests support
-  `auto`, `cpu`, and `accelerated` when the native runtime reports an accelerated
-  device. There is no public per-provider/per-device pinning surface such as
-  `gpu0`. Internally the runtime can resolve a concrete execution route
-  (`provider` + ggml stable device name + optional PCI `device_id` from CUDA/HIP,
-  and from Vulkan when available). What is route-isolated today:
+  `auto`, `cpu`, `accelerated`, and a physical GPU id from `GET /v1/devices`
+  (for example `vulkan:amd-radeon-rx-7900-xtx` or `metal:apple-m1`). There is
+  no ordinal selector such as `gpu0`. Internally the runtime resolves a concrete
+  execution route (`provider` + ggml stable device name + optional PCI
+  `device_id` from CUDA/HIP, and from Vulkan when available). Metal Exact is
+  allowed by public/stable id; Metal has no PCI/UUID identity. What is
+  route-isolated today:
   - thread-local ggml **backend-handle** cache (Exact pin never shares a handle;
     preferred/Auto may Optimus-fall through discrete -> iGPU but always caches
     under the device that actually initialized)
@@ -162,11 +177,11 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   - **admission capacity stays per model identity** (CPU and accelerated share one
     slot for the same model; route does not multiply capacity)
   Exact device pins are fail-closed: missing devices, init failures, Metal
-  (still `MTLCreateSystemDefaultDevice` only), and CPU StableId Exact return typed
-  not-found / not-addressable / init-failed errors instead of silently swapping
-  cards or falling back to CPU. Unavailable coarse `accelerated` targets still
-  fail closed. Physical PCI keys are normalized (trim + lower-case) only; full
-  BDF grammar validation is a follow-up.
+  PCI/UUID Exact, and CPU StableId Exact return typed not-found /
+  not-addressable / init-failed errors instead of silently swapping cards or
+  falling back to CPU. Unavailable coarse `accelerated` targets still fail
+  closed. Physical PCI keys are normalized (trim + lower-case) only; full BDF
+  grammar validation is a follow-up.
 - On Windows ReBAR discrete GPUs, Vulkan Peak Working Set can exceed the HIP
   and CPU figures even when DeviceLocal buffers are not mapped. ReBAR types
   are DeviceLocal|HostVisible, so Windows still counts that VRAM toward the
@@ -219,6 +234,12 @@ sequencing, see [Roadmap](ROADMAP.md) (Implemented-baseline section).
   ignored -- use a multilingual Whisper pack when you need to force or read back the
   language. (Wiring Qwen's text-prompt language conditioning is tracked, but needs a
   real-pack parity check against the reference inference before it can be claimed.)
+  Qwen3-ASR 0.6B q4 on `fixtures/en_zh_mixed.wav` (5s English + ~8s Mandarin)
+  currently drops the English lead-in and truncates the Mandarin tail; the same
+  clip is a single 0--13s decode (not VAD/leading-silence clipping), and the
+  family rejects `--language`. Treat this as a model code-switch limit of that
+  pack -- use Whisper, MiMo-ASR, or moss-transcribe-diarize when the English
+  half must be kept. fp16 / 1.7B were not re-measured on this host.
   Dolphin is specify-only: it does not auto-detect, so an explicit `--language`
   selects one of its 14 recognition codes (`zh` plus 13 Chinese regional-dialect
   codes such as `zh-sichuan`, `zh-shanghai`, `zh-hebei`) via a decode-prompt

@@ -809,6 +809,21 @@ pub(crate) struct OpenAsrExecutionContract {
     pub word_timestamp_source: WordTimestampSource,
     pub longform_slice_shape: OpenAsrLongformSliceShape,
     pub(crate) invocation_span: OpenAsrInvocationSpan,
+    /// Preferred longform window in seconds for a family whose greedy decode
+    /// degrades as it nears its invocation ceiling (a quality bound, narrower
+    /// than the `invocation_span` hard ceiling); `None` when the family simply
+    /// rides the generic window with no tighter quality target.
+    pub preferred_longform_window_seconds: Option<f32>,
+    /// Whether the family places its word times by a cross-attention DTW over
+    /// the buffer it was handed (buffer-absolute). Such a decode never sees the
+    /// slice-relative rebasing the longform assembler applies from
+    /// `content_start_sample`, so any non-zero slice padding biases every word
+    /// in a padded slice by the left-pad width -- and longform must zero it.
+    /// CTC / forced-alignment families timestamp from token or alignment times
+    /// (padding-invariant) and so leave this `false`; the
+    /// `ConservativeSeq2SeqV1` decode profile zeros padding for a different,
+    /// decode-side reason and is handled separately.
+    pub dtw_word_times_buffer_sensitive: bool,
     pub emits_punctuation: Option<bool>,
 }
 
@@ -930,6 +945,20 @@ impl OpenAsrArchitectureDescriptor {
             OpenAsrEncoderAttentionSpan::FixedWindow
             | OpenAsrEncoderAttentionSpan::LocalChunked => None,
         }
+    }
+
+    /// The family's preferred longform window, distinct from the hard
+    /// [`Self::max_single_invocation_seconds`] ceiling (see
+    /// [`OpenAsrExecutionContract::preferred_longform_window_seconds`]).
+    pub(crate) fn preferred_longform_window_seconds(self) -> Option<f32> {
+        self.execution_contract.preferred_longform_window_seconds
+    }
+
+    /// Whether this family's cross-attention-DTW word times are buffer-absolute
+    /// and so must have longform slice padding zeroed (see
+    /// [`OpenAsrExecutionContract::dtw_word_times_buffer_sensitive`]).
+    pub(crate) fn dtw_word_times_buffer_sensitive(self) -> bool {
+        self.execution_contract.dtw_word_times_buffer_sensitive
     }
 
     #[cfg(test)]
@@ -1663,6 +1692,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                 crate::models::cohere::runtime_contract::validate_runtime_pack_contract,
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: true,
+            preferred_longform_window_seconds: None,
             executor_component_id: COHERE_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -1774,6 +1805,22 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // into the shared blocks.
         },
         execution_contract: OpenAsrExecutionContract {
+            // whisper is the only family that reaches its 30s full window in
+            // ordinary longform operation (its `Default` longform profile keeps
+            // the Auto elect unclamped), and its greedy decode is most likely to
+            // bail a 30s window to no-speech -- or trip the degenerate-repeat
+            // guard -- exactly at the edge of its 30s training regime on soft,
+            // repetitive, continuous speech. Dropping ~3s under the 30s
+            // invocation ceiling (which stays in force as the hard bound) gives
+            // the decode enough margin to complete. Measured on the long-clip
+            // suite: this lifts the four long clips' mean in-window coverage from
+            // 0.930 to 0.957 (the longest, a 635s soft monologue, from 0.823 to
+            // 0.897) while leaving single-window clips byte-for-byte unchanged.
+            // Kept deliberately below, never above, the ceiling -- the backend
+            // clamps any declared window to the invocation ceiling so a future
+            // row cannot widen past the hard bound.
+            preferred_longform_window_seconds: Some(27.0),
+            dtw_word_times_buffer_sensitive: true,
             executor_component_id: WHISPER_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -1859,6 +1906,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                 crate::models::qwen::runtime_contract::validate_runtime_pack_contract,
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: QWEN3_ASR_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -1959,6 +2008,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // Non-autoregressive CTC: encoder + CTC head only, no decoder stage.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: PARAKEET_CTC_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2059,6 +2110,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // ArchitectureGraph strategy like xasr.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: PARAKEET_TDT_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2146,6 +2199,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // transformer encoder + CTC head, no decoder stage.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: WAV2VEC2_CTC_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2237,6 +2292,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // generic block-stack composer.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: XASR_ZIPFORMER_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2338,6 +2395,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // RoPE conv-stem encoder + cross-attn decoder are not composer blocks).
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: MOONSHINE_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2438,6 +2497,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // kind), so no data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: DOLPHIN_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2540,6 +2601,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // descriptor pins the primary `enc.blk` stack.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: SENSEVOICE_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2632,6 +2695,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // block kind), so no data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: FIRERED_AED_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2731,6 +2796,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: FIRERED_LLM_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2828,6 +2895,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: FUNASR_NANO_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -2918,6 +2987,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // block kind), so no data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: MIMO_ASR_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -3013,6 +3084,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: MOSS_TD_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
@@ -3143,6 +3216,8 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // kind), so no data-driven block-stack descriptor.
         },
         execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
             executor_component_id: GRANITE_SPEECH_EXECUTOR_COMPONENT_ID,
             runtime_factory:
                 crate::models::executor_component_registry::materialize_builtin_executor::<
