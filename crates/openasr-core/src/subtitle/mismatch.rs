@@ -9,7 +9,9 @@
 //!
 //! What happens on rejection is a caller policy: external manuscripts stay
 //! fail-closed, while an in-process ASR transcript degrades to its
-//! approximate native timeline. The checks themselves stay shared.
+//! approximate native timeline -- except when only the acoustic-confidence
+//! gate fires (a flattened posterior, usually from music or noise), in which
+//! case the aligned timeline is kept. The checks themselves stay shared.
 //!
 //! They intentionally do **not** reuse [`super::validate_word_anchors`]: that
 //! validator is for native ASR anchors and treats a pause longer than 4 s as
@@ -86,8 +88,16 @@ pub enum ForcedAlignmentMismatch {
 pub enum ForcedAlignmentFailurePolicy {
     /// External manuscript (`openasr align`, `POST /v1/audio/precise-timeline`).
     FailClosed,
-    /// In-process ASR output being timestamp-refined. Keep the model-native
-    /// approximate timeline instead of discarding the transcript.
+    /// In-process ASR output being timestamp-refined. Geometric failures
+    /// discard the aligned words and return the model-native approximate
+    /// timeline. A low acoustic confidence alone does not: the transcript is
+    /// the model's own output from the same audio, so music / noise / reverber-
+    /// ation can flatten the posterior (dropping the score below the calibrated
+    /// threshold) without indicating any mismatch. Keeping the aligned words in
+    /// that case is still strictly better for timing than the decode-time
+    /// windows the ASR produced, so the aligned timeline is returned with
+    /// [`TimelineQuality::ForcedAligned`] and a degraded-reason that names the
+    /// low score.
     DegradeToApproximate,
 }
 
@@ -258,9 +268,23 @@ pub fn evaluate_forced_alignment_gates(
 
 /// Apply [`ForcedAlignmentFailurePolicy`] after [`evaluate_forced_alignment_gates`].
 ///
-/// Fail-closed returns the mismatch. Degrade returns `original` with
-/// [`TimelineQuality::NativeApproximate`] and a readable reason, never the
-/// rejected aligned words.
+/// Fail-closed returns the mismatch unconditionally. Under
+/// [`ForcedAlignmentFailurePolicy::DegradeToApproximate`]:
+///
+/// - a **geometric** failure (empty word list, collapsed bins, inverted /
+///   non-monotonic intervals, over-audio tail, more than half the words at
+///   zero width, or no aligned boundaries) discards the aligned words and
+///   returns `original` with [`TimelineQuality::NativeApproximate`] plus a
+///   readable reason;
+/// - a **low acoustic confidence** failure alone is not evidence of a
+///   transcript / audio mismatch for an in-process transcript: the transcript
+///   is the model's own output from the same audio, and music / noise /
+///   reverberation flatten the timestamp posterior, pushing the score below
+///   the calibrated [`MIN_MEAN_CHOSEN_BIN_LOG_PROB`] without changing word
+///   identity. The aligned 80 ms grid is still strictly better for per-word
+///   timing than the model-native decode-time windows, so the aligned words
+///   are returned with [`TimelineQuality::ForcedAligned`] and no degraded
+///   reason.
 pub fn apply_forced_alignment_gate_policy(
     original: Transcription,
     mut aligned: Transcription,
@@ -275,10 +299,16 @@ pub fn apply_forced_alignment_gate_policy(
         }
         (Err(error), ForcedAlignmentFailurePolicy::FailClosed) => Err(error),
         (Err(error), ForcedAlignmentFailurePolicy::DegradeToApproximate) => {
-            let mut kept = original;
-            kept.timeline_quality = Some(TimelineQuality::NativeApproximate);
-            kept.timeline_degraded_reason = Some(error.to_string());
-            Ok(kept)
+            if matches!(error, ForcedAlignmentMismatch::LowAcousticConfidence { .. }) {
+                aligned.timeline_quality = Some(TimelineQuality::ForcedAligned);
+                aligned.timeline_degraded_reason = None;
+                Ok(aligned)
+            } else {
+                let mut kept = original;
+                kept.timeline_quality = Some(TimelineQuality::NativeApproximate);
+                kept.timeline_degraded_reason = Some(error.to_string());
+                Ok(kept)
+            }
         }
     }
 }
@@ -576,6 +606,54 @@ mod tests {
             "reason must stay in the mismatch class: {reason}"
         );
         assert_eq!(kept.segments[0].words, original.segments[0].words);
+    }
+
+    #[test]
+    fn in_process_low_acoustic_confidence_keeps_aligned_timeline() {
+        let original = transcription_with_words(spread_words(8, 8.0));
+        let aligned = transcription_with_words(spread_words(8, 8.0));
+        let gate = evaluate_forced_alignment_gates(&aligned, &[-2.0, -2.0], 8.0)
+            .expect_err("low confidence must fail the acoustic gate");
+        assert!(
+            matches!(gate, ForcedAlignmentMismatch::LowAcousticConfidence { .. }),
+            "expected acoustic confidence, got {gate:?}",
+        );
+        let kept = apply_forced_alignment_gate_policy(
+            original,
+            aligned,
+            Err(gate),
+            ForcedAlignmentFailurePolicy::DegradeToApproximate,
+        )
+        .expect("in-process low confidence must keep the aligned timeline");
+        assert_eq!(kept.timeline_quality, Some(TimelineQuality::ForcedAligned));
+        assert!(
+            kept.timeline_degraded_reason.is_none(),
+            "no degraded reason when the aligned timeline is kept: {:?}",
+            kept.timeline_degraded_reason
+        );
+    }
+
+    #[test]
+    fn external_low_acoustic_confidence_is_err() {
+        let original = transcription_with_words(spread_words(8, 8.0));
+        let aligned = transcription_with_words(spread_words(8, 8.0));
+        let gate = evaluate_forced_alignment_gates(&aligned, &[-2.0, -2.0], 8.0)
+            .expect_err("low confidence must fail the acoustic gate");
+        assert!(
+            matches!(gate, ForcedAlignmentMismatch::LowAcousticConfidence { .. }),
+            "expected acoustic confidence, got {gate:?}",
+        );
+        let error = apply_forced_alignment_gate_policy(
+            original,
+            aligned,
+            Err(gate),
+            ForcedAlignmentFailurePolicy::FailClosed,
+        )
+        .expect_err("external manuscript must fail closed on low confidence");
+        assert!(
+            matches!(error, ForcedAlignmentMismatch::LowAcousticConfidence { .. }),
+            "got {error}"
+        );
     }
 
     #[test]
