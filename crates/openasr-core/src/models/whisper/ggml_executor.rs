@@ -821,6 +821,12 @@ struct WhisperDecoderActorJob {
     prelude_result: WhisperEncoderPreludeSeamResult,
     decoder_state: Seq2SeqDecoderState,
     audio_duration: f32,
+    /// Per-0.02-s-frame RMS envelope of the request audio (buffer-absolute, in
+    /// the whisper 16 kHz / 0.02 s frame units the DTW word times use), `None`
+    /// when the run did not request cross-attention word timestamps. Feeds the
+    /// pause-boundary word-onset refinement so a word the center fold parked in
+    /// a mid-segment silence is pulled to its real audio onset.
+    word_audio_rms_frames: Option<Vec<f32>>,
     allow_persistent_session_reuse: bool,
     backend: GgmlCpuGraphBackend,
     reuse_mode: GgmlDecodeReuseMode,
@@ -962,6 +968,7 @@ impl WhisperDecoderActorJob {
                 &self.prelude_result,
                 &encoder_result,
                 self.audio_duration,
+                self.word_audio_rms_frames.as_deref(),
                 decoder_persistent_cache_populated,
                 &self.trace,
                 &self.control,
@@ -4888,6 +4895,7 @@ fn execute_whisper_with_prepared_runtime(
         } => output_hidden_f32.clone(),
     };
     let audio_duration = audio_duration_seconds(prepared_audio);
+    let word_audio_rms_frames = whisper_dtw_word_audio_rms_frames(prepared_audio, request_options);
     let decoder_graph_config =
         whisper_decoder_graph_config(resolved_backend, decoder_placement_policy);
     if let Some(serve_batch_config) = serve_batch_config.filter(|_| can_use_serve_batch) {
@@ -4998,6 +5006,7 @@ fn execute_whisper_with_prepared_runtime(
             prelude_result,
             decoder_state,
             audio_duration,
+            word_audio_rms_frames: word_audio_rms_frames.clone(),
             allow_persistent_session_reuse,
             backend: resolved_backend,
             reuse_mode,
@@ -5085,6 +5094,7 @@ fn execute_whisper_with_prepared_runtime(
         prelude_result,
         decoder_state,
         audio_duration,
+        word_audio_rms_frames,
         allow_persistent_session_reuse,
         backend: resolved_backend,
         reuse_mode,
@@ -5854,6 +5864,52 @@ fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
 }
 
+/// Per-frame RMS envelope of the request audio on a 0.02-s grid -- the same
+/// 16 kHz / 0.02-s frame units the DTW word times are expressed in -- for the
+/// whisper cross-attention word-timing path. `None` when that path is not
+/// active (no word timestamps requested, or the diarization-forced post-hoc
+/// anchor mode which never refines onsets) so callers can skip the refinement
+/// cleanly.
+///
+/// `samples_f32` is the prepared 16 kHz mono PCM that the mel frontend already
+/// consumes; the DTW word times are absolute seconds from the start of this
+/// buffer. Each envelope entry is the square root of the mean square of the
+/// next 320 samples (0.02 s at 16 kHz). A clip fully below the f32 dynamic
+/// range (all zeros) yields a median of zero, and the onset-refinement
+/// predicate refuses to fire for a non-positive floor -- so all-silent input
+/// is left exactly as the fold produced it, no words move.
+fn whisper_dtw_word_audio_rms_frames(
+    audio: &GgmlAsrPreparedAudioView,
+    request_options: &GgmlAsrExecutionOptions,
+) -> Option<Vec<f32>> {
+    if whisper_word_timestamp_mode(request_options) != WhisperWordTimestampMode::CrossAttention {
+        return None;
+    }
+    if audio.sample_rate_hz != WHISPER_SAMPLE_RATE_HZ {
+        // This path assumes 16 kHz mono (as the mel frontend already does); a
+        // different rate means the caller is misusing the prepared audio view.
+        return None;
+    }
+    let samples = audio.samples_f32.as_ref();
+    if samples.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(samples.len().div_ceil(WHISPER_DTW_ENVELOPE_FRAME_COUNT));
+    for frame_start in (0..samples.len()).step_by(WHISPER_DTW_ENVELOPE_FRAME_COUNT) {
+        let frame_end = (frame_start + WHISPER_DTW_ENVELOPE_FRAME_COUNT).min(samples.len());
+        let mut sum = 0.0_f64;
+        for &sample in &samples[frame_start..frame_end] {
+            if !sample.is_finite() {
+                return None;
+            }
+            let value = f64::from(sample);
+            sum += value * value;
+        }
+        out.push((sum / (frame_end - frame_start) as f64).sqrt() as f32);
+    }
+    Some(out)
+}
+
 /// How a whisper decode derives word timestamps for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WhisperWordTimestampMode {
@@ -6169,11 +6225,185 @@ fn whisper_cap_dtw_word_spans(
     capped_words
 }
 
+/// Length of the DTW envelope RMS window, in samples (0.02 s at 16 kHz), the
+/// same duration as one 0.02 s/s frame the DTW word times are expressed in.
+const WHISPER_DTW_ENVELOPE_FRAME_COUNT: usize = 320;
+
+/// Share of a word's front half tolerated above the floor before the word is no
+/// longer hollow (a speech onset bleeding into the front half).
+const WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX: f32 = 0.5;
+/// Maximum of the front half may sit, as a fraction of the clip's peak envelope
+/// level, before the silence is no longer trusted as a real pause. A music or
+/// noise background never reads as digital zero -- its floor is a real level --
+/// so without this a quiet pause in a music-backed clip looks hollow and the
+/// onset push fires on the music floor, moving a word that was already
+/// acceptable. Requiring the front to be within this fraction of the clip's
+/// peak isolates true zero-crossing silence from a low floor. Measured on the
+/// test corpus at 3% of peak, where digital-silence pauses sit far below it and
+/// the quietest music beds it must reject all sit above it.
+const WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION: f64 = 0.03;
+/// dB above the clip's own noise floor (the median envelope level) that counts
+/// as real speech. Measured in dB over the envelope so it adapts per clip
+/// rather than assuming a fixed absolute speech level.
+const WHISPER_DTW_ONSET_FLOOR_MARGIN_DB: f64 = 5.0;
+/// Minimum duration of the speech run above the floor that qualifies as the
+/// word's onset (expressed in envelope frames of 0.02 s).
+const WHISPER_DTW_ONSET_SUSTAIN_FRAMES: usize = 5;
+/// Minimum run of silence between the run before a word and its onset, in
+/// seconds, so a run that merely touches a brief inter-word glottal gap is not
+/// treated as a real pause.
+const WHISPER_DTW_ONSET_MIN_SILENCE_S: f32 = 0.03;
+/// The onset must sit at least this many seconds after the fold's start, or the
+/// push is an adjustment smaller than the fold's own calibration error and the
+/// word is left as-is.
+const WHISPER_DTW_ONSET_MIN_PUSH_S: f32 = 0.25;
+/// Upper bound on how far back into a pause a word's start may be pulled.
+const WHISPER_DTW_ONSET_MAX_PUSH_S: f32 = 5.0;
+
+/// Pull a word that the center fold landed in silence to its real audio onset.
+///
+/// The DTW entry frame the fold treats as a word's center sits where the monotone
+/// path first *enters* a token's row. After an intra-segment pause that entry is
+/// at the tail of the preceding word or part-way into the pause, not on the next
+/// word's audio; the `boundary_fraction` split that follows places the next word's
+/// start a full `fraction * gap` before its center -- i.e. a fraction of the pause
+/// early, where the audio is silent. (Measured: a 2 s pause before `Look` in the
+/// `dog` clip parks it ~1 s into the silence, where the envelope is digital zero.)
+///
+/// This pass recovers the onset from the audio when the fold could not: a word
+/// whose front half is true silence (its energy only begins later inside its own
+/// window) is advanced to that first sustained speech run. Because the fold's
+/// adjacent boundaries coincide (the previous word's end equals this word's old
+/// start), advancing the start opens a real gap where the pause actually sits
+/// instead of smearing the word across it, while leaving the timeline monotone
+/// and non-overlapping by construction -- no neighbour is ever touched.
+///
+/// The speech floor is `10^(margin/20)` times the *median* frame RMS, tracking a
+/// quiet recording down to its own level (a high percentile would peg the bar at
+/// the loudest peak). Crucially the front must also stay within a small fraction
+/// of the clip's *peak*: a music or noise bed never reads as digital zero, so a
+/// quiet passage inside a music-backed clip is *not* a trusted pause and a push
+/// would only move a word that was already acceptable. That ceiling is what
+/// separates a genuine zero-silence pause (fire) from a low music floor (skip).
+fn whisper_refine_dtw_word_onsets(
+    mut words: Vec<crate::WordTimestamp>,
+    audio_rms_frames: Option<&[f32]>,
+    duration_s: f32,
+) -> Vec<crate::WordTimestamp> {
+    let Some(levels) = audio_rms_frames else {
+        return words;
+    };
+    if levels.len() < 4 || duration_s <= 0.0 || words.len() < 2 {
+        return words;
+    }
+    let seconds_per_frame = WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    ranked.sort_by(f64::total_cmp);
+    let noise_floor = ranked[ranked.len() / 2];
+    if !(noise_floor > 0.0 && noise_floor.is_finite()) {
+        return words;
+    }
+    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let clip_peak = *ranked.last().unwrap_or(&0.0);
+    if !(clip_peak > 0.0 && clip_peak.is_finite()) {
+        return words;
+    }
+    // A front frame that reads at or above this is not true silence (see
+    // [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]).
+    let silence_ceiling = clip_peak * WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION;
+    let min_quiet_frames =
+        ((WHISPER_DTW_ONSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
+    for word in words.iter_mut().skip(1) {
+        let raw_start = f64::from(word.start);
+        let raw_end = f64::from(word.end);
+        let span = raw_end - raw_start;
+        if span < 0.3_f64 {
+            continue;
+        }
+        let start_s = raw_start.max(0.0).min(f64::from(duration_s));
+        let end_s = raw_end.max(start_s).min(f64::from(duration_s));
+        let frame_start = (start_s / seconds_per_frame) as usize;
+        let frame_end = ((end_s / seconds_per_frame).min(levels.len() as f64 - 1.0) as usize)
+            .max(frame_start + 1);
+        let window = &levels[frame_start..frame_end + 1];
+        if window.len() < 4 {
+            continue;
+        }
+        let window_len = window.len();
+        let is_above = |index: usize| f64::from(window[index]) >= threshold;
+        let front_len = (window_len / 2).clamp(1, window_len);
+        // A hollow word: the front half sits in true silence, not just a quiet
+        // passage. Three conditions on the front half of the window:
+        //   1. its *mean* level is below the noise floor (not just a fraction of
+        //      frames -- a single loud blip in a quiet front must not pass);
+        //   2. *no* front frame crosses the silence ceiling (3% of clip peak),
+        //      so a music floor never masquerades as a pause (see
+        //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]);
+        //   3. fewer than half its frames are above the floor (no sustained
+        //      speech leaking into the front).
+        let front_mean =
+            (0..front_len).map(|i| f64::from(window[i])).sum::<f64>() / front_len as f64;
+        let front_max = (0..front_len)
+            .map(|i| f64::from(window[i]))
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        let front_above = (0..front_len).filter(|&i| is_above(i)).count() as f64 / front_len as f64;
+        if front_mean >= threshold
+            || front_max > silence_ceiling
+            || front_above > WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
+        {
+            continue;
+        }
+        // The onset: the first speech run (>= sustain frames above the floor)
+        // preceded by a quiet run of at least the minimum silence length,
+        // inside this word's own window.
+        let mut onset_rel: Option<usize> = None;
+        let mut index = 0usize;
+        while index < window_len && onset_rel.is_none() {
+            if is_above(index) {
+                let mut run_end = index;
+                while run_end + 1 < window_len && is_above(run_end + 1) {
+                    run_end += 1;
+                }
+                let run_len = run_end - index + 1;
+                if run_len >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+                    let mut quiet = 0usize;
+                    let mut probe = index;
+                    while probe > 0 && !is_above(probe - 1) {
+                        probe -= 1;
+                        quiet += 1;
+                    }
+                    if quiet >= min_quiet_frames {
+                        onset_rel = Some(index);
+                    }
+                }
+                index = run_end + 1;
+            } else {
+                index += 1;
+            }
+        }
+        let Some(rel) = onset_rel else {
+            continue;
+        };
+        let onset_s = ((frame_start + rel) as f64 * seconds_per_frame) as f32;
+        let push = onset_s - raw_start as f32;
+        // A word's start may only move forward into later audio, never backward.
+        // The minimum push guards against a sub-calibration-error wiggle; the
+        // maximum caps how deep into a pause we trust the envelope to lead us.
+        if !(WHISPER_DTW_ONSET_MIN_PUSH_S..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push) {
+            continue;
+        }
+        word.start = onset_s;
+    }
+    words
+}
+
 fn whisper_cross_attention_word_timestamps(
     tokenizer: &WhisperTokenizer,
     token_alignments: &[WhisperGeneratedTokenAlignment],
     generated_probabilities: &[f32],
     audio_duration_seconds: f32,
+    audio_rms_frames: Option<&[f32]>,
 ) -> Result<Vec<crate::WordTimestamp>, WhisperGgmlExecutorError> {
     if token_alignments.is_empty() {
         return Ok(Vec::new());
@@ -6362,7 +6592,11 @@ fn whisper_cross_attention_word_timestamps(
                 }
             }
             if !words.is_empty() {
-                return Ok(words);
+                return Ok(whisper_refine_dtw_word_onsets(
+                    words,
+                    audio_rms_frames,
+                    duration,
+                ));
             }
             // Every bracketed run failed to align: fall through to the
             // center-of-mass degrade below.
@@ -6455,7 +6689,11 @@ fn whisper_cross_attention_word_timestamps(
                     }
                 })?;
                 words = whisper_cap_dtw_word_spans(words, seconds_per_frame);
-                return Ok(words);
+                return Ok(whisper_refine_dtw_word_onsets(
+                    words,
+                    audio_rms_frames,
+                    duration,
+                ));
             }
         }
     }
@@ -6814,6 +7052,7 @@ fn run_whisper_decode_loop(
     prelude_result: &WhisperEncoderPreludeSeamResult,
     encoder_result: &WhisperEncoderGraphSeamResult,
     audio_duration_seconds: f32,
+    word_audio_rms_frames: Option<&[f32]>,
     decoder_persistent_cache_populated: bool,
     trace: &WhisperGgmlTrace,
     control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
@@ -7148,6 +7387,7 @@ fn run_whisper_decode_loop(
             &step_runner.token_alignments,
             &decode.generated_probabilities,
             audio_duration_seconds,
+            word_audio_rms_frames,
         )?,
         WhisperWordTimestampMode::PostHocAnchors => seq2seq_word_timestamps_from_generated_tokens(
             &decode.generated_tokens,

@@ -1979,3 +1979,70 @@ fn whisper_dtw_lead_silence_advance_fires_only_on_a_leading_leak() {
     let no_front = whisper_dtw_lead_silence_advance_frame(0, None, spf, min_gap);
     assert_eq!(no_front, None);
 }
+
+// ---------------------------------------------------------------------------
+// whisper_refine_dtw_word_onsets
+// ---------------------------------------------------------------------------
+
+fn word_ts(word: &str, start: f32, end: f32) -> crate::WordTimestamp {
+    crate::WordTimestamp {
+        word: word.to_string(),
+        start,
+        end,
+        confidence: None,
+    }
+}
+
+/// A 15 s, 0.02 s/frame envelope (750 frames) at a 0.001 noise floor with a
+/// single 0.5 peak at 8 s that sets the clip peak (and so the 3% silence
+/// ceiling). The [2.0, 4.0) word-b window is filled from 0.001 up to 3.8 s and
+/// a 0.25 speech onset occupies [3.8, 4.0).
+fn refine_fixture_envelope() -> Vec<f32> {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    for s in env[190..200].iter_mut() {
+        *s = 0.25;
+    }
+    env
+}
+
+/// `whisper_refine_dtw_word_onsets` advances a word the fold parked in true
+/// zero-silence to its real onset at 3.8 s: the previous word's boundary is
+/// left untouched, so a real gap is opened where the pause sits.
+#[test]
+fn refine_dtw_onsets_pushes_true_silence_word_to_its_onset() {
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let env = refine_fixture_envelope();
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+    // The first word is never modified.
+    assert!((out[0].start - 0.5).abs() < 1e-4 && (out[0].end - 0.6).abs() < 1e-4);
+}
+
+/// The same window with a low music floor filling the front half (0.021 ~=
+/// 4.2% of the clip peak, above the 3% ceiling) is *not* trusted as a pause:
+/// a quiet passage over a music bed is ambiguous, so no push fires and the word
+/// keeps its fold position. This is the gate that stops the refinement from
+/// regressing continuous-speech / music-backed clips.
+#[test]
+fn refine_dtw_onsets_refuses_a_music_floor_front() {
+    let mut env = refine_fixture_envelope();
+    for s in env[100..190].iter_mut() {
+        *s = 0.021;
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+    assert!((out[1].end - 4.0).abs() < 1e-4);
+}
+
+/// No envelope (a run without cross-attention word timestamps) is a byte-exact
+/// no-op.
+#[test]
+fn refine_dtw_onsets_noop_without_envelope() {
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, None, 15.0);
+    assert_eq!(out[0].start, 0.5);
+    assert_eq!(out[1].start, 2.0);
+    assert_eq!(out[1].end, 4.0);
+}
