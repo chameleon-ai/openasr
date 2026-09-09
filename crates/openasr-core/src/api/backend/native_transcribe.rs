@@ -5103,12 +5103,7 @@ mod carry_meaningful_word_tests {
 
     #[test]
     fn a_transcript_with_any_real_word_is_meaningful() {
-        for text in [
-            "Thank you.",
-            "Well . . .",
-            "¶¶ Part One ¶¶",
-            "   3:30",
-        ] {
+        for text in ["Thank you.", "Well . . .", "¶¶ Part One ¶¶", "   3:30"] {
             assert!(carry_text_has_meaningful_word(text), "{text:?}");
         }
     }
