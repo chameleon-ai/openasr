@@ -565,10 +565,21 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     let onset_frame = (audio_onset_seconds / seconds_per_frame).floor() as usize;
     let first_peak_displaced = first_content_raw_peak
         .is_some_and(|first_peak| first_peak + DTW_SPEECH_BAND_MARGIN_FRAMES < band_start);
+    // The displacement anchor is only meant to correct a sink substitution that
+    // moved the first word's peak to a *neighbouring* word: the true onset then
+    // sits a fraction of a second before the post-substitution band. When the
+    // measured energy onset instead sits many seconds ahead of the band, the
+    // onset is a different region than the band brackets, and anchoring to it
+    // would slide a correct band across that non-speech gap and re-park the
+    // first word in the music. Only anchor when the onset is within this gap
+    // of the corrected band.
+    let onset_disp_gap_ok = band_start.saturating_sub(onset_frame) as f32 * seconds_per_frame
+        <= ONSET_DISP_MAX_ANCHOR_GAP_SECONDS;
     let band_start = if stripped_sinks.is_some()
         && audio_onset_seconds.is_finite()
         && first_peak_displaced
         && onset_frame < band_start
+        && onset_disp_gap_ok
     {
         if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
             eprintln!(
@@ -586,10 +597,8 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         // leaves the band bracketing the chunk front (a residual early-attention
         // frame, not the stripped sink). The DTW's start-early bias then walks
         // that leading silence and parks the first word at the silent chunk
-        // start instead of where speech begins (measured up to ~-20s vs the
-        // truth on leading-silent long-form chunks such as `ploomet`). Advancing
-        // the band start to the measured audio onset makes the DTW begin at the
-        // first real energy.
+        // start instead of where speech begins. Advancing the band start to the
+        // measured audio onset makes the DTW begin at the first real energy.
         //
         // Two guards keep this inert where it would be wrong. `onset_frame >
         // band_start` requires the measured onset to sit *ahead* of the band:
@@ -3271,9 +3280,8 @@ const SINK_STRIP_SEARCH_FRAMES: usize = 10;
 /// Windows that fall short of the tolerant tier fall back to the uniform baseline.
 /// 0.10 was tuned against the old span-tiling DTW; the current entry-frame
 /// center fold is robust to a modest residual zigzag, and raising this admits
-/// the short clips (dog's post-strip fraction is ~0.20) whose DTW entry centers
-/// still land well inside the truth windows. Measured in-window coverage only
-/// rises (jfk/tomoe/nimi/ploomet unchanged, dog 27%->73%, arnold 51%->86%).
+/// the short clips whose DTW entry centers still land well inside the truth
+/// windows. Measured in-window coverage only rises.
 const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.25;
 
 /// Minimum DTW band duration, in seconds, before the post-sink-strip
@@ -3285,9 +3293,8 @@ const COHERE_DTW_MAX_BACKWARD_PAIR_FRACTION: f32 = 0.25;
 /// 20s floor predates the current fold: with the old span-tiling DTW, a 15-25s
 /// window accumulated enough drift to time worse than uniform, so short windows
 /// were deliberately kept uniform. The current entry-frame center fold lands
-/// well inside the truth windows on those shorter bands (the dog clip's 12.7s
-/// band and the arnold clip's 16.6s band), so the floor drops to 10s to admit
-/// them; anything under 10s stays on the uniform baseline.
+/// well inside the truth windows on those shorter bands), so the floor drops to
+/// 10s to admit them; anything under 10s stays on the uniform baseline.
 const COHERE_DTW_TOLERANT_MIN_BAND_SECONDS: f32 = 10.0;
 
 /// Minimum window duration, in seconds, before the order-gate fallback switches
@@ -3323,8 +3330,7 @@ const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 /// the word is spoken, so the midpoint puts every word start a little late,
 /// which is why whole runs of words drift past the truth window and appear "off
 /// by one". Moving the boundary closer to the word's own center (0.35) pulls
-/// each start toward the true speech onset (measured vs the 0.5 midpoint fold:
-/// jfk in-window 73%->100%, tomoe 30%->90%, nimi 39%->88%, ploomet 53%->82%).
+/// each start toward the true speech onset.
 const COHERE_DTW_BOUNDARY_FRACTION: f32 = 0.35;
 
 /// Baseline seconds by which each DTW center is placed earlier before the
@@ -3344,6 +3350,16 @@ const COHERE_DTW_BOUNDARY_FRACTION: f32 = 0.35;
 /// rapid aside inside a long pause-heavy window -- with every word start a
 /// third of a second late, just past its truth window.
 const COHERE_DTW_ONSET_LEAD_SECONDS: f32 = 0.20;
+
+/// Maximum seconds between the measured audio onset and the (post sink-strip)
+/// band start for the first-token-displacement anchor to trust the onset as
+/// the band floor. A larger gap means the onset is a separate region from the
+/// one the cross-attention brackets (a music/ambient bed in a long-form chunk
+/// whose real speech opens much later), in which case anchoring the first
+/// word to the onset slides a correct band across that non-speech gap. Set
+/// generously above the genuine sink-displacement case (a fraction of a
+/// second) and far below the music-bed regime.
+const ONSET_DISP_MAX_ANCHOR_GAP_SECONDS: f32 = 3.0;
 
 /// Words per second of band audio above which the measured late-onset bias
 /// grows and a larger onset lead is warranted.

@@ -44,6 +44,21 @@ pub(crate) fn token_text_carries_speech(text: &str) -> bool {
 /// and offset. 10 frames is 0.2s at Whisper's 0.02s/frame.
 pub(crate) const DTW_SPEECH_BAND_MARGIN_FRAMES: usize = 10;
 
+/// Leading-frame zone a sink-substitution must not land on, in frames.
+///
+/// Cohere's last-layer cross-attention spreads a diffuse "floor" of mass over
+/// the first frames of a chunk (the shared priming sink plus its slow-decaying
+/// tail). When a sink-locked row's dominant frame is masked, substituting with
+/// the "next strongest unmasked frame" can land on that same leading floor
+/// (the frame just beside the masked sink) instead of the row's real speech
+/// peak, collapsing the band's earliest bound into the leading silence/music.
+/// The substitution therefore prefers a frame at or beyond this zone and only
+/// falls back to the nearest unmasked frame when the row has no mass outside
+/// the zone. Kept in sync with the model's sink-strip search width. This is
+/// only consulted when `masked_frames` is supplied (the cohere path), so a
+/// `None` caller (whisper) never enters the substituted branch.
+pub(crate) const DTW_SINK_SUBSTITUTE_FLOOR_FRAMES: usize = 10;
+
 /// Frame index band the DTW path should align onto, derived from where each
 /// token's cross-attention actually peaks. Returns `[start, end)` (end
 /// exclusive) within `frame_count`, or `None` when the rows are empty or
@@ -126,15 +141,35 @@ pub(crate) fn speech_band_from_rows(
             continue;
         }
         // The dominant frame is the (masked) sink artifact: the row's real
-        // speech location is its next strongest unmasked frame.
-        let frame = if is_masked(dominant_frame) {
-            match finite
+        // speech location is its next strongest unmasked frame, but that frame
+        // must not also sit in the leading diffuse floor. A sink-locked row's
+        // strongest unmasked frame can be the floor frame just beside the masked
+        // sink (the slow-decaying tail of the same priming artifact) rather than
+        // the row's real, later speech peak; substituting to it collapses the
+        // band's earliest bound into the leading silence/music. Prefer the
+        // strongest unmasked frame at or beyond the floor zone, falling back to
+        // the nearest unmasked frame only when the row carries no mass beyond it.
+        // The strongest unmasked frame at or past `min_frame`; the sink
+        // substitution calls this once with the floor zone width and once with
+        // no lower bound as the fallback.
+        let best_unmasked = |min_frame: usize| {
+            finite
                 .iter()
-                .filter(|(candidate, _)| *candidate != dominant_frame && !is_masked(*candidate))
+                .filter(|(candidate, _)| {
+                    *candidate != dominant_frame
+                        && !is_masked(*candidate)
+                        && *candidate >= min_frame
+                })
                 .max_by(|a, b| a.1.total_cmp(&b.1))
-            {
-                Some(&(alternate_frame, _)) => alternate_frame,
-                None => continue,
+                .map(|&(candidate, _)| candidate)
+        };
+        let frame = if is_masked(dominant_frame) {
+            match best_unmasked(DTW_SINK_SUBSTITUTE_FLOOR_FRAMES) {
+                Some(alternate_frame) => alternate_frame,
+                None => match best_unmasked(0) {
+                    Some(alternate_frame) => alternate_frame,
+                    None => continue,
+                },
             }
         } else {
             dominant_frame
