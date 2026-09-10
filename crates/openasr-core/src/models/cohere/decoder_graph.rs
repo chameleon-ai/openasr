@@ -790,6 +790,7 @@ fn cohere_plain_transcription_from_generated_tokens(
     } else {
         Vec::new()
     };
+    let words = cohere_pad_word_windows(&words, audio_duration_seconds);
     let segments = if words.is_empty() || text.is_empty() {
         Vec::new()
     } else {
@@ -3496,6 +3497,50 @@ fn cohere_cap_dtw_word_spans(
     capped_words
 }
 
+/// Seconds by which every cohere word window's start is moved earlier.
+///
+/// Cohere's DTW tiles each word to a seam between its own token's entry frame
+/// and the next token's; the seam is where the *next* token's attention
+/// arrives, not where this word's speech starts. Measured across the long-form
+/// test suite, a word's window start therefore sits a fixed small amount
+/// (~0.1s median) past its true acoustic onset, which a wide window hides but
+/// the tight truth windows of short function words expose as full window
+/// misses. Pulling the start earlier by this amount re-covers the onset.
+const COHERE_WORD_ONSET_PAD_SECONDS: f32 = 0.10;
+
+/// Seconds by which every cohere word window's end is moved later.
+///
+/// The tile seam is likewise slightly short of the word's true acoustic
+/// offset on a minority of words (measured ~5% of matched words miss their
+/// truth window entirely on the early side). A small end pad covers that
+/// offset without widening the common case meaningfully, and is much smaller
+/// than the start pad because the end-side miss rate is lower.
+const COHERE_WORD_OFFSET_PAD_SECONDS: f32 = 0.05;
+
+/// Move every word window's start earlier and its end later, clamped to the
+/// audio's time range, so the window covers the speech's acoustic
+/// onset/offset rather than the DTW seam frames. The timeline stays ordered
+/// because a start only moves earlier and an end only moves later, so an
+/// already-monotone, non-overlapping sequence stays so (adjacent windows may
+/// gain a little overlap, which the downstream VTT de-overlap handles).
+fn cohere_pad_word_windows(
+    words: &[WordTimestamp],
+    audio_duration_seconds: f32,
+) -> Vec<WordTimestamp> {
+    words
+        .iter()
+        .map(|word| {
+            let end = (word.end + COHERE_WORD_OFFSET_PAD_SECONDS).min(audio_duration_seconds);
+            WordTimestamp {
+                word: word.word.clone(),
+                start: (0.0f32.max(word.start - COHERE_WORD_ONSET_PAD_SECONDS)).min(end),
+                end,
+                confidence: word.confidence,
+            }
+        })
+        .collect()
+}
+
 /// The wall-clock length of the window, given the per-row frame count and the
 /// family's seconds-per-frame.
 fn band_duration_seconds(window: &[Vec<f32>], seconds_per_frame: f32) -> f32 {
@@ -4867,6 +4912,36 @@ mod tests {
         let expected =
             COHERE_DTW_ONSET_LEAD_SECONDS + COHERE_DTW_LEAD_DENSITY_SLOPE * 1.6_f32.max(0.0);
         assert!((dense - expected).abs() < 1e-6);
+    }
+
+    fn word(word: &str, start: f32, end: f32) -> WordTimestamp {
+        WordTimestamp {
+            word: word.to_string(),
+            start,
+            end,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn cohere_pad_word_windows_widens_toward_the_edges_and_clamps_to_the_audio() {
+        let words = vec![
+            word("a", 0.0, 0.4),
+            word("b", 0.4, 0.9),
+            word("c", 9.95, 10.0),
+        ];
+        let padded = cohere_pad_word_windows(&words, 10.0);
+        assert_eq!(padded[0].start, 0.0, "start clamps at 0");
+        assert!((padded[0].end - (0.4 + COHERE_WORD_OFFSET_PAD_SECONDS)).abs() < f32::EPSILON);
+        assert!((padded[1].start - (0.4 - COHERE_WORD_ONSET_PAD_SECONDS)).abs() < f32::EPSILON);
+        assert!((padded[1].end - (0.9 + COHERE_WORD_OFFSET_PAD_SECONDS)).abs() < f32::EPSILON);
+        assert!(padded[2].start < 9.95, "start pulled earlier");
+        assert_eq!(padded[2].end, 10.0, "end clamps at the audio duration");
+        assert_eq!(
+            padded.iter().map(|w| w.word.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "word text and confidence are preserved"
+        );
     }
 
     #[test]
