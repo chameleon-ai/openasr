@@ -2983,11 +2983,21 @@ fn run_native_transcription_impl(
             });
         }
         if has_processed_audio || !whole_file_single_slice {
+            // Re-deriving word spans at a stitched seam is only meaningful for
+            // families that *generate* their spans by uniform token tiling
+            // (DecodeInvariant worded-stitch families: qwen, moonshine, the
+            // ForcedAligner pack), whose pre-stitch interpolation no longer
+            // matches the post-stitch text. `DecodeSensitive` families such as
+            // cohere emit real cross-attention anchors that the stitch already
+            // splits at the seam; a `NativeApproximate` provenance label alone
+            // must not make the assembler smear those acoustic anchors into a
+            // char-proportional tile.
+            let seam_rederives_word_spans = word_timestamp_source.has_synthetic_word_spans()
+                && selected_family.word_timestamps
+                    == crate::arch::OpenAsrWordTimestampStrategy::DecodeInvariant;
             let mut assembler =
                 TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default())
-                    .with_approximate_word_timestamps(
-                        word_timestamp_source.has_synthetic_word_spans(),
-                    );
+                    .with_approximate_word_timestamps(seam_rederives_word_spans);
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
             let mut rolling_prompt_token_ids: Vec<u32> = Vec::new();
             let carry_prompt_mode =
