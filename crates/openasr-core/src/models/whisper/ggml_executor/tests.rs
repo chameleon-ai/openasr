@@ -2046,3 +2046,55 @@ fn refine_dtw_onsets_noop_without_envelope() {
     assert_eq!(out[1].start, 2.0);
     assert_eq!(out[1].end, 4.0);
 }
+
+// ---------------------------------------------------------------------------
+// whisper_pad_dtw_word_windows
+// ---------------------------------------------------------------------------
+
+/// An interior word is widened on both sides by exactly the pads, while the
+/// first word's start is clamped to 0.0 and the last word's end is clamped to
+/// the audio duration; interior order is preserved.
+#[test]
+fn pad_dtw_word_windows_widens_toward_the_edges_and_clamps_to_the_audio() {
+    let words = vec![
+        word_ts("a", 0.02, 0.70),
+        word_ts("b", 0.70, 1.30),
+        word_ts("c", 1.30, 14.98),
+    ];
+    let out = whisper_pad_dtw_word_windows(words, 15.0);
+    assert!(
+        (out[0].start - 0.0).abs() < 1e-4,
+        "a.start={}",
+        out[0].start
+    );
+    assert!((out[0].end - 0.80).abs() < 1e-4, "a.end={}", out[0].end);
+    assert!(
+        (out[1].start - 0.60).abs() < 1e-4,
+        "b.start={}",
+        out[1].start
+    );
+    assert!((out[1].end - 1.40).abs() < 1e-4, "b.end={}", out[1].end);
+    assert!(
+        (out[2].start - 1.20).abs() < 1e-4,
+        "c.start={}",
+        out[2].start
+    );
+    assert!((out[2].end - 15.0).abs() < 1e-4, "c.end={}", out[2].end);
+    for (index, word) in out.iter().enumerate() {
+        assert!(word.start <= word.end, "word[{index}] inverted");
+        if index + 1 < out.len() {
+            assert!(word.end <= out[index + 1].end);
+        }
+    }
+}
+
+/// Zero-duration audio clamps every window edge to 0.0 and keeps each window
+/// non-negative; an empty input is a byte-exact no-op.
+#[test]
+fn pad_dtw_word_windows_is_a_noop_when_empty_and_clamps_zero_duration() {
+    let empty = whisper_pad_dtw_word_windows(Vec::new(), 15.0);
+    assert!(empty.is_empty());
+    let zero = whisper_pad_dtw_word_windows(vec![word_ts("a", 0.30, 0.90)], 0.0);
+    assert_eq!(zero[0].start, 0.0);
+    assert_eq!(zero[0].end, 0.0);
+}

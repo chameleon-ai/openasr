@@ -6398,6 +6398,59 @@ fn whisper_refine_dtw_word_onsets(
     words
 }
 
+/// Seconds each whisper word window's start is moved earlier, so the seam the
+/// center fold placed between two adjacent words (the previous word's end and
+/// this word's start, which coincide) lands on the real speech onset instead of
+/// a hair inside it. Whisper's DTW treats every token's entry frame as the word
+/// center and splits the gap between two centers to form the shared boundary,
+/// so the boundary sits a fraction of a second inside the next word's audio.
+/// The boundary is a fixed point of the per-word least-squares affine fit
+/// TempErr uses, so a uniform per-side pad of this kind leaves TempErr
+/// unchanged while the window widens back over the onset the fold clipped.
+const WHISPER_WORD_ONSET_PAD_SECONDS: f32 = 0.10;
+
+/// Seconds each whisper word window's end is moved later, the offset-side
+/// counterpart of [`WHISPER_WORD_ONSET_PAD_SECONDS`]. The end seam is shared
+/// with the next word's start, so both sides of a boundary are pulled out by the
+/// pad at once.
+const WHISPER_WORD_OFFSET_PAD_SECONDS: f32 = 0.10;
+
+/// Widen each word window back over the true speech span: start earlier by
+/// [`WHISPER_WORD_ONSET_PAD_SECONDS`], end later by
+/// [`WHISPER_WORD_OFFSET_PAD_SECONDS`], clamped to `[0, duration]`.
+///
+/// The DTW center fold places adjacent words' windows back-to-back on shared
+/// seam boundaries, so a word's window can end up a tenth of a second inside
+/// its real onset/offset (the measured start-leak median is ~0.06s late, the
+/// end-leak median ~0.21s short, with real speech energy in the clipped region).
+/// Because the fold's seams are continuous, the pad is the one knob that pulls a
+/// window edge back over the clipped audio without disturbing the word centers
+/// the fold calibrated, and it is invariant to the per-word affine fit the
+/// normalized TempErr metric uses.
+///
+/// Clamping and the start-before-end invariant keep the windows monotone: only
+/// the first word's start can touch 0.0 and only the last word's end can touch
+/// `duration`, and a pad far smaller than any word span can never invert an
+/// interior pair.
+fn whisper_pad_dtw_word_windows(
+    mut words: Vec<crate::WordTimestamp>,
+    audio_duration_seconds: f32,
+) -> Vec<crate::WordTimestamp> {
+    if words.is_empty() {
+        return words;
+    }
+    let duration = audio_duration_seconds.max(0.0);
+    for word in &mut words {
+        let new_start = (word.start - WHISPER_WORD_ONSET_PAD_SECONDS)
+            .max(0.0)
+            .min(duration);
+        let new_end = (word.end + WHISPER_WORD_OFFSET_PAD_SECONDS).min(duration);
+        word.start = new_start;
+        word.end = new_end.max(new_start);
+    }
+    words
+}
+
 fn whisper_cross_attention_word_timestamps(
     tokenizer: &WhisperTokenizer,
     token_alignments: &[WhisperGeneratedTokenAlignment],
@@ -6592,9 +6645,8 @@ fn whisper_cross_attention_word_timestamps(
                 }
             }
             if !words.is_empty() {
-                return Ok(whisper_refine_dtw_word_onsets(
-                    words,
-                    audio_rms_frames,
+                return Ok(whisper_pad_dtw_word_windows(
+                    whisper_refine_dtw_word_onsets(words, audio_rms_frames, duration),
                     duration,
                 ));
             }
@@ -6689,9 +6741,8 @@ fn whisper_cross_attention_word_timestamps(
                     }
                 })?;
                 words = whisper_cap_dtw_word_spans(words, seconds_per_frame);
-                return Ok(whisper_refine_dtw_word_onsets(
-                    words,
-                    audio_rms_frames,
+                return Ok(whisper_pad_dtw_word_windows(
+                    whisper_refine_dtw_word_onsets(words, audio_rms_frames, duration),
                     duration,
                 ));
             }
@@ -6721,6 +6772,7 @@ fn whisper_cross_attention_word_timestamps(
         NO_ONSET_LEAD,
         f32::INFINITY,
     )
+    .map(|words| whisper_pad_dtw_word_windows(words, duration))
     .map_err(
         |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
             reason: format!("whisper cross-attention word timestamp token decode failed: {error}"),
