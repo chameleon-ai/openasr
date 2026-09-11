@@ -1906,7 +1906,7 @@ fn encoder_graph_upload_bytes_after_prepare_outputs_remains_supported() {
 }
 
 #[test]
-fn whisper_dtw_onset_lead_default_curve_is_flat_then_density_capped() {
+fn whisper_dtw_onset_lead_default_curve_is_flat_across_density() {
     let tuning = WhisperDtwLeadTuning::default();
     // The curve must mirror the compiled defaults exactly.
     assert!((tuning.baseline - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
@@ -1914,26 +1914,18 @@ fn whisper_dtw_onset_lead_default_curve_is_flat_then_density_capped() {
     assert!((tuning.slope - WHISPER_DTW_LEAD_DENSITY_SLOPE).abs() < 1e-6);
     assert!((tuning.maximum - WHISPER_DTW_ONSET_LEAD_MAX_SECONDS).abs() < 1e-6);
 
-    // Sparse band (at or below the knee): flat baseline, no density term.
-    let slow = whisper_dtw_onset_lead_for(&tuning, 10.0, 20); // 2.0 words/s < 2.4
-    assert!((slow - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+    // The density slope is zero, so the lead is the flat baseline for every
+    // band density: no per-segment discontinuity, which the corpus measured as
+    // the cleanest whole-suite TempErr mean.
+    assert!(WHISPER_DTW_LEAD_DENSITY_SLOPE == 0.0);
 
-    // Dense band: growth above the knee, capped at the 0.15s maximum. The cap
-    // is the whole point: the historical 0.35s ceiling over-led dense bands and
-    // dropped short truth words, so the lead must never exceed the measured
-    // onset-offset width even on the densest band.
-    let dense = whisper_dtw_onset_lead_for(&tuning, 1.0, 20); // 20 words/s
-    assert!(
-        (dense - WHISPER_DTW_ONSET_LEAD_MAX_SECONDS).abs() < 1e-6,
-        "dense band lead must cap at the maximum (got {dense}, max {})",
-        WHISPER_DTW_ONSET_LEAD_MAX_SECONDS
-    );
-
-    // A mild-density band (just past the knee) sits strictly between the
-    // baseline and the cap: 2.5 words/s -> baseline + slope * 0.1, still under
-    // the 0.15s ceiling.
+    // Sparse, mild, and dense bands all resolve to the same flat baseline.
+    let slow = whisper_dtw_onset_lead_for(&tuning, 10.0, 20); // 2.0 words/s
     let mid = whisper_dtw_onset_lead_for(&tuning, 10.0, 25); // 2.5 words/s
-    assert!(WHISPER_DTW_ONSET_LEAD_SECONDS < mid && mid < WHISPER_DTW_ONSET_LEAD_MAX_SECONDS);
+    let dense = whisper_dtw_onset_lead_for(&tuning, 1.0, 20); // 20 words/s
+    assert!((slow - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+    assert!((mid - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
+    assert!((dense - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
 }
 
 #[test]

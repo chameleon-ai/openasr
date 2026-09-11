@@ -6039,10 +6039,17 @@ const WHISPER_DTW_ONSET_LEAD_SECONDS: f32 = 0.05;
 const WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
 
 /// Rate (in seconds of added lead per extra word/second above the knee) by
-/// which the onset lead grows with band density. The DTW entry frames --
-/// treated as word centers -- sit later the more tightly the words pack, so a
-/// fixed lead cannot correct both sparse and dense bands.
-const WHISPER_DTW_LEAD_DENSITY_SLOPE: f32 = 0.43;
+/// which the onset lead grows with band density. Set to zero: a per-band
+/// density-scaled lead applies a different shift to each decoded segment, and
+/// those per-band discontinuities show up as locally-correlated per-word start
+/// jitter that the per-word affine TempErr fit cannot absorb -- the largest
+/// addressable timing contribution left after the window-mapping pass. With the
+/// slope flat every band is led at the same [`WHISPER_DTW_ONSET_LEAD_SECONDS`]
+/// baseline, which the test corpus measured as the cleanest whole-suite mean
+/// (no clip regressed, the long dense clips improved). The env override and the
+/// curve are retained so a deployment can still re-enable density growth if a
+/// future corpus shows it is warranted.
+const WHISPER_DTW_LEAD_DENSITY_SLOPE: f32 = 0.0;
 
 /// Upper bound on the density-scaled onset lead. Whisper's DTW entry frames
 /// are already near-onset-accurate (short clips land in-window with the flat
@@ -6121,18 +6128,20 @@ fn whisper_dtw_lead_tuning() -> WhisperDtwLeadTuning {
     }
 }
 
-/// The onset lead for one DTW band, scaled by how densely its words pack.
+/// The onset lead for one DTW band.
 ///
-/// Whisper's measured late-onset bias is density-dependent: on a slow band
-/// (<= [`WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC`] words/s) the baseline
-/// [`WHISPER_DTW_ONSET_LEAD_SECONDS`] suffices, but as the speaking rate
-/// climbs the DTW centers land a growing fixed amount past the true onset, so
-/// the lead grows at [`WHISPER_DTW_LEAD_DENSITY_SLOPE`] per extra word/second
-/// up to [`WHISPER_DTW_ONSET_LEAD_MAX_SECONDS`].
+/// The density-scaled lead is currently flat: with
+/// [`WHISPER_DTW_LEAD_DENSITY_SLOPE`] at zero every band resolves to the
+/// [`WHISPER_DTW_ONSET_LEAD_SECONDS`] baseline regardless of density. A
+/// per-band (density-varying) lead applies a different shift to each decoded
+/// segment, and those per-band discontinuities surface as locally-correlated
+/// per-word start jitter that the per-word affine TempErr fit cannot absorb.
+/// The curve, the knee, and the env override are retained so a deployment can
+/// re-enable density growth if a corpus shows it is warranted.
 ///
-/// The density is in *words* per second of band audio, not tokens: a band can
-/// be token-dense (many subwords) yet speak at a relaxed pace, in which case
-/// the late bias is small. Token density does not separate them; word density does.
+/// The density would have been in *words* per second of band audio, not tokens:
+/// a band can be token-dense (many subwords) yet speak at a relaxed pace, in
+/// which case the late bias is small.
 fn whisper_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
     whisper_dtw_onset_lead_for(&whisper_dtw_lead_tuning(), band_seconds, word_count)
 }
