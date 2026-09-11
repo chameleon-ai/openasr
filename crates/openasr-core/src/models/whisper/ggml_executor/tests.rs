@@ -1906,40 +1906,12 @@ fn encoder_graph_upload_bytes_after_prepare_outputs_remains_supported() {
 }
 
 #[test]
-fn whisper_dtw_onset_lead_default_curve_is_flat_across_density() {
-    let tuning = WhisperDtwLeadTuning::default();
-    // The curve must mirror the compiled defaults exactly.
-    assert!((tuning.baseline - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
-    assert!((tuning.knee - WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC).abs() < 1e-6);
-    assert!((tuning.slope - WHISPER_DTW_LEAD_DENSITY_SLOPE).abs() < 1e-6);
-    assert!((tuning.maximum - WHISPER_DTW_ONSET_LEAD_MAX_SECONDS).abs() < 1e-6);
-
-    // The density slope is zero, so the lead is the flat baseline for every
-    // band density: no per-segment discontinuity, which the corpus measured as
-    // the cleanest whole-suite TempErr mean.
-    assert!(WHISPER_DTW_LEAD_DENSITY_SLOPE == 0.0);
-
-    // Sparse, mild, and dense bands all resolve to the same flat baseline.
-    let slow = whisper_dtw_onset_lead_for(&tuning, 10.0, 20); // 2.0 words/s
-    let mid = whisper_dtw_onset_lead_for(&tuning, 10.0, 25); // 2.5 words/s
-    let dense = whisper_dtw_onset_lead_for(&tuning, 1.0, 20); // 20 words/s
-    assert!((slow - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
-    assert!((mid - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
-    assert!((dense - WHISPER_DTW_ONSET_LEAD_SECONDS).abs() < 1e-6);
-}
-
-#[test]
-fn whisper_dtw_onset_lead_tuning_default_matches_constants() {
-    // The env-override path (whisper_dtw_lead_tuning) falls back to these exact
-    // points when the four OPENASR_WHISPER_DTW_LEAD_* vars are unset, so the
-    // no-override lead is the historical curve. The pure Default is what the
-    // runtime reads, so pin it here rather than mutating process env (which is
-    // unsafe in this edition and races under parallel nextest).
-    let tuning = WhisperDtwLeadTuning::default();
-    assert_eq!(tuning.baseline, WHISPER_DTW_ONSET_LEAD_SECONDS);
-    assert_eq!(tuning.knee, WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC);
-    assert_eq!(tuning.slope, WHISPER_DTW_LEAD_DENSITY_SLOPE);
-    assert_eq!(tuning.maximum, WHISPER_DTW_ONSET_LEAD_MAX_SECONDS);
+fn whisper_dtw_onset_lead_is_the_flat_baseline() {
+    // The onset lead is the single flat constant (no density-scaled curve); the
+    // runtime reads it via whisper_dtw_onset_lead, whose env-override fallback is
+    // the compiled default. Pin the constant here rather than mutating process
+    // env, which is unsafe in this edition and races under parallel nextest.
+    assert!((WHISPER_DTW_ONSET_LEAD_SECONDS - 0.05).abs() < 1e-6);
 }
 
 #[test]

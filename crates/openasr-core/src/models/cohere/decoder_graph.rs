@@ -3380,15 +3380,16 @@ const COHERE_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.42;
 /// [`COHERE_DTW_ONSET_LEAD_SECONDS`] suffices, but as the speaking rate climbs
 /// the DTW centers land a growing fixed amount past the true onset, so the
 /// lead grows at [`COHERE_DTW_LEAD_DENSITY_SLOPE`] per extra word/second up to
-/// [`COHERE_DTW_ONSET_LEAD_MAX_SECONDS`]. This is the same density-scaled lead
-/// whisper's DTW fold uses (see `whisper_dtw_onset_lead`), which the cohere
-/// path previously lacked -- the reason dense, rapid-aside windows (the
-/// `sleepy` clip) lost in-window coverage while the sparse windows held.
+/// [`COHERE_DTW_ONSET_LEAD_MAX_SECONDS`]. Whisper's DTW fold keeps its own,
+/// separate, flat lead (see `whisper_dtw_onset_lead`); cohere's per-band
+/// density term is an independent addition on this path (the reason dense,
+/// rapid-aside windows such as the `sleepy` clip recovered in-window coverage
+/// while their sparse neighbours held) and is not shared with whisper.
 ///
 /// The density is in *content-token* count per second of band audio, matching
-/// the window's own decoded output (whisper counts decoded words; cohere
-/// decodes `<|notimestamps|>` so the content-token count of the band carries
-/// the same signal without re-decoding the whole window).
+/// the window's own decoded output (cohere decodes `<|notimestamps|>` so the
+/// content-token count of the band carries the same signal as a decoded word
+/// count, without re-decoding the whole window).
 /// Tuning of the onset-lead curve, read once per call so a deployment can
 /// retune it without a rebuild. Each element falls back to its compiled
 /// default when unset or unparsable, so a bare environment is byte-identical

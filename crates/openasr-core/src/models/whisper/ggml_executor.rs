@@ -6025,125 +6025,27 @@ fn run_frame_bounds(
 /// the gap at this fraction puts the start before the center, at the true onset.
 const WHISPER_DTW_BOUNDARY_FRACTION: f32 = 0.45;
 
-/// Baseline seconds by which each DTW center is placed earlier before the
-/// boundary split, for a band speaking at or below the density knee. Whisper's
-/// DTW biases the path to start early (the first cost cell is pulled to the
-/// global minimum), so its entry frames center only slightly behind the onset:
-/// a small lead (one DTW frame at 0.02s/frame would overshoot) is the best
-/// trade. Denser bands add lead on top of this baseline via [`whisper_dtw_onset_lead`].
+/// Seconds by which each DTW center is placed earlier before the boundary
+/// split, so a word's start lands at its real speech onset rather than a hair
+/// past it. Whisper's DTW biases the path to start early (the first cost cell
+/// is pulled to the global minimum), so the per-token entry frame the fold
+/// treats as a center sits only slightly behind the true onset: a small
+/// constant lead (one DTW frame at 0.02s/frame would overshoot) is the best
+/// trade across band densities -- the test corpus measured a flat baseline as
+/// a cleaner whole-suite TempErr mean than any density-scaled curve, because a
+/// per-band (density-varying) shift creates segment-to-segment discontinuities
+/// that the per-word affine fit cannot absorb.
 const WHISPER_DTW_ONSET_LEAD_SECONDS: f32 = 0.05;
 
-/// Words per second of band audio above which the measured late-onset bias
-/// grows and a larger onset lead is warranted. At or below the knee a band is
-/// led at the baseline; denser bands carry the extra pull.
-const WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC: f32 = 2.4;
-
-/// Rate (in seconds of added lead per extra word/second above the knee) by
-/// which the onset lead grows with band density. Set to zero: a per-band
-/// density-scaled lead applies a different shift to each decoded segment, and
-/// those per-band discontinuities show up as locally-correlated per-word start
-/// jitter that the per-word affine TempErr fit cannot absorb -- the largest
-/// addressable timing contribution left after the window-mapping pass. With the
-/// slope flat every band is led at the same [`WHISPER_DTW_ONSET_LEAD_SECONDS`]
-/// baseline, which the test corpus measured as the cleanest whole-suite mean
-/// (no clip regressed, the long dense clips improved). The env override and the
-/// curve are retained so a deployment can still re-enable density growth if a
-/// future corpus shows it is warranted.
-const WHISPER_DTW_LEAD_DENSITY_SLOPE: f32 = 0.0;
-
-/// Upper bound on the density-scaled onset lead. Whisper's DTW entry frames
-/// are already near-onset-accurate (short clips land in-window with the flat
-/// baseline alone), so the density term is nearly pure over-correction: once a
-/// band is dense the old 0.35s cap pushed every word start ~0.15-0.35s before
-/// its true speech onset, and the short truth words the fold protects then fell
-/// entirely outside their candidate window (the long-clip in-window coverage
-/// regression). Capping the lead at 0.15s -- still a touch above a typical
-/// spoken-word width -- keeps some density pull for the
-/// genuinely dense bands while leaving the short clip, which never leaves the
-/// flat baseline, byte-for-byte unchanged.
-const WHISPER_DTW_ONSET_LEAD_MAX_SECONDS: f32 = 0.15;
-
-/// Tuning of the onset-lead curve. `Default` is the deployed curve; the four
-/// points can be overridden at run time (see `whisper_dtw_lead_tuning`) so a
-/// deployment can retune the lead per corpus without a rebuild.
-///
-/// The lead is subtracted from every word center before the boundary fold, so
-/// it is the one knob that shifts whole words earlier. DTW entry frames are
-/// already near-onset-accurate (short clips land in-window on the flat
-/// baseline alone), so a large lead pushes every word start before the true
-/// onset and drops the short truth words the fold protects. Kept as a plain
-/// struct so the lead curve is a pure, env-free function (and the no-override
-/// path stays byte-identical to the constants).
-#[derive(Debug, Clone, Copy)]
-struct WhisperDtwLeadTuning {
-    baseline: f32,
-    knee: f32,
-    slope: f32,
-    maximum: f32,
-}
-
-impl Default for WhisperDtwLeadTuning {
-    fn default() -> Self {
-        Self {
-            baseline: WHISPER_DTW_ONSET_LEAD_SECONDS,
-            knee: WHISPER_DTW_LEAD_DENSITY_KNEE_PER_SEC,
-            slope: WHISPER_DTW_LEAD_DENSITY_SLOPE,
-            maximum: WHISPER_DTW_ONSET_LEAD_MAX_SECONDS,
-        }
-    }
-}
-
-/// The onset lead for a tuning curve and one band, scaled by how densely its
-/// words pack: a flat baseline up to the knee, then a linear growth with band
-/// density capped at the maximum. Split out as a pure function so the curve's
-/// shape is unit-testable without touching the process environment.
-fn whisper_dtw_onset_lead_for(
-    tuning: &WhisperDtwLeadTuning,
-    band_seconds: f32,
-    word_count: usize,
-) -> f32 {
-    let band_seconds = band_seconds.max(0.05);
-    let density = (word_count as f32) / band_seconds;
-    let excess = (density - tuning.knee).max(0.0);
-    (tuning.baseline + tuning.slope * excess).min(tuning.maximum)
-}
-
-/// The tuning curve to apply now, honoring the deployment env overrides. Each
-/// element falls back to its compiled default (see `WhisperDtwLeadTuning::default`)
-/// when unset or unparsable, so a bare environment is byte-identical to the
-/// historical behavior.
-fn whisper_dtw_lead_tuning() -> WhisperDtwLeadTuning {
-    let default = WhisperDtwLeadTuning::default();
-    let read = |name: &str, fallback: f32| {
-        std::env::var(name)
-            .ok()
-            .and_then(|raw| raw.parse::<f32>().ok())
-            .unwrap_or(fallback)
-    };
-    WhisperDtwLeadTuning {
-        baseline: read("OPENASR_WHISPER_DTW_LEAD_BASE_SECONDS", default.baseline),
-        knee: read("OPENASR_WHISPER_DTW_LEAD_KNEE_PER_SEC", default.knee),
-        slope: read("OPENASR_WHISPER_DTW_LEAD_SLOPE", default.slope),
-        maximum: read("OPENASR_WHISPER_DTW_LEAD_MAX_SECONDS", default.maximum),
-    }
-}
-
-/// The onset lead for one DTW band.
-///
-/// The density-scaled lead is currently flat: with
-/// [`WHISPER_DTW_LEAD_DENSITY_SLOPE`] at zero every band resolves to the
-/// [`WHISPER_DTW_ONSET_LEAD_SECONDS`] baseline regardless of density. A
-/// per-band (density-varying) lead applies a different shift to each decoded
-/// segment, and those per-band discontinuities surface as locally-correlated
-/// per-word start jitter that the per-word affine TempErr fit cannot absorb.
-/// The curve, the knee, and the env override are retained so a deployment can
-/// re-enable density growth if a corpus shows it is warranted.
-///
-/// The density would have been in *words* per second of band audio, not tokens:
-/// a band can be token-dense (many subwords) yet speak at a relaxed pace, in
-/// which case the late bias is small.
-fn whisper_dtw_onset_lead(band_seconds: f32, word_count: usize) -> f32 {
-    whisper_dtw_onset_lead_for(&whisper_dtw_lead_tuning(), band_seconds, word_count)
+/// The onset lead in use, honoring the deployment env override so a
+/// deployment can retune it per corpus without a rebuild. Each call re-reads
+/// the environment and falls back to the compiled default when unset or
+/// unparsable, so a bare environment is byte-identical to historical behavior.
+fn whisper_dtw_onset_lead() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_LEAD_BASE_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_LEAD_SECONDS)
 }
 
 /// Maximum duration, in seconds, a single DTW word may keep. The center fold
@@ -6594,23 +6496,7 @@ fn whisper_cross_attention_word_timestamps(
                     None => (band_start as f32) * seconds_per_frame,
                 };
                 let band_end_secs = (band_end as f32) * seconds_per_frame;
-                // The onset lead is a property of this band's own speaking rate,
-                // not the window's: a window can hold one dense band (e.g. a rapid
-                // aside) inside otherwise relaxed utterances, and the dense band's
-                // extra lead must not be diluted to the window mean -- that left
-                // the rapid band's words a third of a second late. Conversely a
-                // relaxed band must not inherit a dense neighbour's lead. A run is
-                // one timestamp-bracketed segment, so its decoded word count over
-                // its own span is the right density measure.
-                let band_word_count = decode_text(&token_ids[*lo..*hi]).map_or(0, |text| {
-                    text.split_whitespace()
-                        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
-                        .count()
-                });
-                let onset_lead = whisper_dtw_onset_lead(
-                    (band_width as f32) * seconds_per_frame,
-                    band_word_count,
-                );
+                let onset_lead = whisper_dtw_onset_lead();
                 let token_times: Vec<Seq2SeqTokenTime> = spans
                     .iter()
                     .enumerate()
@@ -6723,17 +6609,7 @@ fn whisper_cross_attention_word_timestamps(
                         }
                     })
                     .collect();
-                // All content tokens are aligned here, so the decoded word count
-                // is the whole run.
-                let word_count = decode_text(&token_ids).map_or(0, |text| {
-                    text.split_whitespace()
-                        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
-                        .count()
-                });
-                let onset_lead = whisper_dtw_onset_lead(
-                    (dtw_frame_end - dtw_frame_start) as f32 * seconds_per_frame,
-                    word_count,
-                );
+                let onset_lead = whisper_dtw_onset_lead();
                 let mut words = seq2seq_word_timestamps_from_token_times(
                     &token_times,
                     band_start_secs,
