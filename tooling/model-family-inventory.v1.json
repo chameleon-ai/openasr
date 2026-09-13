@@ -103,7 +103,7 @@
         "supports_source_language_hint": true,
         "adapter_binding": "unsupported",
         "prepared_runtime": "shared-cohere-transcribe-v1",
-        "word_timestamp_strategy": "decode-invariant",
+        "word_timestamp_strategy": "decode-sensitive",
         "invocation_span": {
           "policy": "elastic",
           "max_seconds": null

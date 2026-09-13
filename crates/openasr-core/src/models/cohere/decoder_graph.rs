@@ -5641,7 +5641,7 @@ mod tests {
         // Eight content words with the diffuse front-loaded artifact (same
         // shape as the unit test above): the raw peak order zig-zags, so only
         // the sink-stripped re-test can admit the DTW pass and emit spans.
-        let rows = vec![
+        let rows = [
             sink_row(frames, 3, 10),
             sink_row(frames, 3, 13),
             right_row(frames, 16),
@@ -5716,7 +5716,7 @@ mod tests {
         // the reals still zig-zag after it is stripped (a middle word's real
         // sits *after* the last one), so no amount of stripping makes the
         // signal trustworthy and the caller keeps the uniform timestamps.
-        let rows = vec![
+        let rows = [
             sink_row(frames, 3, 12),
             right_row(frames, 16),
             sink_row(frames, 3, 30),
@@ -5935,7 +5935,7 @@ mod tests {
         let n = 30usize;
         (0..n)
             .map(|i| {
-                let step = (i / 2) as usize;
+                let step = i / 2;
                 let frame: usize = if i % 2 == 0 {
                     (frames / 2).saturating_sub(step.saturating_mul(3))
                 } else {
@@ -5987,7 +5987,7 @@ mod tests {
         // The raw DTW spans (pre-cap) must include a span wider than the cap:
         // the monotone path spends the 0.8s->16.0s pause on one of the two
         // rows regardless of which token "owns" the second peak frame.
-        let band_rows: Vec<Vec<f32>> = rows.iter().map(|row| row.clone()).collect();
+        let band_rows: Vec<Vec<f32>> = rows.to_vec();
         let (band_start, band_end) =
             crate::models::seq2seq_dtw_alignment::speech_frame_bounds(&band_rows, &[true; 2])
                 .expect("band");
