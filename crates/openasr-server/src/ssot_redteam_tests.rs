@@ -95,13 +95,6 @@ const EXPECTED_ROUTE_MATRIX: &[RouteExpect] = &[
     },
     RouteExpect {
         method: "GET",
-        path: "/v1/audio/transcriptions/progress",
-        none: 401,
-        device: 200,
-        operator: 200,
-    },
-    RouteExpect {
-        method: "GET",
         path: "/v1/audio/transcriptions/{id}/progress",
         none: 401,
         device: 200,
@@ -854,7 +847,7 @@ async fn ssot_13_pending_idle_switch_rejects_stream_file_jobs() {
 /// SSOT 10: a busy server must queue cancelable file jobs. `?stream=true`
 /// must not jump the FIFO.
 ///
-/// If correct: queued (or 429 without starting a second native slot).
+/// If correct: queued and cancellable without starting a second native slot.
 /// Otherwise Y: 200 while the native slot is still held.
 #[tokio::test]
 async fn ssot_10_stream_file_jobs_do_not_bypass_fifo() {
@@ -867,32 +860,234 @@ async fn ssot_10_stream_file_jobs_do_not_bypass_fifo() {
         .try_acquire("hold-native-slot")
         .unwrap();
     let app = policy_app(runtime.clone(), home);
-    let response = post_transcription(
-        app,
+    let streamed = tokio::spawn(post_transcription(
+        app.clone(),
         "/v1/audio/transcriptions?stream=true",
         Some("stream-queued"),
-    )
-    .await;
-    assert_ne!(
-        response.status(),
-        StatusCode::OK,
-        "stream=true must not run while the native slot is occupied: {:?}",
-        response.status()
-    );
-    assert!(
-        runtime
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !runtime
             .native_execution
             .remote_policy()
             .is_file_queued("stream-queued")
-            || response.status() == StatusCode::TOO_MANY_REQUESTS
-            || response.status() == StatusCode::CONFLICT,
-        "busy stream file job must enter the FIFO or fail closed busy, got {}",
-        response.status()
+        {
+            assert!(
+                !streamed.is_finished(),
+                "stream job rejected instead of queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stream job enters FIFO");
+    let cancel = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions/stream-queued/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), streamed)
+        .await
+        .expect("queued cancellation completes")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !runtime
+            .native_execution
+            .remote_policy()
+            .is_file_queued("stream-queued")
     );
 }
 
-/// SSOT 22: a client must be able to cancel a file job. The SSE stream path
-/// currently uses an uncancellable execution context.
+async fn post_timeline(app: axum::Router, id: Option<&str>) -> axum::http::Response<Body> {
+    let (content_type, body) = sample_multipart(id, false);
+    let body = String::from_utf8(body).unwrap().replace(
+        "--openasr-redteam-boundary--",
+        "--openasr-redteam-boundary\r\nContent-Disposition: form-data; name=\"transcript\"\r\n\r\nhello world\r\n--openasr-redteam-boundary--",
+    );
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/audio/precise-timeline")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn precise_timeline_running_worker_honors_pause_resume_and_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = ServerRuntime::default();
+    let app = policy_app(runtime.clone(), temp.path().join("home"));
+    for action in ["resume", "cancel"] {
+        let permit = runtime
+            .native_execution
+            .try_acquire("held-native-slot")
+            .unwrap();
+        let boundary = "timeline-control-boundary";
+        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"jfk.wav\"\r\nContent-Type: audio/wav\r\n\r\n").into_bytes();
+        body.extend_from_slice(include_bytes!("../../../fixtures/jfk.wav"));
+        let transcript = r#"{"text":"hello","timeline_quality":"native_reliable","segments":[{"start":0,"end":1,"text":"hello","words":[{"word":"hello","start":0,"end":1}]}]}"#;
+        body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcript_json\"\r\n\r\n{transcript}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcription_id\"\r\n\r\ntimeline-running\r\n--{boundary}--\r\n").as_bytes());
+        let task = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/precise-timeline")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !runtime
+                .native_execution
+                .remote_policy()
+                .is_file_queued("timeline-running")
+            {
+                assert!(!task.is_finished(), "timeline failed before queueing");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pause = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcriptions/timeline-running/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pause.status(), StatusCode::ACCEPTED);
+        drop(permit);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while runtime
+                .native_execution
+                .remote_policy()
+                .file_running()
+                .as_deref()
+                != Some("timeline-running")
+                || !runtime.native_execution.has_active_sessions()
+            {
+                assert!(!task.is_finished(), "paused worker finished unexpectedly");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        let control = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/audio/transcriptions/timeline-running/{action}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::ACCEPTED);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .expect("controlled worker exits")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if action == "resume" {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
+        assert!(!runtime.native_execution.has_active_sessions());
+        assert!(
+            runtime
+                .native_execution
+                .remote_policy()
+                .file_running()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn precise_timeline_uses_shared_fifo_and_cancel_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = ServerRuntime::default();
+    let _permit = runtime
+        .native_execution
+        .try_acquire("held-native-slot")
+        .unwrap();
+    let app = policy_app(runtime.clone(), temp.path().join("home"));
+    assert_eq!(
+        post_timeline(app.clone(), None).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    for disconnect in [false, true] {
+        let task = tokio::spawn(post_timeline(app.clone(), Some("timeline-queued")));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !runtime
+                .native_execution
+                .remote_policy()
+                .is_file_queued("timeline-queued")
+            {
+                assert!(!task.is_finished(), "timeline rejected instead of queued");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeline enters shared FIFO");
+        if disconnect {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let cancel = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/audio/transcriptions/timeline-queued/cancel")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("timeline cancellation completes")
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        assert!(
+            !runtime
+                .native_execution
+                .remote_policy()
+                .is_file_queued("timeline-queued")
+        );
+    }
+}
+
+/// SSOT 22: a client must be able to cancel a file job.
 ///
 /// If correct: cancel returns 202 and the stream fails closed canceled.
 /// Otherwise Y: cancel 404 / stream completes with status ok.
@@ -1498,100 +1693,6 @@ async fn operator_stream_file_job_keeps_enrolled_voice_id_fail_closed() {
             || body.to_ascii_lowercase().contains("diariz")
             || body.to_ascii_lowercase().contains("speaker"),
         "operator stream enrolled Voice ID must fail closed: {body}"
-    );
-}
-
-/// SSOT 21: the id-less progress endpoint uses the same owner gate as
-/// `{id}/progress`. A paired device must not observe an operator-local job.
-#[tokio::test]
-async fn legacy_progress_hides_operator_local_and_peer_jobs_from_device() {
-    use openasr_core::api::backend::{
-        ProgressBackendClass, ProgressPlan, ProgressPlanInput, ProgressReporter,
-        ProgressSegmenterKind,
-    };
-
-    let plan = ProgressPlan::build(ProgressPlanInput {
-        audio_duration_s: 1.0,
-        voice_id: false,
-        external_diarize: false,
-        segmenter: ProgressSegmenterKind::Auto,
-        punctuate: false,
-        align: false,
-        backend: ProgressBackendClass::AutoOrCpu,
-        persist: false,
-    });
-    let _reporter = ProgressReporter::install(Some("progress-job".to_string()), plan);
-    let auth = ServerAuth::pairing("admin-token");
-    {
-        let mut pairing = auth.lock_pairing();
-        pairing.credentials.insert(
-            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            DeviceCredentialRecord {
-                device_id: "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                device_name: "Phone".to_string(),
-                token_hash: bearer_token_hash("device-token"),
-                issued_at_unix_secs: 1,
-                last_seen_unix_secs: None,
-                revoked: false,
-            },
-        );
-    }
-    let distribution = DistributionContext::new(DistributionRuntime {
-        openasr_home: None,
-        catalog_url: None,
-        catalog_local_override: None,
-    });
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        "Bearer device-token".parse().unwrap(),
-    );
-
-    let hidden = transcription_progress(
-        axum::Extension(auth.clone()),
-        axum::Extension(distribution.clone()),
-        headers.clone(),
-    )
-    .await
-    .expect("device reading operator-local progress must not error");
-    let hidden_json = to_bytes(hidden.into_body(), 1024 * 64).await.unwrap();
-    let hidden_value: serde_json::Value = serde_json::from_slice(&hidden_json).unwrap();
-    assert_eq!(
-        hidden_value["phase"],
-        serde_json::Value::Null,
-        "operator-local progress must read idle to a paired device: {hidden_value}"
-    );
-
-    distribution.set_transcription_owner("progress-job", Some("bbbbbbbbbbbbbbbbbbbbbbbb"));
-    let peer = transcription_progress(
-        axum::Extension(auth.clone()),
-        axum::Extension(distribution.clone()),
-        headers.clone(),
-    )
-    .await
-    .expect("device reading a peer job must not error");
-    let peer_json = to_bytes(peer.into_body(), 1024 * 64).await.unwrap();
-    let peer_value: serde_json::Value = serde_json::from_slice(&peer_json).unwrap();
-    assert_eq!(
-        peer_value["phase"],
-        serde_json::Value::Null,
-        "peer progress must read idle: {peer_value}"
-    );
-
-    distribution.set_transcription_owner("progress-job", Some("aaaaaaaaaaaaaaaaaaaaaaaa"));
-    let own = transcription_progress(
-        axum::Extension(auth),
-        axum::Extension(distribution),
-        headers,
-    )
-    .await
-    .expect("owner must read its own legacy progress");
-    let own_json = to_bytes(own.into_body(), 1024 * 64).await.unwrap();
-    let own_value: serde_json::Value = serde_json::from_slice(&own_json).unwrap();
-    assert_eq!(
-        own_value["phase"].as_str(),
-        Some("decode"),
-        "owning device must see live progress: {own_value}"
     );
 }
 

@@ -247,10 +247,6 @@ pub fn app_with_runtime_and_distribution_and_launch_options(
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/v1/audio/precise-timeline", post(precise_timeline))
         .route(
-            "/v1/audio/transcriptions/progress",
-            get(transcription_progress),
-        )
-        .route(
             "/v1/audio/transcriptions/{id}/progress",
             get(transcription_progress_by_id),
         )
@@ -1480,10 +1476,6 @@ pub(crate) struct ServedNativePack {
     pub identity: openasr_core::NativeRuntimeModelIdentity,
 }
 
-/// Compatibility name retained for embedders while the implementation is an
-/// active-runtime slot rather than a path authority.
-pub type BoundModelPackPath = ActiveRuntimeSlot;
-
 impl std::fmt::Debug for ActiveRuntimeSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActiveRuntimeSlot")
@@ -1771,7 +1763,7 @@ pub struct ServerRuntime {
     /// `AudioPreparationOptions::with_ffmpeg_bin_explicit`. Only an explicit
     /// choice skips the in-process symphonia decode path.
     pub ffmpeg_bin_explicit: bool,
-    pub model_pack_path: BoundModelPackPath,
+    pub model_pack_path: ActiveRuntimeSlot,
 }
 
 impl Default for ServerRuntime {
@@ -1781,7 +1773,7 @@ impl Default for ServerRuntime {
             native_execution: NativeExecutionSupervisor::default(),
             ffmpeg_bin: None,
             ffmpeg_bin_explicit: false,
-            model_pack_path: BoundModelPackPath::default(),
+            model_pack_path: ActiveRuntimeSlot::default(),
         }
     }
 }
@@ -1859,6 +1851,24 @@ impl ServerRuntime {
             verified_model_identity,
             route,
             kind,
+            admitted_file_id,
+        )?;
+        Ok(AdmittedNativeExecution { permit, activity })
+    }
+
+    /// Auxiliary compute does not depend on the active ASR snapshot, but must
+    /// retain native occupancy and serialize entry against model activation.
+    pub(crate) fn acquire_native_auxiliary_execution(
+        &self,
+        identity: &str,
+        admitted_file_id: Option<&str>,
+    ) -> Result<AdmittedNativeExecution, ApiError> {
+        let _activation_gate = self.begin_native_activation()?;
+        let activity = NativeActivityGuard::enter();
+        let permit = self.try_acquire_native_execution(
+            identity,
+            None,
+            NativeAdmissionKind::File,
             admitted_file_id,
         )?;
         Ok(AdmittedNativeExecution { permit, activity })

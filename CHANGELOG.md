@@ -57,6 +57,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Core API: `refine_existing_transcription_timeline` and
+  `align_plain_transcript_to_audio` now require a `RequestExecutionContext`
+  argument for progress and cooperative task control. Callers without an
+  external controller must pass an explicit uncancellable context.
+
+- Breaking API cleanup: removed the id-less `GET /v1/audio/transcriptions/progress`
+  compatibility route and its aggregate native-progress API. Clients must use
+  `GET /v1/audio/transcriptions/{id}/progress`. Removed the hidden, unsupported
+  `openasr live --diarize` compatibility flag and the obsolete
+  `BoundModelPackPath` Rust type alias.
 - Forced alignment now scores the Qwen3 timestamp-head chosen-bin
   log-softmax (mean over start/end boundaries) in addition to the existing
   geometric gates. **External manuscripts** (`openasr align`,
@@ -141,7 +151,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CLI: `openasr verify` now runs the same quantization-floor audit `model-pack audit-quant` performs (the audio-encoder Q8_0 floor, plus the declared-tier ceiling) against every local pack it checks, and fails closed on a violation. A pack that previously passed `openasr verify` on tensor structure alone may no longer pass if its quantization does not meet the floor.
 - CLI: `openasr model-pack verify` now re-seals (marks read-only) any object it re-hashes and finds intact, so a store whose file permissions were lost -- for example a backup restored without them -- gets its fast, no-rehash object identity back after one verify pass.
 - Core: `pull` no longer re-hashes an already-installed, sealed pack before deciding to skip its download; it trusts the digest named by the object's own path once the seal is intact. A same-size, in-place corruption of an installed pack (bit rot, or a backup restored to the same bytes-mostly-but-not-quite state) is therefore no longer self-healed by re-running `pull` -- run `openasr model-pack verify` to detect and, once re-sealed, recover from that case instead.
-- Server: `GET /v1/audio/transcriptions/progress` (the id-less form) keeps its exact response body while at most one native transcription is active, and now returns `409 Conflict` when more than one is. It used to return an unattributed snapshot belonging to whichever request held the global slot, which a caller had no way to distinguish from its own. Clients polling progress should move to the id-scoped route above.
 - Core: a family's execution backend is resolved once per request by the shared dispatch, from the request's own backend preference and that family's declared `AutoGpuPolicy`, and handed to the family as an explicit value. Families can no longer resolve it themselves -- the resolvers are private to `ggml_runtime` and `GgmlCpuGraphConfig::default()` no longer answers "what backend should this request use" -- so a single request cannot observe two different backends at two graph-build sites, and a family that declares a gated policy cannot be handed a backend that policy excludes. Qwen and firered-llm previously reached a resolver that bypassed the family gate on several paths, and qwen's serve-batch worker thread re-resolved instead of reading the value materialized on the submitting thread.
 - Local pack import (server `POST /v1/models/local/import`, FFI `openasr_install_local_pack`) now requires the file's sha256/size to match an entry in the signed public catalog; a local `.oasr` that is not in the catalog is rejected instead of being installed under an identity derived from its own metadata or filename. This closes an install path that bypassed catalog signature verification. Import a build published to the catalog, or use the catalog pull path directly.
 - Model installation now uses one open-core license policy across CLI, server,
@@ -157,6 +166,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** Voice ID: the minimum accepted speech for one enrollment sample (`MIN_SAMPLE_SPEECH_SECONDS`) is raised from 5.0s to 10.0s, to sit above recognition's own naming floor (8.0s) with a margin -- an enrollment that only just cleared the old floor could already fail the very next recognition attempt, since real speech is consistently thinner evidence than an enrollment prompt's read-aloud passage for the same nominal seconds. A sample between 5 and 10 seconds of detected speech that previously enrolled now fails quality assessment with the same "too short" error, pointing the user at a longer re-record.
 
 ### Fixed
+
+- Moonshine: conv-stem GroupNorm now normalizes over both time and channels,
+  matching the reference model instead of normalizing each frame separately.
+  Runtime metadata validation also uses the architecture registry's identities,
+  accepting the canonical identity emitted by the local pack writer.
+- Server: precise-timeline requests with `transcription_id` now share file
+  queueing, ownership, pause/resume/cancel, and disconnect cleanup. SSE file
+  requests with an id also join the shared FIFO instead of returning busy.
 
 - Long-form: duplicate and isolated fragments at long-audio slice seams
   are fixed; slice windows and non-seam cue timings are unchanged.
