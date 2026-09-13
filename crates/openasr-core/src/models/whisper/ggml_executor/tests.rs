@@ -1958,7 +1958,7 @@ fn word_ts(word: &str, start: f32, end: f32) -> crate::WordTimestamp {
 }
 
 /// A 15 s, 0.02 s/frame envelope (750 frames) at a 0.001 noise floor with a
-/// single 0.5 peak at 8 s that sets the clip peak (and so the 3% silence
+/// single 0.5 peak at 8 s that sets the clip peak (and so the 5% silence
 /// ceiling). The [2.0, 4.0) word-b window is filled from 0.001 up to 3.8 s and
 /// a 0.25 speech onset occupies [3.8, 4.0).
 fn refine_fixture_envelope() -> Vec<f32> {
@@ -1983,11 +1983,11 @@ fn refine_dtw_onsets_pushes_true_silence_word_to_its_onset() {
     assert!((out[0].start - 0.5).abs() < 1e-4 && (out[0].end - 0.6).abs() < 1e-4);
 }
 
-/// The same window with a low music floor filling the front half (0.021 ~=
-/// 4.2% of the clip peak, above the 3% ceiling) is *not* trusted as a pause:
-/// a quiet passage over a music bed is ambiguous, so no push fires and the word
-/// keeps its fold position. This is the gate that stops the refinement from
-/// regressing continuous-speech / music-backed clips.
+/// The same window with a low music floor filling the front half (a sustained
+/// level, so the front's mean sits above the floor) is *not* trusted as a
+/// pause: a quiet passage over a music bed is ambiguous, so no push fires and
+/// the word keeps its fold position. This is the gate that stops the refinement
+/// from regressing continuous-speech / music-backed clips.
 #[test]
 fn refine_dtw_onsets_refuses_a_music_floor_front() {
     let mut env = refine_fixture_envelope();

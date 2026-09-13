@@ -6149,10 +6149,14 @@ const WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX: f32 = 0.5;
 /// so without this a quiet pause in a music-backed clip looks hollow and the
 /// onset push fires on the music floor, moving a word that was already
 /// acceptable. Requiring the front to be within this fraction of the clip's
-/// peak isolates true zero-crossing silence from a low floor. Measured on the
-/// test corpus at 3% of peak, where digital-silence pauses sit far below it and
-/// the quietest music beds it must reject all sit above it.
-const WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION: f64 = 0.03;
+/// peak isolates true zero-crossing silence from a low floor. Swept over the
+/// test corpus: 5% of peak is the largest that stays regression-free -- it
+/// tolerates the single offset-bleed frame a fast preceding word leaves in the
+/// next word's front (so a word after a brief inter-word gap still gets pulled
+/// to its real onset) while every music bed it must reject still sits above it;
+/// above ~8% it starts chasing those offsets and drops an InWin overlap on
+/// music-backed clips.
+const WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION: f64 = 0.05;
 /// dB above the clip's own noise floor (the median envelope level) that counts
 /// as real speech. Measured in dB over the envelope so it adapts per clip
 /// rather than assuming a fixed absolute speech level.
@@ -6247,7 +6251,7 @@ fn whisper_refine_dtw_word_onsets(
         // passage. Three conditions on the front half of the window:
         //   1. its *mean* level is below the noise floor (not just a fraction of
         //      frames -- a single loud blip in a quiet front must not pass);
-        //   2. *no* front frame crosses the silence ceiling (3% of clip peak),
+        //   2. *no* front frame crosses the silence ceiling (5% of clip peak),
         //      so a music floor never masquerades as a pause (see
         //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]);
         //   3. fewer than half its frames are above the floor (no sustained
