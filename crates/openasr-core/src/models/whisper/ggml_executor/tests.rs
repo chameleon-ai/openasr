@@ -1657,11 +1657,14 @@ fn diarization_forced_word_anchors_keep_whisper_decode_path_identical() {
 #[test]
 fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
     let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
     let request_options = GgmlAsrExecutionOptions {
         language: None,
         task: crate::TranscriptionTask::Transcribe,
         prompt: None,
-        prompt_token_ids: Some((1..=40).collect()),
+        prompt_token_ids: Some(vec![1; 40]),
         phrase_bias: None,
         inference_threads: None,
         word_timestamps: false,
@@ -1675,8 +1678,12 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         adapter_path: None,
     };
 
+    // Seed and generated use ids below the first timestamp id so they are
+    // treated as plain words, isolating the tail-trim from the timestamp strip.
+    assert!(1 < first_timestamp && 2 < first_timestamp);
+    let generated = vec![2; 10];
     let carry_prompt_token_ids =
-        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[41, 42, 43, 44])
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
             .expect("carry prompt tokens")
             .expect("carry prompt token ids");
 
@@ -1684,9 +1691,62 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         carry_prompt_token_ids.len(),
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT
     );
+    // tail = last 32 of seed[1;40] ++ generated[2;10] = 22 ones then 10 twos.
+    let mut expected = vec![1; 22];
+    expected.extend(std::iter::repeat(2).take(10));
+    assert_eq!(carry_prompt_token_ids.as_slice(), &expected);
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_strips_prior_slice_timestamps() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![6, 6]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // A prior slice's decode interleaves word tokens (id 1) with its per-step
+    // timestamp markers (at/above the first timestamp id). Only the words may
+    // reach the next slice's carry; the prior slice's wall-clock offsets must
+    // not leak across the boundary.
+    let generated = vec![1, first_timestamp + 50, 6, first_timestamp + 120, 1];
+
+    let carry = build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
+        .expect("carry prompt tokens")
+        .expect("carry prompt token ids");
+
+    assert!(
+        carry.iter().all(|id| *id < first_timestamp),
+        "no per-step timestamp may be carried: {carry:?}"
+    );
+    // seed [6;2] ++ stripped generated [1,6,1]
+    assert_eq!(carry.as_slice(), &[6, 6, 1, 6, 1]);
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_empty_when_generated_is_all_timestamps() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: None,
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // A slice that emitted only timestamps (near-silence) leaves nothing to
+    // carry; the caller then holds the previous context rather than a
+    // timestamp-only seed.
+    let generated = vec![first_timestamp, first_timestamp + 40];
     assert_eq!(
-        carry_prompt_token_ids.as_slice(),
-        &(13..=44).collect::<Vec<_>>()
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
+            .expect("valid"),
+        None
     );
 }
 
@@ -1998,6 +2058,25 @@ fn refine_dtw_onsets_refuses_a_music_floor_front() {
     let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
     assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
     assert!((out[1].end - 4.0).abs() < 1e-4);
+}
+
+/// A boundary word whose start maps to or past the last envelope frame -- common
+/// at a longform slice end, where the frame array is shorter than
+/// `duration_s / seconds_per_frame` -- must not overrun the slice. Pre-fix this
+/// indexed out of bounds and panicked (`range end index ... out of range`);
+/// post-fix the word is clamped into range and, finding no usable window, is
+/// left unrefined rather than aborting the run.
+#[test]
+fn refine_dtw_onsets_clamps_a_word_at_or_past_the_end() {
+    let env = refine_fixture_envelope(); // 750 frames
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 15.5, 16.0), // start past the 750-frame end, span 0.5 >= 0.3
+    ];
+    // duration_s larger than the envelope implies so `start_s / spf` overshoots.
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 16.0);
+    assert_eq!(out[1].start, 15.5, "unrefined; must not panic");
+    assert_eq!(out[1].end, 16.0, "unrefined; must not panic");
 }
 
 /// No envelope (a run without cross-attention word timestamps) is a byte-exact

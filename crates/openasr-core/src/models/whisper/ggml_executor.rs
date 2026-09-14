@@ -4451,12 +4451,32 @@ fn build_whisper_carry_prompt_token_ids(
         return Ok(None);
     };
 
+    // Whisper's per-step timestamp tokens (`<|t+X.XX|>`) encode a frame offset
+    // meaningful only for the slice they were decoded in. Carrying a prior
+    // slice's timestamp tail into the next slice's `<|startofprev|>` context
+    // biases the next slice's first decoded timestamp forward, so seconds of
+    // genuine speech at the slice head emit before the first timestamp token
+    // the model commits to and the longform assembler drops them as an
+    // unbracketed lead. Condition the next slice on the prior slice's words
+    // (the carry's purpose) rather than its wall-clock offset.
+    let stripped_generated: Vec<u32> = generated_tokens
+        .iter()
+        .cloned()
+        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+        .collect();
+
     Ok(build_longform_token_history_carry(
         true,
         carry_tokens,
-        generated_tokens,
+        &stripped_generated,
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
     ))
+}
+
+fn is_not_whisper_timestamp(tokenizer: &WhisperTokenizer, token_id: u32) -> bool {
+    !tokenizer
+        .first_timestamp_token_id()
+        .is_some_and(|first_timestamp_id| token_id >= first_timestamp_id)
 }
 
 fn build_whisper_carry_prompt_seed_token_ids(
@@ -6237,9 +6257,16 @@ fn whisper_refine_dtw_word_onsets(
         }
         let start_s = raw_start.max(0.0).min(f64::from(duration_s));
         let end_s = raw_end.max(start_s).min(f64::from(duration_s));
-        let frame_start = (start_s / seconds_per_frame) as usize;
-        let frame_end = ((end_s / seconds_per_frame).min(levels.len() as f64 - 1.0) as usize)
-            .max(frame_start + 1);
+        // A boundary word whose start maps to or past the last envelope frame
+        // (common at a longform slice end) must not overrun the frame array;
+        // clamp both indices into range, letting the window-length guard below
+        // bail the word without refinement rather than panic.
+        let last_frame = levels.len() - 1;
+        let frame_start = ((start_s / seconds_per_frame) as usize).min(last_frame);
+        let frame_end = ((end_s / seconds_per_frame) as usize)
+            .min(last_frame)
+            .max(frame_start + 1)
+            .min(last_frame);
         let window = &levels[frame_start..frame_end + 1];
         if window.len() < 4 {
             continue;
