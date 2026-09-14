@@ -6708,12 +6708,65 @@ fn cross_attention_center_seconds(
 /// token. Missing or non-monotone bounds degrade to the full window, which is
 /// the correct behavior for single-window or `.en` decodes that emit no
 /// timestamp tokens.
+/// Deterministic 64-bit PRNG (splitmix64) used only for the whisper
+/// temperature-fallback ladder. A fixed seed makes a given re-decode identical
+/// across runs, so the ladder's sampled trajectory is reproducible rather than
+/// leaving a slice's transcript to GPU run-to-run flake.
+struct WhisperDecodeSplitMix64 {
+    state: u64,
+}
+
+impl WhisperDecodeSplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+    fn next_unit_f32(&mut self) -> f32 {
+        // 53-bit scaled unit in f64 (exact), truncated to f32 (24 random bits),
+        // then nipped into (1e-6, 1) so the Gumbel log-draw never sees log(0).
+        let unit = (self.next_u64() >> 11) as f64 * (1.0f64 / (1u64 << 53) as f64);
+        (unit as f32 + 1.0e-6).min(1.0f32 - 1.0e-7)
+    }
+}
+
+/// Gumbel-max token sample over a logit row tempered by `temperature`. Returns
+/// `None` when the row is empty (caller falls back to argmax). The Gumbel-max
+/// trick samples from softmax(logits / temperature) without a second softmax
+/// pass, and is the standard way to draw the temperature-tempered next token.
+/// Logits are scaled in place (a single pass over the vocab row, negligible
+/// next to the matmul that produced it).
+fn whisper_sample_over_logits(
+    rng: &mut WhisperDecodeSplitMix64,
+    logits: &[f32],
+    temperature: f32,
+) -> Option<u32> {
+    if logits.is_empty() {
+        return None;
+    }
+    let inv_temperature = 1.0f32 / temperature;
+    let mut best_index = 0usize;
+    let mut best_key = f32::NEG_INFINITY;
+    for (index, logit) in logits.iter().enumerate() {
+        let key = logit * inv_temperature - rng.next_unit_f32().ln();
+        if key > best_key {
+            best_key = key;
+            best_index = index;
+        }
+    }
+    u32::try_from(best_index).ok()
+}
+
 struct WhisperGreedyDecodeStepRunnerAdapter<'a> {
     execution: &'a WhisperGgmlExecutionMetadata,
     decoder_weights: &'a WhisperDecoderWeightSeam,
     trace: &'a WhisperGgmlTrace,
     decode_loop_start: Instant,
     decode_steps_completed: usize,
+    decode_temperature: f32,
+    decode_sample_seed: u64,
     plan_cache_base: WhisperDecoderStepPlanCacheBase,
     decoder_graph_config: WhisperDecoderGraphExecutionConfig,
     decoder_persistent_weights: &'a WhisperDecoderPersistentWeightCache,
@@ -6972,15 +7025,246 @@ impl Seq2SeqGreedyDecodeStepExecutor for WhisperGreedyDecodeStepRunnerAdapter<'_
             );
         }
         self.last_step_compute_evidence = step_logits.compute_evidence;
+        // At temperature 0 the step is pure argmax (the graph's own hint), so a
+        // non-ladder decode is byte-identical to it. Only the temperature-
+        // fallback ladder samples: draw the next token from the full host logit
+        // row with a seeded Gumbel-max (see `whisper_sample_decoded_token`). The
+        // shared driver's host-row fast path consumes this hint directly, so the
+        // sample flows through without touching the argmax path.
+        let greedy_token_hint = if self.decode_temperature > 0.0 {
+            let mut rng = WhisperDecodeSplitMix64 {
+                state: self
+                    .decode_sample_seed
+                    .wrapping_add(input.step_index as u64),
+            };
+            whisper_sample_over_logits(&mut rng, &step_logits.logits, self.decode_temperature)
+                .or(step_logits.greedy_token_hint)
+        } else {
+            step_logits.greedy_token_hint
+        };
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
             logits: step_logits.logits,
-            greedy_token_hint: step_logits.greedy_token_hint,
+            greedy_token_hint,
         })
     }
 
     fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
         self.last_step_compute_evidence.take()
     }
+}
+
+/// Seed base for the temperature-fallback ladder's per-rung PRNG. The seed is
+/// fixed (not wall-clock) so a given slice's fallback trajectory reproduces
+/// across runs instead of leaving the recovered text to GPU run-to-run flake.
+const WHISPER_TEMPERATURE_LADDER_BASE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The temperature ladder run when a temperature-0 decode is cut short by the
+/// degenerate-repetition guard: whisper-timestamped's fallback ladders the
+/// temperature up by 0.2 until the repetition attractor breaks at 1.0.
+const WHISPER_TEMPERATURE_LADDER: [f32; 4] = [0.2, 0.4, 0.7, 1.0];
+
+/// Env opt-out (defaults on). Set to disable the guard-triggered fallback and
+/// restore the original temperature-0-only behavior, so a regression can be
+/// isolated to the ladder on a problem machine without a rebuild.
+fn whisper_temperature_ladder_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DISABLE_TEMPERATURE_LADDER").is_none()
+}
+
+/// What one decode round produced, carried up for the fallback ladder to keep
+/// the winning candidate. `token_alignments` is the cross-attention word-align
+/// row captured during THIS round's decode (the word-timing path uses it), so
+/// the surviving candidate's alignments must come from the same round that
+/// won, not an earlier discarded one.
+struct WhisperDecodeCandidate {
+    text_trimmed: String,
+    token_alignments: Vec<WhisperGeneratedTokenAlignment>,
+}
+
+/// Pick the fallback candidate to keep. The temperature-0 result is the
+/// incumbent; a higher-temperature round replaces it only when it is not itself
+/// guard-cut and has more text than the current candidate (recovering speech
+/// the guard dropped). Ties keep the incumbent (prefers the lower temperature,
+/// i.e. the less perturbed decode).
+fn whisper_decode_candidate_better(
+    candidate: &WhisperDecodeCandidate,
+    incumbent: &WhisperDecodeCandidate,
+) -> bool {
+    if incumbent.text_trimmed.is_empty() {
+        return !candidate.text_trimmed.is_empty();
+    }
+    if candidate.text_trimmed.is_empty() {
+        return false;
+    }
+    candidate.text_trimmed.len() > incumbent.text_trimmed.len()
+}
+
+/// Run one temperature-0 (or re-decode) greedy pass over an already-encoded
+/// slice: build a fresh self-KV/step runner for the given `temperature`, drive
+/// the shared greedy driver, and hand back the text plus the cross-attention
+/// alignments captured during this pass. The encoder is NOT re-run here, so a
+/// temperature-fallback re-decode costs one extra decoder pass, not an encode.
+#[allow(clippy::too_many_arguments)]
+fn run_whisper_decode_round(
+    execution: &WhisperGgmlExecutionMetadata,
+    decoder_persistent_static: &mut WhisperDecoderPersistentStaticSession,
+    decoder_weights: &WhisperDecoderWeightSeam,
+    tokenizer: &WhisperTokenizer,
+    request_options: &GgmlAsrExecutionOptions,
+    prelude_summary: &str,
+    encoder_summary: &str,
+    plan_cache_base: WhisperDecoderStepPlanCacheBase,
+    initial_prompt_tokens: &[u32],
+    encoder_hidden_f32: &[f32],
+    eot_token_id: u32,
+    max_generated_tokens: usize,
+    needs_encoder_hidden_in_step: bool,
+    decoder_cross_flash_attention: bool,
+    decoder_collect_cross_attention: bool,
+    temperature: f32,
+    sample_seed: u64,
+    trace: &WhisperGgmlTrace,
+    control: &std::sync::Arc<crate::api::backend::TranscriptionControl>,
+    decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
+    unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
+    reuse_mode: GgmlDecodeReuseMode,
+) -> Result<(WhisperDecodeCandidate, WhisperGreedyDecodeResult), WhisperGgmlExecutorError> {
+    let decoder_persistent_weights = &decoder_persistent_static.cache;
+    let decode_loop_span = trace.start_stage("decode_loop");
+    let decode_loop_start = Instant::now();
+    let mut step_runner = WhisperGreedyDecodeStepRunnerAdapter {
+        execution,
+        decoder_weights,
+        trace,
+        decode_loop_start,
+        decode_steps_completed: 0,
+        decode_temperature: temperature,
+        decode_sample_seed: sample_seed,
+        plan_cache_base,
+        decoder_graph_config: WhisperDecoderGraphExecutionConfig {
+            attention_heads: execution.decoder_attention_heads,
+            use_self_flash_attention: whisper_decoder_self_flash_attention_enabled(),
+            use_cross_flash_attention: decoder_cross_flash_attention,
+            collect_cross_attention: decoder_collect_cross_attention,
+            layer_norm_epsilon: 1.0e-5_f32,
+        },
+        decoder_persistent_weights,
+        decoder_self_kv_state: WhisperDecoderSelfKvCacheState::new(),
+        decoder_reuse: &mut decoder_persistent_static.reuse,
+        decoder_graph_runner: &mut decoder_persistent_static.runner,
+        reuse_mode,
+        decoder_graph_input: WhisperDecoderGraphExecutionInput {
+            decoder_prefix_tokens: Vec::with_capacity(
+                initial_prompt_tokens
+                    .len()
+                    .saturating_add(max_generated_tokens),
+            ),
+            encoder_hidden_state: if needs_encoder_hidden_in_step {
+                encoder_hidden_f32.to_vec()
+            } else {
+                Vec::new()
+            },
+            encoder_layout: WhisperDecoderHiddenStateLayout::SequenceHidden,
+        },
+        decoder_step_input: WhisperDecoderStepSeamInput {
+            encoder_frames: plan_cache_base.encoder_frames,
+            encoder_hidden_size: plan_cache_base.encoder_hidden_size,
+            step_index: 0,
+            position_offset: 0,
+        },
+        decoder_tensor_cache: WhisperDecoderExecutionTensorCache::default(),
+        plan_by_token_count: BTreeMap::new(),
+        token_alignments: Vec::new(),
+        last_step_compute_evidence: None,
+    };
+    let decode_text_token_ids = |token_ids: &[u32]| {
+        tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
+            WhisperGreedyDecodeError::TokenizerDecodeFailed {
+                reason: error.to_string(),
+            }
+        })
+    };
+    let config = BuiltinSeq2SeqDecodePolicyConfigInput {
+        initial_prompt_tokens: initial_prompt_tokens.to_vec(),
+        eot_token_id,
+        vocab_size: execution.vocab_size,
+        max_generated_tokens,
+    };
+    let decode = match run_whisper_greedy_decode_loop(
+        &config,
+        tokenizer,
+        request_options.phrase_bias.as_ref(),
+        &mut step_runner,
+        &decode_text_token_ids,
+        control,
+        decode_work_progress,
+        unstable_decode_text,
+    ) {
+        Ok(decode) => {
+            decode_loop_span.finish_with_extra(
+                "ok",
+                &format!(
+                    "steps_executed={} generated_tokens={} max_generated_tokens={} temperature={temperature}",
+                    step_runner.decode_steps_completed,
+                    decode.generated_tokens.len(),
+                    config.max_generated_tokens
+                ),
+            );
+            decode
+        }
+        // Hitting the token budget without EOT degrades to the generated
+        // prefix (mirrors cohere/moonshine/qwen) instead of failing the whole
+        // call. A cut-short by budget is NOT a repetition loop, so the
+        // temperature fallback leaves it to the (separate) budget-salvage
+        // handling below and does not ladder it.
+        Err(WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+            generated_tokens,
+            generated_probabilities,
+            max_generated_tokens,
+        }) => {
+            decode_loop_span.finish_with_extra(
+                "degraded-max-tokens-cap",
+                &format!(
+                    "steps_executed={} generated_tokens={} max_generated_tokens={max_generated_tokens}",
+                    step_runner.decode_steps_completed,
+                    generated_tokens.len(),
+                ),
+            );
+            eprintln!(
+                "openasr_whisper_ggml_executor stage=decode_loop event=max_tokens_cap_degraded status=partial-returned max_generated_tokens={max_generated_tokens} generated_tokens={}",
+                generated_tokens.len(),
+            );
+            let text = decode_text_token_ids(&generated_tokens)
+                .map_err(map_greedy_decode_error)
+                .map_err(|error| {
+                    decorate_decoder_boundary_error(error, prelude_summary, encoder_summary)
+                })?;
+            WhisperGreedyDecodeResult {
+                text,
+                generated_tokens,
+                generated_probabilities,
+                stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+            }
+        }
+        Err(error) => {
+            decode_loop_span.finish_with_extra(
+                "err",
+                &format!(
+                    "steps_executed={} max_generated_tokens={}",
+                    step_runner.decode_steps_completed, config.max_generated_tokens
+                ),
+            );
+            return Err(decorate_decoder_boundary_error(
+                map_greedy_decode_error(error),
+                prelude_summary,
+                encoder_summary,
+            ));
+        }
+    };
+    let candidate = WhisperDecodeCandidate {
+        text_trimmed: decode.text.trim().to_string(),
+        token_alignments: std::mem::take(&mut step_runner.token_alignments),
+    };
+    Ok((candidate, decode))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7051,8 +7335,6 @@ fn run_whisper_decode_loop(
         max_generated_tokens,
     )
     .map_err(|error| decorate_decoder_boundary_error(error, &prelude_summary, &encoder_summary))?;
-    let decode_loop_span = trace.start_stage("decode_loop");
-    let decode_loop_start = Instant::now();
     let plan_cache_base = WhisperDecoderStepPlanCacheBase {
         metadata: WhisperDecoderGraphMetadata {
             decoder_layers: execution.decoder_layers,
@@ -7149,153 +7431,83 @@ fn run_whisper_decode_loop(
         }
         None => initial_prompt_tokens,
     };
-    let mut step_runner = WhisperGreedyDecodeStepRunnerAdapter {
-        execution,
-        decoder_weights,
-        trace,
-        decode_loop_start,
-        decode_steps_completed: 0,
-        plan_cache_base,
-        decoder_graph_config: WhisperDecoderGraphExecutionConfig {
-            attention_heads: execution.decoder_attention_heads,
-            use_self_flash_attention: whisper_decoder_self_flash_attention_enabled(),
-            use_cross_flash_attention: decoder_cross_flash_attention,
-            collect_cross_attention: decoder_collect_cross_attention,
-            layer_norm_epsilon: 1.0e-5_f32,
-        },
-        decoder_persistent_weights,
-        decoder_self_kv_state: WhisperDecoderSelfKvCacheState::new(),
-        decoder_reuse: &mut decoder_persistent_static.reuse,
-        decoder_graph_runner: &mut decoder_persistent_static.runner,
-        reuse_mode,
-        decoder_graph_input: WhisperDecoderGraphExecutionInput {
-            decoder_prefix_tokens: Vec::with_capacity(
-                initial_prompt_tokens
-                    .len()
-                    .saturating_add(max_generated_tokens),
-            ),
-            encoder_hidden_state: if needs_encoder_hidden_in_step {
-                encoder_hidden_f32.to_vec()
-            } else {
-                Vec::new()
-            },
-            encoder_layout: WhisperDecoderHiddenStateLayout::SequenceHidden,
-        },
-        decoder_step_input: WhisperDecoderStepSeamInput {
-            encoder_frames,
-            encoder_hidden_size,
-            step_index: 0,
-            position_offset: 0,
-        },
-        decoder_tensor_cache: WhisperDecoderExecutionTensorCache::default(),
-        plan_by_token_count: BTreeMap::new(),
-        token_alignments: Vec::new(),
-        last_step_compute_evidence: None,
-    };
-    let decode_text_token_ids = |token_ids: &[u32]| {
-        tokenizer.decode_text_token_ids(token_ids).map_err(|error| {
-            WhisperGreedyDecodeError::TokenizerDecodeFailed {
-                reason: error.to_string(),
-            }
-        })
-    };
-    let config = BuiltinSeq2SeqDecodePolicyConfigInput {
-        initial_prompt_tokens,
-        eot_token_id,
-        vocab_size: execution.vocab_size,
-        max_generated_tokens,
-    };
-    let decode = match run_whisper_greedy_decode_loop(
-        &config,
-        tokenizer,
-        request_options.phrase_bias.as_ref(),
-        &mut step_runner,
-        &decode_text_token_ids,
-        control,
-        decode_work_progress,
-        unstable_decode_text,
-    ) {
-        Ok(decode) => {
-            decode_loop_span.finish_with_extra(
-                "ok",
-                &format!(
-                    "steps_executed={} generated_tokens={} max_generated_tokens={}",
-                    step_runner.decode_steps_completed,
-                    decode.generated_tokens.len(),
-                    config.max_generated_tokens
-                ),
-            );
-            decode
-        }
-        // Hitting the token budget without EOT degrades to the generated
-        // prefix (mirrors cohere/moonshine/qwen, see
-        // `qwen::ggml_executor::Qwen3AsrGgmlExecutorError` and
-        // `moonshine::decoder_graph::run_moonshine_greedy_decode_loop`'s
-        // callers) instead of failing the whole call. This case is reached
-        // by ill-conditioned OOD decode (e.g. a language mismatch driving a
-        // non-terminating greedy trajectory) more easily on one ggml backend
-        // than another -- both backends are equally exposed to it in
-        // principle, it is just easier to trigger on Metal in practice (see
-        // the platform-audit doc for why: near-tied argmax logits are prone
-        // to ULP-level cross-backend flips). It is a genuine decode-quality
-        // problem (the model ran out of budget still uncertain what to say
-        // next), not a backend bug, so the honest response is to hand back
-        // whatever was actually transcribed rather than raise a hard,
-        // fail-closed transcription error for an otherwise-successful
-        // decode run. The "degraded" trace tag (distinct from both "ok" and
-        // "err") keeps this outcome visible rather than silently folding it
-        // into a normal completion.
-        Err(WhisperGreedyDecodeError::EotNotReachedBeforeMaxTokens {
-            generated_tokens,
-            generated_probabilities,
+    // Round 1 is always a pure temperature-0 (argmax) greedy pass, so a slice
+    // that decodes cleanly on the first try takes this path and is byte-
+    // identical to before the temperature ladder was added. Only when that
+    // pass is cut short by the degenerate-repetition guard -- the loop locks
+    // into a repeated phrase and the guard truncates it, losing the real
+    // speech that followed -- do we ladder the temperature up (whisper-
+    // timestamped's fallback), re-decoding the SAME encoded slice (no second
+    // encoder run) with a seeded sampler until the attractor breaks, and keep
+    // the longest non-looping text. This recovers the speech the guard dropped
+    // (e.g. a "Thank you" x N backchannel that, at T=0, locks the whole 30 s
+    // window into the phrase) while leaving every healthy slice untouched.
+    let mut ladder_rung = |temperature: f32, seed: u64, round: usize| {
+        run_whisper_decode_round(
+            execution,
+            decoder_persistent_static,
+            decoder_weights,
+            tokenizer,
+            request_options,
+            &prelude_summary,
+            &encoder_summary,
+            plan_cache_base,
+            &initial_prompt_tokens,
+            encoder_hidden_f32,
+            eot_token_id,
             max_generated_tokens,
-        }) => {
-            decode_loop_span.finish_with_extra(
-                "degraded-max-tokens-cap",
-                &format!(
-                    "steps_executed={} generated_tokens={} max_generated_tokens={max_generated_tokens}",
-                    step_runner.decode_steps_completed,
-                    generated_tokens.len(),
-                ),
-            );
-            // Same visibility contract as the shared degenerate-ngram guard's
-            // own `eprintln!` (`seq2seq_greedy_decode::run_seq2seq_greedy_decode_loop_v0`):
-            // a real field occurrence should be observable in stderr, not
-            // silently folded into a normal completion.
-            eprintln!(
-                "openasr_whisper_ggml_executor stage=decode_loop event=max_tokens_cap_degraded status=partial-returned max_generated_tokens={max_generated_tokens} generated_tokens={}",
-                generated_tokens.len(),
-            );
-            let text = decode_text_token_ids(&generated_tokens)
-                .map_err(map_greedy_decode_error)
-                .map_err(|error| {
-                    decorate_decoder_boundary_error(error, &prelude_summary, &encoder_summary)
-                })?;
-            WhisperGreedyDecodeResult {
-                text,
-                generated_tokens,
-                generated_probabilities,
-                // Salvaging the prefix is not the same as completing the
-                // decode; the trace tag above says so and so must the result.
-                stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+            needs_encoder_hidden_in_step,
+            decoder_cross_flash_attention,
+            decoder_collect_cross_attention,
+            temperature,
+            seed,
+            trace,
+            control,
+            decode_work_progress,
+            unstable_decode_text,
+            reuse_mode,
+        )
+        .map(
+            |(candidate, result)| {
+                eprintln!(
+                    "openasr_whisper_greedy_decode stage=temperature_ladder event=round_completed round={round} temperature={temperature} text_len={} stop_reason={:?}",
+                    candidate.text_trimmed.len(),
+                    result.stop_reason
+                );
+                (candidate, result)
+            },
+        )
+    };
+    let (mut candidate, mut decode) = ladder_rung(0.0, WHISPER_TEMPERATURE_LADDER_BASE_SEED, 1)
+        .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+    if decode.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
+        && whisper_temperature_ladder_enabled()
+        && !initial_prompt_tokens.is_empty()
+    {
+        let mut best = (candidate, decode);
+        for (i, &temperature) in WHISPER_TEMPERATURE_LADDER.iter().enumerate() {
+            let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
+                .wrapping_add(i as u64)
+                .wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let (cand, result) = ladder_rung(temperature, seed, i + 2).map_err(|e| {
+                decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary)
+            })?;
+            // A ladder round that STILL hits the repeat guard was cut short, so
+            // it cannot have recovered more than the incumbent -- skip it (do
+            // not replace the incumbent with a shorter guard-cut slice).
+            if result.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
+                continue;
+            }
+            if whisper_decode_candidate_better(&cand, &best.0) {
+                best = (cand, result);
             }
         }
-        Err(error) => {
-            decode_loop_span.finish_with_extra(
-                "err",
-                &format!(
-                    "steps_executed={} max_generated_tokens={}",
-                    step_runner.decode_steps_completed, config.max_generated_tokens
-                ),
-            );
-            return Err(decorate_decoder_boundary_error(
-                map_greedy_decode_error(error),
-                &prelude_summary,
-                &encoder_summary,
-            ));
-        }
-    };
-    if decode.text.trim().is_empty() {
+        candidate = best.0;
+        decode = best.1;
+    }
+    let step_runner_token_alignments = candidate.token_alignments;
+    let decode_text_trimmed = candidate.text_trimmed;
+    if decode_text_trimmed.is_empty() {
         // A window whose decode leaves no text (a no-speech window that emits
         // only special tokens, or a salvaged prefix the degenerate-repeat guard
         // reduced to special tokens) is an honest empty result, not a decode
@@ -7320,12 +7532,12 @@ fn run_whisper_decode_loop(
             stop_reason,
         });
     }
-    let text = decode.text.trim().to_string();
+    let text = decode_text_trimmed;
     let words = match word_timestamp_mode {
         WhisperWordTimestampMode::Off => Vec::new(),
         WhisperWordTimestampMode::CrossAttention => whisper_cross_attention_word_timestamps(
             tokenizer,
-            &step_runner.token_alignments,
+            &step_runner_token_alignments,
             &decode.generated_probabilities,
             audio_duration_seconds,
             word_audio_rms_frames,
