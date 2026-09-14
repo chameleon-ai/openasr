@@ -34,6 +34,19 @@ impl Default for SegmentMergePolicy {
     }
 }
 
+/// Largest gap (seconds) between the last matched word in the previous segment
+/// and the first matched word in the current that the seam-stitch will accept
+/// when both segments carry **acoustic** (not interpolated) word timestamps. A
+/// true slice-boundary re-read sits inside the inter-slice overlap: for the
+/// default 0.5s overlap the two word-instances land within a single word or
+/// two, and even a jittery re-read stays under ~2s. Anything wider is a
+/// legitimate repeat -- a verse re-sung, a question-and-echo, an ABAB pattern
+/// in a song, etc. -- and stitching would consume real words from both
+/// segments. Interpolated (`approximate_word_timestamps`) families tile word
+/// spans uniformly across the segment, so their regap is a function of the
+/// tile rather than acoustic reality; the guard is skipped for them.
+const SEGMENT_STITCH_MAX_REGAP_SECONDS: f32 = 2.0;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -350,7 +363,14 @@ impl TranscriptAssembler {
             return false;
         }
         let min_units = if time_overlaps { 2 } else { 3 };
-        let stitched = apply_suffix_prefix_stitch(previous, current, min_units, time_overlap);
+        let stitched = apply_suffix_prefix_stitch(
+            previous,
+            current,
+            min_units,
+            time_overlap,
+            SEGMENT_STITCH_MAX_REGAP_SECONDS,
+            self.approximate_word_timestamps,
+        );
         if stitched && self.approximate_word_timestamps {
             // A prior seam may already have advanced these estimates beyond
             // the original audio window. Preserve that committed boundary
@@ -393,6 +413,8 @@ fn apply_suffix_prefix_stitch(
     current: &mut Segment,
     min_units: usize,
     time_overlap_seconds: f32,
+    max_seam_regap_seconds: f32,
+    approximate_word_timestamps: bool,
 ) -> bool {
     let Some(overlap) = suffix_prefix_overlap(
         &previous.text,
@@ -414,6 +436,28 @@ fn apply_suffix_prefix_stitch(
     let remainder = char_suffix(&current.text, consume_end).trim().to_string();
     let previous_words = split_words_at_char(&previous.text, &previous.words, overlap.prev_start);
     let current_words = split_words_at_char(&current.text, &current.words, consume_end);
+    // Reject the seam when both segments carry acoustic (non-interpolated) word
+    // timestamps and the matched word-instances sit several seconds apart in
+    // the original audio. A true slice-boundary re-read lands within the
+    // inter-slice overlap (~0.5s at `SlicingOptions::default`) so the two
+    // word-instances are acoustically adjacent. A legitimate repeat (a verse
+    // re-sung seconds later, an ABAB pattern in a song, etc.) sits far beyond
+    // that gap; stitching would consume real words from both segments and lose
+    // audible content. Interpolated families carry synthetic tile times, so
+    // their regap is not acoustically meaningful and the guard is skipped.
+    // For acoustic words the two matched word-instances must sit close in the
+    // original audio; for synthetic tile times the guard is skipped.
+    if !approximate_word_timestamps
+        && let (Some((_, prev_match)), Some((curr_match, _))) =
+            (previous_words.as_ref(), current_words.as_ref())
+        && let (Some(prev_match_last), Some(curr_match_first)) =
+            (prev_match.last(), curr_match.first())
+    {
+        let regap_seconds = curr_match_first.start - prev_match_last.end;
+        if regap_seconds > max_seam_regap_seconds {
+            return false;
+        }
+    }
     let leftover_words = current_words
         .as_ref()
         .map(|(_, leftover)| leftover.clone())
@@ -1647,6 +1691,92 @@ mod tests {
         assert!(
             (transcription.segments[1].start - 25.0).abs() < 1e-3,
             "remainder must keep the later slice window, got {:#?}",
+            transcription.segments
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_repeated_phrase_far_from_seam_with_acoustic_words() {
+        // Whisper (acoustic word timestamps) on a music clip: the previous slice
+        // ends with "She came from Planet Claire" at 233-236s absolute, and the
+        // next slice legitimately re-sings the same phrase 9s later at 245-249s
+        // absolute. The texts share a suffix/prefix seam, but the matched
+        // word-instances sit ~9s apart in the original audio -- far outside the
+        // ~0.5s slice overlap. The seam-stitch must NOT consume the phrase
+        // out of both segments. This is the false-negative the regap guard
+        // exists to prevent; the worded Decode Invariant family
+        // (approximate_word_timestamps=true) is exempt because its tile times
+        // make the regap meaningless.
+        //
+        // Whisper word times are slice-relative, so both segments use
+        // RelativeToSliceContent; the slice offsets land prev's clause at
+        // 212.5-239.0s and curr's at 238.5-265.0s in the original axis (the
+        // 0.5s abut matches the default slice overlap).
+        let prev_text = "Some say she's from Mars She came from Planet Claire";
+        let cur_text = "She came from Planet Claire all the trees are red";
+        // slice 1 covers 212..239 original; slice 2 covers 238.5..265 original.
+        // Both use content==slice so `RelativeToSliceContent` places them at the
+        // right spot on the original timeline via content_offset.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 212, 16_000 * 239),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                0.0,
+                27.0,
+                vec![
+                    word("Some", 0.5, 0.9),
+                    word("say", 0.9, 1.2),
+                    word("she's", 1.2, 1.7),
+                    word("from", 1.7, 2.0),
+                    word("Mars", 2.0, 2.8),
+                    word("She", 20.5, 20.9),
+                    word("came", 20.9, 21.3),
+                    word("from", 21.3, 21.7),
+                    word("Planet", 21.7, 22.4),
+                    word("Claire", 22.4, 24.1),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::RelativeToSliceContent,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 238 + 8_000, 16_000 * 265),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                0.0,
+                27.0,
+                vec![
+                    word("She", 2.0, 2.4),
+                    word("came", 2.4, 2.8),
+                    word("from", 2.8, 3.2),
+                    word("Planet", 3.2, 3.9),
+                    word("Claire", 3.9, 5.6),
+                    word("all", 6.5, 6.8),
+                    word("the", 6.8, 7.1),
+                    word("trees", 7.1, 7.6),
+                    word("are", 7.6, 7.9),
+                    word("red", 7.9, 8.5),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::RelativeToSliceContent,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(
+            transcription
+                .text
+                .matches("She came from Planet Claire")
+                .count(),
+            2,
+            "a repeated phrase 8s apart must survive both segments, got {:?}",
+            transcription.text
+        );
+        assert_eq!(
+            transcription.segments.len(),
+            2,
+            "the second verse must not be dropped as a seam, got {:#?}",
             transcription.segments
         );
     }
