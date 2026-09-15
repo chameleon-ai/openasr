@@ -2091,6 +2091,108 @@ fn refine_dtw_onsets_noop_without_envelope() {
 }
 
 // ---------------------------------------------------------------------------
+// whisper_refine_dtw_word_offsets
+// ---------------------------------------------------------------------------
+
+/// A 15 s, 0.02 s/frame envelope (750 frames) at a 0.001 noise floor with a
+/// single 0.5 peak at 8 s that sets the clip peak (and so the 5% silence
+/// ceiling). The [2.0, 4.0) word window has a 0.25 speech run in [2.0, 2.6)
+/// followed by digital-zero silence to 4.0 s -- the trailing-silence (hollow
+/// back) shape the offset refinement retreats.
+fn offset_fixture_envelope() -> Vec<f32> {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    for s in env[100..130].iter_mut() {
+        *s = 0.25;
+    }
+    env
+}
+
+/// `whisper_refine_dtw_word_offsets` retreats a word the fold let run past its
+/// speech into the trailing silence back to its real offset at 2.6 s: the next
+/// word's start is left untouched, so a real gap is opened where the pause sits.
+#[test]
+fn refine_dtw_offsets_pulls_true_silence_word_to_its_offset() {
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let env = offset_fixture_envelope();
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.6).abs() < 0.05, "end={}", out[1].end);
+    // start is untouched, as is the next word.
+    assert!((out[1].start - 2.0).abs() < 1e-4 && (out[2].end - 4.5).abs() < 1e-4);
+}
+
+/// The same window but with a low music floor filling the back half (a
+/// sustained level, so the back's mean sits above the floor) is *not* trusted
+/// as trailing silence: a quiet passage over a music bed is ambiguous, so no
+/// pull fires and the word keeps its fold position.
+#[test]
+fn refine_dtw_offsets_refuses_a_music_floor_back() {
+    let mut env = offset_fixture_envelope();
+    for s in env[150..200].iter_mut() {
+        *s = 0.021;
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A middle word whose end maps to or past the last envelope frame -- common at
+/// a longform slice end where the frame array is shorter than
+/// `duration_s / seconds_per_frame` -- must not overrun the slice. The word is
+/// clamped into range and, finding no usable window, is left unrefined rather
+/// than aborting the run.
+#[test]
+fn refine_dtw_offsets_clamps_a_word_at_or_past_the_end() {
+    let env = offset_fixture_envelope(); // 750 frames
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 15.4, 16.0), // end past the 750-frame end, span 0.6 >= 0.3
+        word_ts("c", 16.0, 16.2), // the last word is skipped regardless
+    ];
+    // duration_s larger than the envelope implies so `end_s / spf` overshoots.
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 16.0);
+    assert_eq!(out[1].end, 16.0, "unrefined; must not panic");
+}
+
+/// The last word is never retreated: its true end is the audio end, so the
+/// silence after it is the clip's legitimate tail, not a fold leak.
+#[test]
+fn refine_dtw_offsets_skips_the_last_word() {
+    let mut env = offset_fixture_envelope();
+    for s in env[0..600].iter_mut() {
+        *s = 0.25; // trailing word's window [11.5, 13.5) sits in speech to its end
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 11.5, 13.5), // the last word
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert_eq!(out[1].end, 13.5, "last word untouched");
+}
+
+/// No envelope (a run without cross-attention word timestamps) is a byte-exact
+/// no-op.
+#[test]
+fn refine_dtw_offsets_noop_without_envelope() {
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, None, 15.0);
+    assert_eq!(out[1].end, 4.0);
+}
+
+// ---------------------------------------------------------------------------
 // whisper_pad_dtw_word_windows
 // ---------------------------------------------------------------------------
 
