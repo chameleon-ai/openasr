@@ -467,9 +467,15 @@ fn apply_suffix_prefix_stitch(
         current.words = leftover_words;
         return true;
     }
-    if let Some((keep_prefix, _)) = previous_words {
-        previous.words = keep_prefix;
-    }
+    // The overlap phrase is re-homed onto `previous` below: its text becomes
+    // `prev_prefix + consumed`, so `previous` keeps every word it already had
+    // -- the words before the overlap AND the overlap's own words. Truncating
+    // `previous.words` to the pre-overlap prefix (the historical behavior)
+    // deleted the overlap's words here while `current.words = leftover` dropped
+    // them on the other side, so a phrase whose speech straddled the slice
+    // boundary (the overlap re-read) survived in text but lost every word
+    // window. Keeping the earlier segment's native acoustic words leaves exactly
+    // one timed copy of the phrase in the timeline.
     let mut completed = format!("{prev_prefix}{consumed}");
     // A period sitting on `previous` after the overlap is a truncated-slice
     // hallucination when current continues with content (no punct right after
@@ -1778,6 +1784,97 @@ mod tests {
             2,
             "the second verse must not be dropped as a seam, got {:#?}",
             transcription.segments
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_overlap_words_when_seam_phrase_is_previous_tail() {
+        // Whisper (acoustic) on bonnie: the phrase "There we go" straddles the
+        // 292.0s slice cut, so both slices decode it and each collapses the x2
+        // to one. In the previous slice it is the segment TAIL
+        // ("...wee bit. There we go."), in the next it is the segment HEAD
+        // ("There we go. All right."). The two word-instances sit 0.44s apart,
+        // inside the 2s seam regap, so the stitch proceeds to dedupe. The old
+        // path truncated previous.words to the pre-overlap prefix AND dropped
+        // the overlap from current.words, so the phrase survived in text but
+        // lost every word window on both sides. The earlier segment must keep
+        // its native overlap words so the phrase stays in the timeline exactly
+        // once, timed.
+        let prev_text = "wee bit. There we go.";
+        let cur_text = "There we go. All right.";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 265, 16_000 * 292),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                265.0,
+                292.0,
+                vec![
+                    word("wee", 268.0, 269.0),
+                    word("bit.", 290.6, 291.2),
+                    word("There", 290.40, 291.53),
+                    word("we", 291.33, 291.78),
+                    word("go.", 291.58, 292.00),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 291, 16_000 * 319),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                291.5,
+                318.5,
+                vec![
+                    word("There", 292.44, 292.74),
+                    word("we", 292.54, 293.32),
+                    word("go.", 293.12, 294.23),
+                    word("All", 294.03, 294.98),
+                    word("right.", 294.78, 296.48),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+
+        // The seam must have deduped (one "There we go.", remainder after it).
+        assert_eq!(
+            transcription.text.matches("There we go").count(),
+            1,
+            "the seam re-read must collapse to one phrase, got {:?}",
+            transcription.text
+        );
+
+        // The phrase's words must survive in the word timeline exactly once:
+        // on the earlier (committed) segment, not orphaned from both.
+        let prev_words: Vec<String> = transcription.segments[0]
+            .words
+            .iter()
+            .map(|w| w.word.trim().to_string())
+            .collect();
+        assert!(
+            prev_words.iter().any(|w| w.eq_ignore_ascii_case("There")),
+            "previous tail 'There' lost its word window (orphaned phrase), got {prev_words:?}"
+        );
+        assert!(
+            prev_words.iter().any(|w| w.eq_ignore_ascii_case("go.")),
+            "previous tail 'go.' lost its word window (orphaned phrase), got {prev_words:?}"
+        );
+        let cur_words: Vec<String> = transcription.segments[1]
+            .words
+            .iter()
+            .map(|w| w.word.trim().to_string())
+            .collect();
+        assert!(
+            !cur_words.iter().any(|w| w.eq_ignore_ascii_case("There")),
+            "current seam copy must not double the phrase, got {cur_words:?}"
+        );
+        assert!(
+            cur_words.iter().any(|w| w.eq_ignore_ascii_case("All")),
+            "the post-seam remainder must survive, got {cur_words:?}"
         );
     }
 
