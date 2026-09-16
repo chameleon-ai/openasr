@@ -47,6 +47,22 @@ impl Default for SegmentMergePolicy {
 /// tile rather than acoustic reality; the guard is skipped for them.
 const SEGMENT_STITCH_MAX_REGAP_SECONDS: f32 = 2.0;
 
+/// How far past the previous segment's end the current slice's matched seam
+/// phrase may still BEGIN and count as a re-read, when both segments carry
+/// **acoustic** word timestamps. A true re-read re-emits audio the previous
+/// slice already covered, so that audio (and hence the current slice's copy of
+/// the phrase) sits inside the inter-slice overlap, i.e. strictly before
+/// `previous.end`. A phrase whose first word in the current slice begins
+/// after `previous.end` is NOT a re-read: it is NEW audio the previous slice
+/// never transcribed. The regap guard above cannot catch this shape, because
+/// a deliberate repeat landing right at the cut ("there we go <pause> there
+/// we go", a question-and-echo) can have a small regap (under
+/// `SEGMENT_STITCH_MAX_REGAP_SECONDS`) while still starting clear after
+/// `previous.end`. Stitching that phrase would consume real words from the
+/// current segment and lose audible content, so it is refused up to this
+/// tolerance (enough for onset-timing jitter on a word straddling the cut).
+const SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS: f32 = 0.15;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -455,6 +471,16 @@ fn apply_suffix_prefix_stitch(
     {
         let regap_seconds = curr_match_first.start - prev_match_last.end;
         if regap_seconds > max_seam_regap_seconds {
+            return false;
+        }
+        // A re-read is audio the previous slice already covered, so the
+        // current slice's copy of the phrase must sit at/before `previous.end`
+        // (inside the inter-slice overlap). A phrase that BEGINS after the
+        // previous segment's end is new audio the previous slice never
+        // transcribed -- a deliberate repeat/echo landing at the cut -- even
+        // when its regap is small enough to pass the check above.
+        let past_prev_end = curr_match_first.start - previous.end;
+        if past_prev_end > SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS {
             return false;
         }
     }
@@ -1789,17 +1815,15 @@ mod tests {
 
     #[test]
     fn assembler_keeps_overlap_words_when_seam_phrase_is_previous_tail() {
-        // Whisper (acoustic) on bonnie: the phrase "There we go" straddles the
-        // 292.0s slice cut, so both slices decode it and each collapses the x2
-        // to one. In the previous slice it is the segment TAIL
-        // ("...wee bit. There we go."), in the next it is the segment HEAD
-        // ("There we go. All right."). The two word-instances sit 0.44s apart,
-        // inside the 2s seam regap, so the stitch proceeds to dedupe. The old
-        // path truncated previous.words to the pre-overlap prefix AND dropped
-        // the overlap from current.words, so the phrase survived in text but
-        // lost every word window on both sides. The earlier segment must keep
-        // its native overlap words so the phrase stays in the timeline exactly
-        // once, timed.
+        // Whisper (acoustic) genuine re-read at the 292.0s slice cut: the same
+        // "There we go" audio (290.4-292.0) sits in the inter-slice overlap, so
+        // BOTH slices read it and each emits it. In the previous slice it is the
+        // segment TAIL ("...wee bit. There we go."); in the next it is the
+        // segment HEAD ("There we go. All right."). The current slice's copy
+        // BEGINS inside the overlap, before previous.end (292.0), so it is a
+        // true re-read: the stitch dedupes to one phrase. The deduped phrase's
+        // word windows must survive on the earlier (committed) segment, not be
+        // orphaned from both sides.
         let prev_text = "wee bit. There we go.";
         let cur_text = "There we go. All right.";
         let mut assembler =
@@ -1813,10 +1837,10 @@ mod tests {
                 292.0,
                 vec![
                     word("wee", 268.0, 269.0),
-                    word("bit.", 290.6, 291.2),
-                    word("There", 290.40, 291.53),
-                    word("we", 291.33, 291.78),
-                    word("go.", 291.58, 292.00),
+                    word("bit.", 289.6, 290.2),
+                    word("There", 290.40, 291.10),
+                    word("we", 291.10, 291.55),
+                    word("go.", 291.55, 292.00),
                 ],
             )],
             time_domain: SegmentTimeDomain::AbsoluteOriginal,
@@ -1829,9 +1853,9 @@ mod tests {
                 291.5,
                 318.5,
                 vec![
-                    word("There", 292.44, 292.74),
-                    word("we", 292.54, 293.32),
-                    word("go.", 293.12, 294.23),
+                    word("There", 291.55, 291.65),
+                    word("we", 291.65, 291.90),
+                    word("go.", 291.90, 292.00),
                     word("All", 294.03, 294.98),
                     word("right.", 294.78, 296.48),
                 ],
@@ -1844,7 +1868,7 @@ mod tests {
         assert_eq!(
             transcription.text.matches("There we go").count(),
             1,
-            "the seam re-read must collapse to one phrase, got {:?}",
+            "a seam re-read must collapse to one phrase, got {:?}",
             transcription.text
         );
 
@@ -1875,6 +1899,88 @@ mod tests {
         assert!(
             cur_words.iter().any(|w| w.eq_ignore_ascii_case("All")),
             "the post-seam remainder must survive, got {cur_words:?}"
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_distinct_repeated_phrase_at_the_cut() {
+        // Whisper (acoustic) on bonnie's real 292.0s cut: "there we go" is said
+        // TWICE, with a silent gap across the cut -- utterance 1 in the previous
+        // slice's tail (ending at 292.0), then silence, then utterance 2 in the
+        // next slice's HEAD (292.44-294.23, fully AFTER previous.end). This is a
+        // legitimate echo, not a slice-overlap re-read: the current slice's copy
+        // is NEW audio the previous slice never transcribed. The regap between
+        // the two word-instances is only ~0.5s (inside the 2s regap guard), so
+        // the old path stitched it and DROPPED utterance 2. The reread
+        // past-previous-end guard must refuse the stitch, so both "There we go"
+        // survive, each timed.
+        let prev_text = "wee bit. There we go.";
+        let cur_text = "There we go. All right.";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 265, 16_000 * 292),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                265.0,
+                292.0,
+                vec![
+                    word("wee", 268.0, 269.0),
+                    word("bit.", 290.0, 290.6),
+                    word("There", 290.40, 291.30),
+                    word("we", 291.30, 291.70),
+                    word("go.", 291.70, 292.00),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 291, 16_000 * 319),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                291.5,
+                318.5,
+                vec![
+                    word("There", 292.44, 292.74),
+                    word("we", 292.54, 293.32),
+                    word("go.", 293.12, 293.60),
+                    word("All", 294.03, 294.98),
+                    word("right.", 294.78, 296.48),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+
+        // Both utterances must survive (the echo must not be collapsed to one).
+        assert_eq!(
+            transcription.text.matches("There we go").count(),
+            2,
+            "a repeated phrase said twice across the cut must not be deduped, got {:?}",
+            transcription.text
+        );
+
+        // The second utterance's words must survive on the later segment.
+        let cur_words: Vec<String> = transcription
+            .segments
+            .last()
+            .map(|segment| {
+                segment
+                    .words
+                    .iter()
+                    .map(|w| w.word.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            cur_words.iter().any(|w| w.eq_ignore_ascii_case("There")),
+            "the SECOND 'there we go' lost its word window, got {cur_words:?}"
+        );
+        assert!(
+            cur_words.iter().any(|w| w.eq_ignore_ascii_case("All")),
+            "the post-echo continuation must survive, got {cur_words:?}"
         );
     }
 
