@@ -7967,11 +7967,15 @@ fn run_whisper_decode_loop(
         )
         .map(
             |(candidate, result)| {
-                eprintln!(
-                    "openasr_whisper_greedy_decode stage=temperature_ladder event=round_completed round={round} temperature={temperature} text_len={} stop_reason={:?}",
-                    candidate.text_trimmed.len(),
-                    result.stop_reason
-                );
+                // Round 1 is the plain greedy (temperature 0) pass; only report
+                // the elevated-temperature ladder rounds.
+                if round >= 2 {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=temperature_ladder event=round_completed round={round} temperature={temperature} text_len={} stop_reason={:?}",
+                        candidate.text_trimmed.len(),
+                        result.stop_reason
+                    );
+                }
                 (candidate, result)
             },
         )
