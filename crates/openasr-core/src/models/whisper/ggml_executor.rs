@@ -7278,6 +7278,296 @@ fn whisper_temperature_ladder_enabled() -> bool {
     std::env::var_os("OPENASR_WHISPER_DISABLE_TEMPERATURE_LADDER").is_none()
 }
 
+/// Minimum consecutive-token block that may be collapsed by the tail-repeat
+/// pass. Below this, a repeated tail is treated as genuine backchannel /
+/// stutter ("hoo-ah hoo-ah", "um um um") and left untouched; the no-speech
+/// hallucination shape is a full clause (a sentence or more) emitted twice.
+const WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS: usize = 6;
+
+/// Env opt-out (defaults on). Collapse a window whose decoded text ends with a
+/// long clause emitted back-to-back at its tail (the no-speech tail-repeat
+/// hallucination) to the first copy, so the duplicated words stop dragging the
+/// transcript (and their phantom timestamps) past the real speech.
+fn whisper_tail_repeat_collapse_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DISABLE_TAIL_REPEAT_COLLAPSE").is_none()
+}
+
+/// Minimum dB by which the kept run's audio must exceed the removed run's for
+/// the collapse to fire (the removed span is "silence" while the kept copy is
+/// the real speech). A no-speech tail hallucination sits near the window's
+/// ambient level, well below the real-speech first copy. A genuine repeated
+/// line sits at the same level as its first copy (ratio ~1, ~0 dB) and is
+/// refused. 3 dB (~1.4x amplitude) is the low end of the measured gap; it
+/// stays comfortably below a real speech repeat while above the no-speech
+/// attractor's ambient-vs-speech margin.
+const WHISPER_TAIL_REPEAT_MIN_SILENCE_DB: f32 = 3.0;
+
+/// A decode ended cleanly (a stop token, not a guard-cut or the token budget).
+/// Only such decodes can have "finished" hallucinated text: a guard-cut window
+/// is already a prefix salvage and a budget-cut one may resume in the next
+/// slice, so neither is collapsed here.
+fn whisper_stop_reason_is_stop_token(stop_reason: &Seq2SeqGreedyDecodeStopReason) -> bool {
+    matches!(stop_reason, Seq2SeqGreedyDecodeStopReason::StopToken)
+}
+
+/// A pending tail-repeat collapse: the kept (first-copy) span and the removed
+/// (second-copy) span, both as half-open `[lo, hi)` index ranges into the
+/// generated token sequence. The removed span is the block to splice out;
+/// the kept span is the surviving span used as the acoustic reference.
+#[derive(Debug)]
+struct WhisperRepeatedBlockRemoval {
+    kept_range: (usize, usize),
+    removed_range: (usize, usize),
+}
+
+/// The tail-repeat collapse candidate for the generated tokens, or `None`
+/// when the window's tail is not a repeated long block. Two shapes are
+/// matched:
+///
+/// 1. Cross-run: the final text run is verbatim-equal to the run immediately
+///    before it, and each run has at least `WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS`
+///    tokens. This is the no-speech tail-repeat hallucination shape in which
+///    the model emits a long clause as one `<|start|> text <|end|>` segment and
+///    then re-emits it as a second `<|start|> text <|end|>` segment. Kept span
+///    is the first run, removed span is the second.
+/// 2. Same-run: the final text run's tail is a verbatim 2x of itself. A
+///    sub-shape where both copies fell into the same run (the mid-segment
+///    timestamp got suppressed or was not emitted). Kept span is the first
+///    half of the run, removed span is the second half.
+fn whisper_repeated_block_removal(
+    tokens: &[u32],
+    is_timestamp: &dyn Fn(u32) -> bool,
+) -> Option<WhisperRepeatedBlockRemoval> {
+    let runs = text_token_runs(tokens, is_timestamp);
+    if runs.len() >= 2 {
+        let (lo_prev, hi_prev) = runs[runs.len() - 2];
+        let (lo_last, hi_last) = runs[runs.len() - 1];
+        let m_prev = hi_prev.saturating_sub(lo_prev).saturating_add(1);
+        let m_last = hi_last.saturating_sub(lo_last).saturating_add(1);
+        if m_last >= WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS
+            && m_prev == m_last
+            && tokens[lo_prev..=hi_prev] == tokens[lo_last..=hi_last]
+        {
+            return Some(WhisperRepeatedBlockRemoval {
+                kept_range: (lo_prev, hi_prev.saturating_add(1)),
+                removed_range: (lo_last, hi_last.saturating_add(1)),
+            });
+        }
+    }
+    let (lo, hi) = *runs.last()?;
+    let m = hi.saturating_sub(lo).saturating_add(1);
+    if m < 2 * WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS {
+        return None;
+    }
+    let run = &tokens[lo..=hi];
+    let mut n = m / 2;
+    while n >= WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS {
+        if run[m - 2 * n..m - n] == run[m - n..m] {
+            let kept_start = lo;
+            let kept_end = lo.saturating_add(n);
+            let removed_start = hi.saturating_sub(n).saturating_add(1);
+            let removed_end = hi.saturating_add(1);
+            return Some(WhisperRepeatedBlockRemoval {
+                kept_range: (kept_start, kept_end),
+                removed_range: (removed_start, removed_end),
+            });
+        }
+        n -= 1;
+    }
+    None
+}
+
+/// Acoustic gate for the tail-repeat collapse: fire only when the removed
+/// span's audio is a clear no-speech level, at least
+/// [`WHISPER_TAIL_REPEAT_MIN_SILENCE_DB`] below the kept span's audio. A
+/// genuine repeated line sits at the same real-speech level as its first
+/// copy, so its audio is not below the gate and the collapse is refused.
+///
+/// Returns `false` when no envelope is available (non-CrossAttention mode)
+/// or the comparison is not possible, which degrades to leaving the decode
+/// unchanged (the safe direction).
+///
+/// Each repeat run is bracketed by the decoded timestamp tokens that
+/// separated it from its neighbor, so [`run_frame_bounds`] gives a reliable
+/// per-run encoder-frame band at 0.02 s/frame -- the same rate as `rms_frames`
+/// (320 samples at 16 kHz). The band's audio level is the RMS envelope mean
+/// over it. Using the explicit timestamp tokens (not the cross-attention of
+/// the text tokens) matters: the hallucinated copy's text attention is
+/// diffuse and cannot be trusted to locate its audio, but the timestamp tokens
+/// still place it where the model believes it spoke.
+fn whisper_tail_repeat_acoustic_gate(
+    removal: &WhisperRepeatedBlockRemoval,
+    tokenizer: &WhisperTokenizer,
+    tokens: &[u32],
+    rms_frames: Option<&[f32]>,
+) -> bool {
+    let Some(rms) = rms_frames else {
+        return false;
+    };
+    if rms.len() < 4 {
+        return false;
+    }
+    // Each run of the cross-run shape is bracketed by decoded timestamp tokens
+    // (that is exactly what separates the two runs), so `run_frame_bounds`
+    // gives a reliable [start, end) encoder-frame band per run at 0.02 s/frame
+    // -- the same rate as `rms`. The band's audio level is the RMS envelope
+    // mean over that band. Using the explicit timestamp tokens (not the
+    // cross-attention of the text tokens) matters: the hallucinated copy's text
+    // attention is diffuse and cannot be trusted to locate its audio, but the
+    // timestamp tokens still place it where the model believes it spoke.
+    let Some(timestamp_begin) = tokenizer.first_timestamp_token_id() else {
+        return false;
+    };
+    // The encoder always has 1500 frames but `rms` covers only the clip's real
+    // length at 0.02 s/frame, so resolve bands in the 1500-frame space and
+    // scale them into `rms` indices.
+    const ENCODER_FRAME_RESOLUTION: usize = 1500;
+    // `rms` covers the clip's real length at 0.02 s/frame while the encoder
+    // always has 1500 frames, so a 1500-frame band scales into `rms` indices.
+    let scale = rms.len() as f64 / ENCODER_FRAME_RESOLUTION as f64;
+    // RMS envelope level of a contiguous text-token range `[lo, hi]` (inclusive)
+    // from the envelope frames its decoded timestamps place it on. Each run is
+    // bracketed by `<|start|>/<|end|>` timestamp tokens; a token range that is
+    // only a part of its run (the within-run shape, where both copies share one
+    // bracket) gets the sub-band proportional to its token share, so the first
+    // and second copy read their own audio instead of both reading the run.
+    let is_ts = |id: u32| id >= timestamp_begin;
+    let runs = text_token_runs(tokens, &is_ts);
+    let level_of = |lo: usize, hi: usize| -> Option<f32> {
+        let (rlo, rhi) = runs
+            .iter()
+            .copied()
+            .find(|&(rlo, rhi)| rlo <= lo && hi <= rhi)?;
+        let (run_start, run_end) = run_frame_bounds(
+            rlo,
+            rhi,
+            tokens,
+            Some(timestamp_begin),
+            ENCODER_FRAME_RESOLUTION,
+        )?;
+        if run_end <= run_start {
+            return None;
+        }
+        let run_tokens = rhi.saturating_sub(rlo).saturating_add(1) as f64;
+        let run_width = (run_end - run_start) as f64;
+        let lo_frac = lo.saturating_sub(rlo) as f64 / run_tokens;
+        let hi_frac = hi.saturating_sub(rlo).saturating_add(1) as f64 / run_tokens;
+        let band_start = run_start + (lo_frac * run_width) as usize;
+        let band_end = run_start + (hi_frac * run_width) as usize;
+        let start = (band_start as f64 * scale).round() as usize;
+        let end = (band_end as f64 * scale).round() as usize;
+        let start = start.min(rms.len());
+        let end = end.clamp(start, rms.len());
+        if end <= start {
+            return None;
+        }
+        let window = &rms[start..end];
+        let level = (window.iter().map(|v: &f32| v * v).sum::<f32>() / window.len() as f32).sqrt();
+        (level > 0.0 && level.is_finite()).then_some(level)
+    };
+    let (kept_level, removed_level) = (
+        level_of(removal.kept_range.0, removal.kept_range.1.saturating_sub(1)),
+        level_of(
+            removal.removed_range.0,
+            removal.removed_range.1.saturating_sub(1),
+        ),
+    );
+    let (kept_level, removed_level) = match (kept_level, removed_level) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    let margin_db = 20.0_f32 * (kept_level / removed_level.max(1e-9_f32)).log10();
+    if std::env::var_os("OPENASR_WHISPER_DEBUG_TAIL_REPEAT").is_some() {
+        eprintln!(
+            "openasr_whisper_ggml_executor stage=tail_repeat event=acoustic_gate kept_rms={:.5} removed_rms={:.5} margin_db={:.2} fire={}",
+            kept_level,
+            removed_level,
+            margin_db,
+            margin_db >= WHISPER_TAIL_REPEAT_MIN_SILENCE_DB
+        );
+    }
+    margin_db >= WHISPER_TAIL_REPEAT_MIN_SILENCE_DB
+}
+
+/// Splice out the half-open index range `[start, end)` in place. Used to drop
+/// the repeated block from any parallel vector (tokens, probabilities,
+/// alignments) while keeping the run's first copy, the prefix, and the
+/// trailing `<|end|>` timestamp the run was bracketed by.
+fn splice_out_range<T>(v: &mut Vec<T>, start: usize, end: usize) {
+    if start < end {
+        v.drain(start..end);
+    }
+}
+
+/// Collapse a clean-stop window's repeated tail (see
+/// [`whisper_tail_repeat_collapse_enabled`]): splice the repeated block out of
+/// the generated tokens, the per-token probabilities, the cross-attention
+/// alignments (all parallel to the tokens), and re-derive the text. The
+/// trailing `<|end|>` that closes the run brackets one less frame, so the run's
+/// DTW band tightens to the first copy without touching the band math.
+///
+/// Gated on the acoustic evidence: only fires when [`whisper_tail_repeat_acoustic_gate`]
+/// confirms the removed span's audio is a clear no-speech level below the kept
+/// span's. No acoustic envelope (non-CrossAttention mode or missing rms frames)
+/// degrades to a no-op, so the gate is fail-safe.
+fn whisper_collapse_repeated_decode_tail(
+    tokenizer: &WhisperTokenizer,
+    decode: &mut WhisperGreedyDecodeResult,
+    token_alignments: &mut Vec<WhisperGeneratedTokenAlignment>,
+    word_audio_rms_frames: Option<&[f32]>,
+) -> Result<bool, WhisperGgmlExecutorError> {
+    if !whisper_tail_repeat_collapse_enabled()
+        || !whisper_stop_reason_is_stop_token(&decode.stop_reason)
+        || decode.generated_tokens.is_empty()
+    {
+        return Ok(false);
+    }
+    let is_timestamp = |token_id: u32| {
+        tokenizer
+            .first_timestamp_token_id()
+            .is_some_and(|begin| token_id >= begin)
+    };
+    let Some(removal) = whisper_repeated_block_removal(&decode.generated_tokens, &is_timestamp)
+    else {
+        return Ok(false);
+    };
+    if !whisper_tail_repeat_acoustic_gate(
+        &removal,
+        tokenizer,
+        &decode.generated_tokens,
+        word_audio_rms_frames,
+    ) {
+        return Ok(false);
+    }
+    let (start, end) = removal.removed_range;
+    let token_count = decode.generated_tokens.len();
+    let drop = end - start;
+    // The parallel vectors are 1:1 with the tokens in the word-timestamp path;
+    // splice them at the same range only when their length matches, so a partial
+    // alignment row (cross-attention not collected) degrades to a tokens-only
+    // collapse instead of an out-of-bounds splice.
+    if decode.generated_probabilities.len() == token_count {
+        splice_out_range(&mut decode.generated_probabilities, start, end);
+    }
+    if token_alignments.len() == token_count {
+        splice_out_range(token_alignments, start, end);
+    }
+    splice_out_range(&mut decode.generated_tokens, start, end);
+    let text = tokenizer
+        .decode_text_token_ids(&decode.generated_tokens)
+        .map_err(
+            |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                reason: format!("whisper tail-repeat collapse token decode failed: {error}"),
+            },
+        )?;
+    decode.text = text;
+    let kept_tokens = token_count.saturating_sub(drop);
+    eprintln!(
+        "openasr_whisper_ggml_executor stage=decode_loop event=tail_repeat_collapse status=collapsed start={start} end={end} dropped_tokens={drop} kept_tokens={kept_tokens}"
+    );
+    Ok(true)
+}
+
 /// What one decode round produced, carried up for the fallback ladder to keep
 /// the winning candidate. `token_alignments` is the cross-attention word-align
 /// row captured during THIS round's decode (the word-timing path uses it), so
@@ -7713,7 +8003,26 @@ fn run_whisper_decode_loop(
         candidate = best.0;
         decode = best.1;
     }
-    let step_runner_token_alignments = candidate.token_alignments;
+    let mut step_runner_token_alignments = candidate.token_alignments;
+    // No-speech tail-repeat hallucination: a clean-stop window whose decoded
+    // text ends with a long clause emitted back-to-back verbatim at its tail
+    // (the model fills trailing silence with a repeated sentence). The shared
+    // n-gram repeat guard cannot see this -- its repeating unit is a clause
+    // (well over the guard's 8-token n-gram cap) repeated only twice (under the
+    // guard's 4x floor) and the decode ends on an honest stop token. Collapse
+    // the run to its first copy: it keeps the real speech, drops the phantom
+    // words and their timestamps, and tightens the run's trailing <|end|> band
+    // to the first copy without touching the band math.
+    let collapsed_whisper_repeated_tail = whisper_collapse_repeated_decode_tail(
+        tokenizer,
+        &mut decode,
+        &mut step_runner_token_alignments,
+        word_audio_rms_frames,
+    )
+    .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+    if collapsed_whisper_repeated_tail {
+        candidate.text_trimmed = decode.text.trim().to_string();
+    }
     let decode_text_trimmed = candidate.text_trimmed;
     if decode_text_trimmed.is_empty() {
         // A window whose decode leaves no text (a no-speech window that emits

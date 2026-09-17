@@ -2243,3 +2243,408 @@ fn pad_dtw_word_windows_is_a_noop_when_empty_and_clamps_zero_duration() {
     assert_eq!(zero[0].start, 0.0);
     assert_eq!(zero[0].end, 0.0);
 }
+
+fn tail_repeat_is_timestamp(tokenizer: &WhisperTokenizer) -> impl Fn(u32) -> bool {
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    move |token_id: u32| token_id >= first_timestamp
+}
+
+/// A long clause emitted verbatim twice within the final text run (a 2x
+/// repeat of a block at least the min block long) is the no-speech
+/// hallucination the pass targets: the range to remove is exactly the second
+/// copy, leaving the first copy and the trailing timestamp.
+#[test]
+fn tail_repeat_range_collapses_a_within_run_verbatim_twice_repeat() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let is_timestamp = tail_repeat_is_timestamp(&tokenizer);
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts_start] [a b c d e f] [a b c d e f] [ts_end]; single run of 12.
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 1,
+    ];
+    let removal = whisper_repeated_block_removal(&tokens, &is_timestamp).expect("a repeat");
+    // The repeated unit is 6; drop the trailing copy -> indices 7..13.
+    assert_eq!(removal.removed_range, (7, 13));
+    assert_eq!(&tokens[..7], &[first_timestamp, 1, 2, 3, 4, 5, 6]);
+}
+
+/// A long clause emitted verbatim twice as two adjacent text runs (each a
+/// single `<|start|> text <|end|>` segment separated by a mid-segment
+/// timestamp) is the other no-speech hallucination shape: the range to remove
+/// is exactly the second run, leaving the first run and its bracketing
+/// timestamps.
+#[test]
+fn tail_repeat_range_collapses_two_verbatim_siblings_to_one_copy() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let is_timestamp = tail_repeat_is_timestamp(&tokenizer);
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts] [a b c d e f] [ts_mid] [a b c d e f] [ts_end]; two runs of 6.
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 8,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 24,
+    ];
+    let removal = whisper_repeated_block_removal(&tokens, &is_timestamp).expect("a repeat");
+    // Drop the second run: [lo_last, hi_last + 1) -> indices 8..14.
+    assert_eq!(removal.removed_range, (8, 14));
+    assert_eq!(
+        &tokens[..removal.removed_range.0],
+        &[first_timestamp, 1, 2, 3, 4, 5, 6, first_timestamp + 8]
+    );
+    assert_eq!(&tokens[removal.removed_range.1..], &[first_timestamp + 24]);
+}
+
+/// A clause a couple of tokens too short to be the no-speech shape (its
+/// repeating unit is under the min block) is genuine backchannel and must not
+/// collapse.
+#[test]
+fn tail_repeat_range_leaves_sub_min_block_repeats_alone() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let is_timestamp = tail_repeat_is_timestamp(&tokenizer);
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // "hoo-ah hoo-ah": unit n=3 < 6 -> no collapse.
+    let short = vec![first_timestamp, 1, 2, 3, 1, 2, 3, first_timestamp];
+    assert!(whisper_repeated_block_removal(&short, &is_timestamp).is_none());
+}
+
+/// A sentence that merely rhymes with the next (shares the tail but not a
+/// verbatim block) is not a hallucination and must survive.
+#[test]
+fn tail_repeat_range_leaves_non_verbatim_tails_alone() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let is_timestamp = tail_repeat_is_timestamp(&tokenizer);
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        1,
+        2,
+        3,
+        4,
+        9,
+        8,
+        first_timestamp + 1,
+    ];
+    assert!(whisper_repeated_block_removal(&tokens, &is_timestamp).is_none());
+}
+
+/// A repeated long block in an earlier run is untouched; only the final run's
+/// tail is eligible (a mid-clip repeat the prior slice already heard is real).
+#[test]
+fn tail_repeat_range_only_considers_the_final_text_run() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let is_timestamp = tail_repeat_is_timestamp(&tokenizer);
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // run1 = [a x6 a x6] (its own repeat) then ts, then run2 = [a b c] (no tail repeat).
+    let tokens = vec![
+        first_timestamp,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        first_timestamp + 9,
+        5,
+        6,
+        7,
+        first_timestamp + 15,
+    ];
+    assert!(
+        whisper_repeated_block_removal(&tokens, &is_timestamp).is_none(),
+        "only the final run's tail may collapse"
+    );
+}
+/// A tiny rms envelope whose first half is loud and second half silent,
+/// 0.02 s/frame, 1500 frames (the encoder frame space). Used by the collapse
+/// tests so the acoustic gate reads real levels.
+fn tail_repeat_silence_second_half_rms() -> Vec<f32> {
+    let mut rms = vec![0.05_f32; 1500];
+    for (i, slot) in rms.iter_mut().enumerate() {
+        if i < 50 {
+            *slot = 0.2_f32;
+        } else if i < 100 {
+            *slot = 0.002_f32;
+        }
+    }
+    rms
+}
+
+/// A tiny rms envelope that is loud throughout the bracket window (a genuine
+/// repeated line has real speech in both copies), so the gate must refuse.
+fn tail_repeat_loud_everywhere_rms() -> Vec<f32> {
+    (0..1500)
+        .map(|i| if i < 100 { 0.2_f32 } else { 0.05_f32 })
+        .collect()
+}
+
+fn tail_repeat_alignments(tokens: &[u32]) -> Vec<WhisperGeneratedTokenAlignment> {
+    tokens
+        .iter()
+        .map(|&token_id| WhisperGeneratedTokenAlignment {
+            token_id,
+            frame_probs: vec![0.5_f32],
+        })
+        .collect()
+}
+
+fn tail_repeat_decode(
+    tokens: Vec<u32>,
+    stop_reason: Seq2SeqGreedyDecodeStopReason,
+) -> WhisperGreedyDecodeResult {
+    WhisperGreedyDecodeResult {
+        generated_probabilities: vec![0.9_f32; tokens.len()],
+        generated_tokens: tokens,
+        text: String::new(),
+        stop_reason,
+    }
+}
+
+/// No-speech shape: a long clause emitted verbatim twice within the final text
+/// run, second copy over near-silence. The collapse splices the tokens, the
+/// parallel probabilities, the cross-attention alignments, and re-derives the
+/// (single-copy) text.
+#[test]
+fn collapse_repeated_tail_splices_tokens_probs_alignments_and_text() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [a b c d e f] [a b c d e f] [ts(100)]; single run of 12, second
+    // copy sits over silence.
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 100,
+    ];
+    let rms = tail_repeat_silence_second_half_rms();
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    let result =
+        whisper_collapse_repeated_decode_tail(&tokenizer, &mut decode, &mut alignments, Some(&rms))
+            .expect("collapse");
+    assert!(result, "no-speech second copy must collapse");
+    // The second copy (tokens 7..13) is gone; first copy + both ts remain.
+    assert_eq!(
+        decode.generated_tokens,
+        vec![first_timestamp, 1, 2, 3, 4, 5, 6, first_timestamp + 100]
+    );
+    assert_eq!(decode.generated_probabilities.len(), 8);
+    assert_eq!(alignments.len(), 8);
+    assert_eq!(
+        alignments.iter().map(|a| a.token_id).collect::<Vec<_>>(),
+        decode.generated_tokens.as_slice()
+    );
+    // Text re-derived from the surviving text tokens (one copy), not doubled.
+    let expected_text = tokenizer
+        .decode_text_token_ids(&[1, 2, 3, 4, 5, 6])
+        .expect("decode text");
+    assert_eq!(decode.text, expected_text);
+    assert!(
+        !decode
+            .text
+            .contains(&format!("{expected_text}{expected_text}")),
+        "text should not contain both copies: {:?}",
+        decode.text
+    );
+}
+
+/// Genuine repeated line: the same clause emitted twice but both copies sit
+/// over real speech (equal level). The acoustic gate refuses, so the decode is
+/// left byte-identical.
+#[test]
+fn collapse_repeated_tail_is_a_noop_when_both_copies_are_real_speech() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 100,
+    ];
+    let rms = tail_repeat_loud_everywhere_rms();
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    let before = tokenizer.decode_text_token_ids(&tokens).expect("decode");
+    decode.text = before.clone();
+    let result =
+        whisper_collapse_repeated_decode_tail(&tokenizer, &mut decode, &mut alignments, Some(&rms))
+            .expect("no-op");
+    assert!(!result, "a genuine repeat must not collapse");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(decode.text, before);
+}
+
+/// A repeated long clause emitted as two adjacent `<|start|>/<|end|>` runs
+/// (the cross-run shape), second over silence: the collapse splices the second
+/// run and keeps the first run plus the bracketing timestamps.
+#[test]
+fn collapse_repeated_tail_splices_two_verbatim_runs_and_keeps_bracketing_ts() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [a b c d e f] [ts(50)] [a b c d e f] [ts(100)]; two runs of 6,
+    // the second over silence.
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 50,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 100,
+    ];
+    let rms = tail_repeat_silence_second_half_rms();
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    let result =
+        whisper_collapse_repeated_decode_tail(&tokenizer, &mut decode, &mut alignments, Some(&rms))
+            .expect("collapse");
+    assert!(result, "no-speech second run must collapse");
+    assert_eq!(
+        decode.generated_tokens,
+        vec![
+            first_timestamp,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            first_timestamp + 50,
+            first_timestamp + 100
+        ]
+    );
+    assert_eq!(decode.generated_probabilities.len(), 9);
+    assert_eq!(alignments.len(), 9);
+    assert_eq!(
+        alignments.iter().map(|a| a.token_id).collect::<Vec<_>>(),
+        decode.generated_tokens.as_slice()
+    );
+    let expected_text = tokenizer
+        .decode_text_token_ids(&[1, 2, 3, 4, 5, 6])
+        .expect("decode text");
+    assert_eq!(decode.text, expected_text);
+}
+
+/// No stop token, no collapse: a guard-cut decode ends on its own stop reason,
+/// so even a verbatim repeated tail is left untouched (the cut prefix was a
+/// salvage, not a finished hallucination).
+#[test]
+fn collapse_repeated_tail_is_a_noop_on_a_non_stop_reason() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![
+        first_timestamp,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        first_timestamp + 100,
+    ];
+    let rms = tail_repeat_silence_second_half_rms();
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(
+        tokens.clone(),
+        Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard,
+    );
+    let before = tokenizer.decode_text_token_ids(&tokens).expect("decode");
+    decode.text = before.clone();
+    let result =
+        whisper_collapse_repeated_decode_tail(&tokenizer, &mut decode, &mut alignments, Some(&rms))
+            .expect("no-op");
+    assert!(!result, "a guard-cut decode must not collapse");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(decode.text, before);
+}
