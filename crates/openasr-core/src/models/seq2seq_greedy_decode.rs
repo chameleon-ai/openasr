@@ -5,10 +5,22 @@ use crate::api::backend::{UnstableDecodeTextObserver, WorkProgressObserver};
 use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_logits};
 
 /// Largest token n-gram the degenerate-loop guard inspects (token ids, not
-/// characters). An observed greedy loop is a very short cycle - a single
-/// stuttered token, or a 2-4 token phrase emitted back to back - so 8 covers
-/// the field failures while keeping the per-step tail scan tiny.
-pub(crate) const MAX_REPEAT_NGRAM: usize = 8;
+/// characters). Most observed greedy loops are very short cycles - a single
+/// stuttered token, or a 2-4 token phrase emitted back to back - but a locked
+/// cycle can also be a whole clause (a 9+ token phrase), and such a unit is
+/// structurally invisible to a smaller cap: a loop whose cycle has minimal
+/// period `L` is only n-periodic for n that are multiples of `L`, so any
+/// aperiodic unit longer than the cap can never satisfy a block test at
+/// n <= cap. An unbounded clause loop therefore ran to the token budget, and
+/// the budget salvage left many verbatim copies in the transcript (with every
+/// word stamped to the same slice edge) instead of a guard cut. 64 covers
+/// clause- and sentence-length attractors while the per-step tail scan stays
+/// tiny: per n it is one short block compare that stops at the first mismatch,
+/// so a healthy tail costs a linear fraction of cap^2 token compares per step
+/// - negligible next to one decoder step. What still keeps legitimate short
+/// human repetition out is the per-length bound, not the cap (see
+/// [`default_max_consecutive_ngram_repeats`]).
+pub(crate) const MAX_REPEAT_NGRAM: usize = 64;
 
 /// Consecutive identical cycles that mark a multi-token phrase loop as
 /// degenerate. This is the shape the original field degeneration took (a ~5
@@ -47,7 +59,10 @@ pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
 ///
 /// Hence single-token stutters and two-token cycles - where Mandarin
 /// backchannel, laughter and emphatic agreement routinely run four to six
-/// cycles - get room, while longer phrases keep the original bound.
+/// cycles - get room, while longer cycles keep the original bound. The 3+ tier
+/// (the flat 4) therefore also governs clause-length cycles of 9-64 tokens up
+/// to [`MAX_REPEAT_NGRAM`]: legitimate speech repeats a 3+ token unit at most
+/// a few times running, and that is if anything even rarer for a clause.
 pub(crate) fn default_max_consecutive_ngram_repeats(ngram_len: usize) -> usize {
     match ngram_len {
         0 => 0,
@@ -1616,6 +1631,99 @@ mod tests {
         }
     }
 
+    /// Clause-length cycles (9-64 token units) are the same degenerate shape:
+    /// a locked loop of one phrase is not "a human repeating a sentence four
+    /// times running", so the scan cap must reach over them. The per-length
+    /// bound (the flat 4 for 3+) is what still lets legitimate short human
+    /// repetition survive.
+    #[test]
+    fn degenerate_repeat_guard_catches_clause_length_cycles() {
+        for ngram_len in [9usize, 16, 32, 64] {
+            let ngram: Vec<u32> = (0..ngram_len as u32).map(|i| i + 100).collect();
+            let repeat = |times: usize| -> Vec<u32> {
+                std::iter::repeat_n(ngram.as_slice(), times)
+                    .flatten()
+                    .copied()
+                    .collect()
+            };
+
+            assert_eq!(
+                detect_degenerate_ngram_repeat(
+                    &repeat(3),
+                    MAX_REPEAT_NGRAM,
+                    default_max_consecutive_ngram_repeats,
+                ),
+                None,
+                "n={ngram_len}: 3 cycles is one under the bound and must survive"
+            );
+
+            let hit = detect_degenerate_ngram_repeat(
+                &repeat(4),
+                MAX_REPEAT_NGRAM,
+                default_max_consecutive_ngram_repeats,
+            )
+            .unwrap_or_else(|| panic!("n={ngram_len}: 4 cycles must trip"));
+            assert_eq!(hit.ngram_len, ngram_len);
+            assert_eq!(hit.repeats, 4);
+            assert_eq!(hit.keep_len, ngram_len, "must keep exactly one cycle");
+        }
+    }
+
+    /// The locked-loop field shape: healthy decode prefix, then the model locks
+    /// onto one phrase and re-emits it until the budget. Whatever the copy
+    /// count has stacked up, the guard truncates the tail to the prefix plus
+    /// a single cycle.
+    #[test]
+    fn degenerate_repeat_guard_keeps_prefix_plus_one_cycle_on_a_locked_phrase_loop() {
+        let prefix: Vec<u32> = (1..=40).collect();
+        let ngram: Vec<u32> = (0..9u32).map(|i| i + 100).collect();
+        let mut tokens = prefix.clone();
+        for _ in 0..13 {
+            tokens.extend_from_slice(&ngram);
+        }
+
+        let mut kept = prefix.clone();
+        kept.extend_from_slice(&ngram);
+
+        let hit = detect_degenerate_ngram_repeat(
+            &tokens,
+            MAX_REPEAT_NGRAM,
+            default_max_consecutive_ngram_repeats,
+        )
+        .expect("13 locked 9-token cycles must trip");
+        assert_eq!(hit.ngram_len, 9);
+        assert_eq!(hit.repeats, 13);
+        assert_eq!(
+            &tokens[..hit.keep_len],
+            &kept,
+            "keep the prefix plus one cycle"
+        );
+    }
+
+    /// Pin the scan edge: a cycle whose minimal period sits just above the cap
+    /// is structurally out of scan range (an L-periodic loop is n-periodic
+    /// only for n multiples of L). Its damage is still bounded by the token
+    /// budget itself, so the cap is a scan-cost trade-off, not a safety bound.
+    #[test]
+    fn degenerate_repeat_guard_scan_cap_bounds_the_period_reached() {
+        let ngram: Vec<u32> = (0..(MAX_REPEAT_NGRAM + 1) as u32)
+            .map(|i| i + 100)
+            .collect();
+        let tokens: Vec<u32> = std::iter::repeat_n(ngram.as_slice(), 4)
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            detect_degenerate_ngram_repeat(
+                &tokens,
+                MAX_REPEAT_NGRAM,
+                default_max_consecutive_ngram_repeats,
+            ),
+            None,
+            "a period above the cap is out of scan range"
+        );
+    }
+
     /// The safety argument the tiering rests on, made executable: an unbounded
     /// loop (what a real degenerate decode produces, since greedy argmax never
     /// escapes it) is truncated to the SAME prefix under the relaxed bound as
@@ -1712,6 +1820,68 @@ mod tests {
         assert_eq!(
             step_executor.logits_calls,
             default_max_consecutive_ngram_repeats(1)
+        );
+    }
+
+    /// The clause-length counterpart: a decode locked onto a 9-token phrase.
+    /// Without the scan reaching over 8-token cycles this runs to
+    /// `max_generated_tokens` and reports `EotNotReachedBeforeMaxTokens` - the
+    /// family then salvages the prefix with many verbatim copies of the cycle
+    /// intact. The guard must instead end the decode on one cycle.
+    #[test]
+    fn seq2seq_greedy_decode_guard_terminates_a_clause_length_loop() {
+        let cycle: Vec<u32> = (100..=108).collect();
+        let pieces: [&str; 9] = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        let mut sequence = Vec::new();
+        for _ in 0..40 {
+            sequence.extend_from_slice(&cycle);
+        }
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 200,
+            sequence,
+            logits_calls: 0,
+        };
+        let mut table = BTreeMap::new();
+        for (&token, piece) in cycle.iter().zip(pieces) {
+            table.insert(token, piece);
+        }
+        let token_decoder = SyntheticTokenDecoder { table };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 200,
+            max_generated_tokens: 200,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
+            None,
+        )
+        .expect("guard should finish the decode, not error out");
+
+        assert_eq!(
+            output.stop_reason,
+            Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
+        );
+        // Truncated to a single occurrence of the 9-token cycle.
+        assert_eq!(output.generated_tokens, cycle);
+        assert_eq!(output.text, "abcdefghi");
+        // Four full 9-token cycles at the 3+ tier bound.
+        assert_eq!(
+            step_executor.logits_calls,
+            default_max_consecutive_ngram_repeats(9) * 9
         );
     }
 
