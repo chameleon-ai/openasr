@@ -1679,11 +1679,13 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
     };
 
     // Seed and generated use ids below the first timestamp id so they are
-    // treated as plain words, isolating the tail-trim from the timestamp strip.
-    assert!(1 < first_timestamp && 2 < first_timestamp);
-    let generated = vec![2; 10];
+    // treated as plain words, isolating the tail-trim from the timestamp
+    // strip. The generated tail alternates so it is not loop-dominant (a
+    // flat run would be refused by the carry loop-dominance gate).
+    assert!(2 < first_timestamp);
+    let generated = vec![2, 3, 2, 3, 2, 3, 2, 3, 2, 3];
     let carry_prompt_token_ids =
-        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
             .expect("carry prompt tokens")
             .expect("carry prompt token ids");
 
@@ -1691,9 +1693,9 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         carry_prompt_token_ids.len(),
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT
     );
-    // tail = last 32 of seed[1;40] ++ generated[2;10] = 22 ones then 10 twos.
+    // tail = last 32 of seed[1;40] ++ generated = 22 ones then the run.
     let mut expected = vec![1; 22];
-    expected.extend(std::iter::repeat(2).take(10));
+    expected.extend_from_slice(&generated);
     assert_eq!(carry_prompt_token_ids.as_slice(), &expected);
 }
 
@@ -1715,9 +1717,10 @@ fn build_whisper_carry_prompt_token_ids_strips_prior_slice_timestamps() {
     // not leak across the boundary.
     let generated = vec![1, first_timestamp + 50, 6, first_timestamp + 120, 1];
 
-    let carry = build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
-        .expect("carry prompt tokens")
-        .expect("carry prompt token ids");
+    let carry =
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
+            .expect("carry prompt tokens")
+            .expect("carry prompt token ids");
 
     assert!(
         carry.iter().all(|id| *id < first_timestamp),
@@ -1744,8 +1747,115 @@ fn build_whisper_carry_prompt_token_ids_empty_when_generated_is_all_timestamps()
     // timestamp-only seed.
     let generated = vec![first_timestamp, first_timestamp + 40];
     assert_eq!(
-        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated)
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
             .expect("valid"),
+        None
+    );
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_refuses_a_loop_dominated_winner() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // A winner that recited one short phrase over a groove: the cycle is
+    // separated by per-step timestamps (so the in-decode guard, which reads
+    // the raw token stream, may miss it) and the decode stopped mid-cycle.
+    // Carrying it forward re-primes the next slice onto the same attractor,
+    // so the carry must be refused and the previous context kept.
+    let cycle = [3, 4, 5, 6];
+    let mut generated = Vec::new();
+    for _ in 0..3 {
+        generated.extend_from_slice(&cycle);
+        generated.push(first_timestamp + 50);
+    }
+    generated.extend_from_slice(&cycle[..2]);
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
+            .expect("valid"),
+        None,
+        "a loop-dominant winner must not be carried"
+    );
+
+    // The same phrase decoded only once (genuine speech) still carries.
+    let generated = vec![3, first_timestamp + 50, 4, 5, 6];
+    assert!(
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
+            .expect("valid")
+            .is_some()
+    );
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_strips_a_guard_trip_cycle() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![1, 2]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // A guard-cut stream: genuine speech, then the single kept occurrence of
+    // the loop the driver truncated (keep_len = prefix + one cycle). After
+    // the truncate the cycle is not detectable as a repeat - only the trip's
+    // own ngram_len identifies it - so the carry must strip that many raw
+    // tokens off the tail. The raw cycle carries an interleaved per-step
+    // timestamp (5 raw tokens for 4 words), so the strip drops the cycle's
+    // words plus one neighbouring content token: the loop's tokens must never
+    // reach the next slice's prompt.
+    let cycle_words = [3, 4, 5, 6];
+    let generated = [
+        9,
+        8,
+        7,
+        first_timestamp + 50,
+        9,
+        8,
+        7,
+        first_timestamp + 120,
+        cycle_words[0],
+        cycle_words[1],
+        first_timestamp + 200,
+        cycle_words[2],
+        cycle_words[3],
+    ];
+    let carry = build_whisper_carry_prompt_token_ids(
+        &tokenizer,
+        &request_options,
+        &generated,
+        Some(5), // raw cycle length: two words + timestamp + two words
+    )
+    .expect("valid")
+    .expect("the genuine prefix still carries");
+
+    // seed [1, 2] ++ stripped generated with the last 5 stripped tokens
+    // removed: cycle words gone, no loop token left in the prompt tail.
+    assert_eq!(carry.as_slice(), &[1, 2, 9, 8, 7, 9, 8]);
+    assert!(
+        !carry.iter().any(|id| cycle_words.contains(id)),
+        "no loop token may be carried: {carry:?}"
+    );
+
+    // A guard-cut stream that kept only the loop (pure attractor) carries
+    // nothing: the caller holds the previous slice's carry.
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(
+            &tokenizer,
+            &request_options,
+            &[3, first_timestamp + 200, 4, 5],
+            Some(4)
+        )
+        .expect("valid"),
         None
     );
 }
@@ -1832,7 +1942,7 @@ fn whisper_carry_producer_honors_the_effective_carry_switch() {
         ..GgmlAsrExecutionOptions::default()
     };
     assert_eq!(
-        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[1, 2, 3])
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[1, 2, 3], None)
             .expect("disabled carry is valid"),
         None
     );
@@ -2446,6 +2556,7 @@ fn tail_repeat_decode(
         generated_tokens: tokens,
         text: String::new(),
         stop_reason,
+        guard_trip_ngram_len: None,
     }
 }
 
@@ -2647,4 +2758,151 @@ fn collapse_repeated_tail_is_a_noop_on_a_non_stop_reason() {
     assert!(!result, "a guard-cut decode must not collapse");
     assert_eq!(decode.generated_tokens, tokens);
     assert_eq!(decode.text, before);
+}
+
+/// One alignment row whose cross-attention peaks at `frame` (0..1500).
+fn ladder_alignment_peaking_at(frame: usize) -> WhisperGeneratedTokenAlignment {
+    WhisperGeneratedTokenAlignment {
+        token_id: 1,
+        frame_probs: (0..1500)
+            .map(|f| if f == frame { 1.0_f32 } else { 0.001_f32 })
+            .collect(),
+    }
+}
+
+fn ladder_candidate(text: &str, peak_frames: &[usize]) -> WhisperDecodeCandidate {
+    WhisperDecodeCandidate {
+        text_trimmed: text.to_string(),
+        token_alignments: peak_frames
+            .iter()
+            .copied()
+            .map(ladder_alignment_peaking_at)
+            .collect(),
+    }
+}
+
+fn ladder_candidate_evidence(candidate: &WhisperDecodeCandidate) -> Option<f32> {
+    whisper_ladder_evidence_span_seconds(candidate, 30.0)
+}
+
+#[test]
+fn ladder_evidence_span_measures_spread_and_collapses_to_zero() {
+    let spread = ladder_candidate("real verse", &[100, 300, 500, 900, 1200, 1400]);
+    let span = ladder_candidate_evidence(&spread).expect("span");
+    // p10..p90 = frames 100..1400 over 1500, scaled to the 30 s slice.
+    assert!((span - 1300.0_f32 / 1500.0 * 30.0).abs() < 1e-3);
+
+    let collapsed = ladder_candidate("hallucinated filler", &[1499, 1498, 1499, 1497, 1499]);
+    let span = ladder_candidate_evidence(&collapsed).expect("span");
+    assert!(span < 0.05, "a collapsed run measures no span, got {span}");
+
+    let sparse = ladder_candidate("short", &[10, 20, 30]);
+    assert!(
+        ladder_candidate_evidence(&sparse).is_none(),
+        "fewer than 4 rows is not measurable"
+    );
+}
+
+#[test]
+fn ladder_cannot_win_by_length_when_attention_collapses() {
+    // The incumbent tracked real audio; the challenger is the longer text but
+    // its attention is pinned to the last frame (the no-speech attractor).
+    let incumbent = ladder_candidate("real speech here", &[100, 400, 700, 1000, 1200]);
+    let challenger = ladder_candidate(
+        "a much longer hallucinated filler run of nonsense text",
+        &[1499, 1498, 1499, 1497, 1499, 1500, 1499, 1496],
+    );
+    assert!(!whisper_decode_candidate_better(
+        &challenger,
+        &incumbent,
+        ladder_candidate_evidence(&challenger),
+        ladder_candidate_evidence(&incumbent)
+    ));
+}
+
+#[test]
+fn ladder_round_over_more_audio_wins_even_if_shorter() {
+    // The guard-cut incumbent only covered the loop at the slice head; the
+    // challenger actually tracked the audio further in.
+    let incumbent = ladder_candidate("Lock, start! Rock!", &[100, 110, 120, 130]);
+    let challenger = ladder_candidate("verse", &[100, 300, 1000, 1400]);
+    assert!(whisper_decode_candidate_better(
+        &challenger,
+        &incumbent,
+        ladder_candidate_evidence(&challenger),
+        ladder_candidate_evidence(&incumbent)
+    ));
+}
+
+#[test]
+fn ladder_tie_on_evidence_falls_back_to_length_and_keeps_incumbent_on_shorter() {
+    let incumbent = ladder_candidate("short", &[100, 400, 700, 1000, 1200]);
+    let longer = ladder_candidate(
+        "a longer text over the same audio",
+        &[110, 400, 700, 1000, 1200, 1210],
+    );
+    assert!(whisper_decode_candidate_better(
+        &longer,
+        &incumbent,
+        ladder_candidate_evidence(&longer),
+        ladder_candidate_evidence(&incumbent)
+    ));
+    let shorter = ladder_candidate("a", &[110, 400, 700, 1000, 1200, 1210]);
+    assert!(!whisper_decode_candidate_better(
+        &shorter,
+        &incumbent,
+        ladder_candidate_evidence(&shorter),
+        ladder_candidate_evidence(&incumbent)
+    ));
+}
+
+#[test]
+fn ladder_falls_back_to_length_when_evidence_unmeasurable() {
+    let incumbent = ladder_candidate("short", &[]);
+    let longer = ladder_candidate("a longer text", &[]);
+    assert!(whisper_decode_candidate_better(
+        &longer, &incumbent, None, None
+    ));
+    assert!(!whisper_decode_candidate_better(
+        &incumbent, &longer, None, None
+    ));
+    // An empty challenger never wins, evidence or not.
+    let empty = ladder_candidate("", &[100, 200, 300, 400]);
+    let real = ladder_candidate("anything", &[100, 200, 300, 400]);
+    assert!(!whisper_decode_candidate_better(&empty, &real, None, None));
+}
+
+#[test]
+fn carry_loop_dominance_shapes() {
+    // The lobster shape: a short phrase recited over a groove, stopped
+    // mid-cycle (3 full cycles + 2 of the 6 tokens).
+    let cycle = [10u32, 11, 12, 13, 14, 15];
+    let mut tokens = Vec::new();
+    for _ in 0..3 {
+        tokens.extend_from_slice(&cycle);
+    }
+    tokens.extend_from_slice(&cycle[..2]);
+    assert!(whisper_carry_is_loop_dominant(&tokens));
+
+    // Single-token stutter reaches the floor at 8; 5 is below it.
+    assert!(whisper_carry_is_loop_dominant(&[7u32; 8]));
+    assert!(!whisper_carry_is_loop_dominant(&[7u32; 5]));
+
+    // Two cycles of a phrase is emphatic speech, not a loop.
+    let mut two = Vec::new();
+    for _ in 0..2 {
+        two.extend_from_slice(&cycle);
+    }
+    assert!(!whisper_carry_is_loop_dominant(&two));
+
+    // A loop that only fills a minority of a long decode is not dominant: the
+    // prefix carries the real speech, so its carry stays useful.
+    let mut prefix = vec![99u32; 20];
+    prefix.extend_from_slice(&[1u32, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
+    assert!(!whisper_carry_is_loop_dominant(&prefix));
+
+    // No repetition at all.
+    assert!(!whisper_carry_is_loop_dominant(
+        &(0..40).map(|i| i as u32).collect::<Vec<_>>()
+    ));
 }

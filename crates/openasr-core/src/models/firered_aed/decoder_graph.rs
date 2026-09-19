@@ -1529,6 +1529,7 @@ pub(crate) fn run_firered_aed_decoder_greedy_with_runtime(
                 generated_tokens,
                 generated_probabilities: Vec::new(),
                 stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                guard_trip_ngram_len: None,
             }
         }
         // Preserve the stable cancel marker so native/server boundaries can

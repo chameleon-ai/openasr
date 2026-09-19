@@ -181,6 +181,7 @@ pub(crate) fn run_moonshine_decoder_short_form_with_runtime(
             generated_tokens,
             generated_probabilities,
             stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+            guard_trip_ngram_len: None,
         },
         // Preserve the stable cancel marker so native/server boundaries can
         // rewrite to `BackendError::TranscriptionCanceled`.

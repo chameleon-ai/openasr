@@ -938,6 +938,7 @@ fn run_moss_td_decoder_with_runtime(
                 generated_tokens,
                 generated_probabilities: Vec::new(),
                 stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                guard_trip_ngram_len: None,
             }
         }
         Err(error) => {

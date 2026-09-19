@@ -4445,6 +4445,7 @@ fn build_whisper_carry_prompt_token_ids(
     tokenizer: &WhisperTokenizer,
     request_options: &GgmlAsrExecutionOptions,
     generated_tokens: &[u32],
+    guard_trip_ngram_len: Option<usize>,
 ) -> Result<Option<Vec<u32>>, WhisperGgmlExecutorError> {
     let Some(carry_tokens) = build_whisper_carry_prompt_seed_token_ids(tokenizer, request_options)?
     else {
@@ -4465,12 +4466,93 @@ fn build_whisper_carry_prompt_token_ids(
         .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
         .collect();
 
+    // A guard-cut stream ends with the single kept occurrence of the loop the
+    // driver just truncated (keep_len = prefix + one cycle). The truncate
+    // removes every other occurrence, so no repetition detector can see the
+    // loop in the result: the tail cycle is only identifiable as the trip's
+    // own `ngram_len`. Without stripping it, the next slice's prompt ends on
+    // the attractor phrase and that decode re-locks onto the same cycle (a
+    // mid-sentence loop tail feeding straight back into the following slice).
+    // Drop the kept occurrence; the surviving prefix is real speech and
+    // conditions the next slice as usual. `cycle` counts raw tokens, so when
+    // the cycle carried interleaved timestamps this drops a few extra content
+    // tokens -- a little stale context is cheaper than re-priming the loop.
+    // If nothing beyond the loop survives, the stream was the attractor: the
+    // next slice keeps the previous carry.
+    let carry_source: &[u32] = if let Some(cycle) = guard_trip_ngram_len {
+        if stripped_generated.len() <= cycle {
+            return Ok(None);
+        }
+        &stripped_generated[..stripped_generated.len() - cycle]
+    } else {
+        &stripped_generated
+    };
+
+    // A winner whose text is dominated by one short cycle (the model locked
+    // onto a repeated phrase over a passage that does not carry the real
+    // speech, e.g. an instrumental groove) must not be carried: those
+    // repetitions are exactly the attractor that re-conditions the next
+    // slice's decode onto the same loop, so the next slice re-locks early and
+    // loses the real speech its window holds. The next slice keeps the most
+    // recent non-loop-dominant carry, the way it keeps the carry after a
+    // punctuation-only (suppressed-content) slice.
+    if whisper_carry_is_loop_dominant(carry_source) {
+        return Ok(None);
+    }
+
     Ok(build_longform_token_history_carry(
         true,
         carry_tokens,
-        &stripped_generated,
+        carry_source,
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
     ))
+}
+
+/// True when a slice winner's (timestamp-free) token stream is dominated by
+/// one repeated cycle: a period of 1..32 tokens repeated at least 3 full
+/// cycles at the tail (8 for a single token, 6 for a two-token unit, the
+/// shared guard's own backchannel floors), allowing one partial cycle at the
+/// very end (the model stopped mid-phrase), with the repeated region making
+/// up at least half the stream. A short-phrase cycle like "Lock, start!
+/// Rock!" recited over an instrumental groove is exactly this shape; a
+/// genuinely repeated verse line is too, but skipping its carry update is
+/// harmless -- the next slice only inherits the previous slice's carry, which
+/// carries the same speech shape.
+fn whisper_carry_is_loop_dominant(tokens: &[u32]) -> bool {
+    let len = tokens.len();
+    let max_n = (len / 3).min(32);
+    for n in 1..=max_n {
+        let threshold = match n {
+            1 => 8,
+            2 => 6,
+            _ => 3,
+        };
+        // Allow the tail to sit mid-cycle: the trailing `p = len % n` tokens
+        // must then be a prefix of the last full cycle.
+        let p = len % n;
+        let full_len = len - p;
+        if full_len < n {
+            continue;
+        }
+        if p > 0 && tokens[full_len - n..full_len - n + p] != tokens[len - p..] {
+            continue;
+        }
+        let cycle = &tokens[full_len - n..full_len];
+        let mut reps = 1usize;
+        while reps * n < full_len
+            && &tokens[full_len - (reps + 1) * n..full_len - reps * n] == cycle
+        {
+            reps += 1;
+        }
+        if reps < threshold {
+            continue;
+        }
+        let looped = (reps - 1) * n + p;
+        if looped * 2 >= len {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_not_whisper_timestamp(tokenizer: &WhisperTokenizer, token_id: u32) -> bool {
@@ -7278,6 +7360,15 @@ fn whisper_temperature_ladder_enabled() -> bool {
     std::env::var_os("OPENASR_WHISPER_DISABLE_TEMPERATURE_LADDER").is_none()
 }
 
+/// Env opt-in (defaults off). When set, the temperature ladder also prints
+/// each round's full text and the carried initial prompt, so a
+/// longform slice's round-by-round behavior (which round recovered speech,
+/// which one hallucinated) can be read directly from stderr. The summary
+/// `round_completed` lines stay on always; this adds the payloads.
+fn whisper_ladder_debug_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DEBUG_LADDER").is_some()
+}
+
 /// Minimum consecutive-token block that may be collapsed by the tail-repeat
 /// pass. Below this, a repeated tail is treated as genuine backchannel /
 /// stutter ("hoo-ah hoo-ah", "um um um") and left untouched; the no-speech
@@ -7580,12 +7671,22 @@ struct WhisperDecodeCandidate {
 
 /// Pick the fallback candidate to keep. The temperature-0 result is the
 /// incumbent; a higher-temperature round replaces it only when it is not itself
-/// guard-cut and has more text than the current candidate (recovering speech
-/// the guard dropped). Ties keep the incumbent (prefers the lower temperature,
-/// i.e. the less perturbed decode).
+/// guard-cut AND its text is backed by more acoustic evidence than the
+/// incumbent's (see the evidence span below). Ties keep the incumbent (prefers
+/// the lower temperature, i.e. the less perturbed decode).
+///
+/// Length alone cannot win: the loud no-speech attractor makes a collapsed
+/// hallucination round (e.g. a T=1.0 filler run whose cross-attention is
+/// pinned to the last frame) the LONGEST text on the ladder while covering no
+/// audio at all. The evidence spans decide first; length breaks a tie between
+/// rounds over the same audio. When the span is unmeasurable on either side
+/// (no alignment rows yet, e.g. a non-cross-attention timestamp mode) the
+/// length comparison is the fallback the ladder used before evidence existed.
 fn whisper_decode_candidate_better(
     candidate: &WhisperDecodeCandidate,
     incumbent: &WhisperDecodeCandidate,
+    candidate_evidence: Option<f32>,
+    incumbent_evidence: Option<f32>,
 ) -> bool {
     if incumbent.text_trimmed.is_empty() {
         return !candidate.text_trimmed.is_empty();
@@ -7593,7 +7694,59 @@ fn whisper_decode_candidate_better(
     if candidate.text_trimmed.is_empty() {
         return false;
     }
-    candidate.text_trimmed.len() > incumbent.text_trimmed.len()
+    match (incumbent_evidence, candidate_evidence) {
+        (Some(incumbent_span), Some(candidate_span)) => {
+            const MIN_PROGRESS: f32 = WHISPER_LADDER_EVIDENCE_PROGRESS_MIN_SECONDS;
+            candidate_span > incumbent_span + MIN_PROGRESS
+                || candidate_span - incumbent_span <= MIN_PROGRESS
+                    && incumbent_span - candidate_span <= MIN_PROGRESS
+                    && candidate.text_trimmed.len() > incumbent.text_trimmed.len()
+        }
+        _ => candidate.text_trimmed.len() > incumbent.text_trimmed.len(),
+    }
+}
+
+/// Minimum by which a challenger ladder round must advance the audio its
+/// token cross-attention covers for its extra text to count at all. A collapsed
+/// hallucination round measures ~0 span (all of its attention pinned to one
+/// frame), so it never advances the frontier no matter how long its text is.
+/// 0.3 s is far above a collapsed run's spread and far below the audio one
+/// real word spans, so a round over the same audio still settles by length.
+const WHISPER_LADDER_EVIDENCE_PROGRESS_MIN_SECONDS: f32 = 0.3;
+
+/// The span of audio, in seconds, that a candidate's token cross-attention
+/// covers: the 10th-to-90th percentile of the per-token argmax frames, scaled
+/// from the 1500-frame encoder space down to the slice's real duration. The
+/// percentiles keep one stray peak from inflating the span. `None` when fewer
+/// than 4 tokens have an alignment row (not enough to measure a spread) or the
+/// slice duration is not positive; callers then fall back to length.
+fn whisper_ladder_evidence_span_seconds(
+    candidate: &WhisperDecodeCandidate,
+    audio_duration_seconds: f32,
+) -> Option<f32> {
+    const ENCODER_FRAME_RESOLUTION: usize = 1500;
+    if audio_duration_seconds <= 0.0 {
+        return None;
+    }
+    let mut peaks: Vec<usize> = candidate
+        .token_alignments
+        .iter()
+        .filter_map(|alignment| {
+            alignment
+                .frame_probs
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Less))
+                .map(|(frame, _)| frame)
+        })
+        .collect();
+    if peaks.len() < 4 {
+        return None;
+    }
+    peaks.sort_unstable();
+    let lo = peaks[peaks.len() * 10 / 100];
+    let hi = peaks[(peaks.len() * 90 / 100).min(peaks.len() - 1)];
+    Some(hi.saturating_sub(lo) as f32 / ENCODER_FRAME_RESOLUTION as f32 * audio_duration_seconds)
 }
 
 /// Run one temperature-0 (or re-decode) greedy pass over an already-encoded
@@ -7741,6 +7894,7 @@ fn run_whisper_decode_round(
                 generated_tokens,
                 generated_probabilities,
                 stop_reason: Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                guard_trip_ngram_len: None,
             }
         }
         Err(error) => {
@@ -7975,6 +8129,15 @@ fn run_whisper_decode_loop(
                         candidate.text_trimmed.len(),
                         result.stop_reason
                     );
+                    if whisper_ladder_debug_enabled() {
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=temperature_ladder event=round_debug round={round} temperature={temperature} stop_reason={:?} evidence_secs={:?} text={:?}",
+                            result.stop_reason,
+                            whisper_ladder_evidence_span_seconds(&candidate, audio_duration_seconds)
+                                .map(|secs| (secs * 1000.0).round() / 1000.0),
+                            candidate.text_trimmed
+                        );
+                    }
                 }
                 (candidate, result)
             },
@@ -7987,6 +8150,20 @@ fn run_whisper_decode_loop(
         && !initial_prompt_tokens.is_empty()
     {
         let mut best = (candidate, decode);
+        let mut best_evidence =
+            whisper_ladder_evidence_span_seconds(&best.0, audio_duration_seconds);
+        if whisper_ladder_debug_enabled() {
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=temperature_ladder event=ladder_start initial_prompt_text={:?}",
+                tokenizer.decode_text_token_ids(&initial_prompt_tokens)
+            );
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=temperature_ladder event=round_debug round=1 temperature=0 stop_reason={:?} evidence_secs={:?} text={:?}",
+                best.1.stop_reason,
+                best_evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                best.0.text_trimmed
+            );
+        }
         for (i, &temperature) in WHISPER_TEMPERATURE_LADDER.iter().enumerate() {
             let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
                 .wrapping_add(i as u64)
@@ -8000,12 +8177,22 @@ fn run_whisper_decode_loop(
             if result.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
                 continue;
             }
-            if whisper_decode_candidate_better(&cand, &best.0) {
+            let cand_evidence = whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
+            if whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence) {
                 best = (cand, result);
+                best_evidence = cand_evidence;
             }
         }
         candidate = best.0;
         decode = best.1;
+        if whisper_ladder_debug_enabled() {
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=temperature_ladder event=ladder_won stop_reason={:?} winner_evidence_secs={:?} text={:?}",
+                decode.stop_reason,
+                best_evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                candidate.text_trimmed
+            );
+        }
     }
     let mut step_runner_token_alignments = candidate.token_alignments;
     // No-speech tail-repeat hallucination: a clean-stop window whose decoded
@@ -8091,8 +8278,12 @@ fn run_whisper_decode_loop(
             words,
         }]
     };
-    let carry_prompt_token_ids =
-        build_whisper_carry_prompt_token_ids(tokenizer, request_options, &decode.generated_tokens)?;
+    let carry_prompt_token_ids = build_whisper_carry_prompt_token_ids(
+        tokenizer,
+        request_options,
+        &decode.generated_tokens,
+        decode.guard_trip_ngram_len,
+    )?;
     Ok(WhisperExecutionOutput {
         text,
         segments,

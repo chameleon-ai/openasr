@@ -20,6 +20,10 @@ pub(crate) struct WhisperGreedyDecodeResult {
     /// which is the difference between a transcript that covers its audio and
     /// one that silently stops partway.
     pub stop_reason: Seq2SeqGreedyDecodeStopReason,
+    /// Pass-through of the shared driver's guard-trip cycle length: the
+    /// executor's longform carry strips this many tokens off a guard-cut
+    /// stream's tail (the kept loop occurrence) before forwarding it.
+    pub guard_trip_ngram_len: Option<usize>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -98,6 +102,7 @@ pub(crate) fn run_whisper_greedy_decode_loop(
         generated_probabilities: shared.generated_probabilities,
         text: shared.text,
         stop_reason: shared.stop_reason,
+        guard_trip_ngram_len: shared.guard_trip_ngram_len,
     })
 }
 

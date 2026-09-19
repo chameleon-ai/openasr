@@ -16,9 +16,9 @@ use crate::models::phrase_bias_decode::{TokenPhraseBias, apply_phrase_bias_to_lo
 /// word stamped to the same slice edge) instead of a guard cut. 64 covers
 /// clause- and sentence-length attractors while the per-step tail scan stays
 /// tiny: per n it is one short block compare that stops at the first mismatch,
-/// so a healthy tail costs a linear fraction of cap^2 token compares per step
-/// - negligible next to one decoder step. What still keeps legitimate short
-/// human repetition out is the per-length bound, not the cap (see
+/// so a healthy tail costs a linear fraction of cap^2 token compares per
+/// step, negligible next to one decoder step. What still keeps legitimate
+/// short human repetition out is the per-length bound, not the cap (see
 /// [`default_max_consecutive_ngram_repeats`]).
 pub(crate) const MAX_REPEAT_NGRAM: usize = 64;
 
@@ -173,6 +173,14 @@ pub(crate) struct Seq2SeqGreedyDecodeResult {
     pub generated_probabilities: Vec<f32>,
     pub text: String,
     pub stop_reason: Seq2SeqGreedyDecodeStopReason,
+    /// The repeated cycle length (`ngram_len`) when the degenerate-repeat
+    /// guard ended this decode: the last `n` tokens of `generated_tokens` are
+    /// the single kept occurrence of the loop. The guard truncates the stream
+    /// down to one occurrence, so the repeat is undetectable in the result
+    /// itself -- families that forward stream tails into the next decode's
+    /// prompt (longform carry) need this to strip the attractor. `None` when
+    /// the decode did not trip the guard.
+    pub guard_trip_ngram_len: Option<usize>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -313,6 +321,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_with_adapter_v0<E>(
         generated_probabilities: output.generated_probabilities,
         text: normalize_text(output.text),
         stop_reason: output.stop_reason,
+        guard_trip_ngram_len: output.guard_trip_ngram_len,
     })
 }
 
@@ -351,6 +360,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
     let mut generated = Vec::new();
     let mut generated_probabilities = Vec::new();
     let mut stop_reason: Option<Seq2SeqGreedyDecodeStopReason> = None;
+    let mut guard_trip_ngram_len: Option<usize> = None;
 
     for step_index in 0..config.max_generated_tokens {
         // L1 cooperative cancel: poll the request's control before each
@@ -428,6 +438,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             // decode ends here, but the audio past the loop was never
             // transcribed and callers must be able to see that.
             stop_reason = Some(Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard);
+            guard_trip_ngram_len = Some(loop_hit.ngram_len);
             break;
         }
     }
@@ -446,6 +457,7 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
         generated_probabilities,
         text,
         stop_reason,
+        guard_trip_ngram_len,
     })
 }
 
@@ -776,6 +788,7 @@ mod tests {
         assert_eq!(step_executor.logits_calls, 3);
         assert_eq!(output.stop_reason, Seq2SeqGreedyDecodeStopReason::StopToken);
         assert!(!output.stop_reason.is_truncated());
+        assert_eq!(output.guard_trip_ngram_len, None);
     }
 
     #[test]
@@ -895,6 +908,9 @@ mod tests {
             Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
         );
         assert!(output.stop_reason.is_truncated());
+        // The kept tail is the trip's single cycle; its length is the only
+        // way a caller can identify the attractor in the truncated stream.
+        assert_eq!(output.guard_trip_ngram_len, Some(1));
     }
 
     #[test]
