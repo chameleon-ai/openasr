@@ -4556,9 +4556,9 @@ fn whisper_carry_is_loop_dominant(tokens: &[u32]) -> bool {
 }
 
 fn is_not_whisper_timestamp(tokenizer: &WhisperTokenizer, token_id: u32) -> bool {
-    !tokenizer
+    tokenizer
         .first_timestamp_token_id()
-        .is_some_and(|first_timestamp_id| token_id >= first_timestamp_id)
+        .is_none_or(|first_timestamp_id| token_id < first_timestamp_id)
 }
 
 fn build_whisper_carry_prompt_seed_token_ids(
