@@ -7749,6 +7749,75 @@ fn whisper_ladder_evidence_span_seconds(
     Some(hi.saturating_sub(lo) as f32 / ENCODER_FRAME_RESOLUTION as f32 * audio_duration_seconds)
 }
 
+/// A carried slice whose first cross-attention-placed word starts this far
+/// into the window (slice-relative seconds) is a carry head-skip candidate:
+/// the <startofprev> carry made the model treat the carried tail words as the
+/// start of THIS window's content, so it begins emitting mid-slice and the
+/// audio ahead of the first word is never transcribed. A healthy carried
+/// decode re-reads the ~0.5 s slice overlap, so its first word lands well
+/// inside this bound; anything past it is a skip, not an onset.
+const WHISPER_CARRY_HEAD_SKIP_MIN_SECONDS: f32 = 2.0;
+
+/// The skipped head must still be audible for it to count as dropped speech:
+/// its RMS envelope level may sit at most this many dB below the decoded
+/// region's level. A genuinely quiet or silent head is a legitimate onset
+/// the model is allowed to leave alone (re-decoding it would only risk
+/// hallucinating into silence).
+const WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB: f32 = 6.0;
+
+/// The carry-less recovery decode's first word must land at least this far
+/// before the carried decode's first word for a wholesale word swap to be
+/// adopted: it must genuinely cover the skipped head, not a different late
+/// onset of its own. (The head-only splice needs no such check -- its grafted
+/// words sit before the carried first word by construction.)
+const WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS: f32 = 0.5;
+
+/// A carried-decode word narrower than this is a degenerate tag placement
+/// (a zero-width *music*/*singing* stamp), not speech. When a head-skip
+/// slice's carried words are all such tags the carried decode carries no
+/// real content after the skip, so the carry-less re-decode may take over
+/// its word list and text wholesale; a single real word anywhere keeps the
+/// conservative head-only splice.
+const WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH: f32 = 0.05;
+
+/// Acoustic gate for the carry head-skip recovery: does the slice audio ahead
+/// of the first placed word carry comparable signal to the decoded region?
+/// Compares the RMS envelope levels of the head `[0, first_word_start)` and
+/// the decoded region `[first_word_start, last_word_end)`; the head passes
+/// when it sits within [`WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB`] of the
+/// decoded level. Frames where either level is unmeasurable fail closed.
+fn whisper_slice_head_is_audible(
+    rms_frames: &[f32],
+    first_word_start: f32,
+    last_word_end: f32,
+) -> bool {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    if rms_frames.len() < 2 || first_word_start <= 0.0 || last_word_end <= first_word_start {
+        return false;
+    }
+    // Root-mean-square of the envelope frames over a range: the frames are
+    // already RMS values, so this is a dB-stable mean level for the region.
+    let level = |lo: usize, hi: usize| -> Option<f32> {
+        let lo = lo.min(rms_frames.len());
+        let hi = hi.min(rms_frames.len());
+        if hi <= lo {
+            return None;
+        }
+        let window = &rms_frames[lo..hi];
+        let rms =
+            (window.iter().map(|value| value * value).sum::<f32>() / window.len() as f32).sqrt();
+        (rms > 0.0_f32 && rms.is_finite()).then_some(rms)
+    };
+    let head_end = ((first_word_start as f64 / FRAME_SECONDS).floor() as usize).max(1);
+    let speech_end = (last_word_end as f64 / FRAME_SECONDS).floor() as usize;
+    let (head, speech) = match (level(0, head_end), level(head_end, speech_end)) {
+        (Some(head), Some(speech)) => (head, speech),
+        _ => return false,
+    };
+    20.0_f32 * (speech / head).log10() <= WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB
+}
+
 /// Run one temperature-0 (or re-decode) greedy pass over an already-encoded
 /// slice: build a fresh self-KV/step runner for the given `temperature`, drive
 /// the shared greedy driver, and hand back the text plus the cross-attention
@@ -8094,7 +8163,16 @@ fn run_whisper_decode_loop(
     // the longest non-looping text. This recovers the speech the guard dropped
     // (e.g. a "Thank you" x N backchannel that, at T=0, locks the whole 30 s
     // window into the phrase) while leaving every healthy slice untouched.
-    let mut ladder_rung = |temperature: f32, seed: u64, round: usize| {
+    // One greedy pass over the already-encoded slice at a given prompt,
+    // generated-token budget and temperature. Round 1 (below) is the plain
+    // temperature-0 (argmax) carry pass; the fallback ladder re-runs it with
+    // elevated temperature on the same prompt, and the carry head-skip
+    // recovery further down re-runs it with the base (carry-less) prompt.
+    let mut decode_round = |prompt_tokens: &[u32],
+                            prompt_max_generated_tokens: usize,
+                            temperature: f32,
+                            seed: u64,
+                            round: usize| {
         run_whisper_decode_round(
             execution,
             decoder_persistent_static,
@@ -8104,10 +8182,10 @@ fn run_whisper_decode_loop(
             &prelude_summary,
             &encoder_summary,
             plan_cache_base,
-            &initial_prompt_tokens,
+            prompt_tokens,
             encoder_hidden_f32,
             eot_token_id,
-            max_generated_tokens,
+            prompt_max_generated_tokens,
             needs_encoder_hidden_in_step,
             decoder_cross_flash_attention,
             decoder_collect_cross_attention,
@@ -8143,8 +8221,14 @@ fn run_whisper_decode_loop(
             },
         )
     };
-    let (mut candidate, mut decode) = ladder_rung(0.0, WHISPER_TEMPERATURE_LADDER_BASE_SEED, 1)
-        .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+    let (mut candidate, mut decode) = decode_round(
+        &initial_prompt_tokens,
+        max_generated_tokens,
+        0.0,
+        WHISPER_TEMPERATURE_LADDER_BASE_SEED,
+        1,
+    )
+    .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
     if decode.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard
         && whisper_temperature_ladder_enabled()
         && !initial_prompt_tokens.is_empty()
@@ -8168,9 +8252,14 @@ fn run_whisper_decode_loop(
             let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
                 .wrapping_add(i as u64)
                 .wrapping_mul(0x2545_F491_4F6C_DD1D);
-            let (cand, result) = ladder_rung(temperature, seed, i + 2).map_err(|e| {
-                decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary)
-            })?;
+            let (cand, result) = decode_round(
+                &initial_prompt_tokens,
+                max_generated_tokens,
+                temperature,
+                seed,
+                i + 2,
+            )
+            .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
             // A ladder round that STILL hits the repeat guard was cut short, so
             // it cannot have recovered more than the incumbent -- skip it (do
             // not replace the incumbent with a shorter guard-cut slice).
@@ -8240,8 +8329,8 @@ fn run_whisper_decode_loop(
             stop_reason,
         });
     }
-    let text = decode_text_trimmed;
-    let words = match word_timestamp_mode {
+    let mut text = decode_text_trimmed;
+    let mut words = match word_timestamp_mode {
         WhisperWordTimestampMode::Off => Vec::new(),
         WhisperWordTimestampMode::CrossAttention => whisper_cross_attention_word_timestamps(
             tokenizer,
@@ -8264,6 +8353,142 @@ fn run_whisper_decode_loop(
             },
         )?,
     };
+    // Carry head-skip recovery (word splice): the longform carry seeds this
+    // slice's prompt with the previous slice's tail tokens in <startofprev>.
+    // Because the model has already "spoken" the carried words, it can treat
+    // them as the start of THIS window's content and begin emitting mid-
+    // slice, never generating words for the real speech at the slice head
+    // (the first cross-attention-placed word lands seconds into the slice
+    // while the audio ahead of it is at ordinary speech level). When that
+    // shape shows up, re-decode the SAME encoded slice with the base (carry-
+    // less) prompt and graft only the re-decode's hole words (majority time
+    // before the carried first word) in front of the carried words. The
+    // carried decode's tokens, text tail, carry and stop reason stay
+    // untouched, so every slice after this one is conditioned exactly as
+    // before and no downstream content changes. The rare case where the
+    // carried decode's own words are all degenerate zero-width tags (no real
+    // content after the skip at all) instead swaps in the re-decode's word
+    // list wholesale. Every healthy slice (first word inside the overlap
+    // re-read, or a quiet head) takes no action here and stays untouched.
+    if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
+        && request_options.longform_prompt_carry_enabled()
+        && request_options
+            .prompt_token_ids
+            .as_deref()
+            .is_some_and(|token_ids| !token_ids.is_empty())
+    {
+        let head_skip_candidate =
+            if let (Some(rms_frames), Some(first_word)) = (word_audio_rms_frames, words.first()) {
+                let last_end = words
+                    .last()
+                    .map(|last_word| last_word.end)
+                    .unwrap_or(first_word.start);
+                (first_word.start >= WHISPER_CARRY_HEAD_SKIP_MIN_SECONDS
+                    && whisper_slice_head_is_audible(rms_frames, first_word.start, last_end))
+                .then_some((rms_frames, first_word.start))
+            } else {
+                None
+            };
+        if let Some((rms_frames, carried_first_start)) = head_skip_candidate {
+            // Base (carry-less) prompt for the re-decode. It is shorter than
+            // the carry prompt, so its generated-token budget is larger, but
+            // prompt + generated still sums to `max_target_positions` -- the
+            // same total the schedule validation above already admitted for
+            // the carry prompt, so no re-validation is needed. Every stage is
+            // fail-open: the recovery is a salvage path, so any failure keeps
+            // the carried decode untouched instead of failing the request.
+            let mut base_options = request_options.clone();
+            base_options.prompt = None;
+            base_options.prompt_token_ids = None;
+            let base = build_whisper_initial_prompt_tokens(
+                execution,
+                tokenizer,
+                &base_options,
+                detected_language.as_deref(),
+            )
+            .ok()
+            .and_then(|base_prompt_tokens| {
+                decode_generated_token_step_cap(
+                    execution.max_target_positions,
+                    base_prompt_tokens.len(),
+                )
+                .ok()
+                .map(|base_max_generated_tokens| (base_prompt_tokens, base_max_generated_tokens))
+            });
+            if let Some((base_prompt_tokens, base_max_generated_tokens)) = base
+                && let Ok((recovered_candidate, recovered_decode)) = decode_round(
+                    &base_prompt_tokens,
+                    base_max_generated_tokens,
+                    0.0,
+                    WHISPER_TEMPERATURE_LADDER_BASE_SEED,
+                    0,
+                )
+                && whisper_stop_reason_is_stop_token(&recovered_decode.stop_reason)
+            {
+                let recovered_words = whisper_cross_attention_word_timestamps(
+                    tokenizer,
+                    &recovered_candidate.token_alignments,
+                    &recovered_decode.generated_probabilities,
+                    audio_duration_seconds,
+                    Some(rms_frames),
+                )
+                .unwrap_or_default();
+                // The hole words: the re-decode's words whose majority
+                // time sits before the carried decode's first word.
+                // Pure punctuation/symbol stamps (a lone ".", "-", or a
+                // mojibake token) are DTW artifacts, not words, so a
+                // grafted set holding only those grafts nothing.
+                let hole_words: Vec<crate::WordTimestamp> = recovered_words
+                    .iter()
+                    .filter(|word| {
+                        0.5 * (word.start + word.end) < carried_first_start
+                            && word.word.trim().chars().any(|c| c.is_alphanumeric())
+                    })
+                    .cloned()
+                    .collect();
+                if !hole_words.is_empty() {
+                    let carried_is_all_degenerate = words.iter().all(|word| {
+                        word.end - word.start < WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH
+                    });
+                    let recovered_covers_head = recovered_words.first().is_some_and(|word| {
+                        word.start + WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS < carried_first_start
+                    });
+                    if carried_is_all_degenerate && recovered_covers_head {
+                        let recovered_text = recovered_decode.text.trim().to_string();
+                        if !recovered_text.is_empty()
+                            && recovered_text.chars().any(|c| c.is_alphanumeric())
+                        {
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
+                                recovered_words[0].start,
+                                recovered_words.len(),
+                                words.len()
+                            );
+                            text = recovered_text;
+                            words = recovered_words;
+                        }
+                    } else {
+                        // Head-only splice: the grafted words precede the
+                        // carried first word, the rest of the carried
+                        // decode (and its token stream, which feeds the
+                        // next slice's carry) is preserved verbatim.
+                        let prefix = crate::transcript_text::join_segment_texts(
+                            hole_words.iter().map(|word| word.word.trim()),
+                        );
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=carry_head_skip event=head_spliced carried_first_word={carried_first_start:.2}s grafted_words={} first_grafted_word={:.2}s",
+                            hole_words.len(),
+                            hole_words[0].start
+                        );
+                        let mut spliced = hole_words;
+                        spliced.extend_from_slice(&words);
+                        words = spliced;
+                        text = format!("{prefix} {text}");
+                    }
+                }
+            }
+        }
+    }
     let segments = if words.is_empty() || text.is_empty() {
         Vec::new()
     } else {

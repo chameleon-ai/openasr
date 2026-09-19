@@ -2906,3 +2906,65 @@ fn carry_loop_dominance_shapes() {
         &(0..40).map(|i| i as u32).collect::<Vec<_>>()
     ));
 }
+
+#[test]
+fn slice_head_is_audible_when_head_matches_speech_level() {
+    // 100 x 20 ms frames = 2 s of flat, speech-level envelope.
+    let rms = vec![0.5_f32; 100];
+    // First word at 0.2 s, last ends at 1.8 s: head and region at equal level.
+    assert!(super::whisper_slice_head_is_audible(&rms, 0.2, 1.8));
+    // A louder head (music into speech) also passes: it is audible either way.
+    let rms_head_louder = {
+        let mut rms = vec![0.0_f32; 100];
+        rms[..10].copy_from_slice(&[2.0_f32; 10]);
+        rms[10..].copy_from_slice(&vec![0.5; 90]);
+        rms
+    };
+    assert!(super::whisper_slice_head_is_audible(
+        &rms_head_louder,
+        0.2,
+        1.8
+    ));
+}
+
+#[test]
+fn slice_head_is_silent_when_head_is_quiet_or_empty() {
+    // Silent head, speech-level region: a legitimate onset, not a drop.
+    let mut rms = vec![0.0_f32; 100];
+    rms[10..].copy_from_slice(&vec![0.5_f32; 90]);
+    assert!(!super::whisper_slice_head_is_audible(&rms, 0.2, 1.8));
+
+    // Degenerate inputs fail closed.
+    assert!(!super::whisper_slice_head_is_audible(&[], 10.0, 20.0));
+    assert!(!super::whisper_slice_head_is_audible(
+        &[0.5_f32],
+        10.0,
+        20.0
+    ));
+    assert!(!super::whisper_slice_head_is_audible(
+        &[0.5_f32; 100],
+        0.0,
+        1.0
+    ));
+    assert!(!super::whisper_slice_head_is_audible(
+        &[0.5_f32; 100],
+        1.0,
+        1.0
+    ));
+}
+
+#[test]
+fn slice_head_deficit_bound_sits_at_six_db() {
+    // 2 s of 20 ms frames; the decoded region is [0.4, 1.9] s.
+    let mut rms = vec![0.0_f32; 100];
+    let region = 0.5_f32;
+    rms[20..95].copy_from_slice(&vec![region; 75]);
+    // 3 dB below the region: within the bound, audible.
+    let head_3db = region * 10.0_f32.powf(-3.0 / 20.0);
+    rms[..20].copy_from_slice(&[head_3db; 20]);
+    assert!(super::whisper_slice_head_is_audible(&rms, 0.4, 1.9));
+    // 10 dB below the region: outside the bound, not audible.
+    let head_10db = region * 10.0_f32.powf(-10.0 / 20.0);
+    rms[..20].copy_from_slice(&[head_10db; 20]);
+    assert!(!super::whisper_slice_head_is_audible(&rms, 0.4, 1.9));
+}

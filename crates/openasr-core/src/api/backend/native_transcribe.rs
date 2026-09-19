@@ -3241,6 +3241,29 @@ fn run_native_transcription_impl(
                             truncation,
                         });
                     }
+                    // OPENASR_TIMING=1 detail: the slice's raw decode output
+                    // (carry prompt + text + per-word spans) before the
+                    // assembler trims/stitches it, for diagnosing longform
+                    // drops slice-by-slice.
+                    crate::stage_timing::log_detail_event(
+                        "native_transcribe",
+                        format!(
+                            "stage=longform_slice_transcript index={slice_index} \
+                             slice=[{:.2}..{:.2}]s carry_tokens=[{}] {}",
+                            slice.start_sample as f32 / 16_000.0,
+                            slice.content_end_sample as f32 / 16_000.0,
+                            if carry_prompt_mode == LongformPromptCarryMode::TokenHistory {
+                                rolling_prompt_token_ids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            } else {
+                                String::new()
+                            },
+                            longform_slice_transcript_debug_line(&transcription)
+                        ),
+                    );
                     ran_any_slice = true;
                     match carry_prompt_mode {
                         LongformPromptCarryMode::Disabled => {}
@@ -3544,6 +3567,31 @@ fn format_truncation_anchor(truncation: &DecodeTruncation) -> String {
         .transcript_covers_up_to_seconds
         .map(|seconds| format!("{seconds:.2}s"))
         .unwrap_or_else(|| "?".to_string())
+}
+
+/// One `OPENASR_TIMING` stderr line with a slice's raw decode output as the
+/// longform driver sees it (before the assembler trims/stitches): per-segment
+/// word spans in slice-relative seconds plus the full slice text. Tells an
+/// assembly-side drop (words present here, gone in the output) apart from one
+/// the decode never produced.
+fn longform_slice_transcript_debug_line(transcription: &Transcription) -> String {
+    let mut line = String::new();
+    for segment in &transcription.segments {
+        let words: Vec<String> = segment
+            .words
+            .iter()
+            .map(|word| format!("{:?}@{:.2}-{:.2}", word.word.trim(), word.start, word.end))
+            .collect();
+        line.push_str(&format!(
+            "seg(rel)=[{:.2}..{:.2}] [{}] ",
+            segment.start,
+            segment.end,
+            words.join(" ")
+        ));
+    }
+    line.push_str("text=");
+    line.push_str(&transcription.text.replace('\n', "\\n"));
+    line
 }
 
 /// Normalize decode output before transcript-aware post-processing. Punctuation
