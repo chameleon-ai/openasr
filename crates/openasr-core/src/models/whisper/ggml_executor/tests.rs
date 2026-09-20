@@ -2760,6 +2760,438 @@ fn collapse_repeated_tail_is_a_noop_on_a_non_stop_reason() {
     assert_eq!(decode.text, before);
 }
 
+/// Layer (a): the placed words of a run that all folded onto one instant (a
+/// 0.1 s span after the word-window pad) are a small fraction of the bracket
+/// band, so the run is collapsed; words that visibly take their share of the
+/// band are not.
+#[test]
+fn degenerate_tail_span_collapsed_fires_below_the_band_fraction() {
+    // The ali tail shape: words on one point, the 3.18 s tail-slice band.
+    assert!(whisper_degenerate_tail_span_collapsed(0.1, 3.18));
+    // The fraction boundary: exactly 10% of the band is not below it.
+    assert!(!whisper_degenerate_tail_span_collapsed(0.1 * 3.18, 3.18));
+    assert!(whisper_degenerate_tail_span_collapsed(
+        0.1 * 3.18 - 1e-9,
+        3.18
+    ));
+    // A genuine short closing run IS span-collapsed on a wide band -- the
+    // layer (b) envelope is what protects it.
+    assert!(whisper_degenerate_tail_span_collapsed(1.0, 27.0));
+    assert!(!whisper_degenerate_tail_span_collapsed(2.7, 27.0));
+}
+
+/// Layer (a) floor: with a degenerate (zero-width) bracket the absolute
+/// 0.1 s floor is the only tolerance left.
+#[test]
+fn degenerate_tail_span_collapsed_uses_the_absolute_floor_on_a_zero_band() {
+    assert!(whisper_degenerate_tail_span_collapsed(0.05, 0.0));
+    assert!(!whisper_degenerate_tail_span_collapsed(0.1, 0.0));
+    assert!(!whisper_degenerate_tail_span_collapsed(1.5, 0.0));
+}
+
+/// Layer (b): a sustained speech run (5+ consecutive 0.02 s frames above
+/// median+5dB) anywhere in the region is real audio under the words; the
+/// same level outside the region leaves it confirmed silent.
+#[test]
+fn degenerate_tail_region_silence_flags_sustained_speech_in_the_region() {
+    // 159 frames at floor; speech (0.01, far above floor*10^0.25) on frames
+    // 150..159.
+    let mut levels = vec![0.0005_f32; 159];
+    for sample in levels[150..159].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(Some(&levels), 3.03, 3.33, 3.18),
+        Some(true)
+    );
+    // The same speech at the slice head leaves the tail region silent.
+    let mut head_speech = vec![0.0005_f32; 159];
+    for sample in head_speech[..50].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(Some(&head_speech), 3.03, 3.33, 3.18),
+        Some(false)
+    );
+}
+
+/// Layer (b) fail-open: a missing envelope, an immeasurably short region, and
+/// a blip shorter than the sustain floor all refuse the verdict the splice
+/// needs.
+#[test]
+fn degenerate_tail_region_silence_refuses_when_silence_cannot_be_confirmed() {
+    let quiet = vec![0.0005_f32; 159];
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(None, 3.03, 3.33, 3.18),
+        None
+    );
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(Some(&quiet), 3.03, 3.33, 0.0),
+        None
+    );
+    // The region clips down to fewer than four frames: not measurable.
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(Some(&quiet), 3.13, 3.33, 3.18),
+        None
+    );
+    // Four consecutive frames above the floor is a blip, not a sustain.
+    let mut blip = vec![0.0005_f32; 159];
+    for sample in blip[150..154].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    assert_eq!(
+        whisper_degenerate_tail_region_silence(Some(&blip), 3.03, 3.33, 3.18),
+        Some(false)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// whisper_splice_degenerate_tail_run
+// ---------------------------------------------------------------------------
+
+/// The full pass: a clean-stop decode whose final run's words all fold onto
+/// the window-end instant over confirmed silence is spliced out of the
+/// tokens, the probabilities, and the alignments, its placed words are
+/// drained from the word list, and the re-derived text is empty -- the
+/// caller's empty-text degrade then reports the slice as honest no-speech.
+#[test]
+fn splice_degenerate_tail_run_splices_a_folded_tail_run_over_silence() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [hallu 6] [ts(159)]: one run brackets the whole 3.18 s tail
+    // slice, its five placed words all fold onto the window end.
+    let tokens = vec![ts, 1, 2, 3, 4, 5, 6, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![
+        word_ts("a", 3.18, 3.18),
+        word_ts("b", 3.18, 3.18),
+        word_ts("c", 3.18, 3.18),
+        word_ts("d", 3.18, 3.18),
+        word_ts("e", 3.18, 3.18),
+    ];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 5)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("splice");
+    assert!(
+        spliced,
+        "a folded run over confirmed silence must be spliced"
+    );
+    assert_eq!(decode.generated_tokens, vec![ts, ts + 159]);
+    assert_eq!(decode.generated_probabilities.len(), 2);
+    assert_eq!(alignments.len(), 2);
+    assert!(
+        decode.text.trim().is_empty(),
+        "no text tokens survive: {:?}",
+        decode.text
+    );
+    assert!(words.is_empty(), "the run's placed words must be drained");
+}
+
+/// A real first run survives in the tokens, the text, and the word list: only
+/// the folded final run's own words are drained.
+#[test]
+fn splice_degenerate_tail_run_keeps_earlier_runs_and_their_words() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [real 3] [ts(100)] [ts(150)] [hallu 3] [ts(159)]: the final run
+    // folds two placed words onto the window end over silence.
+    let tokens = vec![ts, 1, 2, 3, ts + 100, ts + 150, 4, 5, 6, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![
+        word_ts("a", 0.10, 0.30),
+        word_ts("b", 0.30, 0.70),
+        word_ts("c", 0.70, 1.10),
+        word_ts("d", 3.18, 3.18),
+        word_ts("e", 3.18, 3.18),
+    ];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 3), (3, 5)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("splice");
+    assert!(spliced);
+    assert_eq!(
+        decode.generated_tokens,
+        vec![ts, 1, 2, 3, ts + 100, ts + 150, ts + 159]
+    );
+    assert_eq!(decode.generated_probabilities.len(), 7);
+    assert_eq!(alignments.len(), 7);
+    assert_eq!(words.len(), 3);
+    assert_eq!(words[0].word, "a");
+    let expected_text = tokenizer
+        .decode_text_token_ids(&[1, 2, 3])
+        .expect("decode text");
+    assert_eq!(decode.text, expected_text);
+}
+
+/// The layer (b) gate: a sustained speech run under a shape-collapsed final
+/// run is real audio (a short closing line), so the splice must refuse.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_with_sustained_speech_under_the_run() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, 3, 4, 5, 6, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("a", 3.18, 3.18), word_ts("b", 3.18, 3.18)];
+    let mut speech = vec![0.0005_f32; 159];
+    for sample in speech[140..159].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 2)],
+        159,
+        Some(&speech),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "sustained speech under the run is real audio");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// A final run whose words actually spread over the band is not span-
+/// collapsed, so the decode is left byte-identical.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_on_spread_words() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, 3, 4, 5, 6, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![
+        word_ts("a", 0.40, 0.80),
+        word_ts("b", 0.80, 1.20),
+        word_ts("c", 1.20, 1.80),
+    ];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 3)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a run spread over its band must survive");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 3);
+}
+
+/// One placed word cannot be told apart from a tight bracket on a short
+/// closing word: the min-words gate keeps it, even over confirmed silence.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_on_a_single_word_run() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("bye", 3.18, 3.18)];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a single placed word must survive");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 1);
+}
+
+/// A guard-cut decode's final run is a retained loop prefix the next slice may
+/// continue: never splice it, even when it folds onto silence.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_on_a_guard_cut() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, 3, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(
+        tokens.clone(),
+        Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard,
+    );
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![
+        word_ts("a", 3.18, 3.18),
+        word_ts("b", 3.18, 3.18),
+        word_ts("c", 3.18, 3.18),
+    ];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 3)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a guard-cut decode must not be spliced");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 3);
+}
+
+/// A range list that no longer pairs 1:1 with the token stream's runs is
+/// untrustworthy: refuse rather than splice at shifted indices.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_when_the_run_ranges_misalign() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // Two runs in the tokens, one entry in the range list.
+    let tokens = vec![ts, 1, 2, ts + 100, ts + 150, 4, 5, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("a", 3.18, 3.18), word_ts("b", 3.18, 3.18)];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 0)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "misaligned ranges must refuse the splice");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// No envelope means the silence cannot be confirmed: fail open and keep the
+/// run even when its shape is a perfect fold.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_without_an_envelope() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, 3, 4, 5, 6, ts + 159];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("a", 3.18, 3.18), word_ts("b", 3.18, 3.18)];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 2)],
+        159,
+        None,
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "without an envelope the splice must refuse");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// An alignment row that lost 1:1 parity with the tokens makes the run ranges
+/// untrustworthy: refuse.
+#[test]
+fn splice_degenerate_tail_run_is_a_noop_when_the_alignments_misalign() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, 3, 4, 5, 6, ts + 159];
+    // One alignment row short of the token count.
+    let mut alignments = tail_repeat_alignments(&tokens);
+    alignments.pop();
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("a", 3.18, 3.18), word_ts("b", 3.18, 3.18)];
+    let quiet = vec![0.0005_f32; 159];
+    let spliced = whisper_splice_degenerate_tail_run(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 2)],
+        159,
+        Some(&quiet),
+        3.18,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a ragged alignment row must refuse the splice");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
 /// One alignment row whose cross-attention peaks at `frame` (0..1500).
 fn ladder_alignment_peaking_at(frame: usize) -> WhisperGeneratedTokenAlignment {
     WhisperGeneratedTokenAlignment {

@@ -6648,15 +6648,23 @@ fn whisper_pad_dtw_word_windows(
     words
 }
 
+/// Word timestamps for one decode from its per-token cross-attention rows.
+/// The second return value pairs EVERY content run of the token stream (the
+/// same partition and order as [`text_token_runs`]) with the half-open range
+/// of the returned word list that run's words occupy. A run the DTW pass
+/// failed to align maps to an empty range; the whole-window paths that align
+/// without decoded timestamps map the run list to a single range over all
+/// words. The degenerate-tail splice consumes the final run's range to keep
+/// the token stream, the re-derived text, and the word list in sync.
 fn whisper_cross_attention_word_timestamps(
     tokenizer: &WhisperTokenizer,
     token_alignments: &[WhisperGeneratedTokenAlignment],
     generated_probabilities: &[f32],
     audio_duration_seconds: f32,
     audio_rms_frames: Option<&[f32]>,
-) -> Result<Vec<crate::WordTimestamp>, WhisperGgmlExecutorError> {
+) -> Result<(Vec<crate::WordTimestamp>, Vec<(usize, usize)>), WhisperGgmlExecutorError> {
     if token_alignments.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     // Alignments are recorded one per generated token; a step that yielded no
     // cross-attention probs breaks that parity, in which case confidence is
@@ -6714,10 +6722,13 @@ fn whisper_cross_attention_word_timestamps(
         });
         if bracketed_by_timestamps {
             let mut words = Vec::new();
+            let mut run_word_ranges: Vec<(usize, usize)> = Vec::new();
             for (lo, hi) in &runs {
+                let run_word_start = words.len();
                 let Some((band_start, band_end)) =
                     run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution)
                 else {
+                    run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 };
                 let attention: Vec<Vec<f32>> = full_window[*lo..=*hi]
@@ -6725,6 +6736,7 @@ fn whisper_cross_attention_word_timestamps(
                     .map(|row| row[band_start.min(row.len())..band_end.min(row.len())].to_vec())
                     .collect();
                 let Some(spans) = dtw_align_token_frames(&attention) else {
+                    run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 };
                 let band_width = band_end.saturating_sub(band_start);
@@ -6807,6 +6819,7 @@ fn whisper_cross_attention_word_timestamps(
                     })
                     .collect();
                 if token_times.is_empty() {
+                    run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 }
                 // A per-segment decode failure is non-fatal: keep the other
@@ -6824,16 +6837,20 @@ fn whisper_cross_attention_word_timestamps(
                     block_words = whisper_cap_dtw_word_spans(block_words, seconds_per_frame);
                     words.extend(block_words);
                 }
+                run_word_ranges.push((run_word_start, words.len()));
             }
             if !words.is_empty() {
-                return Ok(whisper_pad_dtw_word_windows(
+                let words = whisper_pad_dtw_word_windows(
                     whisper_refine_dtw_word_offsets(
                         whisper_refine_dtw_word_onsets(words, audio_rms_frames, duration),
                         audio_rms_frames,
                         duration,
                     ),
                     duration,
-                ));
+                );
+                // The pad only widens the existing windows (the count is
+                // unchanged), so the per-run ranges stay valid.
+                return Ok((words, run_word_ranges));
             }
             // Every bracketed run failed to align: fall through to the
             // center-of-mass degrade below.
@@ -6916,14 +6933,18 @@ fn whisper_cross_attention_word_timestamps(
                     }
                 })?;
                 words = whisper_cap_dtw_word_spans(words, seconds_per_frame);
-                return Ok(whisper_pad_dtw_word_windows(
+                let words = whisper_pad_dtw_word_windows(
                     whisper_refine_dtw_word_offsets(
                         whisper_refine_dtw_word_onsets(words, audio_rms_frames, duration),
                         audio_rms_frames,
                         duration,
                     ),
                     duration,
-                ));
+                );
+                // The whole window aligned as one unbracketed pass: a single
+                // range covering every word.
+                let word_count = words.len();
+                return Ok((words, vec![(0, word_count)]));
             }
         }
     }
@@ -6951,7 +6972,11 @@ fn whisper_cross_attention_word_timestamps(
         NO_ONSET_LEAD,
         f32::INFINITY,
     )
-    .map(|words| whisper_pad_dtw_word_windows(words, duration))
+    .map(|words| {
+        let words = whisper_pad_dtw_word_windows(words, duration);
+        let word_count = words.len();
+        (words, vec![(0, word_count)])
+    })
     .map_err(
         |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
             reason: format!("whisper cross-attention word timestamp token decode failed: {error}"),
@@ -7659,6 +7684,281 @@ fn whisper_collapse_repeated_decode_tail(
     Ok(true)
 }
 
+/// Env opt-out (defaults on) for the degenerate-tail-run splice. See
+/// [`whisper_splice_degenerate_tail_run`].
+fn whisper_degenerate_tail_run_splice_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DISABLE_DEGENERATE_TAIL_RUN_SPLICE").is_none()
+}
+
+/// Debug env: log the final run's placed-word span, bracket band, and
+/// collapse/silence verdict for every clean-stop decode, so a deployment can
+/// trace why a tail run was (or was not) spliced.
+fn whisper_degenerate_tail_run_debug() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DEBUG_DEGENERATE_TAIL").is_some()
+}
+
+/// Minimum number of placed words in the final text run before it is
+/// removable as a degenerate tail. One placed word is a single attention
+/// point, and a short closing word parked at the window edge is
+/// indistinguishable from a placement artifact; two or more independent
+/// words all folded onto one instant is the hallucination's signature, since
+/// real words, even at the fastest tempo, occupy distinct 0.02 s frames.
+const WHISPER_DEGENERATE_TAIL_MIN_WORDS: usize = 2;
+
+/// Share of the run's decoded bracket band the placed-word span may occupy
+/// before it stops counting as collapsed. The band is the
+/// `<|start|>`..`<|end|>` window the run's audio should sit in, so a real
+/// run's words take a visible fraction of it, while a no-speech run's
+/// diffuse cross-attention folds every word onto one point in or at the
+/// band's edge.
+const WHISPER_DEGENERATE_TAIL_SPAN_FRACTION: f64 = 0.1;
+
+/// Absolute floor, in seconds, below the placed-word span must stay to count
+/// as collapsed when the decoded bracket itself degenerates (a zero-width
+/// band leaves the fraction gate nothing to compare against): the floor
+/// matches the 0.02 s frame resolution and the 0.1 s window pad the DTW pass
+/// applies to every word.
+const WHISPER_DEGENERATE_TAIL_SPAN_MIN_SECONDS: f64 = 0.1;
+
+/// Padding, in seconds, added on each side of the placed-word span when
+/// judging the audio envelope for the no-speech verdict: a hallucinated
+/// run's words carry no energy where they are placed, so the audio over the
+/// span plus its own placement margin must be silence.
+const WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS: f64 = 0.15;
+
+/// Layer (a) of the degenerate-tail gate: whether the final run's placed-word
+/// span collapses relative to its decoded bracket band. The span is measured
+/// over the PLACED words (`max(end) - min(start)`, after the DTW center fold
+/// and the word-window pad), and a band of width `band_seconds` tolerates a
+/// collapsed span below `max(SPAN_MIN_SECONDS, SPAN_FRACTION * band)`. A
+/// short real closing run is exactly span-collapsed by this measure on a
+/// wide band, so this is only the shape gate: the splice additionally
+/// requires the acoustic verdict of [`whisper_degenerate_tail_region_silence`].
+fn whisper_degenerate_tail_span_collapsed(span_seconds: f64, band_seconds: f64) -> bool {
+    let tolerance = WHISPER_DEGENERATE_TAIL_SPAN_MIN_SECONDS
+        .max(WHISPER_DEGENERATE_TAIL_SPAN_FRACTION * band_seconds.max(0.0));
+    span_seconds < tolerance
+}
+
+/// Layer (b) of the degenerate-tail gate: the acoustic verdict for the span
+/// of the final run, from the slice-local RMS envelope. Reuses the DTW onset
+/// floor: the threshold is the envelope's median frame RMS times
+/// `10^(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20)` (a speech level that adapts
+/// to the recording's own floor), and a sustained speech run is
+/// `WHISPER_DTW_ONSET_SUSTAIN_FRAMES` consecutive 0.02 s frames at or above
+/// it anywhere in the window-clipped region.
+///
+/// Returns `Some(false)` only when a region of at least four frames is
+/// confirmed silent; `Some(true)` when a sustained speech run sits in the
+/// region; and `None` when the envelope is missing or unusable, or the
+/// region clips down to fewer than four frames, in which case silence cannot
+/// be confirmed and the splice refuses (fail-open: the run stays).
+fn whisper_degenerate_tail_region_silence(
+    levels: Option<&[f32]>,
+    region_start_seconds: f64,
+    region_end_seconds: f64,
+    duration_seconds: f64,
+) -> Option<bool> {
+    let levels = levels?;
+    if levels.len() < 4 || duration_seconds <= 0.0 {
+        return None;
+    }
+    let seconds_per_frame = WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    ranked.sort_by(f64::total_cmp);
+    let noise_floor = ranked[ranked.len() / 2];
+    if !(noise_floor > 0.0 && noise_floor.is_finite()) {
+        return None;
+    }
+    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let start_s = region_start_seconds.max(0.0).min(duration_seconds);
+    let end_s = region_end_seconds.max(start_s).min(duration_seconds);
+    // The placed words are already clamped to [0, duration], so the region
+    // clips inside the window; the indices are clamped into the frame array
+    // anyway, letting the window-length guard below bail the verdict rather
+    // than overrun a slice envelope that is shorter than the decoded window
+    // edge maps to.
+    let last_frame = levels.len() - 1;
+    let frame_start = ((start_s / seconds_per_frame) as usize).min(last_frame);
+    let frame_end = ((end_s / seconds_per_frame) as usize)
+        .min(last_frame)
+        .max(frame_start + 1);
+    if frame_end - frame_start < 4 {
+        return None;
+    }
+    let mut consecutive = 0usize;
+    for &sample in &levels[frame_start..frame_end] {
+        if f64::from(sample) >= threshold {
+            consecutive += 1;
+            if consecutive >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+                return Some(true);
+            }
+        } else {
+            consecutive = 0;
+        }
+    }
+    Some(false)
+}
+
+/// Splice the decode's degenerate final text run out of the generated tokens,
+/// the parallel probabilities, and the cross-attention alignments, re-derive
+/// the text, and drop the run's placed words from `words` (its half-open word
+/// range comes from `run_word_ranges`, the ranges the cross-attention word
+/// pass reported paired 1:1 with the token stream's text runs, in order).
+/// Same splice mechanics as the tail-repeat collapse above.
+///
+/// A no-speech hallucinated tail has a two-layer signature, and BOTH layers
+/// must agree before anything is dropped:
+/// (a) the final run's two or more placed words all fold onto one instant,
+///     so their placed-word span is a small fraction of the run's decoded
+///     bracket band ([`whisper_degenerate_tail_span_collapsed`]); and
+/// (b) the audio under that span is silence: no sustained speech run in the
+///     slice-local envelope over the span plus its placement margin
+///     ([`whisper_degenerate_tail_region_silence`]).
+///
+/// That is the shape the no-speech attractor produces on trailing silence:
+/// the timestamp head emits a clean wide bracket and the decode ends on an
+/// honest stop token (no loop for the n-gram repeat guard to trip on), the
+/// text head emits a single clause (no verbatim second copy for the
+/// tail-repeat collapse to fold), and the words' diffuse cross-attention
+/// folds the clause onto one window-edge instant, surfacing downstream as a
+/// chain of zero-length words. Both layers are needed: a genuinely short
+/// closing run is exactly span-collapsed on a wide band, and only the
+/// envelope separates real audio from the hallucination.
+///
+/// Gated like the tail-repeat collapse on a clean STOP-token decode: a
+/// guard-cut final run is a retained loop prefix that the next slice may
+/// continue, and a budget-exhausted one ends on real speech at its edge, so
+/// neither is touched here. Every other failure degrades to a no-op
+/// (fail-open): no usable envelope, a run whose words do not line up 1:1
+/// with the tokens, or an unverdictable region all keep the run. Because the
+/// splice happens before the carry head-skip recovery and the next slice's
+/// carry are built from the token stream, the hallucinated tail leaves the
+/// text, the word list, and the carry prompt together; when it empties the
+/// window's text the caller's empty-text degrade treats the slice as an
+/// honest no-speech result.
+fn whisper_splice_degenerate_tail_run(
+    tokenizer: &WhisperTokenizer,
+    decode: &mut WhisperGreedyDecodeResult,
+    token_alignments: &mut Vec<WhisperGeneratedTokenAlignment>,
+    words: &mut Vec<crate::WordTimestamp>,
+    run_word_ranges: &[(usize, usize)],
+    frame_resolution: usize,
+    word_audio_rms_frames: Option<&[f32]>,
+    audio_duration_seconds: f32,
+) -> Result<bool, WhisperGgmlExecutorError> {
+    if !whisper_degenerate_tail_run_splice_enabled()
+        || !whisper_stop_reason_is_stop_token(&decode.stop_reason)
+        || decode.generated_tokens.is_empty()
+        // The word ranges index the token stream's runs; if the alignment row
+        // lost 1:1 parity with the tokens the ranges are as off as they are
+        // untrustworthy, so refuse rather than splice at shifted indices.
+        || token_alignments.len() != decode.generated_tokens.len()
+        || words.is_empty()
+    {
+        return Ok(false);
+    }
+    let timestamp_begin = tokenizer.first_timestamp_token_id();
+    let runs = text_token_runs(&decode.generated_tokens, &|token_id: u32| {
+        timestamp_begin.is_some_and(|begin| token_id >= begin)
+    });
+    if runs.is_empty() || run_word_ranges.len() != runs.len() {
+        return Ok(false);
+    }
+    let Some(&word_range) = run_word_ranges.last() else {
+        return Ok(false);
+    };
+    let Some(run_words) = words.get(word_range.0..word_range.1) else {
+        return Ok(false);
+    };
+    let (first_word, last_word) = match (run_words.first(), run_words.last()) {
+        (Some(first), Some(last)) => (first, last),
+        _ => return Ok(false),
+    };
+    if run_words.len() < WHISPER_DEGENERATE_TAIL_MIN_WORDS {
+        return Ok(false);
+    }
+    let (run_lo, run_hi) = runs.last().copied().expect("runs checked non-empty above");
+    let seconds_per_frame = 2.0_f64 * WHISPER_HOP_LENGTH as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    // The band the run's audio should sit in, from the nearest decoded
+    // bracket (a collapsed bracket reads as zero width and an unbracketed
+    // end as the window edge, exactly as [`run_frame_bounds`] reports).
+    let band_seconds = match run_frame_bounds(
+        run_lo,
+        run_hi,
+        &decode.generated_tokens,
+        timestamp_begin,
+        frame_resolution,
+    ) {
+        Some((band_start, band_end)) => {
+            (band_end.saturating_sub(band_start) as f64) * seconds_per_frame
+        }
+        None => 0.0,
+    };
+    let span_seconds = (f64::from(last_word.end) - f64::from(first_word.start)).max(0.0);
+    let collapsed = whisper_degenerate_tail_span_collapsed(span_seconds, band_seconds);
+    let region_silence = if collapsed {
+        whisper_degenerate_tail_region_silence(
+            word_audio_rms_frames,
+            f64::from(first_word.start) - WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS,
+            f64::from(last_word.end) + WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS,
+            f64::from(audio_duration_seconds),
+        )
+    } else {
+        None
+    };
+    let fire = collapsed && region_silence == Some(false);
+    if whisper_degenerate_tail_run_debug() {
+        let run_words_len = run_words.len();
+        eprintln!(
+            "openasr_whisper_ggml_executor stage=decode_loop event=degenerate_tail_probe final_run=[{run_lo}..{run_hi}] run_words={run_words_len} span_seconds={span_seconds:.3} band_seconds={band_seconds:.3} collapsed={collapsed} region_silence={region_silence:?} fire={fire}"
+        );
+    }
+    if !fire {
+        return Ok(false);
+    }
+    let token_count = decode.generated_tokens.len();
+    let drop = run_hi.saturating_sub(run_lo).saturating_add(1);
+    // The parallel vectors are 1:1 with the tokens in the word-timestamp
+    // path; splice them at the run's range only when their length matches, so
+    // a partial probability row degrades to a tokens-only splice instead of
+    // an out-of-bounds one.
+    if decode.generated_probabilities.len() == token_count {
+        splice_out_range(
+            &mut decode.generated_probabilities,
+            run_lo,
+            run_hi.saturating_add(1),
+        );
+    }
+    if token_alignments.len() == token_count {
+        splice_out_range(token_alignments, run_lo, run_hi.saturating_add(1));
+    }
+    splice_out_range(
+        &mut decode.generated_tokens,
+        run_lo,
+        run_hi.saturating_add(1),
+    );
+    let text = tokenizer
+        .decode_text_token_ids(&decode.generated_tokens)
+        .map_err(
+            |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                reason: format!("whisper degenerate-tail splice token decode failed: {error}"),
+            },
+        )?;
+    decode.text = text;
+    // The runs and the words are both in token order and the spliced run is
+    // the final one, so its word range is the tail of the word list:
+    // draining it leaves the surviving runs' words exactly where the carry
+    // head-skip recovery and the segment builder expect them.
+    let dropped_words = word_range.1.saturating_sub(word_range.0);
+    words.drain(word_range.0..word_range.1);
+    let kept_tokens = decode.generated_tokens.len();
+    eprintln!(
+        "openasr_whisper_ggml_executor stage=decode_loop event=degenerate_tail_splice status=spliced dropped_tokens={drop} dropped_words={dropped_words} kept_tokens={kept_tokens} span_seconds={span_seconds:.3} band_seconds={band_seconds:.3}"
+    );
+    Ok(true)
+}
+
 /// What one decode round produced, carried up for the fallback ladder to keep
 /// the winning candidate. `token_alignments` is the cross-attention word-align
 /// row captured during THIS round's decode (the word-timing path uses it), so
@@ -8330,15 +8630,24 @@ fn run_whisper_decode_loop(
         });
     }
     let mut text = decode_text_trimmed;
+    // The per-run word ranges the cross-attention pass reports (paired 1:1
+    // with the token stream's text runs) so the degenerate-tail splice below
+    // can drop the final run's words from `words` exactly as it drops the run
+    // from the token stream; empty in the modes that do not report runs.
+    let mut degenerate_tail_run_word_ranges: Vec<(usize, usize)> = Vec::new();
     let mut words = match word_timestamp_mode {
         WhisperWordTimestampMode::Off => Vec::new(),
-        WhisperWordTimestampMode::CrossAttention => whisper_cross_attention_word_timestamps(
-            tokenizer,
-            &step_runner_token_alignments,
-            &decode.generated_probabilities,
-            audio_duration_seconds,
-            word_audio_rms_frames,
-        )?,
+        WhisperWordTimestampMode::CrossAttention => {
+            let (timestamped, run_word_ranges) = whisper_cross_attention_word_timestamps(
+                tokenizer,
+                &step_runner_token_alignments,
+                &decode.generated_probabilities,
+                audio_duration_seconds,
+                word_audio_rms_frames,
+            )?;
+            degenerate_tail_run_word_ranges = run_word_ranges;
+            timestamped
+        }
         WhisperWordTimestampMode::PostHocAnchors => seq2seq_word_timestamps_from_generated_tokens(
             &decode.generated_tokens,
             &decode.generated_probabilities,
@@ -8353,6 +8662,48 @@ fn run_whisper_decode_loop(
             },
         )?,
     };
+    // No-speech tail run with a collapsed placed-word span (see the function):
+    // the final run's words all fold onto one instant inside a decoded
+    // bracket and the audio under that span is silence, so the run has no
+    // acoustic basis. This is the hallucination shape the repeat guard cannot
+    // see (no loop to trip on) and the tail-repeat collapse cannot see (no
+    // verbatim second copy). Splice the run's tokens, the re-derived text, and
+    // its placed words together, BEFORE the carry head-skip recovery runs and
+    // the next slice's carry is built from the token stream, so the
+    // hallucination leaves all three at once. A window whose text goes empty
+    // takes the same degrade as the empty-text path above: an honest no-speech
+    // slice with no carry of its own.
+    if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention {
+        let spliced_degenerate_tail = whisper_splice_degenerate_tail_run(
+            tokenizer,
+            &mut decode,
+            &mut step_runner_token_alignments,
+            &mut words,
+            &degenerate_tail_run_word_ranges,
+            encoder_frames,
+            word_audio_rms_frames,
+            audio_duration_seconds,
+        )
+        .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+        if spliced_degenerate_tail {
+            text = decode.text.trim().to_string();
+            if text.is_empty() {
+                eprintln!(
+                    "openasr_whisper_ggml_executor stage=decode_loop event=empty_text_degraded status=empty-returned generated_tokens={} stop_reason={:?}",
+                    decode.generated_tokens.len(),
+                    decode.stop_reason
+                );
+                let stop_reason = decode.stop_reason;
+                return Ok(WhisperExecutionOutput {
+                    text: String::new(),
+                    segments: Vec::new(),
+                    carry_prompt_token_ids: None,
+                    detected_language: detected_language.clone(),
+                    stop_reason,
+                });
+            }
+        }
+    }
     // Carry head-skip recovery (word splice): the longform carry seeds this
     // slice's prompt with the previous slice's tail tokens in <startofprev>.
     // Because the model has already "spoken" the carried words, it can treat
@@ -8425,7 +8776,7 @@ fn run_whisper_decode_loop(
                 )
                 && whisper_stop_reason_is_stop_token(&recovered_decode.stop_reason)
             {
-                let recovered_words = whisper_cross_attention_word_timestamps(
+                let (recovered_words, _) = whisper_cross_attention_word_timestamps(
                     tokenizer,
                     &recovered_candidate.token_alignments,
                     &recovered_decode.generated_probabilities,
