@@ -26,7 +26,7 @@ use crate::ggml_runtime::{GgmlCpuGraphBackend, GgmlCpuGraphConfig, RequestBacken
 #[cfg(test)]
 use crate::longform::plan_longform_slices;
 use crate::longform::{
-    AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
+    AudioSlice, AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
     LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
     TranscriptAssembler, plan_longform_slices_with_materialization_gate,
 };
@@ -53,7 +53,9 @@ use crate::api::backend::{
 use super::{BackendError, Transcription, TranscriptionRequest};
 use crate::Segment;
 use crate::WordTimestamp;
-use crate::api::backend::{DecodeTruncation, TranscriptionLongFormMetadata, TruncatedDecode};
+use crate::api::backend::{
+    DecodeTruncation, DecodeTruncationReason, TranscriptionLongFormMetadata, TruncatedDecode,
+};
 use crate::models::firered_punc::pack::resolve_firered_punc_pack_path;
 use crate::models::firered_punc::policy_runtime::{FireRedPuncActor, load_actor, punctuate};
 #[cfg(test)]
@@ -3125,8 +3127,21 @@ fn run_native_transcription_impl(
                     speaker_scope_count: &mut speaker_scope_count,
                 })?;
             } else {
-                for (slice, &gated) in plan.slices.iter().zip(vad_gated.iter()) {
-                    let slice = slice.clone();
+                // The slices the loop actually decodes, in order: the planned
+                // slices, into which a guard-cut tail re-decode (see
+                // `guard_cut_tail_slice`) inserts itself directly behind the
+                // slice it recovers, ahead of the next planned window.
+                let mut slices_to_run: Vec<(AudioSlice, bool)> = plan
+                    .slices
+                    .iter()
+                    .zip(vad_gated.iter())
+                    .map(|(slice, &gated)| (slice.clone(), gated))
+                    .collect();
+                let mut guard_tails_spawned = 0usize;
+                let mut run_cursor = 0usize;
+                while run_cursor < slices_to_run.len() {
+                    let (slice, gated) = slices_to_run[run_cursor].clone();
+                    run_cursor += 1;
                     if execution_context.control.wait_at_slice_boundary()
                         == super::transcription_control::SliceBoundaryControl::Canceled
                     {
@@ -3225,6 +3240,41 @@ fn run_native_transcription_impl(
                         carry_context,
                         decode_truncation,
                     } = result;
+                    // A guard cut mid-window orphans the window's tail (see
+                    // `guard_cut_tail_slice`): queue the tail re-decode right
+                    // behind this slice, ahead of the next planned window, so
+                    // it inherits this slice's carry prompt.
+                    if let Some(tail) = guard_cut_tail_slice(
+                        &slice,
+                        decode_truncation.as_ref(),
+                        &transcription,
+                        plan.sample_rate_hz,
+                        plan.slices.len(),
+                        plan.slices.len() + guard_tails_spawned,
+                    ) {
+                        guard_tails_spawned += 1;
+                        let rate = plan.sample_rate_hz as f64;
+                        eprintln!(
+                            "openasr_native_transcribe stage=longform event=guard_tail_spawned index={slice_index} parent=[{:.2}..{:.2}]s tail=[{:.2}..{:.2}]s",
+                            slice.start_sample as f64 / rate,
+                            slice.end_sample as f64 / rate,
+                            tail.start_sample as f64 / rate,
+                            tail.end_sample as f64 / rate,
+                        );
+                        slices_to_run.insert(run_cursor, (tail, false));
+                    }
+                    // A guard-cut slice only describes its audio up to its last
+                    // placed word; remember that cut so the push below commits
+                    // up to the words, not the window end. Otherwise the
+                    // assembler's overlap trim treats the orphaned tail as a
+                    // region this slice already owns and deletes the recovery
+                    // decode's words wholesale.
+                    let guard_cut_commit_end = guard_cut_content_end_sample(
+                        &slice,
+                        decode_truncation.as_ref(),
+                        &transcription,
+                        plan.sample_rate_hz,
+                    );
                     if let Some(truncation) = decode_truncation {
                         // A slice whose decode gave up partway is a degraded
                         // result, not a normal one: the audio after this point is
@@ -3265,10 +3315,17 @@ fn run_native_transcription_impl(
                         ),
                     );
                     ran_any_slice = true;
+                    // A tail re-decode slice is transparent to the carry chain:
+                    // it only recovers what the cut loop swallowed, while the
+                    // next planned window stays conditioned exactly as the cut
+                    // slice would have left it. Letting a recovery decode
+                    // re-route the carry would re-decode everything after it --
+                    // a far larger behavior change than restoring one span.
+                    let is_guard_tail = slice.index >= plan.slices.len();
                     match carry_prompt_mode {
                         LongformPromptCarryMode::Disabled => {}
                         LongformPromptCarryMode::Text => {
-                            if !transcription.text.trim().is_empty() {
+                            if !is_guard_tail && !transcription.text.trim().is_empty() {
                                 rolling_prompt = append_context_tail(
                                     &rolling_prompt,
                                     &transcription.text,
@@ -3284,7 +3341,8 @@ fn run_native_transcription_impl(
                             // re-conditions greedy decode onto the same
                             // collapse, so the carry stays at the last
                             // slice that actually produced words.
-                            if carry_text_has_meaningful_word(&transcription.text)
+                            if !is_guard_tail
+                                && carry_text_has_meaningful_word(&transcription.text)
                                 && let Some(prompt_token_ids) =
                                     carry_context.and_then(|context| context.prompt_token_ids)
                             {
@@ -3292,8 +3350,13 @@ fn run_native_transcription_impl(
                             }
                         }
                     }
+                    let mut transcript_slice = slice;
+                    if let Some(cut_end) = guard_cut_commit_end {
+                        transcript_slice.content_end_sample =
+                            transcript_slice.content_end_sample.min(cut_end);
+                    }
                     let transcript = SliceTranscript {
-                        slice,
+                        slice: transcript_slice,
                         text: transcription.text,
                         segments: transcription.segments,
                         time_domain: SegmentTimeDomain::RelativeToSliceContent,
@@ -3567,6 +3630,106 @@ fn format_truncation_anchor(truncation: &DecodeTruncation) -> String {
         .transcript_covers_up_to_seconds
         .map(|seconds| format!("{seconds:.2}s"))
         .unwrap_or_else(|| "?".to_string())
+}
+
+/// Minimum audio, in seconds, that must remain past a guard cut's last placed
+/// word for a tail re-decode to be worth running. Below this the lost span is
+/// a sliver the usual window overlap would swallow anyway.
+const GUARD_TAIL_MIN_UNCOVERED_SECONDS: f32 = 1.0;
+
+/// How far back of the guard cut a tail re-decode's window starts. The re-read
+/// re-seats the decode on the loop's tail (whose audio is still there) and
+/// gives the assembler overlap to stitch the re-decoded words against; the
+/// width matches the planner's standard slice overlap.
+const GUARD_TAIL_OVERLAP_SECONDS: f32 = 0.5;
+
+/// The sample (in the slice's audio buffer) to which a guard-cut decode's
+/// transcript still describes the audio: its last placed word's end, for a
+/// guard cut that has word timestamps. `None` when there is no guard
+/// truncation, or the family emitted no words -- a decode without intra-decode
+/// timestamps cannot measure where its coverage ended, so both consumers below
+/// fall back to the window end exactly as before.
+///
+/// Used twice: the committed-boundary shrink (a guard-cut slice only owns its
+/// audio up to its last word, so recovery decodes are not trimmed away as
+/// phantom overlap) and the tail re-decode's start point.
+fn guard_cut_content_end_sample(
+    slice: &AudioSlice,
+    truncation: Option<&DecodeTruncation>,
+    transcription: &Transcription,
+    sample_rate_hz: u32,
+) -> Option<usize> {
+    let truncation = truncation?;
+    if truncation.reason != DecodeTruncationReason::DegenerateRepeatGuard {
+        return None;
+    }
+    // Word times are relative to this slice's chunk start (the range the
+    // decode ran over); the returned value is absolute in the same buffer the
+    // slice samples from.
+    let cut_seconds = transcription
+        .segments
+        .iter()
+        .flat_map(|segment| segment.words.iter())
+        .map(|word| word.end)
+        .fold(0.0_f32, f32::max);
+    if !cut_seconds.is_finite() || cut_seconds <= 0.0 {
+        return None;
+    }
+    let cut = slice.start_sample as f64 + f64::from(cut_seconds) * f64::from(sample_rate_hz);
+    Some((cut.round() as usize).min(slice.end_sample))
+}
+
+/// The follow-up slice a guard cut mid-window turns into a tail re-decode, or
+/// `None` when there is nothing to recover.
+///
+/// The degenerate-repeat guard is a hard stop: when it trips partway through a
+/// window, everything after the loop's start has no decode at all -- the cut
+/// slice is finished, and the next window begins only the standard overlap
+/// past this window's end, so any speech the loop swallowed mid-window is
+/// orphaned. The rescue is to re-run exactly that orphaned span as an ordinary
+/// slice: it starts a little before the cut (see
+/// [`GUARD_TAIL_OVERLAP_SECONDS`]), ends where the cut window ended, and --
+/// queued directly behind the cut slice by the caller -- inherits the cut
+/// slice's carry prompt, whose tail ends at the loop the guard dropped.
+///
+/// Non-guard cuts are left alone on purpose: a budget-exhausted slice ends on
+/// real speech at its own edge, and the next window's overlap is what picks up
+/// there by design.
+///
+/// `planned_slice_count` is the planner's slice count; `index` is the index to
+/// assign the tail (planner indices are `0..planned_slice_count`, so a
+/// tail-of-tail -- which would chain re-decodes -- is refused by the
+/// origin check below).
+fn guard_cut_tail_slice(
+    parent: &AudioSlice,
+    truncation: Option<&DecodeTruncation>,
+    transcription: &Transcription,
+    sample_rate_hz: u32,
+    planned_slice_count: usize,
+    index: usize,
+) -> Option<AudioSlice> {
+    if parent.index >= planned_slice_count {
+        return None;
+    }
+    let cut_sample =
+        guard_cut_content_end_sample(parent, truncation, transcription, sample_rate_hz)?;
+    let rate = f64::from(sample_rate_hz);
+    let cut_rel = (cut_sample.saturating_sub(parent.start_sample)) as f64;
+    let window_samples = parent.duration_samples() as f64;
+    if window_samples - cut_rel < f64::from(GUARD_TAIL_MIN_UNCOVERED_SECONDS) * rate {
+        return None;
+    }
+    let tail_start = (parent.start_sample as f64 + cut_rel
+        - f64::from(GUARD_TAIL_OVERLAP_SECONDS) * rate)
+        .max(parent.start_sample as f64);
+    Some(AudioSlice {
+        index,
+        kind: AudioSliceKind::Fixed,
+        start_sample: tail_start as usize,
+        end_sample: parent.end_sample,
+        content_start_sample: tail_start as usize,
+        content_end_sample: parent.end_sample,
+    })
 }
 
 /// One `OPENASR_TIMING` stderr line with a slice's raw decode output as the
@@ -5127,6 +5290,235 @@ mod vad_slice_gate_tests {
         assert_eq!(
             vad_speech_spans_overlap_samples(Some(&spans), &slice),
             Some(20_000)
+        );
+    }
+}
+
+#[cfg(test)]
+mod guard_tail_tests {
+    use super::{guard_cut_content_end_sample, guard_cut_tail_slice};
+    use crate::api::backend::{
+        DecodeTruncation, DecodeTruncationReason, Segment, Transcription, WordTimestamp,
+    };
+    use crate::longform::{AudioSlice, AudioSliceKind};
+
+    const RATE: u32 = 16_000;
+
+    fn slice(start_seconds: f32, end_seconds: f32) -> AudioSlice {
+        let start = (start_seconds * RATE as f32) as usize;
+        let end = (end_seconds * RATE as f32) as usize;
+        AudioSlice {
+            index: 3,
+            kind: AudioSliceKind::Fixed,
+            start_sample: start,
+            end_sample: end,
+            content_start_sample: start,
+            content_end_sample: end,
+        }
+    }
+
+    fn words_ending_at(ends: &[f32]) -> Transcription {
+        Transcription {
+            segments: vec![Segment {
+                start: 0.0,
+                end: 27.0,
+                text: String::new(),
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words: ends
+                    .iter()
+                    .enumerate()
+                    .map(|(i, end)| WordTimestamp {
+                        word: format!("w{i}"),
+                        start: end - 0.2,
+                        end: *end,
+                        confidence: None,
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn truncation(reason: DecodeTruncationReason) -> DecodeTruncation {
+        DecodeTruncation {
+            reason,
+            transcript_covers_up_to_seconds: None,
+        }
+    }
+
+    #[test]
+    fn guard_cut_with_open_tail_spawns_the_recovery_slice() {
+        // The space.opus shape: a 27 s window cut at 16.64 s relative, with
+        // ~10.4 s of speech the guard's loop swallowed.
+        let parent = slice(662.5, 689.5);
+        let tail = guard_cut_tail_slice(
+            &parent,
+            Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+            &words_ending_at(&[3.0, 9.41, 16.64]),
+            RATE,
+            4,
+            4,
+        )
+        .expect("a mid-window guard cut with uncovered speech must spawn a tail");
+        assert_eq!(parent.start_sample, (662.5 * RATE as f32) as usize);
+        // The tail starts at the cut (16.64 s) minus the 0.5 s overlap
+        // margin, i.e. 16.14 s into the slice.
+        assert_eq!(
+            tail.start_sample - parent.start_sample,
+            258_240,
+            "16.14 s at 16 kHz"
+        );
+        assert_eq!(tail.end_sample, parent.end_sample);
+        assert_eq!(tail.start_sample, tail.content_start_sample);
+        assert_eq!(tail.end_sample, tail.content_end_sample);
+        assert_eq!(tail.index, 4);
+        assert!(matches!(tail.kind, AudioSliceKind::Fixed));
+    }
+
+    #[test]
+    fn guard_cut_near_window_end_spawns_nothing() {
+        let parent = slice(662.5, 689.5);
+        assert!(
+            guard_cut_tail_slice(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &words_ending_at(&[26.6]),
+                RATE,
+                4,
+                4,
+            )
+            .is_none(),
+            "a cut within the minimum uncovered span leaves nothing worth re-decoding"
+        );
+    }
+
+    #[test]
+    fn non_guard_truncation_spawns_nothing() {
+        let parent = slice(662.5, 689.5);
+        assert!(
+            guard_cut_tail_slice(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::BudgetExhausted)),
+                &words_ending_at(&[10.0]),
+                RATE,
+                4,
+                4,
+            )
+            .is_none(),
+            "a budget-exhausted slice ends on real speech at its edge; the next window picks up"
+        );
+    }
+
+    #[test]
+    fn untruncated_slice_spawns_nothing() {
+        let parent = slice(662.5, 689.5);
+        assert!(
+            guard_cut_tail_slice(&parent, None, &words_ending_at(&[10.0]), RATE, 4, 4,).is_none()
+        );
+    }
+
+    #[test]
+    fn guard_cut_without_words_spawns_nothing() {
+        let parent = slice(662.5, 689.5);
+        assert!(
+            guard_cut_tail_slice(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &Transcription::default(),
+                RATE,
+                4,
+                4,
+            )
+            .is_none(),
+            "no word timestamps means no measurable cut point"
+        );
+    }
+
+    #[test]
+    fn tail_of_tail_is_refused() {
+        let parent = slice(662.5, 689.5);
+        let mut tail = slice(678.64, 689.5);
+        // A derived tail slice lives beyond the planner's index range.
+        tail.index = 4;
+        assert!(
+            guard_cut_tail_slice(
+                &tail,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &words_ending_at(&[5.0]),
+                RATE,
+                4,
+                5,
+            )
+            .is_none(),
+            "a derived tail slice (index >= planned count) must not chain further re-decodes"
+        );
+        // The planner-origin parent of that tail still qualifies.
+        assert!(
+            guard_cut_tail_slice(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &words_ending_at(&[5.0]),
+                RATE,
+                4,
+                5,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn cut_inside_the_overlap_margins_to_the_slice_start() {
+        let parent = slice(662.5, 689.5);
+        let tail = guard_cut_tail_slice(
+            &parent,
+            Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+            &words_ending_at(&[0.3]),
+            RATE,
+            4,
+            4,
+        )
+        .expect("a cut at the slice head still leaves the whole tail uncovered");
+        assert_eq!(tail.start_sample, parent.start_sample);
+    }
+
+    #[test]
+    fn commit_end_anchor_tracks_the_last_word_of_a_guard_cut() {
+        let parent = slice(662.5, 689.5);
+        assert_eq!(
+            guard_cut_content_end_sample(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &words_ending_at(&[16.64]),
+                RATE,
+            ),
+            Some(parent.start_sample + 266_240)
+        );
+        // A clean (untruncated) slice and a non-worded slice anchor nothing:
+        // the committed boundary stays at the window end as before.
+        assert!(
+            guard_cut_content_end_sample(&parent, None, &words_ending_at(&[16.64]), RATE,)
+                .is_none()
+        );
+        assert!(
+            guard_cut_content_end_sample(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::BudgetExhausted)),
+                &words_ending_at(&[16.64]),
+                RATE,
+            )
+            .is_none()
+        );
+        assert!(
+            guard_cut_content_end_sample(
+                &parent,
+                Some(&truncation(DecodeTruncationReason::DegenerateRepeatGuard)),
+                &Transcription::default(),
+                RATE,
+            )
+            .is_none()
         );
     }
 }
