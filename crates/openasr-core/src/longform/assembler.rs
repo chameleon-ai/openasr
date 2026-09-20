@@ -63,6 +63,16 @@ const SEGMENT_STITCH_MAX_REGAP_SECONDS: f32 = 2.0;
 /// tolerance (enough for onset-timing jitter on a word straddling the cut).
 const SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS: f32 = 0.15;
 
+/// How far inside `previous.end` the earlier word-instance of a
+/// single-unit seam may have ended and still count as the word the slice
+/// cut landed on (the clamp check in `apply_suffix_prefix_stitch`). A
+/// straddling word is clamped at the segment end, or its decode end-estimate
+/// lands a few tens of ms short of it. A word that finished clearly before
+/// the cut was followed by NEW speech: its same-text successor across the
+/// boundary is a genuine back-to-back repeat ("Yeah. Yeah."), not a re-read
+/// of the cut word.
+const SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS: f32 = 0.1;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -363,7 +373,12 @@ impl TranscriptAssembler {
     /// CJK char that is not a doubled sentence-initial (「谢谢」), and only
     /// when the segment time-overlap covers that char's estimated duration
     /// -- so 「我 我」 / 「吃饭」+「饭，」 still stitch, while 「八」/「谢」
-    /// and English head-words do not. Matches are always a suffix of
+    /// and English head-words do not (interpolated tile times stay refused).
+    /// A one-unit non-CJK match is a further candidate when both segments
+    /// carry acoustic word timestamps: the straddling-word shape (the cut
+    /// lands mid-word and both slices decode it). It stands only when the
+    /// full acoustic vet passes (regap, past-previous-end, seam clamp).
+    /// Matches are always a suffix of
     /// `previous`; an interior window is never searched.
     ///
     /// The stitch rewrites text only. `previous.end` is left alone so a
@@ -437,6 +452,7 @@ fn apply_suffix_prefix_stitch(
         &current.text,
         min_units,
         time_overlap_seconds,
+        !approximate_word_timestamps,
     ) else {
         return false;
     };
@@ -461,28 +477,62 @@ fn apply_suffix_prefix_stitch(
     // that gap; stitching would consume real words from both segments and lose
     // audible content. Interpolated families carry synthetic tile times, so
     // their regap is not acoustically meaningful and the guard is skipped.
-    // For acoustic words the two matched word-instances must sit close in the
-    // original audio; for synthetic tile times the guard is skipped.
-    if !approximate_word_timestamps
-        && let (Some((_, prev_match)), Some((curr_match, _))) =
-            (previous_words.as_ref(), current_words.as_ref())
-        && let (Some(prev_match_last), Some(curr_match_first)) =
-            (prev_match.last(), curr_match.first())
-    {
-        let regap_seconds = curr_match_first.start - prev_match_last.end;
-        if regap_seconds > max_seam_regap_seconds {
-            return false;
-        }
-        // A re-read is audio the previous slice already covered, so the
-        // current slice's copy of the phrase must sit at/before `previous.end`
-        // (inside the inter-slice overlap). A phrase that BEGINS after the
-        // previous segment's end is new audio the previous slice never
-        // transcribed -- a deliberate repeat/echo landing at the cut -- even
-        // when its regap is small enough to pass the check above.
-        let past_prev_end = curr_match_first.start - previous.end;
-        if past_prev_end > SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS {
-            return false;
-        }
+    //
+    // A single-unit seam additionally needs the whole vet: one shared word is
+    // textually unredundant, so it is admitted only because BOTH word-instances
+    // are placed on the original timeline, the earlier one is the word the cut
+    // landed on (clamped at `previous.end` or within its end-estimate
+    // jitter), and the later one begins where the straddling audio restarts
+    // (at/before `previous.end` within onset jitter). A word that finished
+    // well before the cut, followed by a same-text word after it, is a
+    // genuine back-to-back repeat and is refused by the clamp check; a word
+    // with no usable times of its own is refused outright.
+    let single_unit = overlap.units == 1;
+    let unit_token = current
+        .text
+        .chars()
+        .skip(overlap.curr_start)
+        .take(overlap.curr_end - overlap.curr_start)
+        .collect::<String>();
+    let non_cjk_single_unit = single_unit && !is_single_cjk_char(&unit_token);
+    let mut acoustic_vet_passed = true;
+    if !approximate_word_timestamps {
+        acoustic_vet_passed = match (
+            previous_words
+                .as_ref()
+                .and_then(|(_, matched)| matched.last()),
+            current_words
+                .as_ref()
+                .and_then(|(matched, _)| matched.first()),
+        ) {
+            (Some(prev_match_last), Some(curr_match_first)) => {
+                let regap_seconds = curr_match_first.start - prev_match_last.end;
+                if regap_seconds > max_seam_regap_seconds {
+                    return false;
+                }
+                // A re-read is audio the previous slice already covered, so the
+                // current slice's copy of the phrase must sit at/before
+                // `previous.end` (inside the inter-slice overlap). A phrase
+                // that BEGINS after the previous segment's end is new audio the
+                // previous slice never transcribed -- a deliberate repeat/echo
+                // landing at the cut -- even when its regap is small enough to
+                // pass the check above.
+                let past_prev_end = curr_match_first.start - previous.end;
+                if past_prev_end > SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS {
+                    return false;
+                }
+                if single_unit {
+                    previous.end - prev_match_last.end
+                        <= SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+    }
+    if non_cjk_single_unit && !acoustic_vet_passed {
+        return false;
     }
     let leftover_words = current_words
         .as_ref()
@@ -506,9 +556,14 @@ fn apply_suffix_prefix_stitch(
     // A period sitting on `previous` after the overlap is a truncated-slice
     // hallucination when current continues with content (no punct right after
     // the overlap). Keep it only when the remainder is empty or current
-    // already carried immediately-following seam punct.
-    let strip_truncated_period = consume_end == overlap.curr_end && !remainder.is_empty();
-    if !strip_truncated_period {
+    // already carried immediately-following seam punct. Conversely, the
+    // earlier copy's trailing punct is the same artifact once the re-homed
+    // text carries the current slice's seam punct ("too." + "too," ->
+    // "too,", never "too,.").
+    let consumed_ends_punct = consumed.chars().last().is_some_and(is_seam_punctuation);
+    let strip_trailing_punct =
+        (consume_end == overlap.curr_end && !remainder.is_empty()) || consumed_ends_punct;
+    if !strip_trailing_punct {
         let trailing = previous_trailing_punct(&previous.text, overlap.prev_end);
         if !trailing.is_empty() && !completed.ends_with(&trailing) {
             completed.push_str(&trailing);
@@ -696,6 +751,10 @@ struct SuffixPrefixOverlap {
     prev_end: usize,
     curr_start: usize,
     curr_end: usize,
+    /// Number of matched overlap units. A one-unit seam is textually
+    /// unredundant, so its callers require the acoustic vet to have actually
+    /// placed both word-instances on the timeline before it may stand.
+    units: usize,
 }
 
 fn is_seam_punctuation(ch: char) -> bool {
@@ -789,11 +848,15 @@ const CJK_CHAR_SECONDS: f32 = 0.18;
 
 /// Longest *suffix* of `previous` that is a prefix of `current`. Interior
 /// matches are not considered: a re-read can only replay the previous tail.
+/// A single non-CJK unit is only a *candidate* here; on acoustic families
+/// the caller must still pass its full acoustic vet, and on interpolated
+/// tile times it is refused outright.
 fn suffix_prefix_overlap(
     previous: &str,
     current: &str,
     min_units: usize,
     time_overlap_seconds: f32,
+    acoustic: bool,
 ) -> Option<SuffixPrefixOverlap> {
     let previous_units = overlap_units(previous);
     let current_units = overlap_units(current);
@@ -820,6 +883,7 @@ fn suffix_prefix_overlap(
             previous_suffix,
             &current_units,
             time_overlap_seconds,
+            acoustic,
         ) {
             continue;
         }
@@ -828,6 +892,7 @@ fn suffix_prefix_overlap(
             prev_end: previous_suffix[n - 1].end,
             curr_start: current_prefix[0].start,
             curr_end: current_prefix[n - 1].end,
+            units: n,
         });
     }
     None
@@ -839,6 +904,7 @@ fn accept_overlap_n(
     overlap: &[OverlapUnit],
     current_units: &[OverlapUnit],
     time_overlap_seconds: f32,
+    acoustic: bool,
 ) -> bool {
     if overlap.iter().all(|unit| is_numeric_unit(&unit.token)) {
         return false;
@@ -849,12 +915,26 @@ fn accept_overlap_n(
     // Single-char CJK re-read (「我 我」, 「吃饭」/「饭，」): require the
     // windows to actually overlap by at least that char's spoken duration.
     // A doubled sentence-initial (「谢谢」) is a new phrase, not a re-read.
-    n == 1
+    if n == 1
         && time_overlap_seconds > 1.0e-3
         && time_overlap_seconds + 1.0e-3 >= CJK_CHAR_SECONDS
         && overlap.len() == 1
         && is_single_cjk_char(&overlap[0].token)
         && !(current_units.len() >= 2 && current_units[0].token == current_units[1].token)
+    {
+        return true;
+    }
+    // A single non-CJK word is admitted as a re-read *candidate* only for
+    // families whose word timestamps are acoustic: the straddling-word shape
+    // (the cut lands mid-word, both slices decode it, the earlier copy is
+    // clamped at the boundary and the later copy restarts within onset
+    // jitter). One shared word carries no textual redundancy, so on
+    // interpolated tile times it stays refused (the historical English
+    // head-word false positive); on acoustic families
+    // `apply_suffix_prefix_stitch` then requires the full acoustic vet
+    // (regap, past-previous-end, and the seam clamp) to pass, or the seam
+    // is dropped there. The CJK single-char rule above is untouched.
+    acoustic && n == 1 && !is_single_cjk_char(&overlap[0].token)
 }
 
 fn extend_consumed_current_end(current: &str, overlap_end: usize) -> usize {
@@ -1982,6 +2062,290 @@ mod tests {
             cur_words.iter().any(|w| w.eq_ignore_ascii_case("All")),
             "the post-echo continuation must survive, got {cur_words:?}"
         );
+    }
+
+    #[test]
+    fn assembler_stitches_single_acoustic_word_straddling_the_cut() {
+        // The ducks shape: the cut lands mid-("too") at 72.55s. The earlier
+        // copy is clamped at the boundary, the later slice re-decodes the
+        // same word 0.08s past it. The transcript must carry exactly one
+        // "too", the re-homed text must take the current slice's seam punct
+        // (no "too,."), and the later segment must resume at "man."
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 72 + 8_800),
+            text: "that's my philosophy too.".to_string(),
+            segments: vec![absolute_segment(
+                "that's my philosophy too.",
+                70.0,
+                72.55,
+                vec![
+                    word("that's", 70.5, 70.9),
+                    word("my", 71.0, 71.3),
+                    word("philosophy", 71.4, 72.1),
+                    word("too.", 72.26, 72.55),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 72 + 8_800, 16_000 * 75),
+            text: "too, man. would i like to".to_string(),
+            segments: vec![absolute_segment(
+                "too, man. would i like to",
+                72.55,
+                75.0,
+                vec![
+                    word("too,", 72.63, 73.30),
+                    word("man.", 73.30, 73.60),
+                    word("would", 73.80, 74.20),
+                    word("i", 74.30, 74.50),
+                    word("like", 74.55, 74.90),
+                    word("to", 74.95, 75.00),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            transcription.text,
+            "that's my philosophy too, man. would i like to"
+        );
+        assert_eq!(transcription.segments.len(), 2);
+        let too_words = transcription
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .filter(|w| w.word.trim_matches(['.', ',']).eq_ignore_ascii_case("too"))
+            .count();
+        assert_eq!(
+            too_words, 1,
+            "the straddling word must survive exactly once, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].words[0].word, "man.");
+        assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    #[test]
+    fn assembler_keeps_single_word_said_naturally_before_the_cut() {
+        // The plomet shape: the earlier "yeah." finished 0.4s BEFORE the
+        // 451.0s cut (not clipped by it), and the later "yeah." is a genuine
+        // back-to-back repeat. The seam-clamp check refuses the stitch; both
+        // copies survive with their word windows.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 451),
+            text: "mhm. yeah.".to_string(),
+            segments: vec![absolute_segment(
+                "mhm. yeah.",
+                448.0,
+                451.0,
+                vec![word("mhm.", 448.5, 449.2), word("yeah.", 448.9, 450.6)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 451, 16_000 * 477),
+            text: "yeah. i've been there".to_string(),
+            segments: vec![absolute_segment(
+                "yeah. i've been there",
+                450.74,
+                455.0,
+                vec![
+                    word("yeah.", 450.74, 452.38),
+                    word("i've", 452.18, 453.88),
+                    word("been", 454.05, 454.50),
+                    word("there", 454.50, 455.00),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(
+            transcription
+                .text
+                .split_whitespace()
+                .filter(|w| w.trim_matches(['.', ',']).eq_ignore_ascii_case("yeah"))
+                .count(),
+            2,
+            "a genuine back-to-back repeat must not be deduped, got {:#?}",
+            transcription
+        );
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_keeps_single_word_echo_beginning_clear_after_cut() {
+        // The bonnie shape: "america!" clamped at the 371.5s cut, a clear
+        // pause, then the re-announcement 0.82s past the boundary. New audio,
+        // not a re-read: the past-previous-end guard refuses and both copies
+        // survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 371 + 8_000),
+            text: "happy independence day america!".to_string(),
+            segments: vec![absolute_segment(
+                "happy independence day america!",
+                369.0,
+                371.5,
+                vec![
+                    word("happy", 369.2, 369.8),
+                    word("day", 369.75, 370.9),
+                    word("america!", 370.7, 371.5),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 371 + 8_000, 16_000 * 398),
+            text: "america! america! hello!".to_string(),
+            segments: vec![absolute_segment(
+                "america! america! hello!",
+                371.5,
+                375.0,
+                vec![
+                    word("america!", 372.32, 372.68),
+                    word("america!", 372.48, 373.76),
+                    word("hello!", 373.56, 374.97),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(
+            transcription
+                .text
+                .split_whitespace()
+                .filter(|w| w.trim_matches(['!', '.']).eq_ignore_ascii_case("america"))
+                .count(),
+            3,
+            "the echo must survive both segments, got {:#?}",
+            transcription
+        );
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_keeps_single_word_reread_and_genuine_second_copy() {
+        // The ali shape: the speech is "good. good." -- the first "good" sits
+        // ON the 159.5s cut (clamped) and the second is a genuine immediate
+        // repeat. The later slice re-decoded the straddling first copy too,
+        // so the seam carries it twice. The stitch consumes only the
+        // re-read instance (the one at the cut), leaving the genuine pair.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 159 + 8_000),
+            text: "there we go. good.".to_string(),
+            segments: vec![absolute_segment(
+                "there we go. good.",
+                157.0,
+                159.5,
+                vec![
+                    word("there", 157.5, 157.8),
+                    word("we", 157.8, 158.2),
+                    word("go.", 157.8, 158.9),
+                    word("good.", 159.14, 159.50),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 159 + 8_000, 16_000 * 186),
+            text: "good. good. that's it.".to_string(),
+            segments: vec![absolute_segment(
+                "good. good. that's it.",
+                159.44,
+                162.0,
+                vec![
+                    word("good.", 159.44, 160.07),
+                    word("good.", 159.87, 160.90),
+                    word("that's", 160.70, 161.30),
+                    word("it.", 161.50, 162.00),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            transcription
+                .text
+                .split_whitespace()
+                .filter(|w| w.trim_matches(['.', ',']).eq_ignore_ascii_case("good"))
+                .count(),
+            2,
+            "only the re-read copy may be consumed, got {:#?}",
+            transcription
+        );
+        assert_eq!(
+            transcription.segments[0].text, "there we go. good.",
+            "the earlier copy keeps its clamped window text, got {:#?}",
+            transcription.segments[0]
+        );
+        assert!(
+            transcription.segments[1].text.starts_with("good."),
+            "the genuine second copy must lead the remainder, got {:#?}",
+            transcription.segments[1]
+        );
+        assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    #[test]
+    fn assembler_keeps_single_word_seam_without_acoustic_vet() {
+        // Wordless segments: a one-unit English seam has no word times for
+        // the vet to run on, so it is refused (the historical head-word
+        // protection) and both copies survive.
+        let transcription =
+            assemble_wordless_overlap("that's my philosophy too.", "too, man. would i like to");
+        assert_eq!(transcription.segments.len(), 2);
+        assert!(
+            transcription.text.contains("too.") && transcription.text.contains("too,"),
+            "both wordless copies must survive, got {:?}",
+            transcription.text
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_single_word_seam_for_approximate_families() {
+        // Interpolated (DecodeInvariant) families: the acoustic vet cannot
+        // run on synthetic tile times, so a one-unit English seam stays
+        // refused even when the segments carry words.
+        let previous = "that's my philosophy too.";
+        let current = "too, man. would i like to";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_approximate_word_timestamps(true);
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 72 + 8_800),
+            text: previous.to_string(),
+            segments: vec![absolute_segment(
+                previous,
+                70.0,
+                72.55,
+                interpolated_words(previous, 70.0, 72.55),
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 72 + 8_800, 16_000 * 75),
+            text: current.to_string(),
+            segments: vec![absolute_segment(
+                current,
+                72.55,
+                75.0,
+                interpolated_words(current, 72.55, 75.0),
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(stats.duplicate_merge_count, 0);
     }
 
     #[test]
