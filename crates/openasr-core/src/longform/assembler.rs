@@ -73,6 +73,31 @@ const SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS: f32 = 0.15;
 /// of the cut word.
 const SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS: f32 = 0.1;
 
+/// Confidence ceiling of the new slice's head word for the B-side seam
+/// phantom rule (below). A re-read of audio the previous slice already
+/// committed is a second, weaker decode of that same audio, so the artifact
+/// carries less confidence than the reading that already owns it. Genuine
+/// straddling words are decoded with the whole word's audio in view and
+/// sit at or above this value in every observed seam pair, except shapes
+/// the committed-word floor and the width gate below already keep.
+const SEAM_PHANTOM_HEAD_MAX_CONFIDENCE: f32 = 0.5;
+
+/// Confidence floor of the committed word for the B-side seam phantom rule:
+/// only a committed word decoded with certainty hands its audio over to be
+/// protected. When the committed word is itself uncertain, both readings
+/// are live candidates and neither may be eaten, no matter how weak or
+/// stretched the re-read looks.
+const SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE: f32 = 0.85;
+
+/// Minimum width of the re-read window for the B-side seam phantom rule.
+/// The phantom pads out over the committed tail plus the silence the cut
+/// left behind, so its window is far wider than the speech it covers; a
+/// genuine straddling word stays close to its spoken duration. Genuine
+/// held words (a sung vowel over several seconds of music) are far wider
+/// still but carry the confidence of the slice that heard them whole, and
+/// the two confidence gates above keep them on the table.
+const SEAM_PHANTOM_HEAD_MIN_WIDTH_SECONDS: f32 = 0.9;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -210,6 +235,19 @@ impl TranscriptAssembler {
             {
                 self.stats.duplicate_merge_count += 1;
                 continue;
+            }
+            // B-side seam phantom: the new slice re-read the committed tail
+            // as a different low-confidence head word. Runs AFTER the midpoint
+            // trim, which may have dropped the leading committed fragments
+            // that front a stretched phantom: the head inspected is the first
+            // word that survives into the transcript. The midpoint trim keeps
+            // such a stretched window (its majority sits past the boundary),
+            // so only this rule removes it.
+            if cross_slice_seam && self.drop_seam_phantom_head(&mut mapped) {
+                self.stats.duplicate_merge_count += 1;
+                if mapped.text.trim().is_empty() {
+                    continue;
+                }
             }
             if self.try_drop_redundant_segment(&mapped) {
                 self.stats.duplicate_merge_count += 1;
@@ -429,6 +467,85 @@ impl TranscriptAssembler {
             );
         }
         stitched
+    }
+
+    /// Drop the new slice's head word when it is a B-side seam phantom: a
+    /// decode artifact re-reading audio the previous slice already committed
+    /// as a *different* token. The suffix-prefix stitch cannot remove it
+    /// (the texts share no overlap) and the midpoint trim cannot remove it
+    /// (the stretched window's majority sits past the boundary), so without
+    /// this pass both the committed word and the phantom survive.
+    ///
+    /// Three signals must agree, or the word stays. The committed word is
+    /// the one the cut landed on -- clamped at the previous segment end: a
+    /// word that finished clearly before the cut made room for new speech.
+    /// Both words carry confidence, with the committed word decoded with
+    /// certainty and the re-read weakly. And the re-read window is stretched
+    /// wide, padding over the silence the cut left behind. Same-token heads
+    /// belong to the suffix-prefix stitch family and the midpoint trim, and
+    /// non-Latin heads keep the unit rules, so both stay out of scope.
+    /// Returns `true` when the phantom head word was dropped (the caller
+    /// counts the merge and drops the segment when it was left empty).
+    fn drop_seam_phantom_head(&self, current: &mut Segment) -> bool {
+        if self.approximate_word_timestamps {
+            // Interpolated tiles are not acoustic: width is a function of
+            // the tile, so the stretch test has no meaning for them.
+            return false;
+        }
+        let Some(previous) = self.segments.last() else {
+            return false;
+        };
+        let (Some(committed), Some(phantom)) = (previous.words.last(), current.words.first())
+        else {
+            return false;
+        };
+        // The re-read must reach back over the committed word's audio.
+        if phantom.start >= committed.end {
+            return false;
+        }
+        if previous.end - committed.end > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS {
+            return false;
+        }
+        if normalize_words(&committed.word) == normalize_words(&phantom.word)
+            || !phantom.word.chars().any(|ch| ch.is_ascii_alphabetic())
+        {
+            return false;
+        }
+        let (Some(committed_confidence), Some(phantom_confidence)) =
+            (committed.confidence, phantom.confidence)
+        else {
+            return false;
+        };
+        if committed_confidence < SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE
+            || phantom_confidence >= SEAM_PHANTOM_HEAD_MAX_CONFIDENCE
+        {
+            return false;
+        }
+        if phantom.end - phantom.start < SEAM_PHANTOM_HEAD_MIN_WIDTH_SECONDS {
+            return false;
+        }
+        let chars: Vec<char> = current.text.chars().collect();
+        let new_text = match leading_word_char_offset(&chars, &current.words, 1) {
+            Some(offset) => chars[offset..]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+            // Words did not align to the text (unexpected): rebuild from the
+            // kept tokens rather than mis-slice the string.
+            None => crate::transcript_text::join_segment_texts(
+                current.words[1..].iter().map(|word| word.word.as_str()),
+            ),
+        };
+        current.words.drain(0..1);
+        if let Some(first) = current.words.first() {
+            current.start = first.start;
+        }
+        current.text = new_text;
+        // A phantom head was dropped. The remainder (if any) is genuine
+        // continuation that still runs the redundancy check before it is
+        // pushed.
+        true
     }
 }
 
@@ -1322,6 +1439,15 @@ mod tests {
             start,
             end,
             confidence: None,
+        }
+    }
+
+    fn word_conf(text: &str, start: f32, end: f32, confidence: f32) -> WordTimestamp {
+        WordTimestamp {
+            word: text.to_string(),
+            start,
+            end,
+            confidence: Some(confidence),
         }
     }
 
@@ -2772,6 +2898,504 @@ mod tests {
         let (transcription, stats) = assembler.into_parts();
         assert_eq!(transcription.segments.len(), 2);
         assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_drops_b_side_seam_phantom_at_min_width() {
+        // B-side seam phantom at the narrowest observed re-read width: the
+        // cut lands on the committed "know." (decoded with certainty), and
+        // the new slice re-reads its tail as the different token "And" -
+        // 34% confident, stretched over the committed tail plus the pause
+        // after the cut. The re-read is a decode artifact, not speech, so it
+        // must not survive; the committed word is untouched.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 179 + 8_000),
+            text: "we know.".to_string(),
+            segments: vec![absolute_segment(
+                "we know.",
+                178.9,
+                179.5,
+                vec![
+                    word_conf("we", 179.0, 179.3, 0.97),
+                    word_conf("know.", 179.33, 179.5, 0.982),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 179, 16_000 * 183),
+            text: "And I know what you mean.".to_string(),
+            segments: vec![absolute_segment(
+                "And I know what you mean.",
+                179.32,
+                182.4,
+                vec![
+                    word_conf("And", 179.32, 180.28, 0.338),
+                    word("I", 180.08, 180.54),
+                    word("know", 180.54, 181.0),
+                    word("what", 181.0, 181.45),
+                    word("you", 181.45, 181.8),
+                    word("mean.", 181.8, 182.4),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the phantom head must be dropped, got {:#?}",
+            transcription
+        );
+        assert!(
+            !transcription.text.contains("And"),
+            "the low-confidence re-read must not survive, got {:?}",
+            transcription.text
+        );
+        assert_eq!(
+            transcription.segments[0].text, "we know.",
+            "the committed segment must stay untouched, got {:#?}",
+            transcription.segments
+        );
+        assert_eq!(
+            transcription.segments[1].text, "I know what you mean.",
+            "the remainder must resume after the phantom, got {:?}",
+            transcription.segments[1].text
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|word| word.word.as_str()),
+            Some("I"),
+            "the phantom word window must not survive, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_drops_stretched_b_side_seam_phantom() {
+        // Wide phantom: the cut lands on the committed "tunnel." and the new
+        // slice emits one 45%-confident word whose window stretches 6s over
+        // the committed tail and the following silence (the decode padded
+        // silence with a made-up word). The whole window is artifact.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 182 + 1_760),
+            text: "into the tunnel.".to_string(),
+            segments: vec![absolute_segment(
+                "into the tunnel.",
+                180.5,
+                182.11,
+                vec![
+                    word_conf("into", 180.8, 181.1, 0.96),
+                    word_conf("the", 181.1, 181.3, 0.95),
+                    word_conf("tunnel.", 181.52, 182.11, 0.919),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 181 + 8_000, 16_000 * 190),
+            text: "normal. But yeah, it happened.".to_string(),
+            segments: vec![absolute_segment(
+                "normal. But yeah, it happened.",
+                181.77,
+                189.95,
+                vec![
+                    word_conf("normal.", 181.77, 187.92, 0.455),
+                    word("But", 188.12, 188.5),
+                    word("yeah,", 188.6, 189.0),
+                    word("it", 189.0, 189.3),
+                    word("happened.", 189.3, 189.95),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the stretched phantom head must be dropped, got {:#?}",
+            transcription
+        );
+        assert!(
+            !transcription.text.contains("normal"),
+            "the stretched re-read must not survive, got {:?}",
+            transcription.text
+        );
+        assert!(
+            transcription.segments[0].text.ends_with("into the tunnel."),
+            "the committed tail must keep its own word, got {:?}",
+            transcription.segments[0].text
+        );
+        assert!(
+            transcription.segments[1].text.starts_with("But yeah"),
+            "the remainder must resume at the first real word, got {:?}",
+            transcription.segments[1].text
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|word| word.word.as_str()),
+            Some("But"),
+            "the phantom window must not survive, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_drops_seam_phantom_fronted_by_committed_fragments() {
+        // The real decode shape of a stretched phantom: the slice re-read
+        // emits a run of low-confidence fragments compressed into the
+        // committed region, then one stretched word padded over the
+        // following silence. The midpoint trim clears the fragments on its
+        // own; the phantom rule must then see the stretched word - now the
+        // surviving head - and drop it.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 182 + 1_760),
+            text: "into the tunnel.".to_string(),
+            segments: vec![absolute_segment(
+                "into the tunnel.",
+                180.5,
+                182.11,
+                vec![
+                    word_conf("into", 180.8, 181.1, 0.96),
+                    word_conf("the", 181.1, 181.3, 0.95),
+                    word_conf("tunnel.", 181.52, 182.11, 0.919),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 181 + 8_000, 16_000 * 190),
+            text: "So, I'm going back to normal. But yeah.".to_string(),
+            segments: vec![absolute_segment(
+                "So, I'm going back to normal. But yeah.",
+                181.61,
+                189.0,
+                vec![
+                    word_conf("So,", 181.61, 181.82, 0.052),
+                    word_conf("I'm", 181.62, 181.88, 0.149),
+                    word_conf("going", 181.68, 181.88, 0.088),
+                    word_conf("back", 181.68, 181.88, 0.453),
+                    word_conf("to", 181.68, 181.97, 0.763),
+                    word_conf("normal.", 181.77, 187.92, 0.455),
+                    word("But", 188.12, 188.5),
+                    word("yeah.", 188.6, 188.95),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the stretched head behind the fragments must be dropped, got {:#?}",
+            transcription
+        );
+        assert!(
+            !transcription.text.contains("normal"),
+            "the stretched re-read must not survive, got {:?}",
+            transcription.text
+        );
+        assert!(
+            !transcription.text.contains("So,"),
+            "the committed-region fragments must not survive, got {:?}",
+            transcription.text
+        );
+        assert!(
+            transcription.segments[0].text.ends_with("into the tunnel."),
+            "the committed tail must keep its own word, got {:?}",
+            transcription.segments[0].text
+        );
+        assert_eq!(
+            transcription.segments[1].text, "But yeah.",
+            "the remainder must resume at the first new word, got {:?}",
+            transcription.segments[1].text
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|word| word.word.as_str()),
+            Some("But"),
+            "only the new words may survive, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_b_side_head_when_committed_word_uncertain() {
+        // The committed word is decoded at 82% confidence (under the 85%
+        // floor) even though the re-read is a different token at 41%
+        // confidence stretched a full second wide: both readings are live
+        // candidates and neither may be eaten. Both survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 451),
+            text: "i said it?".to_string(),
+            segments: vec![absolute_segment(
+                "i said it?",
+                450.2,
+                451.0,
+                vec![
+                    word_conf("i", 450.3, 450.5, 0.9),
+                    word_conf("said", 450.5, 450.75, 0.94),
+                    word_conf("it?", 450.8, 451.0, 0.82),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 450 + 12_000, 16_000 * 454),
+            text: "if? then we left.".to_string(),
+            segments: vec![absolute_segment(
+                "if? then we left.",
+                450.91,
+                452.95,
+                vec![
+                    word_conf("if?", 450.91, 451.91, 0.41),
+                    word("then", 451.95, 452.3),
+                    word("we", 452.3, 452.6),
+                    word("left.", 452.6, 452.95),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "an uncertain committed word must not hand its audio away, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[0].text, "i said it?");
+        assert_eq!(
+            transcription.segments[1].text, "if? then we left.",
+            "the straddling head must lead the remainder, got {:?}",
+            transcription.segments[1].text
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_tight_b_side_head_over_confident_committed_word() {
+        // Width gate: the committed word decodes at 99.8% and the re-read at
+        // 23.5%, but its window is tight (0.37s, close to its spoken
+        // duration) - a genuine straddling word, not a stretch over silence.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 64 + 4_800),
+            text: "working on your".to_string(),
+            segments: vec![absolute_segment(
+                "working on your",
+                63.3,
+                64.3,
+                vec![
+                    word_conf("working", 63.45, 63.87, 0.99),
+                    word_conf("on", 63.67, 64.08, 0.994),
+                    word_conf("your", 64.05, 64.3, 0.998),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 64, 16_000 * 67),
+            text: "free time is no longer".to_string(),
+            segments: vec![absolute_segment(
+                "free time is no longer",
+                64.05,
+                65.7,
+                vec![
+                    word_conf("free", 64.26, 64.626, 0.235),
+                    word("time", 64.43, 64.93),
+                    word("is", 64.73, 65.1),
+                    word("no", 64.9, 65.31),
+                    word("longer", 65.11, 65.7),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a tight window is a word, not a phantom, got {:#?}",
+            transcription
+        );
+        assert_eq!(
+            transcription.segments[1].text, "free time is no longer",
+            "the genuine straddle must survive whole, got {:?}",
+            transcription.segments[1].text
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_b_side_head_without_confidence() {
+        // No confidence is no evidence. Some families emit word timestamps
+        // without per-word confidences; the rule stays inert rather than
+        // guessing.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 318 + 15_040),
+            text: "i work.".to_string(),
+            segments: vec![absolute_segment(
+                "i work.",
+                318.0,
+                318.94,
+                vec![
+                    word_conf("i", 318.1, 318.3, 0.96),
+                    word_conf("work.", 318.44, 318.94, 0.958),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 318 + 8_000, 16_000 * 321),
+            text: "Right again.".to_string(),
+            segments: vec![absolute_segment(
+                "Right again.",
+                318.93,
+                319.95,
+                vec![
+                    word("Right", 318.93, 319.61),
+                    word("again.", 319.61, 319.95),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "the rule must be inert without confidences, got {:#?}",
+            transcription
+        );
+        assert_eq!(
+            transcription.segments[1].text, "Right again.",
+            "the head word must survive, got {:?}",
+            transcription.segments[1].text
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_b_side_phantom_shape_for_approximate_families() {
+        // Interpolated (non-acoustic) tile times: width is a function of the
+        // tile, not of speech, so the stretch test is meaningless and the
+        // rule stays off even for a shape that would be a phantom on an
+        // acoustic family.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_approximate_word_timestamps(true);
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 179 + 8_000),
+            text: "we know.".to_string(),
+            segments: vec![absolute_segment(
+                "we know.",
+                178.9,
+                179.5,
+                vec![
+                    word_conf("we", 179.0, 179.3, 0.97),
+                    word_conf("know.", 179.33, 179.5, 0.982),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 179, 16_000 * 183),
+            text: "And I know what you mean.".to_string(),
+            segments: vec![absolute_segment(
+                "And I know what you mean.",
+                179.32,
+                182.4,
+                vec![
+                    word_conf("And", 179.32, 180.28, 0.338),
+                    word("I", 180.08, 180.54),
+                    word("know", 180.54, 181.0),
+                    word("what", 181.0, 181.45),
+                    word("you", 181.45, 181.8),
+                    word("mean.", 181.8, 182.4),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(stats.duplicate_merge_count, 0);
+        assert!(
+            transcription.text.contains("And"),
+            "the approximate family must keep its head word, got {:?}",
+            transcription.text
+        );
+    }
+
+    #[test]
+    fn assembler_stitches_same_token_seam_instead_of_phantom_drop() {
+        // Same-token ownership: the committed "out." clamps the cut and the
+        // re-read is a low-confidence, stretched "out," - every phantom gate
+        // except the token-inequality one would fire. Same-token seams are
+        // the suffix-prefix stitch's territory (and the midpoint trim's):
+        // the stitch consumes the re-read and the committed word stands.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 504),
+            text: "i blacked out.".to_string(),
+            segments: vec![absolute_segment(
+                "i blacked out.",
+                503.2,
+                504.0,
+                vec![
+                    word_conf("i", 503.3, 503.5, 0.95),
+                    word_conf("blacked", 503.5, 503.83, 0.93),
+                    word_conf("out.", 503.83, 504.0, 0.98),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 503 + 12_000, 16_000 * 508),
+            text: "out, rest.".to_string(),
+            segments: vec![absolute_segment(
+                "out, rest.",
+                503.85,
+                507.2,
+                vec![
+                    word_conf("out,", 503.85, 506.85, 0.3),
+                    word("rest.", 506.9, 507.2),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(stats.duplicate_merge_count, 1);
+        let out_words = transcription
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .filter(|word| {
+                word.word
+                    .trim_matches(['.', ','])
+                    .eq_ignore_ascii_case("out")
+            })
+            .count();
+        assert_eq!(
+            out_words, 1,
+            "the straddling 'out' must survive exactly once, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[0].text.ends_with("blacked out,"),
+            "the re-homed seam punct must win, got {:?}",
+            transcription.segments[0].text
+        );
+        assert_eq!(
+            transcription.segments[1].text, "rest.",
+            "the re-read word must leave the remainder, got {:?}",
+            transcription.segments[1].text
+        );
     }
 
     #[test]
