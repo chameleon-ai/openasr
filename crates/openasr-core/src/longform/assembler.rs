@@ -377,9 +377,12 @@ impl TranscriptAssembler {
     /// A one-unit non-CJK match is a further candidate when both segments
     /// carry acoustic word timestamps: the straddling-word shape (the cut
     /// lands mid-word and both slices decode it). It stands only when the
-    /// full acoustic vet passes (regap, past-previous-end, seam clamp).
-    /// Matches are always a suffix of
-    /// `previous`; an interior window is never searched.
+    /// full acoustic vet passes (regap, past-previous-end, seam clamp). The
+    /// same candidate also applies when the match sits one or two current
+    /// units past leading re-read fragments; then the vet must also place
+    /// every fragment word in the committed region.
+    /// Matches are always a suffix of `previous`; an interior window is
+    /// never searched.
     ///
     /// The stitch rewrites text only. `previous.end` is left alone so a
     /// later slice cannot swallow the earlier segment's boundary.
@@ -487,6 +490,13 @@ fn apply_suffix_prefix_stitch(
     // well before the cut, followed by a same-text word after it, is a
     // genuine back-to-back repeat and is refused by the clamp check; a word
     // with no usable times of its own is refused outright.
+    //
+    // A seam that skipped leading re-read fragments additionally needs every
+    // fragment word placed in the committed region (midpoint strictly before
+    // `previous.end`: exactly the words the midpoint trim drops). A fragment
+    // whose audio lies at/past the boundary is new speech -- a fresh phrase
+    // that merely happens to be fronted by the previous tail word -- and must
+    // survive.
     let single_unit = overlap.units == 1;
     let unit_token = current
         .text
@@ -503,7 +513,7 @@ fn apply_suffix_prefix_stitch(
                 .and_then(|(_, matched)| matched.last()),
             current_words
                 .as_ref()
-                .and_then(|(matched, _)| matched.first()),
+                .and_then(|(matched, _)| matched.get(overlap.skip_curr_units)),
         ) {
             (Some(prev_match_last), Some(curr_match_first)) => {
                 let regap_seconds = curr_match_first.start - prev_match_last.end;
@@ -521,12 +531,30 @@ fn apply_suffix_prefix_stitch(
                 if past_prev_end > SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS {
                     return false;
                 }
-                if single_unit {
-                    previous.end - prev_match_last.end
-                        <= SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
-                } else {
-                    true
+                if single_unit
+                    && previous.end - prev_match_last.end
+                        > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
+                {
+                    return false;
                 }
+                if overlap.skip_curr_units > 0 {
+                    let fragments_committed = current_words
+                        .as_ref()
+                        .map(|(matched, _)| {
+                            !matched.is_empty()
+                                && matched
+                                    .iter()
+                                    .take(overlap.skip_curr_units)
+                                    .all(|fragment| {
+                                        0.5 * (fragment.start + fragment.end) < previous.end
+                                    })
+                        })
+                        .unwrap_or(false);
+                    if !fragments_committed {
+                        return false;
+                    }
+                }
+                true
             }
             _ => false,
         };
@@ -755,6 +783,13 @@ struct SuffixPrefixOverlap {
     /// unredundant, so its callers require the acoustic vet to have actually
     /// placed both word-instances on the timeline before it may stand.
     units: usize,
+    /// Leading `current` units consumed beyond the match. A straddling word
+    /// is sometimes fronted in the re-decode by a fragment of the earlier
+    /// word(s) ("...blacked out." / "I black out, but..."); the fragments are
+    /// re-read audio the previous slice already committed, so the one-word
+    /// match sits one or two units in. The vet must prove every fragment word
+    /// is committed-region audio before the skip may stand.
+    skip_curr_units: usize,
 }
 
 fn is_seam_punctuation(ch: char) -> bool {
@@ -851,6 +886,18 @@ const CJK_CHAR_SECONDS: f32 = 0.18;
 /// A single non-CJK unit is only a *candidate* here; on acoustic families
 /// the caller must still pass its full acoustic vet, and on interpolated
 /// tile times it is refused outright.
+///
+/// When no head-anchored match stands on acoustic families, one further
+/// candidate is admitted: the previous tail word equal to the current's
+/// second or third unit, i.e. the match shifted one or two units past
+/// leading re-read fragments ("...blacked out." / "I black out, but...").
+/// The fragments are partial re-decodes of the last word(s) inside the
+/// inter-slice overlap and would otherwise block the one-word seam outright.
+/// Like the head-anchored candidate it stays a candidate:
+/// `apply_suffix_prefix_stitch` must place the matched word on the timeline,
+/// pass the regap / past / seam-clamp vet, AND prove every skipped fragment
+/// word is committed-region audio (a word the midpoint trim drops) before the
+/// seam may stand.
 fn suffix_prefix_overlap(
     previous: &str,
     current: &str,
@@ -893,7 +940,32 @@ fn suffix_prefix_overlap(
             curr_start: current_prefix[0].start,
             curr_end: current_prefix[n - 1].end,
             units: n,
+            skip_curr_units: 0,
         });
+    }
+    if acoustic && current_units.len() >= 2 {
+        let previous_tail = &previous_units[previous_units.len() - 1];
+        let mut skip = 0usize;
+        for (index, shifted) in current_units.iter().take(3).enumerate() {
+            if index >= 1 && previous_tail.token == shifted.token {
+                skip = index;
+                break;
+            }
+        }
+        if skip > 0
+            && !is_numeric_unit(&previous_tail.token)
+            && !is_single_cjk_char(&previous_tail.token)
+        {
+            let shifted = &current_units[skip];
+            return Some(SuffixPrefixOverlap {
+                prev_start: previous_tail.start,
+                prev_end: previous_tail.end,
+                curr_start: shifted.start,
+                curr_end: shifted.end,
+                units: 1,
+                skip_curr_units: skip,
+            });
+        }
     }
     None
 }
@@ -2126,6 +2198,360 @@ mod tests {
         );
         assert_eq!(transcription.segments[1].words[0].word, "man.");
         assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    #[test]
+    fn vy_out_straddle_repro() {
+        // Byte-exact vy/whisper-large-v3-turbo segments 6/7 around the
+        // 504.0s cut: "out." clamped at the previous end (504.0), "out,"
+        // restarting 34ms past it on the next slice.
+        let previous_text = "a really tough day today and I want you guys to know that I got a lot of things done. I got so much done today in like the span of like... not even... it wasn't even that busy and then towards the end it got busy and I got so much done and like the feeling of being able to be like, \"Oh, it's almost three o'clock. I can go play video games with the hotties.\" I was so relieved. You guys don't understand. The moment that I hit go live, I blacked out.";
+        let current_text = "out, but also my body starts relaxing. So thank you. This is a really special place. I don't know how many times I've said this, but this is a really special place. And I'm really happy to see you guys. Hi. I worked really hard today. I'm sure you did too, hottie. Right? You worked hard today? Good job. Good job. What's up? I'm starting to understand that";
+        let previous_words = vec![
+            word("a", 477.19, 477.79),
+            word("really", 477.59, 478.181),
+            word("tough", 477.981, 478.507),
+            word("day", 478.307, 478.776),
+            word("today", 478.576, 479.2),
+            word("and", 479.0, 479.575),
+            word("I", 479.375, 479.702),
+            word("want", 479.502, 479.862),
+            word("you", 479.662, 480.031),
+            word("guys", 479.831, 480.184),
+            word("to", 479.984, 480.286),
+            word("know", 480.086, 480.411),
+            word("that", 480.211, 480.546),
+            word("I", 480.346, 480.689),
+            word("got", 480.489, 481.044),
+            word("a", 480.844, 481.456),
+            word("lot", 481.256, 481.7),
+            word("of", 481.5, 481.918),
+            word("things", 481.718, 482.2075),
+            word("done.", 482.0075, 482.4495),
+            word("I", 482.2495, 482.609),
+            word("got", 482.409, 482.928),
+            word("so", 482.728, 483.377),
+            word("much", 483.177, 483.792),
+            word("done", 483.592, 484.179),
+            word("today", 483.979, 484.698),
+            word("in", 484.498, 485.122),
+            word("like", 484.922, 485.282),
+            word("the", 485.082, 485.577),
+            word("span", 485.377, 485.956),
+            word("of", 485.756, 486.461),
+            word("like...", 486.261, 487.142),
+            word("not", 486.942, 487.585),
+            word("even...", 487.385, 487.849),
+            word("it", 487.649, 488.1635),
+            word("wasn't", 487.9635, 488.4945),
+            word("even", 488.2945, 488.682),
+            word("that", 488.482, 488.905),
+            word("busy", 488.705, 489.187),
+            word("and", 488.987, 489.393),
+            word("then", 489.193, 489.578),
+            word("towards", 489.378, 489.8),
+            word("the", 489.6, 489.955),
+            word("end", 489.755, 490.073),
+            word("it", 489.873, 490.204),
+            word("got", 490.004, 490.405),
+            word("busy", 490.205, 490.795),
+            word("and", 490.595, 491.115),
+            word("I", 490.915, 491.242),
+            word("got", 491.042, 491.447),
+            word("so", 491.247, 491.68),
+            word("much", 491.48, 491.925),
+            word("done", 491.725, 492.171),
+            word("and", 491.971, 492.351),
+            word("like", 492.151, 492.513),
+            word("the", 492.313, 492.761),
+            word("feeling", 492.561, 493.078),
+            word("of", 492.878, 493.29102),
+            word("being", 493.091, 493.489),
+            word("able", 493.289, 493.7),
+            word("to", 493.5, 493.873),
+            word("be", 493.673, 494.06702),
+            word("like,", 493.867, 494.282),
+            word("\"Oh,", 494.082, 494.433),
+            word("it's", 494.233, 494.636),
+            word("almost", 494.436, 494.862),
+            word("three", 494.662, 495.07376),
+            word("o'clock.", 494.87375, 495.31726),
+            word("I", 495.11725, 495.511),
+            word("can", 495.311, 495.727),
+            word("go", 495.527, 496.122),
+            word("play", 495.922, 496.52),
+            word("video", 496.32, 496.756),
+            word("games", 496.556, 496.964),
+            word("with", 496.764, 497.066),
+            word("the", 496.866, 497.227),
+            word("hotties.\"", 497.027, 497.487),
+            word("I", 497.287, 497.738),
+            word("was", 497.538, 498.077),
+            word("so", 497.877, 498.6675),
+            word("relieved.", 498.4675, 499.1475),
+            word("You", 498.9475, 499.293),
+            word("guys", 499.093, 499.49152),
+            word("don't", 499.2915, 500.0945),
+            word("understand.", 499.8945, 501.037),
+            word("The", 500.837, 501.654),
+            word("moment", 501.454, 501.938),
+            word("that", 501.738, 502.106),
+            word("I", 501.906, 502.249),
+            word("hit", 502.049, 502.451),
+            word("go", 502.251, 502.937),
+            word("live,", 502.737, 503.581),
+            word("I", 503.381, 503.898),
+            word("blacked", 503.698, 504.0),
+            word("out.", 503.83, 504.0),
+        ];
+        let current_words = vec![
+            word("out,", 504.0345, 504.5455),
+            word("but", 504.3455, 504.803),
+            word("also", 504.603, 505.08),
+            word("my", 504.88, 505.361),
+            word("body", 505.161, 505.696),
+            word("starts", 505.496, 506.453),
+            word("relaxing.", 506.253, 507.953),
+            word("So", 509.28, 509.648),
+        ];
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 504),
+            text: previous_text.to_string(),
+            segments: vec![absolute_segment(
+                previous_text,
+                477.5,
+                504.0,
+                previous_words,
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 504 + 552, 16_000 * 531),
+            text: current_text.to_string(),
+            segments: vec![absolute_segment(
+                current_text,
+                504.0345,
+                530.5,
+                current_words,
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the 34ms-gap straddle must stitch, got {:#?}",
+            transcription
+        );
+        let out_words = transcription
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .filter(|w| w.word.trim_matches(['.', ',']).eq_ignore_ascii_case("out"))
+            .count();
+        assert_eq!(
+            out_words, 1,
+            "the straddling 'out' must survive exactly once, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[0].text.ends_with("blacked out,"),
+            "re-homed seam punct must win over the clamped copy's period, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[1]
+                .text
+                .starts_with("but also my body"),
+            "the remainder must resume after the re-read, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_stitches_acoustic_seam_fronted_by_committed_fragments() {
+        // The real vy shape: the 504.0s cut splits "...I blacked out." The
+        // next slice re-decodes the overlap tail as fragments plus the
+        // straddling word ("I black out, but also..."). The fragment fronting
+        // blocks a head-anchored prefix match, so without the
+        // committed-fragment skip the seam would never be seen and both "out"
+        // copies survive. Every fragment word sits in the committed region
+        // (midpoint before the boundary: a word the midpoint trim drops), so
+        // the skip stands: one "out" survives, the re-homed seam punct wins,
+        // the remainder resumes at "but".
+        let previous_text = "a really rough day today and I want you to know that I got a lot done. The moment that I hit go live, I blacked out.";
+        let current_text = "I black out, but also my body starts relaxing. So thank you. This is a really special place.";
+        let previous_words = vec![
+            word("a", 477.19, 477.79),
+            word("really", 477.59, 478.181),
+            word("rough", 478.307, 478.776),
+            word("day", 478.9, 479.4),
+            word("today", 479.5, 480.1),
+            word("and", 480.3, 480.8),
+            word("I", 481.0, 481.4),
+            word("want", 481.6, 482.1),
+            word("you", 482.3, 482.8),
+            word("to", 483.0, 483.3),
+            word("know", 483.4, 483.9),
+            word("that", 484.1, 484.6),
+            word("I", 484.8, 485.2),
+            word("got", 485.4, 485.9),
+            word("a", 486.1, 486.4),
+            word("lot", 486.5, 486.9),
+            word("done.", 487.0, 487.6),
+            word("The", 500.837, 501.654),
+            word("moment", 501.454, 501.938),
+            word("that", 501.738, 502.106),
+            word("I", 501.906, 502.249),
+            word("hit", 502.049, 502.451),
+            word("go", 502.251, 502.937),
+            word("live,", 502.737, 503.581),
+            word("I", 503.381, 503.898),
+            word("blacked", 503.698, 504.0),
+            word("out.", 503.83, 504.0),
+        ];
+        let current_words = vec![
+            word("I", 503.5, 503.72),
+            word("black", 503.72, 504.0),
+            word("out,", 504.0345, 504.5455),
+            word("but", 504.3455, 504.803),
+            word("also", 504.603, 505.08),
+            word("my", 504.88, 505.361),
+            word("body", 505.161, 505.696),
+            word("starts", 505.496, 506.453),
+            word("relaxing.", 506.253, 507.953),
+            word("So", 509.28, 509.648),
+        ];
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 477, 16_000 * 504),
+            text: previous_text.to_string(),
+            segments: vec![absolute_segment(
+                previous_text,
+                477.0,
+                504.0,
+                previous_words,
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 503 + 8_000, 16_000 * 531),
+            text: current_text.to_string(),
+            segments: vec![absolute_segment(current_text, 503.5, 530.5, current_words)],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the fragment-fronted straddle must stitch, got {:#?}",
+            transcription
+        );
+        let out_words = transcription
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .filter(|w| w.word.trim_matches(['.', ',']).eq_ignore_ascii_case("out"))
+            .count();
+        assert_eq!(
+            out_words, 1,
+            "the straddling 'out' must survive exactly once, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[0].text.ends_with("blacked out,"),
+            "the previous tail keeps its own words and takes the re-homed seam punct, got {:#?}",
+            transcription
+        );
+        assert!(
+            !transcription.segments[0]
+                .text
+                .ends_with("blacked I black out"),
+            "the fragment text must not graft onto the previous tail, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[1]
+                .text
+                .starts_with("but also my body"),
+            "the fragment and the re-read must both leave the remainder, got {:#?}",
+            transcription
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|w| w.word.as_str()),
+            Some("but"),
+            "the fragment's and re-read's word windows must not survive, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_seam_fronted_by_new_word() {
+        // Negative of the fragment skip: same geometry, but the fronting word
+        // is NEW audio (its midpoint lies past the previous end), a fresh
+        // phrase that merely happens to be lead by the previous tail word.
+        // The committed-region gate refuses the skip; both copies survive.
+        let previous_text = "we shut it out.";
+        let current_text = "well out, but the feed held.";
+        let previous_words = vec![
+            word("we", 500.1, 500.5),
+            word("shut", 500.7, 501.1),
+            word("it", 501.2, 501.5),
+            word("out.", 503.83, 504.0),
+        ];
+        let current_words = vec![
+            word("well", 504.1, 504.45),
+            word("out,", 504.05, 504.4),
+            word("but", 504.45, 504.8),
+            word("the", 504.9, 505.1),
+            word("feed", 505.2, 505.6),
+            word("held.", 505.7, 506.1),
+        ];
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 477, 16_000 * 504),
+            text: previous_text.to_string(),
+            segments: vec![absolute_segment(
+                previous_text,
+                477.0,
+                504.0,
+                previous_words,
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 503 + 8_000, 16_000 * 531),
+            text: current_text.to_string(),
+            segments: vec![absolute_segment(current_text, 503.5, 530.5, current_words)],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a new-word-fronted seam must not stitch, got {:#?}",
+            transcription
+        );
+        let out_words = transcription
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .filter(|w| w.word.trim_matches(['.', ',']).eq_ignore_ascii_case("out"))
+            .count();
+        assert_eq!(
+            out_words, 2,
+            "the new phrase must keep its own lead word, got {:#?}",
+            transcription
+        );
+        assert!(
+            transcription.segments[1].text.starts_with("well out,"),
+            "the fresh phrase must survive whole, got {:#?}",
+            transcription
+        );
     }
 
     #[test]
