@@ -3400,3 +3400,93 @@ fn slice_head_deficit_bound_sits_at_six_db() {
     rms[..20].copy_from_slice(&[head_10db; 20]);
     assert!(!super::whisper_slice_head_is_audible(&rms, 0.4, 1.9));
 }
+
+#[test]
+fn token_stream_subsequence_shapes() {
+    // In-order, non-contiguous: the longer stream carries everything the
+    // shorter one says, in the same order, with more around it.
+    let kept = vec![10u32, 20, 30];
+    let other = vec![5u32, 10, 5, 20, 7, 30, 9];
+    assert!(super::whisper_token_stream_is_subsequence(&kept, &other));
+
+    // Order matters: the same tokens in a different order are a different
+    // reading, not a superset.
+    assert!(!super::whisper_token_stream_is_subsequence(
+        &[30u32, 10],
+        &[10, 30]
+    ));
+
+    // A drop anywhere fails: the subsequence is the content-preservation
+    // guarantee, and losing one token defeats it.
+    assert!(!super::whisper_token_stream_is_subsequence(
+        &kept,
+        &[10, 30]
+    ));
+
+    // Copies count positionally: two of a token need two in the other
+    // stream, even with room around them.
+    assert!(super::whisper_token_stream_is_subsequence(
+        &[7u32, 7],
+        &[7, 8, 7, 9]
+    ));
+    assert!(!super::whisper_token_stream_is_subsequence(
+        &[7u32, 7],
+        &[7, 8]
+    ));
+
+    // An empty kept stream is carried by anything.
+    assert!(super::whisper_token_stream_is_subsequence(&[], &[1u32]));
+    assert!(super::whisper_token_stream_is_subsequence(&[], &[]));
+}
+
+#[test]
+fn dominant_cycle_stripping_shapes() {
+    // The jc shape: a *Squeak* cycle (5 tokens) x 3 interleaved with real
+    // words -- the cycle is the dominant one and is stripped wholesale, the
+    // real content survives.
+    let squeak = [1853u32, 50, 1077, 514, 9];
+    let real = [3301u32, 485, 634, 603, 1699, 309, 484];
+    let mut tokens = Vec::new();
+    tokens.extend_from_slice(&squeak);
+    tokens.extend_from_slice(&squeak);
+    tokens.extend_from_slice(&real);
+    tokens.extend_from_slice(&squeak);
+    let stripped = super::whisper_stream_without_dominant_cycle(&tokens);
+    assert_eq!(stripped, real);
+
+    // A single or double echo is emphatic speech, not a loop: nothing is
+    // stripped.
+    let mut two = Vec::new();
+    for _ in 0..2 {
+        two.extend_from_slice(&squeak);
+    }
+    two.extend_from_slice(&real);
+    assert_eq!(super::whisper_stream_without_dominant_cycle(&two), two);
+
+    // Single-token stutter holds only at the guard's own floor of 8.
+    assert_eq!(
+        super::whisper_stream_without_dominant_cycle(&[7u32; 8]),
+        Vec::<u32>::new()
+    );
+    let five = [7u32; 5];
+    assert_eq!(super::whisper_stream_without_dominant_cycle(&five), five);
+
+    // A phrase repeated twice is a repeated line, not a loop.
+    let phrase = [11u32, 12, 13, 14, 15, 16];
+    let mut twice = Vec::new();
+    for _ in 0..2 {
+        twice.extend_from_slice(&phrase);
+    }
+    assert_eq!(super::whisper_stream_without_dominant_cycle(&twice), twice);
+
+    // No repetition at all: unchanged.
+    let distinct: Vec<u32> = (0..24).map(|i| i as u32).collect();
+    assert_eq!(
+        super::whisper_stream_without_dominant_cycle(&distinct),
+        distinct
+    );
+
+    // Shorter input than the longest period: still checked down to n=1.
+    let short = [9u32, 9, 9, 9, 9];
+    assert_eq!(super::whisper_stream_without_dominant_cycle(&short), short);
+}

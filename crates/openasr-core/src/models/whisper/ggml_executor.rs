@@ -8049,6 +8049,101 @@ fn whisper_ladder_evidence_span_seconds(
     Some(hi.saturating_sub(lo) as f32 / ENCODER_FRAME_RESOLUTION as f32 * audio_duration_seconds)
 }
 
+/// How much less audio (cross-attention span) the ladder's carry-less round
+/// may cover before it is refused. The adoption is a content-preservation
+/// rule (see [`whisper_token_stream_is_subsequence`]), not a quality bet: a
+/// round covering >1.0 s less of the window is dropping real audio, not just
+/// re-stamping it, so the incumbent stays. 1.0 s is far above any
+/// span-measurement wobble (the 10-90 percentile already suppresses single
+/// stray peaks) and far below the span one real clause covers.
+const WHISPER_LADDER_CARRY_LESS_COVERAGE_SLACK_SECONDS: f32 = 1.0;
+
+/// Minimum cross-attention span for a round to enter the stub re-race. A
+/// collapsed round measures ~0 span (every token's attention pinned to one
+/// frame): it is a hallucination over silence or music, with no audio behind
+/// its words. Trading the guard-cut stub for it can only lose placed speech --
+/// the stub's inflated or not, its words still ride real evidence -- so a
+/// zero-span round never wins the re-race whatever its text. 0.5 s is far
+/// above a collapsed run's spread and below the span one real short clause
+/// covers.
+const WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS: f32 = 0.5;
+
+/// Minimum count of salvaged (letters/digits-bearing) content tokens the
+/// ladder's incumbent must hold before the carry-less round may replace it.
+/// The subsequence check is only a content-preservation rule when the
+/// incumbent actually salvaged content: a two-word stub ("I. Rock." on
+/// music noise) survives as a subsequence of almost any longer decode, BPE
+/// fragmenting it into single tokens, so preserving it proves nothing and
+/// hands the window to whatever the carry-less round hallucinated.
+const WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS: usize = 4;
+
+/// True when `kept` appears in `other` as an in-order (not necessarily
+/// contiguous) subsequence: `other` carries everything `kept` says, in the
+/// same order, possibly with more around it. Adopting `other` over `kept`
+/// can therefore never drop a content token `kept` recovered -- the
+/// hallucination check the ladder's span metric alone does not give: a
+/// collapsed filler round carries none of the incumbent's real words, so it
+/// can never pass this, no matter how long its text is.
+fn whisper_token_stream_is_subsequence(kept: &[u32], other: &[u32]) -> bool {
+    let mut other = other.iter().copied();
+    kept.iter()
+        .all(|token| other.by_ref().any(|next| next == *token))
+}
+
+/// The token stream with its dominant short cycle removed: the period `n`
+/// (1..=8) whose non-overlapping n-gram repeats most in the stream, when the
+/// repetition reaches the repeat guard's own occurrence floors (8 for a
+/// single token, 6 for a two-token unit, 3 for anything longer) -- the shape
+/// of a decode locked onto one repeated stamp (a *Squeak* x N) rather than
+/// transcribing the window. All occurrences of that cycle are dropped,
+/// leaving the stream's non-repetitive content; a stream without such a
+/// cycle is returned unchanged, so a genuine single or double word echo is
+/// never deleted before the subsequence comparison.
+fn whisper_stream_without_dominant_cycle(tokens: &[u32]) -> Vec<u32> {
+    let len = tokens.len();
+    let mut best: Option<(usize, Vec<u32>)> = None; // (count, cycle)
+    let mut max_n = 8.min(len);
+    while max_n >= 1 {
+        for start in 0..=len - max_n {
+            let cycle = tokens[start..start + max_n].to_vec();
+            let mut count = 0usize;
+            let mut i = 0usize;
+            while i + max_n <= len {
+                if tokens[i..i + max_n] == cycle {
+                    count += 1;
+                    i += max_n;
+                } else {
+                    i += 1;
+                }
+            }
+            let floor = match max_n {
+                1 => 8,
+                2 => 6,
+                _ => 3,
+            };
+            if count >= floor && count > best.as_ref().map_or(0, |(count, _)| *count) {
+                best = Some((count, cycle));
+            }
+        }
+        max_n -= 1;
+    }
+    let Some((_, cycle)) = best else {
+        return tokens.to_vec();
+    };
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0usize;
+    while i + cycle.len() <= len {
+        if tokens[i..i + cycle.len()] == cycle {
+            i += cycle.len();
+        } else {
+            out.push(tokens[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&tokens[i..]);
+    out
+}
+
 /// A carried slice whose first cross-attention-placed word starts this far
 /// into the window (slice-relative seconds) is a carry head-skip candidate:
 /// the <startofprev> carry made the model treat the carried tail words as the
@@ -8521,6 +8616,18 @@ fn run_whisper_decode_loop(
             },
         )
     };
+    // True when this decode was seeded from a longform inter-slice carry
+    // (`<|startofprev|>` prompt tokens): the ladder's carry-less round and the
+    // carry head-skip recovery below both only make sense under a carry.
+    let carry_prompt_active = request_options.longform_prompt_carry_enabled()
+        && request_options
+            .prompt_token_ids
+            .as_deref()
+            .is_some_and(|token_ids| !token_ids.is_empty());
+    // Set when the ladder's carry-less (base-prompt) round won: its decode is
+    // already the base-prompt re-decode, so the head-skip recovery below must
+    // not re-run the same re-decode and graft a duplicated head.
+    let mut carry_less_round_won = false;
     let (mut candidate, mut decode) = decode_round(
         &initial_prompt_tokens,
         max_generated_tokens,
@@ -8548,6 +8655,18 @@ fn run_whisper_decode_loop(
                 best.0.text_trimmed
             );
         }
+        // The clean (non guard-cut) rounds that lost the span race against
+        // the incumbent, in round order. When the round-1 stub out-races
+        // every one of them (its loop tokens attend to every real instance
+        // of the repeated sound, so its measured span inflates to the whole
+        // window), the span race is void and they re-compete amongst
+        // themselves instead.
+        let mut clean_rounds: Vec<(
+            usize,
+            WhisperDecodeCandidate,
+            WhisperGreedyDecodeResult,
+            Option<f32>,
+        )> = Vec::new();
         for (i, &temperature) in WHISPER_TEMPERATURE_LADDER.iter().enumerate() {
             let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
                 .wrapping_add(i as u64)
@@ -8570,6 +8689,207 @@ fn run_whisper_decode_loop(
             if whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence) {
                 best = (cand, result);
                 best_evidence = cand_evidence;
+            } else {
+                // Losers of the span race stay candidates for the stub
+                // re-race below, which needs every clean round.
+                clean_rounds.push((i + 2, cand, result, cand_evidence));
+            }
+        }
+        // The temperature rounds keep decoding the SAME carry prompt, so when
+        // the carry itself seeded the loop (a `<|startofprev|>` tail that ends
+        // on the audio's own repeated phrase re-locks every greedy pass onto
+        // it) they only break the n-gram lock and stay primed on the carried
+        // tail: the winning round's text is the same stamped loop with a
+        // little extra, and the window's real speech is still gone. The
+        // ladder therefore also tries the base (carry-less) prompt at T=0:
+        // the same encoded slice decoded from a neutral prefix is exactly
+        // what a standalone single-window pass over this audio produces. Its
+        // prompt is shorter than the carry prompt, so its generated-token
+        // budget is larger, but prompt + generated still sums to
+        // `max_target_positions` -- the same total the schedule validation
+        // above already admitted, so no re-validation is needed. A guard cut
+        // means the loop is in the audio, not the carry: such a round offers
+        // nothing over the stub and is skipped, like the temperature rounds
+        // above.
+        //
+        // Adoption has two paths, because the span race the temperature
+        // rounds run is unreliable in different ways:
+        //
+        // Ladder still LOST to the round-1 stub: the stub's loop tokens
+        // attend to every real instance of the repeated sound, so its
+        // measured span inflates to the whole window and no clean round can
+        // out-race it, however real its text. The span race is void, so the
+        // clean rounds re-compete amongst themselves: the first becomes the
+        // incumbent, the rest must win by the ordinary evidence/length rule.
+        //
+        // Ladder won with a CLEAN round: the span race is trustworthy, and
+        // the carry-less round may replace the winner only by content
+        // preservation -- it must cover no more than a slack span less of
+        // the window, and its token stream must carry the incumbent's
+        // salvaged content: after each side strips a dominant short cycle,
+        // the incumbent's tokens must survive as an in-order subsequence of
+        // the round's. A collapsed filler round carries none of the
+        // incumbent's words, so it can never win, however long its text is;
+        // and the loop the incumbent itself locked onto is stripped from
+        // both sides, so a half-broken re-lock cannot fake preservation.
+        if carry_prompt_active {
+            let mut base_options = request_options.clone();
+            base_options.prompt = None;
+            base_options.prompt_token_ids = None;
+            let base_prompt = build_whisper_initial_prompt_tokens(
+                execution,
+                tokenizer,
+                &base_options,
+                detected_language.as_deref(),
+            )
+            .ok()
+            .and_then(|base_prompt_tokens| {
+                decode_generated_token_step_cap(
+                    execution.max_target_positions,
+                    base_prompt_tokens.len(),
+                )
+                .ok()
+                .map(|base_max_generated_tokens| (base_prompt_tokens, base_max_generated_tokens))
+            });
+            if let Some((base_prompt_tokens, base_max_generated_tokens)) = base_prompt {
+                let cl_round = WHISPER_TEMPERATURE_LADDER.len().saturating_add(2);
+                let (cand, result) = decode_round(
+                    &base_prompt_tokens,
+                    base_max_generated_tokens,
+                    0.0,
+                    WHISPER_TEMPERATURE_LADDER_BASE_SEED,
+                    cl_round,
+                )
+                .map_err(|e| {
+                    decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary)
+                })?;
+                let cl_evidence =
+                    whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
+                let cl_clean =
+                    result.stop_reason != Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard;
+                // Real content, not just stamps or periods: a decode whose
+                // whole text is `.` or `*Squeak*` has salvaged nothing and
+                // cannot take over from any other round.
+                let cl_has_content =
+                    cl_clean && cand.text_trimmed.chars().any(|c| c.is_alphanumeric());
+                if best.1.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
+                    let mut entrants = std::mem::take(&mut clean_rounds);
+                    if cl_has_content {
+                        entrants.push((cl_round, cand, result, cl_evidence));
+                    }
+                    // A collapsed candidate (no measured span, or one pinned to
+                    // a single frame) has no audio behind its words and is
+                    // refused before the race: keeping the stub is always as
+                    // good as, and usually better than, adopting it.
+                    let entrants: Vec<_> = entrants
+                        .into_iter()
+                        .filter(|(_, _, _, evidence)| {
+                            evidence.is_some_and(|secs| {
+                                secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
+                            })
+                        })
+                        .collect();
+                    // The race: the first clean round stands as incumbent,
+                    // each later one must win by the ordinary rule.
+                    let mut winner: Option<(
+                        usize,
+                        WhisperDecodeCandidate,
+                        WhisperGreedyDecodeResult,
+                        Option<f32>,
+                    )> = None;
+                    let mut entrants = entrants.into_iter();
+                    if let Some((round, cand, result, evidence)) = entrants.next() {
+                        let mut w = (round, cand, result, evidence);
+                        for (candidate_round, cand, result, evidence) in entrants {
+                            if whisper_decode_candidate_better(&cand, &w.1, evidence, w.3) {
+                                w = (candidate_round, cand, result, evidence);
+                            }
+                        }
+                        winner = Some(w);
+                    }
+                    if let Some((winner_round, winner_cand, winner_result, winner_evidence)) =
+                        winner
+                    {
+                        // Log before `best` takes ownership of the winner.
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={winner_round} stop_reason={:?} evidence_secs={:?} text={:?}",
+                            winner_result.stop_reason,
+                            winner_evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                            winner_cand.text_trimmed
+                        );
+                        best = (winner_cand, winner_result);
+                        best_evidence = winner_evidence;
+                        carry_less_round_won = winner_round == cl_round;
+                    }
+                } else if cl_has_content {
+                    let coverage_ok = match (best_evidence, cl_evidence) {
+                        (Some(best_span), Some(cand_span)) => {
+                            cand_span
+                                >= best_span - WHISPER_LADDER_CARRY_LESS_COVERAGE_SLACK_SECONDS
+                        }
+                        _ => true,
+                    };
+                    let strip_stream = |stream: &[u32]| -> Vec<u32> {
+                        let stripped: Vec<u32> = stream
+                            .iter()
+                            .copied()
+                            .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+                            .collect();
+                        whisper_stream_without_dominant_cycle(&stripped)
+                    };
+                    // The content the incumbent has actually salvaged. A
+                    // guard-cut stub's kept loop cycle is the loop itself,
+                    // not content: its salvaged content is the pre-loop
+                    // prefix, the same notion the carry builder applies to a
+                    // guard-cut stream (and a stamp the winning decode
+                    // rendered under a different token id is a re-stamp, not
+                    // a loss). Every other incumbent counts its whole stream.
+                    let stripped_best: Vec<u32> = best
+                        .1
+                        .generated_tokens
+                        .iter()
+                        .copied()
+                        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+                        .collect();
+                    // The trip cycle counts raw tokens (a timestamp may ride
+                    // in it), so the trimmed tail may run a token longer than
+                    // the stripped cycle: saturate at the stream start, where
+                    // the stub's whole stripped stream is one kept cycle.
+                    let best_content = match best.1.guard_trip_ngram_len {
+                        Some(cycle) => &stripped_best[..stripped_best.len().saturating_sub(cycle)],
+                        None => &stripped_best[..],
+                    };
+                    let salvaged_stream = whisper_stream_without_dominant_cycle(best_content);
+                    // The saved tokens must themselves be salvage (see
+                    // WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS): a tiny
+                    // stub's subsequence test passes against nearly anything.
+                    let salvaged_content_tokens = salvaged_stream
+                        .iter()
+                        .filter(|token_id| {
+                            tokenizer
+                                .decode_text_token_ids(&[**token_id])
+                                .is_ok_and(|text| text.chars().any(char::is_alphanumeric))
+                        })
+                        .count();
+                    let keeps_incumbent_content = salvaged_content_tokens
+                        >= WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS
+                        && whisper_token_stream_is_subsequence(
+                            &salvaged_stream,
+                            &strip_stream(&result.generated_tokens),
+                        );
+                    if coverage_ok && keeps_incumbent_content {
+                        // Log before `best` takes ownership of the winner.
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=temperature_ladder event=carry_less_adopted stop_reason={:?} evidence_secs={:?} text={:?}",
+                            result.stop_reason,
+                            cl_evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                            cand.text_trimmed
+                        );
+                        best = (cand, result);
+                        best_evidence = cl_evidence;
+                        carry_less_round_won = true;
+                    }
+                }
             }
         }
         candidate = best.0;
@@ -8722,6 +9042,10 @@ fn run_whisper_decode_loop(
     // list wholesale. Every healthy slice (first word inside the overlap
     // re-read, or a quiet head) takes no action here and stays untouched.
     if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
+        // When the ladder's carry-less round already won, its decode IS the
+        // base-prompt re-decode: running this recovery would re-decode the
+        // same slice and graft the same head words a second time.
+        && !carry_less_round_won
         && request_options.longform_prompt_carry_enabled()
         && request_options
             .prompt_token_ids
