@@ -1860,6 +1860,141 @@ fn build_whisper_carry_prompt_token_ids_strips_a_guard_trip_cycle() {
     );
 }
 
+fn asterisk_span_tokenizer_fixture() -> WhisperTokenizer {
+    // Text ids 0..10 ("h","e","l","o","w","r","s","i","g","*" and newline);
+    // 11 is EOT and 12..15 the usual controls, so the first timestamp id
+    // (notimestamps + 1 = 15) sits on the <|startofprev|> special, the same
+    // harmless overlap as the main fixture.
+    let mut values = std::collections::BTreeMap::new();
+    values.insert(
+        TOKENIZER_GGML_MODEL_KEY.to_string(),
+        GgufMetadataValue::String(TOKENIZER_GGML_MODEL_VALUE_GPT2.to_string()),
+    );
+    values.insert(
+        TOKENIZER_GGML_TOKENS_KEY.to_string(),
+        GgufMetadataValue::StringArray(vec![
+            "h".to_string(),
+            "e".to_string(),
+            "l".to_string(),
+            "o".to_string(),
+            "w".to_string(),
+            "r".to_string(),
+            "s".to_string(),
+            "i".to_string(),
+            "g".to_string(),
+            "*".to_string(),
+            "\u{010A}".to_string(),
+            "<|endoftext|>".to_string(),
+            "<|startoftranscript|>".to_string(),
+            "<|transcribe|>".to_string(),
+            "<|notimestamps|>".to_string(),
+            "<|startofprev|>".to_string(),
+        ]),
+    );
+    values.insert(
+        TOKENIZER_GGML_MERGES_KEY.to_string(),
+        GgufMetadataValue::StringArray(vec!["x y".to_string()]),
+    );
+    values.insert(
+        TOKENIZER_GGML_SPECIAL_TOKEN_IDS_KEY.to_string(),
+        GgufMetadataValue::U32Array(vec![11, 12, 13, 14, 15]),
+    );
+    values.insert(
+        TOKENIZER_GGML_SOT_TOKEN_ID_KEY.to_string(),
+        GgufMetadataValue::U32(12),
+    );
+    values.insert(
+        TOKENIZER_GGML_EOT_TOKEN_ID_KEY.to_string(),
+        GgufMetadataValue::U32(11),
+    );
+    values.insert(
+        TOKENIZER_GGML_TRANSCRIBE_TOKEN_ID_KEY.to_string(),
+        GgufMetadataValue::U32(13),
+    );
+    values.insert(
+        TOKENIZER_GGML_NO_TIMESTAMPS_TOKEN_ID_KEY.to_string(),
+        GgufMetadataValue::U32(14),
+    );
+    let metadata = GgufMetadata::from_values_for_test(values);
+    WhisperTokenizer::from_gguf_metadata(&metadata).expect("load asterisk fixture tokenizer")
+}
+
+#[test]
+fn strip_whisper_asterisk_annotation_tokens_drops_asterisk_spans_only() {
+    let tokenizer = asterisk_span_tokenizer_fixture();
+    let first_timestamp = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+
+    // "helo *sig* rleh": the paired span (asterisks included) is dropped, the
+    // surrounding words keep their order.
+    let stripped = strip_whisper_asterisk_annotation_tokens(
+        &tokenizer,
+        &[0, 1, 2, 3, 9, 6, 7, 8, 9, 5, 2, 1, 0],
+    )
+    .expect("strip");
+    assert_eq!(stripped, vec![0, 1, 2, 3, 5, 2, 1, 0]);
+
+    // A per-step timestamp inside the span decodes to nothing and stays put
+    // (transparent); the span's words still go away.
+    let stripped = strip_whisper_asterisk_annotation_tokens(
+        &tokenizer,
+        &[0, 9, 6, first_timestamp + 50, 7, 8, 9, 1],
+    )
+    .expect("strip");
+    assert_eq!(stripped, vec![0, first_timestamp + 50, 1]);
+
+    // An unclosed opening asterisk (a decode cut mid-annotation) drops the
+    // star and everything after it, so no dangling `*` reaches the next
+    // slice's prompt.
+    let stripped =
+        strip_whisper_asterisk_annotation_tokens(&tokenizer, &[0, 1, 9, 6, 7]).expect("strip");
+    assert_eq!(stripped, vec![0, 1]);
+
+    // No asterisks in: byte-identical passthrough.
+    let stripped =
+        strip_whisper_asterisk_annotation_tokens(&tokenizer, &[0, 1, 2, 3]).expect("strip");
+    assert_eq!(stripped, vec![0, 1, 2, 3]);
+
+    // Every id in an asterisk span: nothing survives.
+    let stripped =
+        strip_whisper_asterisk_annotation_tokens(&tokenizer, &[9, 6, 7, 8, 9]).expect("strip");
+    assert!(stripped.is_empty());
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_strips_asterisk_annotations() {
+    let tokenizer = asterisk_span_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![0, 1]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // seed [h, e] ++ "l o *sig* r" -> the next prompt primes on the words
+    // only; the annotation habit is not carried forward.
+    let generated = vec![2, 3, 9, 6, 7, 8, 9, 5];
+    let carry =
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
+            .expect("valid")
+            .expect("carry token ids");
+    assert_eq!(carry, vec![0, 1, 2, 3, 5]);
+
+    // A winner holding only annotations (a silence slice the model
+    // "commented") carries nothing: the caller keeps the previous carry,
+    // even when a seed exists.
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(
+            &tokenizer,
+            &request_options,
+            &[9, 6, 7, 8, 9, 9, 6, 7, 8, 9],
+            None
+        )
+        .expect("valid"),
+        None
+    );
+}
+
 #[test]
 fn whisper_prompt_bounds_separate_current_prompt_from_future_carry() {
     let (execution, tokenizer) = whisper_execution_and_tokenizer_fixture();

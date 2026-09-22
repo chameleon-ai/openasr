@@ -919,11 +919,22 @@ fn finish_whisper_serve_batch_output(
             words,
         }]
     };
+    // Asterisk-annotated spans are side-commentary, not transcript content:
+    // the executor's carry builder strips them before re-priming the next
+    // slice (see `strip_whisper_asterisk_annotation_tokens`), so keep the
+    // batch finish consistent with the same prune.
+    let carry_generated_tokens = super::ggml_executor::strip_whisper_asterisk_annotation_tokens(
+        tokenizer,
+        &generated_tokens,
+    )
+    .map_err(|error| WhisperServeBatchError::DecodeFailed {
+        reason: error.to_string(),
+    })?;
     let carry_prompt_token_ids = carry_prompt_seed_token_ids.and_then(|seed| {
         build_longform_token_history_carry(
             true,
             seed,
-            &generated_tokens,
+            &carry_generated_tokens,
             WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
         )
     });

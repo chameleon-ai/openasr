@@ -4500,10 +4500,24 @@ fn build_whisper_carry_prompt_token_ids(
         return Ok(None);
     }
 
+    // Asterisk-annotated spans (`*Sigh*`, `*gasp*`) are the model's
+    // side-commentary on the audio, not transcript content. Carrying them
+    // into the next slice's `<|startofprev|>` prompt re-primes the decode
+    // onto the annotation habit: the spans grow slice over slice, and on
+    // ambiguous or mumbled audio the whole decode locks onto the
+    // SFX-annotation attractor instead of transcribing the slice.
+    let cleaned_source = strip_whisper_asterisk_annotation_tokens(tokenizer, carry_source)?;
+    if cleaned_source.is_empty() {
+        // The stream held only asterisk annotations (a near-silence slice the
+        // model "commented" on): carry nothing, and the caller keeps the
+        // previous slice's carry, exactly as for a punctuation-only slice.
+        return Ok(None);
+    }
+
     Ok(build_longform_token_history_carry(
         true,
         carry_tokens,
-        carry_source,
+        &cleaned_source,
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
     ))
 }
@@ -4559,6 +4573,42 @@ fn is_not_whisper_timestamp(tokenizer: &WhisperTokenizer, token_id: u32) -> bool
     tokenizer
         .first_timestamp_token_id()
         .is_none_or(|first_timestamp_id| token_id < first_timestamp_id)
+}
+
+/// Drop every token that belongs to an asterisk-annotated span (`*Sigh*`,
+/// `*gasp*`, `*laughing*`) of a prior slice's token stream, pairing the
+/// asterisks positionally over the stream's decoded bytes: a token holding
+/// an asterisk, every token inside a paired span, and everything after an
+/// unclosed opening asterisk (a decode cut mid-annotation leaves a dangling
+/// `*` that would otherwise continue the habit in the next prompt). Tokens
+/// that decode to nothing (per-step timestamps, specials) are transparent
+/// and keep their position. The returned stream never holds an asterisk.
+pub(super) fn strip_whisper_asterisk_annotation_tokens(
+    tokenizer: &WhisperTokenizer,
+    token_ids: &[u32],
+) -> Result<Vec<u32>, WhisperGgmlExecutorError> {
+    let mut in_asterisk_span = false;
+    let mut kept = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        let decoded = tokenizer
+            .decode_text_token_ids(std::slice::from_ref(&token_id))
+            .map_err(|error| WhisperGgmlExecutorError::TokenizerMissing {
+                reason: format!("could not decode carry token {token_id}: {error}"),
+            })?;
+        let mut span_touched = false;
+        for ch in decoded.chars() {
+            if ch == '*' {
+                in_asterisk_span = !in_asterisk_span;
+                span_touched = true;
+            } else if in_asterisk_span {
+                span_touched = true;
+            }
+        }
+        if !span_touched {
+            kept.push(token_id);
+        }
+    }
+    Ok(kept)
 }
 
 fn build_whisper_carry_prompt_seed_token_ids(
