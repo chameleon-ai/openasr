@@ -98,6 +98,13 @@ const SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE: f32 = 0.85;
 /// the two confidence gates above keep them on the table.
 const SEAM_PHANTOM_HEAD_MIN_WIDTH_SECONDS: f32 = 0.9;
 
+/// Maximum width of a displaced same-token seam re-read relative to the
+/// committed word it shadows (the B-side seam re-read rule, below): the
+/// re-emitted echo is compressed into a fraction of the utterance it
+/// shadows, while a genuine second utterance is voiced whole and gets the
+/// full width of the slice that heard it.
+const SEAM_REREAD_HEAD_MAX_WIDTH_RATIO: f32 = 0.5;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -244,6 +251,18 @@ impl TranscriptAssembler {
             // such a stretched window (its majority sits past the boundary),
             // so only this rule removes it.
             if cross_slice_seam && self.drop_seam_phantom_head(&mut mapped) {
+                self.stats.duplicate_merge_count += 1;
+                if mapped.text.trim().is_empty() {
+                    continue;
+                }
+            }
+            // B-side seam re-read: the new slice re-emitted the committed
+            // tail word verbatim as a head displaced into its own territory
+            // -- outside the single-unit stitch's overlap-region vet and
+            // beyond the midpoint trim's reach. Same post-trim placement as
+            // the phantom rule: the trim may expose the re-read as the
+            // surviving head.
+            if cross_slice_seam && self.drop_seam_reread_head(trim_boundary, &mut mapped) {
                 self.stats.duplicate_merge_count += 1;
                 if mapped.text.trim().is_empty() {
                     continue;
@@ -482,8 +501,9 @@ impl TranscriptAssembler {
     /// Both words carry confidence, with the committed word decoded with
     /// certainty and the re-read weakly. And the re-read window is stretched
     /// wide, padding over the silence the cut left behind. Same-token heads
-    /// belong to the suffix-prefix stitch family and the midpoint trim, and
-    /// non-Latin heads keep the unit rules, so both stay out of scope.
+    /// are covered by the single-unit seam stitch and the seam re-read rule
+    /// below, and non-Latin heads keep the unit rules, so both stay out of
+    /// scope.
     /// Returns `true` when the phantom head word was dropped (the caller
     /// counts the merge and drops the segment when it was left empty).
     fn drop_seam_phantom_head(&self, current: &mut Segment) -> bool {
@@ -543,6 +563,106 @@ impl TranscriptAssembler {
         }
         current.text = new_text;
         // A phantom head was dropped. The remainder (if any) is genuine
+        // continuation that still runs the redundancy check before it is
+        // pushed.
+        true
+    }
+
+    /// Drop the new slice's head word when it is a B-side seam re-read of
+    /// the committed tail word: the slice re-emitted that word verbatim as
+    /// its own head, but displaced the echo into its own territory, so no
+    /// earlier pass can reach it. The suffix-prefix stitch never matches a
+    /// lone head copy: one shared unit is below its minimum unit count, and
+    /// its single-unit vet (which admits only copies placed inside the
+    /// inter-slice overlap) applies solely to fragment-fronted seams. The
+    /// midpoint trim keeps the echo (its window never reaches back over the
+    /// boundary), and the B-side seam phantom rule targets different-token
+    /// heads only.
+    ///
+    /// All signals must agree, or the word stays. The committed word was
+    /// decoded with certainty -- it owns the audio. The echo sits short-gap
+    /// behind it (within the seam, not new speech) and wholly in the
+    /// uncommitted region, so it cannot be a genuine straddling occurrence.
+    /// It is a compressed echo, at most half the width of the committed
+    /// word: a genuine second utterance is voiced whole and gets the slice
+    /// that heard it its full width. And a genuine seam repeat continues as
+    /// a run (the "America! America!" shape); an isolated echo copy is the
+    /// artifact.
+    ///
+    /// Runs AFTER the midpoint overlap trim, exactly like the phantom rule:
+    /// the trim may first drop the leading committed fragments that front
+    /// the re-read, exposing it as the surviving head. Returns `true` when
+    /// the re-read head word was dropped (the caller counts the merge and
+    /// drops the segment when it was left empty).
+    fn drop_seam_reread_head(&self, boundary: Option<f32>, current: &mut Segment) -> bool {
+        if self.approximate_word_timestamps {
+            // Interpolated tiles are not acoustic: the placement of an
+            // echo is a function of the tile, not of the audio it shadows.
+            return false;
+        }
+        let Some(boundary) = boundary else {
+            return false;
+        };
+        let Some(previous) = self.segments.last() else {
+            return false;
+        };
+        let (Some(committed), Some(reread)) = (previous.words.last(), current.words.first()) else {
+            return false;
+        };
+        if normalize_words(&committed.word) != normalize_words(&reread.word)
+            || !reread.word.chars().any(|ch| ch.is_ascii_alphabetic())
+        {
+            return false;
+        }
+        // The echo lies wholly in the uncommitted region: a same-token
+        // window reaching back over the boundary is a straddling
+        // occurrence owned by the midpoint trim, never an echo.
+        if reread.start < boundary {
+            return false;
+        }
+        let gap_seconds = reread.start - committed.end;
+        if !(0.0..=SEGMENT_STITCH_MAX_REGAP_SECONDS).contains(&gap_seconds) {
+            return false;
+        }
+        let Some(committed_confidence) = committed.confidence else {
+            return false;
+        };
+        if committed_confidence < SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE {
+            return false;
+        }
+        if reread.end - reread.start
+            > SEAM_REREAD_HEAD_MAX_WIDTH_RATIO * (committed.end - committed.start)
+        {
+            return false;
+        }
+        // A genuine seam repeat continues as a run in the new slice; an
+        // isolated echo copy is the artifact.
+        if current
+            .words
+            .get(1)
+            .is_some_and(|next| normalize_words(&reread.word) == normalize_words(&next.word))
+        {
+            return false;
+        }
+        let chars: Vec<char> = current.text.chars().collect();
+        let new_text = match leading_word_char_offset(&chars, &current.words, 1) {
+            Some(offset) => chars[offset..]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+            // Words did not align to the text (unexpected): rebuild from the
+            // kept tokens rather than mis-slice the string.
+            None => crate::transcript_text::join_segment_texts(
+                current.words[1..].iter().map(|word| word.word.as_str()),
+            ),
+        };
+        current.words.drain(0..1);
+        if let Some(first) = current.words.first() {
+            current.start = first.start;
+        }
+        current.text = new_text;
+        // A re-read head was dropped. The remainder (if any) is genuine
         // continuation that still runs the redundancy check before it is
         // pushed.
         true
@@ -3126,6 +3246,356 @@ mod tests {
             "only the new words may survive, got {:#?}",
             transcription
         );
+    }
+
+    #[test]
+    fn assembler_drops_displaced_same_token_seam_reread_head() {
+        // The new slice re-emitted the committed tail word "RTC." as its own
+        // head, but displaced the echoing copy into its own territory a
+        // short seam behind it, compressed to a fifth of the committed
+        // width: one shared unit never reaches the stitch's minimum unit
+        // count, the echo window never reaches back over the boundary, and
+        // the phantom rule targets different-token heads only, so this rule
+        // is the one that must drop it. The committed copy at 93.6% is the
+        // reading that owns the audio; the isolated echo is the artifact.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 231 + 4_480),
+            text: "RTC is that what it's called? RTC.".to_string(),
+            segments: vec![absolute_segment(
+                "RTC is that what it's called? RTC.",
+                226.8,
+                231.28,
+                vec![
+                    word_conf("RTC", 226.809, 228.221, 0.988),
+                    word_conf("is", 228.021, 228.621, 0.99),
+                    word_conf("that", 228.421, 228.774, 0.99),
+                    word_conf("what", 228.574, 228.899, 0.99),
+                    word_conf("it's", 228.698, 229.398, 0.99),
+                    word_conf("called?", 229.198, 230.364, 0.99),
+                    word_conf("RTC.", 230.164, 231.13, 0.936),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 230 + 12_480, 16_000 * 257 + 4_480),
+            text: "RTC. Car to trash to feed.".to_string(),
+            segments: vec![absolute_segment(
+                "RTC. Car to trash to feed.",
+                230.78,
+                234.79,
+                vec![
+                    word_conf("RTC.", 232.47, 232.684, 0.756),
+                    word_conf("Car", 232.483, 232.79, 0.578),
+                    word_conf("to", 232.59, 233.125, 0.9),
+                    word_conf("trash", 232.925, 233.499, 0.9),
+                    word_conf("to", 233.299, 233.908, 0.9),
+                    word_conf("feed.", 233.708, 234.793, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the displaced same-token echo must be dropped, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(
+            transcription.segments[0].text,
+            "RTC is that what it's called? RTC."
+        );
+        assert_eq!(
+            transcription.segments[1].text, "Car to trash to feed.",
+            "the echo head must be gone and the remainder kept, got {:?}",
+            transcription.segments[1].text
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|word| word.word.as_str()),
+            Some("Car"),
+            "the segment must resume at the first new word, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_head_broader_than_committed_word() {
+        // Width gate: the committed word decodes at 100% and the seam copy
+        // at 86.1%, but the seam copy is voiced whole, nearly three times
+        // the clamped committed width while the echo bound is half of it:
+        // a genuine second utterance that the slice that heard it allocated
+        // full room for. Both copies survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 159 + 8_000),
+            text: "I am so good. Good.".to_string(),
+            segments: vec![absolute_segment(
+                "I am so good. Good.",
+                158.0,
+                159.5,
+                vec![
+                    word_conf("I", 158.0, 158.2, 0.9),
+                    word_conf("am", 158.2, 158.4, 0.9),
+                    word_conf("so", 158.4, 158.6, 0.9),
+                    word_conf("good.", 158.6, 158.9, 0.9),
+                    word_conf("Good.", 159.14, 159.5, 1.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 159 + 3_000, 16_000 * 180),
+            text: "Good. That's it.".to_string(),
+            segments: vec![absolute_segment(
+                "Good. That's it.",
+                159.19,
+                161.7,
+                vec![
+                    word_conf("Good.", 159.869, 160.895, 0.861),
+                    word_conf("That's", 160.696, 161.3, 0.9),
+                    word_conf("it.", 161.35, 161.7, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a fully-voiced seam repeat must stay, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Good. That's it.");
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_seam_reread_with_following_run() {
+        // Run gate: every seam-side echo signal agrees (certain committed
+        // word, narrow seam copy, short seam behind it) except that the seam
+        // copy is immediately followed by another same-token word: the
+        // "Rock! Rock! Rock!" shape, where the speaker is genuinely
+        // repeating through the cut. Both seam copies survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 146 + 13_216),
+            text: "We Rock!".to_string(),
+            segments: vec![absolute_segment(
+                "We Rock!",
+                144.0,
+                146.826,
+                vec![
+                    word_conf("We", 144.2, 144.6, 0.9),
+                    word_conf("Rock!", 145.125, 146.826, 0.917),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 146, 16_000 * 170),
+            text: "Rock! Rock! Lobster!".to_string(),
+            segments: vec![absolute_segment(
+                "Rock! Rock! Lobster!",
+                146.0,
+                152.0,
+                vec![
+                    word_conf("Rock!", 148.4, 148.811, 0.837),
+                    word_conf("Rock!", 148.611, 149.78, 0.9),
+                    word_conf("Lobster!", 149.98, 151.5, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a same-token run through the seam is genuine speech, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Rock! Rock! Lobster!");
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_head_when_committed_word_uncertain() {
+        // Committed-confidence gate: the seam copy is an isolated narrow
+        // repeat a short seam behind the committed tail, but the committed
+        // word decodes at 70%, under the 85% floor: both readings are live
+        // candidates and neither may be eaten.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 100 + 8_000),
+            text: "I Mmh.".to_string(),
+            segments: vec![absolute_segment(
+                "I Mmh.",
+                99.0,
+                100.5,
+                vec![
+                    word_conf("I", 99.2, 99.5, 0.9),
+                    word_conf("Mmh.", 100.0, 100.38, 0.7),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 100, 16_000 * 125),
+            text: "Mmh. Onward.".to_string(),
+            segments: vec![absolute_segment(
+                "Mmh. Onward.",
+                100.0,
+                102.0,
+                vec![
+                    word_conf("Mmh.", 101.06, 101.19, 0.8),
+                    word_conf("Onward.", 101.3, 101.9, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "an uncertain committed word must not hand its token away, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Mmh. Onward.");
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_head_beyond_seam_regap() {
+        // Regap gate: the seam copy is an isolated narrow repeat of a
+        // certain committed word, but it sits 2.3s behind it, past the seam
+        // regap: new speech that happens to repeat the token, not an echo of
+        // the cut word.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 101 + 1_760),
+            text: "say RTC.".to_string(),
+            segments: vec![absolute_segment(
+                "say RTC.",
+                99.0,
+                101.1,
+                vec![
+                    word_conf("say", 99.3, 99.6, 0.9),
+                    word_conf("RTC.", 100.0, 100.966, 0.936),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 100, 16_000 * 125),
+            text: "RTC. Go.".to_string(),
+            segments: vec![absolute_segment(
+                "RTC. Go.",
+                100.0,
+                104.2,
+                vec![
+                    word_conf("RTC.", 103.3, 103.514, 0.75),
+                    word_conf("Go.", 103.7, 104.1, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a repeat farther past the seam regap is new speech, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "RTC. Go.");
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_head_straddling_the_committed_boundary() {
+        // Boundary gate: the narrow seam copy starts 0.1s before the
+        // committed frontier, so its majority sitting past the cut makes the
+        // midpoint trim keep it: a straddling occurrence, never an echo,
+        // even though every other echo signal agrees.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 101),
+            text: "we Tap.".to_string(),
+            segments: vec![absolute_segment(
+                "we Tap.",
+                99.0,
+                101.0,
+                vec![
+                    word_conf("we", 99.2, 99.5, 0.9),
+                    word_conf("Tap.", 100.0, 100.5, 0.936),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 100, 16_000 * 125),
+            text: "Tap. Now.".to_string(),
+            segments: vec![absolute_segment(
+                "Tap. Now.",
+                100.0,
+                102.0,
+                vec![
+                    word_conf("Tap.", 100.9, 101.12, 0.8),
+                    word_conf("Now.", 101.3, 101.9, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a window reaching back over the boundary may never be dropped, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Tap. Now.");
+    }
+
+    #[test]
+    fn assembler_keeps_same_token_head_without_committed_confidence() {
+        // Confidence-presence gate: the seam copy is an isolated narrow
+        // repeat of the committed tail a short seam behind it, but the
+        // committed word carries no confidence at all: without the committed
+        // certainty signal the echo verdict has no basis and the word stays.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 100 + 8_000),
+            text: "go and.".to_string(),
+            segments: vec![absolute_segment(
+                "go and.",
+                99.0,
+                100.5,
+                vec![word("go", 99.2, 99.5), word("and.", 100.0, 100.5)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 100, 16_000 * 125),
+            text: "and. Go.".to_string(),
+            segments: vec![absolute_segment(
+                "and. Go.",
+                100.0,
+                102.0,
+                vec![
+                    word_conf("and.", 100.7, 100.85, 0.6),
+                    word_conf("Go.", 101.0, 101.5, 0.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a confidence-less committed word must not hand its token away, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "and. Go.");
     }
 
     #[test]
