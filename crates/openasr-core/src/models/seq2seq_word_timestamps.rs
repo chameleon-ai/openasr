@@ -245,7 +245,7 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
 /// word, and an alphanumeric character after a Han-final word starts a new
 /// word ("用Rust写" -> 用 / Rust / 写). Trailing CJK punctuation stays attached
 /// to the ideograph it follows ("好，" is one word).
-fn han_script_boundary_before(ch: char, previous_char: Option<char>) -> bool {
+pub(crate) fn han_script_boundary_before(ch: char, previous_char: Option<char>) -> bool {
     let Some(last) = previous_char else {
         return false;
     };

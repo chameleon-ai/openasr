@@ -2489,6 +2489,304 @@ fn pad_dtw_word_windows_is_a_noop_when_empty_and_clamps_zero_duration() {
     assert_eq!(zero[0].end, 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// whisper_dtw_silence_ceiling
+// ---------------------------------------------------------------------------
+
+/// A dense bed (peak within the contrast gate of the median) keeps the
+/// conservative 5%-of-peak ceiling; a thin floor raises the ceiling to 3x the
+/// median when that is higher, and keeps the peak fraction when it dominates.
+#[test]
+fn dtw_silence_ceiling_rises_off_the_floor_only_on_thin_floors() {
+    // Dense bed: 4x contrast, ceiling stays at 5% of peak.
+    let dense = whisper_dtw_silence_ceiling(0.10, 0.40);
+    assert!((dense - 0.02).abs() < 1e-9, "dense={dense}");
+    // Thin floor (20x contrast) where the floor multiple (3x) beats the
+    // peak fraction (5%).
+    let thin = whisper_dtw_silence_ceiling(0.01, 0.20);
+    assert!((thin - 0.03).abs() < 1e-9, "thin={thin}");
+    // Thin floor where the peak fraction still dominates.
+    let thin_peak_wins = whisper_dtw_silence_ceiling(0.005, 0.20);
+    assert!(
+        (thin_peak_wins - 0.015).abs() < 1e-9,
+        "thin_peak_wins={thin_peak_wins}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// whisper_reanchor_dtw_token_centers
+// ---------------------------------------------------------------------------
+
+fn reanchor_token(token_id: u32, center_seconds: f32) -> Seq2SeqTokenTime {
+    Seq2SeqTokenTime {
+        token_id,
+        center_seconds,
+        probability: None,
+    }
+}
+
+/// 15 s of 0.02 s frames at a 0.01 thin noise floor with a sustained 0.20
+/// speech run over [1.0, 1.8) (frames 50..89). Peak/median contrast is 20x,
+/// so the silence ceiling is 3x the floor (0.03), not 5% of the peak (0.01).
+/// The speech threshold is ~5 dB over the floor (0.0316).
+fn reanchor_fixture_envelope() -> Vec<f32> {
+    let mut env = vec![0.01f32; 750];
+    for sample in env[50..90].iter_mut() {
+        *sample = 0.20;
+    }
+    env
+}
+
+/// A word-final punctuation token the DTW path parked 1.0 s past its word's
+/// audio in a thin-floor pause is pulled back to the frame just past the run's
+/// end (one frame past [1.0, 1.8) -> 1.8). The word-content token before it
+/// keeps its path-derived center.
+#[test]
+fn reanchor_dtw_token_centers_pulls_word_final_punctuation_off_a_pause() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 2.8)], // "?" 1.0 s past its word's run
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+        0.02,
+    );
+    assert!(
+        (out[0].center_seconds - 1.2).abs() < 1e-3,
+        "word content keeps its center"
+    );
+    assert!(
+        (out[1].center_seconds - 1.8).abs() < 1e-3,
+        "center should land one frame past the run's end, got {}",
+        out[1].center_seconds
+    );
+}
+
+/// The same pull fires across a ~3 s pause (the longest intra-word pause
+/// measured on the test corpus, under the 3.5 s max jump).
+#[test]
+fn reanchor_dtw_token_centers_pulls_punctuation_across_a_three_second_pause() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("life".to_string()),
+            [100, 101] => Some("life.".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.3), reanchor_token(101, 4.9)], // "." 3.1 s past its word's run
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+        0.02,
+    );
+    assert!(
+        (out[1].center_seconds - 1.8).abs() < 1e-3,
+        "center should land one frame past the run's end, got {}",
+        out[1].center_seconds
+    );
+}
+
+/// A token whose center sits on sustained speech (not in a pause) is refused:
+/// its quiet-region test fails and the center stays where the path put it.
+#[test]
+fn reanchor_dtw_token_centers_refuses_an_entry_on_speech() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 0.8), reanchor_token(101, 1.4)], // "?" entry inside the run
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+        0.02,
+    );
+    assert_eq!(
+        out[1].center_seconds, 1.4,
+        "entry on speech keeps its center"
+    );
+}
+
+/// A center with no preceding speech run has nothing to anchor to: even with
+/// a later speech run, nothing before the center is trusted audio and the
+/// center stays where the path put it.
+#[test]
+fn reanchor_dtw_token_centers_refuses_without_a_preceding_speech_run() {
+    let mut env = vec![0.01f32; 750];
+    for sample in env[250..300].iter_mut() {
+        *sample = 0.20; // run [5.0, 6.0) sits AFTER the center
+    }
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 0.0), reanchor_token(101, 10.0)],
+        &decode,
+        Some(&env),
+        0.02,
+    );
+    assert_eq!(
+        out[1].center_seconds, 10.0,
+        "no preceding run keeps the center"
+    );
+}
+
+/// A gap past the reanchor max jump (3.5 s) is a misalignment too large to
+/// trust as an intra-word linger: the center is kept.
+#[test]
+fn reanchor_dtw_token_centers_refuses_a_gap_past_the_max() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 5.8)], // 4.0 s past the run
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+        0.02,
+    );
+    assert_eq!(
+        out[1].center_seconds, 5.8,
+        "gap past the max keeps its center"
+    );
+}
+
+/// A dense bed (peak within 8x of the median) keeps the 5%-of-peak silence
+/// ceiling, so a quiet passage over a music bed is never trusted as a pause
+/// and the pass is a no-op: continuous music-backed clips keep their fold
+/// output byte-for-byte.
+#[test]
+fn reanchor_dtw_token_centers_noop_on_a_dense_music_bed() {
+    // Bed at 0.04 with a 0.30 speech run: contrast is 7.5 < 8, so the ceiling
+    // stays 5% of the peak (0.015) and the bed's 0.04 fails the quiet test.
+    let mut env = vec![0.04f32; 750];
+    for sample in env[50..80].iter_mut() {
+        *sample = 0.30;
+    }
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 0.6), reanchor_token(101, 2.2)],
+        &decode,
+        Some(&env),
+        0.02,
+    );
+    assert_eq!(out[1].center_seconds, 2.2, "music bed keeps its center");
+}
+
+/// A token whose piece carries letters or digits is real word content (a
+/// subword the path may genuinely place in a quiet passage): the piece gate
+/// refuses it before any audio test, even when every audio gate would fire.
+#[test]
+fn reanchor_dtw_token_centers_refuses_a_piece_with_letters() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("ithi".to_string()), // piece "hi": content, not punctuation
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 2.8)],
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+        0.02,
+    );
+    assert_eq!(
+        out[1].center_seconds, 2.8,
+        "a content piece never reanchors"
+    );
+}
+
+/// Word-initial punctuation contributes to the word it *opens*: the `"` in
+/// `"hello` is the first, not the last, contributor to its word, so pulling
+/// it back would smear the next word's start. The walk that mirrors the fold's
+/// word split keeps it where the path put it, even though its own audio gates
+/// (thin-floor pause 0.4 s after the previous run) would all fire.
+#[test]
+fn reanchor_dtw_token_centers_refuses_word_initial_punctuation() {
+    let mut env = reanchor_fixture_envelope();
+    for sample in env[150..190].iter_mut() {
+        *sample = 0.20; // the opened word's own run [3.0, 3.8)
+    }
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [300] => Some("\"".to_string()),
+            [300, 301] => Some("\"hello".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(300, 2.2), reanchor_token(301, 3.2)],
+        &decode,
+        Some(&env),
+        0.02,
+    );
+    assert_eq!(
+        out[0].center_seconds, 2.2,
+        "word-initial punctuation keeps its center"
+    );
+}
+
+/// A frame of bed level (above the thin-floor silence ceiling, below the
+/// speech threshold) in the gap between the run and the center is an untrusted
+/// frame: the walk finds no anchored run and the center stays.
+#[test]
+fn reanchor_dtw_token_centers_refuses_a_gap_with_an_untrusted_frame() {
+    let mut env = reanchor_fixture_envelope();
+    env[120] = 0.0305; // above the 0.03 ceiling, below the 0.0316 floor margin
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it".to_string()),
+            [100, 101] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out = whisper_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 2.8)],
+        &decode,
+        Some(&env),
+        0.02,
+    );
+    assert_eq!(
+        out[1].center_seconds, 2.8,
+        "untrusted gap frame keeps the center"
+    );
+}
+
+/// No envelope (a run without usable 16 k audio) is a byte-exact no-op.
+#[test]
+fn reanchor_dtw_token_centers_noop_without_envelope() {
+    let decode = |ids: &[u32]| -> Option<String> {
+        match ids {
+            [100] => Some("it?".to_string()),
+            _ => None,
+        }
+    };
+    let out =
+        whisper_reanchor_dtw_token_centers(vec![reanchor_token(100, 1.4)], &decode, None, 0.02);
+    assert_eq!(out[0].center_seconds, 1.4);
+}
+
 fn tail_repeat_is_timestamp(tokenizer: &WhisperTokenizer) -> impl Fn(u32) -> bool {
     let first_timestamp = tokenizer
         .first_timestamp_token_id()

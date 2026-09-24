@@ -167,9 +167,10 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput, Seq2SeqGreedyDecodeStopReason,
 };
 use crate::models::seq2seq_word_timestamps::{
-    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenTime,
+    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenTime, han_script_boundary_before,
     seq2seq_word_timestamps_from_generated_tokens, seq2seq_word_timestamps_from_token_times,
 };
+use crate::models::text_prefix::common_prefix_len;
 
 const WHISPER_STREAMING_EXECUTOR_ID: &str = "whisper-ggml-snapshot-streaming-executor-v1";
 /// Largest vocab of an English-only (`.en`) Whisper checkpoint. The canonical
@@ -6327,6 +6328,71 @@ const WHISPER_DTW_ONSET_MIN_PUSH_S: f32 = 0.25;
 /// Upper bound on how far back into a pause a word's start may be pulled.
 const WHISPER_DTW_ONSET_MAX_PUSH_S: f32 = 5.0;
 
+/// Peak-to-median contrast above which a slice's median is a *thin noise
+/// floor* rather than a continuous bed, so the silence ceiling may rise off
+/// the peak and onto the floor (see [`whisper_dtw_silence_ceiling`]).
+/// A dense music bed sits within a few times of its loudest frame (measured
+/// <= ~5x peak/median on the test corpus' music clips); a recording with
+/// room tone, a distant bed, or a line hum carries speech peaks an order of
+/// magnitude above its floor (>= ~10x). In between, neither reading of
+/// "quiet" is safe, so the conservative peak fraction is kept.
+const WHISPER_DTW_THIN_FLOOR_CONTRAST: f64 = 8.0;
+
+/// How far above the floor (the median envelope level) a single frame in a
+/// region may read before the region stops being silence, but only on a
+/// thin-floor slice. A linear factor, so 3.0 is just under 5 dB over the
+/// floor -- the same margin the speech threshold already applies -- so a
+/// region within it is floor noise whose transients peak a few dB over the
+/// median, while sustained speech (above the threshold) still fails the
+/// mean/fraction hollow tests.
+const WHISPER_DTW_THIN_FLOOR_PEAK_OF_MEDIAN: f64 = 3.0;
+
+/// Deployment env override for the thin-floor contrast
+/// ([`WHISPER_DTW_THIN_FLOOR_CONTRAST`]); a bare environment falls back to the
+/// compiled default, staying byte-identical to it.
+fn whisper_dtw_thin_floor_contrast() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_THIN_FLOOR_CONTRAST")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_THIN_FLOOR_CONTRAST)
+}
+
+/// Deployment env override for the thin-floor floor multiple
+/// ([`WHISPER_DTW_THIN_FLOOR_PEAK_OF_MEDIAN`]); a bare environment falls back
+/// to the compiled default, staying byte-identical to it.
+fn whisper_dtw_thin_floor_peak_of_median() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_THIN_FLOOR_PEAK_OF_MEDIAN")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_THIN_FLOOR_PEAK_OF_MEDIAN)
+}
+
+/// The level a region may reach before it stops reading as trusted silence.
+///
+/// The base ceiling is a small fraction of the slice's *peak*
+/// ([`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]): a music or noise bed never
+/// reads as digital zero, so a region that still carries a substantial fraction
+/// of the clip's loudest frame is a bed, not a pause. That reading has one
+/// blind spot: on a recording with a *thin* background floor (room tone, a
+/// distant bed), the floor's own transient peaks can cross the 5%-of-peak
+/// ceiling even though the floor is acoustically silence -- the peak is the
+/// speaker's voice, an order of magnitude above it. The slice's own contrast
+/// tells the two apart: when the peak rises at least
+/// [`WHISPER_DTW_THIN_FLOOR_CONTRAST`] times the floor (the median), the floor
+/// is thin and the ceiling rises to
+/// [`WHISPER_DTW_THIN_FLOOR_PEAK_OF_MEDIAN`] times the floor. Dense bed slices
+/// (peak within a few times of the median) fail the contrast and keep the
+/// conservative peak fraction exactly as before.
+fn whisper_dtw_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
+    let peak_fraction = clip_peak * WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION;
+    let contrast = clip_peak / noise_floor.max(f64::EPSILON);
+    if contrast >= whisper_dtw_thin_floor_contrast() {
+        peak_fraction.max(noise_floor * whisper_dtw_thin_floor_peak_of_median())
+    } else {
+        peak_fraction
+    }
+}
+
 /// Pull a word that the center fold landed in silence to its real audio onset.
 ///
 /// The DTW entry frame the fold treats as a word's center sits where the monotone
@@ -6375,8 +6441,8 @@ fn whisper_refine_dtw_word_onsets(
         return words;
     }
     // A front frame that reads at or above this is not true silence (see
-    // [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]).
-    let silence_ceiling = clip_peak * WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION;
+    // [`whisper_dtw_silence_ceiling`]).
+    let silence_ceiling = whisper_dtw_silence_ceiling(noise_floor, clip_peak);
     let min_quiet_frames =
         ((WHISPER_DTW_ONSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
     for word in words.iter_mut().skip(1) {
@@ -6539,9 +6605,9 @@ fn whisper_refine_dtw_word_offsets(
         return words;
     }
     // A back frame that reads at or above this is not true silence (see
-    // [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`], reused as the silence
-    // ceiling for the trailing half of a word).
-    let silence_ceiling = clip_peak * WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION;
+    // [`whisper_dtw_silence_ceiling`], reused as the silence ceiling for the
+    // trailing half of a word).
+    let silence_ceiling = whisper_dtw_silence_ceiling(noise_floor, clip_peak);
     let min_quiet_frames =
         ((WHISPER_DTW_OFFSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
     let last_frame = levels.len() - 1;
@@ -6645,6 +6711,259 @@ fn whisper_refine_dtw_word_offsets(
     words
 }
 
+/// Minimum distance, in seconds, between the end of the nearest preceding
+/// sustained speech run and a token's center before the token is treated as
+/// parked in the pause after its word's own audio (the word-final punctuation
+/// reanchor, see [`whisper_reanchor_dtw_token_centers`]). Below it, the center
+/// is inside the fold's own calibration error and stays where the path put it.
+const WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS: f32 = 0.15;
+
+/// Maximum distance, in seconds, the reanchor may pull a token's center back
+/// to the end of the preceding speech run. A real pause between a word and the
+/// word-final punctuation the DTW parked in it measures up to ~3s on the test
+/// corpus; farther than this the entry sits beyond a plausible intra-word
+/// linger -- a pause long enough that the model would normally bracket it with
+/// its own timestamp tokens -- and the move cannot be trusted to land the word
+/// on its own speech, so the center stays where the path put it.
+const WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS: f32 = 3.5;
+
+/// Envelope frames (0.02 s each) read forward from the token's center before
+/// the center is treated as sitting in a pause (see
+/// [`whisper_reanchor_dtw_token_centers`]).
+const WHISPER_DTW_REANCHOR_ENTRY_QUIET_FRAMES: usize = 4;
+
+/// Deployment env override for the reanchor minimum gap
+/// ([`WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS`]); a bare environment falls back
+/// to the compiled default, staying byte-identical to it.
+fn whisper_dtw_reanchor_min_gap_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS)
+}
+
+/// Deployment env override for the reanchor maximum jump
+/// ([`WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS`]); a bare environment falls back
+/// to the compiled default, staying byte-identical to it.
+fn whisper_dtw_reanchor_max_jump_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS)
+}
+
+/// Pull a word-final punctuation token the DTW path parked in the pause after
+/// its word back to the word's own audio offset.
+///
+/// The fold counts each token's path *entry* frame as its center and takes a
+/// word's center as the mean of the contributing tokens. A word-final
+/// punctuation token ("it?", "life.") has no audio of its own, and its
+/// monotone path entry lingers in the pause after the word, so the word's
+/// center becomes the mean of the word's own center and that pause: the fold's
+/// seam at the word's end -- and the next word's start, which is the same
+/// seam -- smears across the following silence instead of sitting at the
+/// word's offset. When the next word's audio fills the smeared half of the
+/// window, the edge refiners
+/// ([`whisper_refine_dtw_word_onsets`], [`whisper_refine_dtw_word_offsets`])
+/// see no hollow half either, and cannot trim what is left.
+///
+/// The model's own statement of which tokens carry no audio is their text. A
+/// token whose fold piece has no letter or digit is punctuation, and only one
+/// that is the *last* contributor to its fold word ends a word (an opening
+/// quote or a lone dash contributes to the word it opens, and pulling that
+/// token back would smear the *next* word's start instead of a previous
+/// word's end). For such a word-final punctuation token, when its center sits
+/// in trusted silence and the nearest preceding sustained speech run ended a
+/// plausible pause (between the reanchor gap bounds) before it, the center is
+/// replaced by the frame just past that run's end, before the fold runs. The
+/// fold itself is untouched: it re-derives the word's seams around the
+/// corrected center, and the onset refiner that follows can then see the next
+/// word's real onset inside a window that is no longer smeared.
+///
+/// The trusted-silence requirement is the edge refiners' own (same floor,
+/// same thin-floor ceiling): the center region's mean below the floor, no
+/// frame above the silence ceiling, fewer than half its frames above the
+/// floor, and every frame between the run's end and the center at or below
+/// the ceiling. On a clean clip there is no pause-long punctuation entry to
+/// pull, and on a music bed the ceiling tests fail the way the edge refiners'
+/// do, so the pass is a no-op there.
+fn whisper_reanchor_dtw_token_centers(
+    mut token_times: Vec<Seq2SeqTokenTime>,
+    decode_text: &dyn Fn(&[u32]) -> Option<String>,
+    audio_rms_frames: Option<&[f32]>,
+    seconds_per_frame: f32,
+) -> Vec<Seq2SeqTokenTime> {
+    let debug_reanchor = std::env::var_os("OPENASR_WHISPER_DEBUG_REANCHOR").is_some();
+    let Some(levels) = audio_rms_frames else {
+        return token_times;
+    };
+    if levels.len() < 4 || token_times.is_empty() || !seconds_per_frame.is_finite() {
+        return token_times;
+    }
+    let spf = f64::from(seconds_per_frame);
+    let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    ranked.sort_by(f64::total_cmp);
+    let noise_floor = ranked[ranked.len() / 2];
+    if !(noise_floor > 0.0 && noise_floor.is_finite()) {
+        return token_times;
+    }
+    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let clip_peak = *ranked.last().unwrap_or(&0.0);
+    if !(clip_peak > 0.0 && clip_peak.is_finite()) {
+        return token_times;
+    }
+    let silence_ceiling = whisper_dtw_silence_ceiling(noise_floor, clip_peak);
+    let last_frame = levels.len() - 1;
+    let min_gap = f64::from(whisper_dtw_reanchor_min_gap_seconds());
+    let max_jump = f64::from(whisper_dtw_reanchor_max_jump_seconds());
+
+    // Pass 1 (mirrors the fold's): the incremental prefix decode gives every
+    // token the text piece the fold will attribute to it -- the all-punctuation
+    // pieces are the ones the fold can smear.
+    let mut pieces = Vec::with_capacity(token_times.len());
+    let mut prefix = Vec::with_capacity(token_times.len());
+    let mut previous_decoded = String::new();
+    for token_time in &token_times {
+        prefix.push(token_time.token_id);
+        let Some(decoded) = decode_text(&prefix) else {
+            // The fold will surface the decode failure; keep the path's
+            // centers untouched.
+            return token_times;
+        };
+        let piece = match decoded.strip_prefix(&previous_decoded) {
+            Some(rest) => rest.to_string(),
+            None => {
+                let shared = common_prefix_len(&previous_decoded, &decoded);
+                decoded[shared..].to_string()
+            }
+        };
+        previous_decoded = decoded;
+        pieces.push(piece);
+    }
+
+    for (index, token_time) in token_times.iter_mut().enumerate() {
+        let piece = &pieces[index];
+        // The token's center reaches the fold only through the piece's
+        // non-whitespace characters. A piece with none is timing-inert, and a
+        // piece carrying a letter or digit is real word content: neither is a
+        // candidate.
+        let mut has_content = false;
+        let mut has_alphanumeric = false;
+        for ch in piece.chars() {
+            if !ch.is_whitespace() {
+                has_content = true;
+                if ch.is_alphanumeric() {
+                    has_alphanumeric = true;
+                }
+            }
+        }
+        if !has_content || has_alphanumeric {
+            continue;
+        }
+        // Word-final punctuation only: a later piece carrying a character of
+        // the same fold word means this token opens a word, not ends one, and
+        // pulling it back would smear the next word's start.
+        if later_piece_contributes_to_same_word(index, &pieces) {
+            continue;
+        }
+        let entry_secs = f64::from(token_time.center_seconds);
+        if !entry_secs.is_finite() || entry_secs < 0.0 {
+            continue;
+        }
+        let entry_frame = ((entry_secs / spf) as usize).min(last_frame);
+        // Trusted pause at the center: the same mean / ceiling /
+        // active-fraction tests the edge refiners apply to a word half, over a
+        // short run of frames from the center.
+        let quiet_end = (entry_frame + WHISPER_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        let quiet = &levels[entry_frame..=quiet_end];
+        let quiet_mean =
+            quiet.iter().map(|sample| f64::from(*sample)).sum::<f64>() / quiet.len() as f64;
+        let quiet_max = quiet
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .fold(0.0_f64, f64::max);
+        let quiet_above = quiet
+            .iter()
+            .filter(|sample| f64::from(**sample) >= threshold)
+            .count() as f64
+            / quiet.len() as f64;
+        if quiet_mean >= threshold || quiet_max > silence_ceiling || quiet_above > 0.5 {
+            continue;
+        }
+        // The nearest preceding sustained speech run: walk back over the
+        // trusted-silence frames that separate the center from it. The walk
+        // stops at the frame-array edge (no preceding speech) or at a frame
+        // above the silence ceiling (a music bed, not a pause).
+        let mut scan = entry_frame;
+        let mut run_end: Option<usize> = None;
+        while scan > 0 {
+            let level = f64::from(levels[scan - 1]);
+            if level >= threshold {
+                run_end = Some(scan - 1);
+                break;
+            }
+            if level > silence_ceiling {
+                break;
+            }
+            scan -= 1;
+        }
+        let Some(end) = run_end else {
+            continue;
+        };
+        let mut run_start = end;
+        while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
+            run_start -= 1;
+        }
+        // The anchor must be real speech, not a noise blip: at least the onset
+        // sustain length of frames above the floor.
+        if end - run_start + 1 < WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+            continue;
+        }
+        // The silent gap between the run's end and the center must be a real
+        // pause: clearly past the fold's calibration error, and short enough
+        // to be an intra-word linger rather than a larger drift.
+        let gap_secs = entry_secs - (end as f64 + 1.0) * spf;
+        if !(min_gap..=max_jump).contains(&gap_secs) {
+            continue;
+        }
+        // One frame past the run's last speech frame: the word's own offset.
+        // The fold clamps centers non-decreasing, so the pulled center can
+        // never run ahead of the previous word's.
+        let target_secs = (end as f64 + 1.0) * spf;
+        if debug_reanchor {
+            eprintln!(
+                "reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (preceding run ends at frame {end})",
+            );
+        }
+        token_time.center_seconds = target_secs as f32;
+    }
+    token_times
+}
+
+/// Whether a piece after `index` contributes a character to the same fold
+/// word as the piece at `index`. The walk mirrors the fold's character pass --
+/// whitespace closes a word, a Han ideograph (or an alphanumeric after a
+/// Han-final word) starts a new one -- so the eligibility matches the fold's
+/// own word split exactly.
+fn later_piece_contributes_to_same_word(index: usize, pieces: &[String]) -> bool {
+    // The fold's `last_char()` once the candidate piece has contributed: its
+    // last word-constituting character (a candidate piece is all punctuation,
+    // so its non-whitespace characters all constitute the word). One
+    // character of the first following piece decides: it either closes the
+    // word (whitespace or a Han boundary) or is a same-word contribution.
+    let last = pieces[index].chars().rev().find(|ch| !ch.is_whitespace());
+    for piece in &pieces[index + 1..] {
+        // The first character of the first non-empty following piece decides:
+        // it either closes the word (whitespace or a Han boundary) or is a
+        // same-word contribution from a later piece.
+        if let Some(ch) = piece.chars().next() {
+            return !(ch.is_whitespace()
+                || last.is_some_and(|previous| han_script_boundary_before(ch, Some(previous))));
+        }
+    }
+    false
+}
+
 /// Seconds each whisper word window's start is moved earlier, so the seam the
 /// center fold placed between two adjacent words (the previous word's end and
 /// this word's start, which coincide) lands on the real speech onset instead of
@@ -6722,6 +7041,10 @@ fn whisper_cross_attention_word_timestamps(
     let probabilities_aligned = generated_probabilities.len() == token_alignments.len();
     let duration = audio_duration_seconds.max(0.0);
     let decode_text = |token_ids: &[u32]| tokenizer.decode_text_token_ids(token_ids);
+    // Best-effort variant for the pre-fold reanchor pass: an undecodable
+    // piece leaves the band's centers exactly as the path put them (the
+    // fold surfaces the failure itself).
+    let decode_piece_text = |token_ids: &[u32]| tokenizer.decode_text_token_ids(token_ids).ok();
 
     // Prefer a DTW pass over the per-token cross-attention rows. DTW assigns
     // every token an ordered, non-overlapping span of frames; the token's
@@ -6872,6 +7195,16 @@ fn whisper_cross_attention_word_timestamps(
                     run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 }
+                // A word-final punctuation token carries no audio of its own
+                // and its center can sit in the pause after its word; pull it
+                // back to the word's own offset before the fold turns these
+                // centers into word windows.
+                let token_times = whisper_reanchor_dtw_token_centers(
+                    token_times,
+                    &decode_piece_text,
+                    audio_rms_frames,
+                    seconds_per_frame,
+                );
                 // A per-segment decode failure is non-fatal: keep the other
                 // segments' words rather than dropping the whole transcript.
                 if let Ok(mut block_words) = seq2seq_word_timestamps_from_token_times(
@@ -6966,6 +7299,16 @@ fn whisper_cross_attention_word_timestamps(
                         }
                     })
                     .collect();
+                // A word-final punctuation token carries no audio of its own
+                // and its center can sit in the pause after its word; pull it
+                // back to the word's own offset before the fold turns these
+                // centers into word windows.
+                let token_times = whisper_reanchor_dtw_token_centers(
+                    token_times,
+                    &decode_piece_text,
+                    audio_rms_frames,
+                    seconds_per_frame,
+                );
                 let onset_lead = whisper_dtw_onset_lead();
                 let mut words = seq2seq_word_timestamps_from_token_times(
                     &token_times,
