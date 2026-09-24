@@ -73,6 +73,19 @@ const SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS: f32 = 0.15;
 /// of the cut word.
 const SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS: f32 = 0.1;
 
+/// How far past the end of the committed reading the current slice's copy of
+/// the SAME word may BEGIN and still count as a continuation of that word's
+/// audio, in the seam re-home of `apply_suffix_prefix_stitch`. A word the
+/// cut landed on keeps speaking: the current side's copy begins at the cut,
+/// a little past the end of the previous side's clamped reading. A copy that
+/// begins well after it has different audio behind it -- the committed
+/// phrase ended, a pause, then the phrase AGAIN -- and re-homing onto it
+/// would anchor the committed words to a later occurrence of the same text.
+/// Half a second is the seam-scale budget (onset jitter plus the slice
+/// overlap re-hear); a later utterance of the same phrase sits far beyond
+/// it in every observed seam.
+const SEGMENT_STITCH_REHOME_MAX_RESTART_GAP_SECONDS: f32 = 0.5;
+
 /// Confidence ceiling of the new slice's head word for the B-side seam
 /// phantom rule (below). A re-read of audio the previous slice already
 /// committed is a second, weaker decode of that same audio, so the artifact
@@ -833,6 +846,84 @@ fn apply_suffix_prefix_stitch(
         if !trailing.is_empty() && !completed.ends_with(&trailing) {
             completed.push_str(&trailing);
         }
+    }
+    // A matched previous-side word clamped at `previous.end` is a text-only
+    // continuation: that phrase's audio runs past the previous slice's cut,
+    // so the windows stamped there (pinned out to the slice end by the
+    // placement tail) cover silence, not speech. The current slice re-decoded
+    // the same phrase with its own audio in view, and the acoustic vet above
+    // already proved the two copies sit at this seam. Re-home the matched
+    // words onto the current slice's windows: the text, word identity, and
+    // confidence all stay with `previous`; only the phrase's timing moves to
+    // the one reading that actually heard it.
+    //
+    // The re-home needs the seam geometry, or the words stay: the previous
+    // tail clamps at the cut and the current side's copy keeps running past
+    // that cut (a re-read of committed audio is compressed into the overlap
+    // and stops at the cut). On top of that, EVERY word is judged on its own
+    // windows, because text matching cannot tell a continuation from a LATER
+    // utterance of the same phrase:
+    //
+    // - the current side's copy must BEGIN where the previous read left off,
+    //   not inside it. A re-read of audio the previous slice already stamped
+    //   starts over that audio and the decode stretches it out over the
+    //   following gap; adopting it would unplace sound native windows.
+    // - the restart must be CONTIGUOUS: the same word's audio keeps running
+    //   from the cut, so its copy begins a little past the end of the
+    //   committed reading. A copy that begins well past it sits behind
+    //   different audio -- the phrase ended, a pause, then the phrase AGAIN
+    //   -- and re-homing onto it anchors the committed words to the wrong
+    //   occurrence.
+    // - the adopted window must not BEGIN past the next word in the final
+    //   stream (within the seam clamp tolerance). That successor is the
+    //   following matched word -- still on the previous side when it keeps
+    //   its own windows -- or the current side's first survivor word when
+    //   this pair ends the run. A re-home past it folds the timeline back on
+    //   itself.
+    let prev_side_clamped = previous_words
+        .as_ref()
+        .and_then(|(_, matched)| matched.last())
+        .is_some_and(|last| previous.end - last.end <= SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS);
+    let curr_side_past_cut = current_words
+        .as_ref()
+        .and_then(|(matched, _)| matched.last())
+        .is_some_and(|last| last.end - previous.end > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS);
+    if !approximate_word_timestamps
+        && prev_side_clamped
+        && curr_side_past_cut
+        && let (Some((mut prefix, mut matched_prev)), Some((matched_curr, _))) =
+            (previous_words, current_words)
+    {
+        let rehome = matched_prev
+            .iter()
+            .enumerate()
+            .zip(matched_curr.iter().skip(overlap.skip_curr_units))
+            .map(|((index, prev_word), curr_word)| {
+                let past_previous_read = curr_word.start > prev_word.end;
+                let contiguous_restart = curr_word.start - prev_word.end
+                    <= SEGMENT_STITCH_REHOME_MAX_RESTART_GAP_SECONDS;
+                let keeps_stream_order = matched_prev
+                    .get(index + 1)
+                    .map(|next| next.start)
+                    .or_else(|| leftover_words.first().map(|next| next.start))
+                    .is_none_or(|next_start| {
+                        curr_word.start - next_start <= SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
+                    });
+                past_previous_read && contiguous_restart && keeps_stream_order
+            })
+            .collect::<Vec<_>>();
+        for ((prev_word, curr_word), do_rehome) in matched_prev
+            .iter_mut()
+            .zip(matched_curr.iter().skip(overlap.skip_curr_units))
+            .zip(rehome)
+        {
+            if do_rehome {
+                prev_word.start = curr_word.start;
+                prev_word.end = curr_word.end;
+            }
+        }
+        prefix.extend(matched_prev);
+        previous.words = prefix;
     }
     previous.text = completed;
     current.text = remainder;
@@ -2298,6 +2389,231 @@ mod tests {
             cur_words.iter().any(|w| w.eq_ignore_ascii_case("All")),
             "the post-seam remainder must survive, got {cur_words:?}"
         );
+        // The deduped tail ends exactly at the cut and the current side's
+        // echo stops with it: a compressed re-read of committed audio. The
+        // echo must not re-home the phrase's windows, so the previous
+        // segment keeps its own native placement.
+        let there = transcription.segments[0]
+            .words
+            .iter()
+            .find(|w| w.word == "There")
+            .unwrap();
+        assert_eq!((there.start, there.end), (290.40, 291.10));
+    }
+
+    #[test]
+    fn assembler_rehomes_seam_continuation_onto_the_new_slices_words() {
+        // The continuation shape: the previous slice ran out of audio before
+        // its text did, so its tail phrase is a text-only continuation
+        // clamped at the cut ("mounted." pinned to the slice end over
+        // silence). The next slice re-decoded the same phrase with its own
+        // audio in view, and EACH copy begins where the previous read left
+        // off -- contiguous with it, and never past the word that follows.
+        // The stitch must dedupe to the previous segment AND re-home the
+        // phrase's word windows onto the new slice's reads: the words, text,
+        // and counts stay exactly as stitched; only the timing moves to the
+        // reading that heard the speech.
+        let prev_text = "And then they mounted.";
+        let cur_text = "They mounted on the driveway.";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 75, 16_000 * 100),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                75.0,
+                100.0,
+                vec![
+                    word("And", 97.6, 98.0),
+                    word("then", 97.9, 98.3),
+                    word("they", 99.0, 99.4),
+                    word("mounted.", 99.5, 100.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 99 + 8_000, 16_000 * 126),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                99.5,
+                126.0,
+                vec![
+                    word("They", 99.55, 100.35),
+                    word("mounted", 100.1, 100.7),
+                    word("on", 100.6, 101.0),
+                    word("the", 100.9, 101.3),
+                    word("driveway.", 101.2, 101.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+
+        assert_eq!(transcription.segments.len(), 2);
+        let prev = &transcription.segments[0];
+        // The deduped phrase must stay whole on the earlier segment, by
+        // name, with the new slice's windows in place of the pinned ones.
+        assert_eq!(
+            prev.words
+                .iter()
+                .map(|w| w.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["And", "then", "they", "mounted."],
+            "the deduped phrase must stay whole on the earlier segment, got {prev:?}"
+        );
+        let by_word = |name: &str| prev.words.iter().find(|w| w.word.as_str() == name).unwrap();
+        assert_eq!(
+            (by_word("they").start, by_word("they").end),
+            (99.55, 100.35)
+        );
+        assert_eq!(
+            (by_word("mounted.").start, by_word("mounted.").end),
+            (100.1, 100.7)
+        );
+        // The remainder must resume after the re-read, its windows untouched.
+        let cur = &transcription.segments[1];
+        assert_eq!(cur.words[0].word, "on");
+        assert_eq!((cur.words[0].start, cur.words[0].end), (100.6, 101.0));
+    }
+
+    #[test]
+    fn assembler_keeps_native_windows_when_the_seam_phrase_is_repeated_after_the_cut() {
+        // The rye shape: the committed phrase FINISHED before the cut
+        // ("And then they mounted"), the speaker paused, and the new slice
+        // carries the phrase AGAIN ("They mounted on the driveway."). The
+        // seam dedupe is textually correct -- one copy of the words -- but
+        // the current side's copies sit behind the SECOND utterance: the
+        // first one begins 0.5s past the word that follows it in the
+        // stream, and the second one restarts 1.2s after the committed
+        // reading ended. Neither is a continuation of the committed audio,
+        // so both words keep their native windows and the phrase stays
+        // anchored to its first occurrence.
+        let prev_text = "And then they mounted.";
+        let cur_text = "They mounted on the driveway.";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 75, 16_000 * 100),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                75.0,
+                100.0,
+                vec![
+                    word("And", 97.6, 98.0),
+                    word("then", 97.9, 98.3),
+                    word("they", 99.23, 99.69),
+                    word("mounted.", 99.49, 100.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 99 + 8_000, 16_000 * 126),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                99.5,
+                126.0,
+                vec![
+                    word("They", 100.0, 101.39),
+                    word("mounted", 101.19, 101.68),
+                    word("on", 101.48, 101.88),
+                    word("the", 101.7, 102.0),
+                    word("driveway.", 102.0, 102.6),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+
+        assert_eq!(transcription.segments.len(), 2);
+        let prev = &transcription.segments[0];
+        assert_eq!(
+            prev.words
+                .iter()
+                .map(|w| w.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["And", "then", "they", "mounted."],
+            "the deduped phrase must stay whole on the earlier segment, got {prev:?}"
+        );
+        let by_word = |name: &str| prev.words.iter().find(|w| w.word.as_str() == name).unwrap();
+        assert_eq!((by_word("they").start, by_word("they").end), (99.23, 99.69));
+        assert_eq!(
+            (by_word("mounted.").start, by_word("mounted.").end),
+            (99.49, 100.0)
+        );
+        // The second utterance's words are consumed by the dedupe; the
+        // segment resumes at the first word the seam did not match.
+        let cur = &transcription.segments[1];
+        assert_eq!(cur.words[0].word, "on");
+        assert_eq!((cur.words[0].start, cur.words[0].end), (101.48, 101.88));
+    }
+
+    #[test]
+    fn assembler_keeps_native_windows_when_the_reread_starts_before_the_cut() {
+        // The nimi shape: the previous slice's tail completes at the cut
+        // ("but." clamped at the segment end, native and tight). The next
+        // slice re-reads the committed phrase as its head and its copies
+        // start INSIDE the previous side's own windows (where that committed
+        // audio does), stretched out over the following gap: only their tails
+        // run past the cut. That is an echo of committed speech, not a
+        // reading the previous slice lacked, so the dedupe must keep the
+        // previous side's native windows.
+        let prev_text = "we saw the then but.";
+        let cur_text = "Then but sure enough they did.";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(0, 16_000 * 75, 16_000 * 100),
+            text: prev_text.to_string(),
+            segments: vec![absolute_segment(
+                prev_text,
+                75.0,
+                100.0,
+                vec![
+                    word("we", 97.0, 97.3),
+                    word("saw", 97.2, 97.5),
+                    word("the", 97.6, 97.9),
+                    word("then", 98.8, 99.6),
+                    word("but.", 99.5, 100.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: energy_slice(1, 16_000 * 99 + 8_000, 16_000 * 126),
+            text: cur_text.to_string(),
+            segments: vec![absolute_segment(
+                cur_text,
+                99.5,
+                126.0,
+                vec![
+                    word("Then", 99.55, 100.9),
+                    word("but", 99.65, 101.5),
+                    word("sure", 101.8, 102.1),
+                    word("enough", 102.1, 102.6),
+                    word("they", 102.6, 103.0),
+                    word("did.", 103.0, 103.5),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+
+        assert_eq!(transcription.segments.len(), 2);
+        let prev = &transcription.segments[0];
+        let by_word = |name: &str| prev.words.iter().find(|w| w.word.as_str() == name).unwrap();
+        // The stitched phrase must survive on the earlier segment with its
+        // NATIVE windows, not the re-read's stretched ones.
+        assert_eq!((by_word("then").start, by_word("then").end), (98.8, 99.6));
+        assert_eq!((by_word("but.").start, by_word("but.").end), (99.5, 100.0));
+        // The remainder must resume after the re-read.
+        let cur = &transcription.segments[1];
+        assert_eq!(cur.words[0].word, "sure");
     }
 
     #[test]
@@ -2444,6 +2760,15 @@ mod tests {
         );
         assert_eq!(transcription.segments[1].words[0].word, "man.");
         assert_eq!(stats.duplicate_merge_count, 1);
+        // The straddling word's pre-cut half sat on the pinned previous
+        // window; the post-cut reading owns the whole word, so the deduped
+        // copy is re-homed onto those windows.
+        let too = transcription.segments[0]
+            .words
+            .iter()
+            .find(|w| w.word.trim_matches(['.', ',']) == "too")
+            .unwrap();
+        assert_eq!((too.start, too.end), (72.63, 73.30));
     }
 
     #[test]
