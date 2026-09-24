@@ -1,5 +1,6 @@
 mod batched_decode;
 pub(crate) mod capacity;
+mod dtw_word_timestamps;
 mod execution_policy;
 mod execution_trace;
 mod frontend;
