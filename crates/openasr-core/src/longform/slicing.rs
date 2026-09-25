@@ -176,9 +176,10 @@ pub struct LongFormSlicePlan {
     pub timeline: TimelineMap,
     pub stats: LongFormSliceStats,
     /// VAD speech spans, in original-timeline samples, when the winning plan
-    /// is an identity timeline AND the VAD actually found speech: the neural
-    /// VAD's spans under `Auto`, or the built-in energy VAD's spans under
-    /// `EnergyAuto` (subject to the audibility veto in
+    /// is an identity timeline AND the VAD actually found speech: the
+    /// request's VAD's spans under `Auto` and `EnergyAuto`, or the built-in
+    /// energy VAD's spans under `EnergyAuto` when no speech-detecting
+    /// provider was present (subject to the audibility veto in
     /// `attach_energy_auto_decode_gate`). Consumed by the slice decode loop,
     /// which uses it to skip decoding slices the VAD found to hold no speech.
     /// `None` when the provider was absent, the timeline is packed (spans
@@ -294,7 +295,7 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
             layout_from_identity_slices(plan_energy_slices(samples, sample_rate_hz, options))
         }
         LongFormMode::EnergyAuto => {
-            plan_energy_auto_slices(samples, sample_rate_hz, options, canceled)?
+            plan_energy_auto_slices(samples, sample_rate_hz, options, vad_provider, canceled)?
         }
         LongFormMode::Vad => layout_from_identity_slices(plan_vad_slices(
             samples,
@@ -651,13 +652,16 @@ fn rank_auto_candidates(
 /// takes the contiguous plan's silence-aware cuts; a music-bed recording takes
 /// the eliding packed plan.
 ///
-/// The contiguous winner additionally carries the energy VAD's speech spans
-/// for the slice decode gate (`attach_energy_auto_decode_gate`), subject to
-/// the recording-relative audibility veto.
+/// The contiguous (identity) winner additionally carries VAD speech spans for
+/// the slice decode gate (`attach_energy_auto_decode_gate`): the request's
+/// own speech-detecting VAD's spans when one was provided (the same carriage
+/// `Auto` ships), else the built-in energy VAD's spans under the
+/// recording-relative audibility veto.
 fn plan_energy_auto_slices(
     samples: &[f32],
     sample_rate_hz: u32,
     options: &LongFormOptions,
+    vad_provider: Option<&dyn LongFormVadProvider>,
     canceled: &dyn Fn() -> bool,
 ) -> Result<LongFormPlanningLayout, LongFormSliceError> {
     check_planning_canceled(canceled)?;
@@ -706,34 +710,51 @@ fn plan_energy_auto_slices(
             candidate.layout
         })
         .unwrap_or_else(|| layout_from_identity_slices(vec![full_slice(total_samples)]));
-    attach_energy_auto_decode_gate(&mut winner, samples, sample_rate_hz, options, canceled)?;
+    attach_energy_auto_decode_gate(
+        &mut winner,
+        vad_provider,
+        samples,
+        sample_rate_hz,
+        options,
+        canceled,
+    )?;
     Ok(winner)
 }
 
-/// Carries the built-in energy VAD's speech spans onto `EnergyAuto`'s
-/// *identity* (non-packing) winner for the slice decode gate, under the same
-/// invariant `plan_auto_slices` applies to a neural VAD's spans -- plus an
-/// audibility veto the energy provider cannot supply on its own.
+/// Carries VAD speech spans onto `EnergyAuto`'s *identity* (non-packing)
+/// winner for the slice decode gate, under the same invariant
+/// `plan_auto_slices` applies to its identity winners.
 ///
 /// The decode driver skips exactly the slices whose carried span overlap
-/// falls below [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`]. For a neural VAD
-/// that call is trustworthy by construction; for the energy VAD it is not:
-/// on a uniformly quiet recording its relative gate sits just under the
-/// recording's own voice, so almost no window qualifies as "speech" and
-/// every slice of real (quiet) content would be suppressed. Carrying is
-/// therefore allowed only when no slice the driver *would* skip holds
-/// sustained audible content measured against this recording's own speech
-/// level ([`layout_audibility_reference`] -- a validation judgement that
-/// must not read the energy VAD's silence floor, or the check would be a
-/// closed loop). "Sustained" means two audible windows (a full second): a
-/// single 0.5s window in a below-gate slice is seam residue at a span edge,
-/// and the slice overlap guarantees the previous slice already re-reads it,
-/// so nothing is lost by skipping; two or more windows is content only the
-/// skipped slice carries (a uniformly quiet recording whose slice sits
-/// below the energy gate). Any such slice vetoes the carrier wholesale, and
-/// the plan then decodes every slice exactly as before.
+/// falls below [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`]. Two carriers, in
+/// preference order:
+///
+/// 1. **The request's own speech-detecting VAD** (`vad_provider`, non-
+///    energy-like) when one was given. This is the carriage `Auto` has
+///    shipped: its "less than half a second of speech" call is trustworthy
+///    by construction -- the gate exists precisely because a small model
+///    fills silent and non-speech audio (music beds, long pauses) with
+///    fluent repetition, and a speech-detecting VAD is the one that tells
+///    the two apart.
+/// 2. **The built-in energy VAD**, only when no speech-detecting provider
+///    is present. The energy gate cannot be trusted on its own: on a
+///    uniformly quiet recording its relative gate sits just under the
+///    recording's own voice, so almost no window qualifies as "speech" and
+///    every slice of real (quiet) content would be suppressed. Carrying is
+///    therefore allowed only when no slice the driver *would* skip holds
+///    sustained audible content measured against this recording's own
+///    speech level ([`layout_audibility_reference`] -- a validation
+///    judgement that must not read the energy VAD's silence floor, or the
+///    check would be a closed loop). "Sustained" means two audible windows
+///    (a full second): a single 0.5s window in a below-gate slice is seam
+///    residue at a span edge, and the slice overlap guarantees the previous
+///    slice already re-reads it, so nothing is lost by skipping; two or
+///    more windows is content only the skipped slice carries. Any such
+///    slice vetoes the carrier wholesale, and the plan then decodes every
+///    slice exactly as before.
 fn attach_energy_auto_decode_gate(
     layout: &mut LongFormPlanningLayout,
+    vad_provider: Option<&dyn LongFormVadProvider>,
     samples: &[f32],
     sample_rate_hz: u32,
     options: &LongFormOptions,
@@ -742,6 +763,27 @@ fn attach_energy_auto_decode_gate(
     if layout_uses_packed_timeline(layout) {
         // A packed timeline remaps processed->original seconds, so these
         // original-timeline spans are meaningless there.
+        return Ok(());
+    }
+    if let Some(provider) = vad_provider
+        && provider.provider_kind() != LongFormVadProviderKind::EnergyLike
+    {
+        let vad_spans = provider
+            .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+            .map_err(map_vad_provider_error)?;
+        check_planning_canceled(canceled)?;
+        // A VAD that saw no speech cannot gate anything on, so carrying its
+        // (empty) span list would suppress every slice.
+        if vad_spans
+            .iter()
+            .any(|span| span.end_sample > span.start_sample)
+        {
+            layout.selection_provenance.push(
+                "core.longform.energy_auto.vad-decode-gate:spans-carried:provider=request-vad"
+                    .to_string(),
+            );
+            layout.vad_speech_spans = Some(vad_spans);
+        }
         return Ok(());
     }
     let provider = EnergyLongFormVadProvider;
@@ -781,9 +823,10 @@ fn attach_energy_auto_decode_gate(
         );
         return Ok(());
     }
-    layout
-        .selection_provenance
-        .push("core.longform.energy_auto.vad-decode-gate:spans-carried".to_string());
+    layout.selection_provenance.push(
+        "core.longform.energy_auto.vad-decode-gate:spans-carried:provider=builtin-energy"
+            .to_string(),
+    );
     layout.vad_speech_spans = Some(speech_spans);
     Ok(())
 }
@@ -5060,6 +5103,53 @@ mod tests {
         assert!(
             below_gate >= 1,
             "expected at least one silent trailing slice for the gate: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_identity_plan_prefers_the_request_vad_spans_for_the_gate() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // 33s of tone: the built-in energy VAD keeps one continuous span, but
+        // the request's own (Custom-kind) speech-detecting VAD reports two
+        // end spans. `Auto` has shipped carrying the request VAD's spans for
+        // this exact gate, and `EnergyAuto` must follow the same rule rather
+        // than falling back to the weaker energy spans.
+        let samples = tone(16_000 * 33);
+        let plan =
+            plan_longform_slices(&samples, 16_000, &options, Some(&FixedVadProvider)).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        let Some(spans) = plan.vad_speech_spans.as_ref() else {
+            panic!(
+                "an identity EnergyAuto plan with a speech-detecting request VAD \
+                 must carry its spans for the decode gate: {:?}",
+                plan.stats.provenance
+            );
+        };
+        assert_eq!(
+            spans,
+            &vec![
+                LongFormVadSlice {
+                    start_sample: 0,
+                    end_sample: 16_000
+                },
+                LongFormVadSlice {
+                    start_sample: samples.len() - 16_000,
+                    end_sample: samples.len()
+                }
+            ],
+            "the request VAD's spans must beat the built-in energy spans"
+        );
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("vad-decode-gate:spans-carried:provider=request-vad")),
+            "provenance must record the request-VAD carriage: {:?}",
+            plan.stats.provenance
         );
     }
 
