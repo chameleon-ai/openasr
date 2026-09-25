@@ -5,7 +5,17 @@ pub enum LongFormMode {
     Off,
     Auto,
     Fixed,
+    /// Contiguous, full-coverage energy planner. Slices from the first sample
+    /// to the last choosing only *where* to cut; it can never elide audio.
     Energy,
+    /// The energy planner family, auto-ranked: the contiguous full-coverage
+    /// [`LongFormMode::Energy`] layout against (when the energy VAD keeps at
+    /// least two spans) the packed layout that elides the gaps between them,
+    /// with the same candidate discipline `Auto` applies. A family pinned to
+    /// this mode gets the energy planner's silence-aware cuts plus the elision
+    /// path without the distractor candidates `Auto` adds (the fixed grid, any
+    /// neural-VAD layouts).
+    EnergyAuto,
     Vad,
 }
 

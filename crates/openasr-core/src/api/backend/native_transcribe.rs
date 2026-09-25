@@ -28,7 +28,8 @@ use crate::longform::plan_longform_slices;
 use crate::longform::{
     AudioSlice, AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
     LongFormVadProvider, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
-    TranscriptAssembler, plan_longform_slices_with_materialization_gate,
+    TranscriptAssembler, VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES,
+    plan_longform_slices_with_materialization_gate, vad_speech_spans_overlap_samples,
 };
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicyLongformProfile, BuiltinDecodePolicyLongformPromptCarryMode,
@@ -4549,10 +4550,9 @@ fn apply_dtw_buffer_absolute_longform_no_padding_policy(
     }
 }
 
-/// Narrows the longform window to the family's preferred quality window, when
-/// it declares one (see
-/// [`OpenAsrExecutionContract::preferred_longform_window_seconds`]), in both
-/// cases clamped at the architecture's invocation ceiling.
+/// Narrows the longform *target* window to the family's preferred quality
+/// window, when it declares one (see
+/// [`OpenAsrExecutionContract::preferred_longform_window_seconds`]).
 ///
 /// Today only whisper declares one (27s). That window is a *quality* bound,
 /// distinct from the architectural ceiling: the 30s figure is whisper's hard
@@ -4560,11 +4560,17 @@ fn apply_dtw_buffer_absolute_longform_no_padding_policy(
 /// `InvocationOutsideEnvelope` guard), whereas 27s is the point below which
 /// whisper's greedy decode reliably *completes* a 30s-class window instead of
 /// bailing soft, repetitive speech to no-speech or tripping the
-/// degenerate-repeat guard. Because it is clamped at the ceiling that
-/// `apply_invocation_span_longform_policy` already applied, it can never widen
-/// past the crash boundary; the clamp also guards against any future row that
-/// declares a preferred window above its own ceiling, which would only be able
-/// to *narrow*, never widen past the hard bound. The provenance label is kept
+/// degenerate-repeat guard. The ceiling is kept as `max_chunk_seconds`: it is
+/// the value `apply_invocation_span_longform_policy` already clamped it to, so
+/// the target can never widen past the crash boundary, and the retained head
+/// room lets a silence-aware cut grow *toward* the ceiling to land in a
+/// natural pause (a mid-voicing cut at the soft target is exactly the seam
+/// failure the growth avoids). The mode is pinned to the energy planner
+/// family ([`LongFormMode::EnergyAuto`]) for the same reason the
+/// `ScopedSlices` policy pins to `Energy`: the fixed grid `Auto` would elect
+/// cuts blind to the audio, while the energy planner's cuts honor the pause
+/// preference order (and, for `EnergyAuto` only, the packed elision path stays
+/// available for music-bed recordings). The provenance labels are kept
 /// whisper-stable so existing operators' logs and dashboards keep matching.
 fn apply_preferred_longform_window_policy(
     model_architecture: &str,
@@ -4583,23 +4589,38 @@ fn apply_preferred_longform_window_policy(
             "core.native.longform.policy:whisper-window={window}"
         ));
     }
+    if !matches!(options.mode, LongFormMode::EnergyAuto) {
+        options.mode = LongFormMode::EnergyAuto;
+        provenance
+            .push("core.native.longform.policy:preferred-window-mode=energy_auto".to_string());
+    }
 }
 
-/// Set the longform options to the family's preferred quality `requested`
-/// seconds, or `None` when they already sit there (so a request at the current
-/// value is a no-op). The caller clamps `requested` to the architecture ceiling
-/// ahead of time, never allowing it to widen past the hard bound.
+/// Set the longform *target* chunk to the family's preferred quality
+/// `requested` seconds, or `None` when the options already sit there (so a
+/// request at the current value is a no-op). Only narrows the target, never
+/// the ceiling: `max_chunk_seconds` stays at whatever the safety caps
+/// installed ahead of it (the caller clamps `requested` to that ceiling, so
+/// the target can never go past the hard bound), preserving the head room a
+/// silence-aware cut needs to grow to a pause.
 fn apply_preferred_longform_window(
     options: &mut crate::LongFormOptions,
     requested: f32,
 ) -> Option<f32> {
-    if (requested - options.max_chunk_seconds).abs() <= f32::EPSILON {
-        return None;
+    let mut changed = false;
+    if (options.chunk_seconds - requested).abs() > f32::EPSILON {
+        options.chunk_seconds = requested;
+        changed = true;
     }
-    options.chunk_seconds = requested;
-    options.max_chunk_seconds = requested;
-    options.min_chunk_seconds = options.min_chunk_seconds.min(requested);
-    Some(requested)
+    if options.max_chunk_seconds < requested {
+        options.max_chunk_seconds = requested;
+        changed = true;
+    }
+    if options.min_chunk_seconds > requested {
+        options.min_chunk_seconds = requested;
+        changed = true;
+    }
+    if changed { Some(requested) } else { None }
 }
 
 /// Caps longform chunking to the architecture's declared
@@ -5193,46 +5214,9 @@ fn is_effectively_silent(samples: &[f32], threshold_db: f32) -> bool {
     db <= threshold_db
 }
 
-/// Minimum original-timeline VAD speech a slice must contain before the
-/// long-form decode gate will let it through, expressed in samples so the
-/// comparison is independent of the 16 kHz conversion (8000 samples at 16 kHz
-/// is half a second). A slice below this is decoded to nothing. Half a
-/// second is far below any real utterance and far above the sub-frame jitter
-/// the VAD emits, so a genuinely quiet slice that still holds a real word
-/// always clears it. The gate is only reached on plans that carried VAD
-/// speech spans (auto mode with a speech-detecting VAD); every other plan
-/// decodes every slice exactly as before.
-const VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES: usize = 8_000;
-
-/// Original-timeline sample count of neural-VAD speech overlapping one slice
-/// -- or `None` when the plan carries no VAD spans, which is every mode and
-/// every packed (silence-omitting) plan. `None` means "no gate" (decode
-/// normally); a `Some` count below [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`]
-/// means "suppress".
-fn vad_speech_spans_overlap_samples(
-    spans: Option<&[crate::longform::LongFormVadSlice]>,
-    slice: &crate::longform::AudioSlice,
-) -> Option<usize> {
-    let spans = spans?;
-    if spans.is_empty() {
-        return None;
-    }
-    let slice_start = slice.start_sample;
-    let slice_end = slice.end_sample;
-    let mut overlap_samples = 0usize;
-    for span in spans {
-        let overlap_start = span.start_sample.max(slice_start);
-        let overlap_end = span.end_sample.min(slice_end);
-        if overlap_end > overlap_start {
-            overlap_samples = overlap_samples.saturating_add(overlap_end - overlap_start);
-        }
-    }
-    Some(overlap_samples)
-}
-
 #[cfg(test)]
 mod vad_slice_gate_tests {
-    use super::vad_speech_spans_overlap_samples;
+    use crate::longform::vad_speech_spans_overlap_samples;
     use crate::longform::{AudioSlice, AudioSliceKind, LongFormVadSlice};
 
     fn slice(start: usize, end: usize) -> AudioSlice {
@@ -5585,6 +5569,7 @@ fn build_longform_metadata(
         LongFormMode::Auto => "auto",
         LongFormMode::Fixed => "fixed",
         LongFormMode::Energy => "energy",
+        LongFormMode::EnergyAuto => "energy_auto",
         LongFormMode::Vad => "vad",
     };
     let mut provenance = vec![
@@ -8884,11 +8869,15 @@ mod tests {
             crate::WHISPER_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
-        // Whisper's window is the 27s quality window, well inside the 30s
-        // invocation envelope (the whole point: a full 30s window is where
-        // whisper's greedy decode bails soft speech to no-speech).
+        // Whisper's *target* window is the 27s quality window (the whole
+        // point: a full 30s window is where whisper's greedy decode bails
+        // soft speech to no-speech); the 30s invocation ceiling stays as the
+        // max, so a silence-aware cut may grow into (27, 30] to reach a pause.
+        // The mode pin overrides the requested `Fixed`: the family's quality
+        // window comes with the energy planner family's pause-aware cuts.
+        assert_eq!(resolution.options.mode, LongFormMode::EnergyAuto);
         assert_eq!(resolution.options.chunk_seconds, 27.0);
-        assert_eq!(resolution.options.max_chunk_seconds, 27.0);
+        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
         // Whisper's cross-attention-DTW word times are buffer-absolute while the
         // assembler rebases from `content_start_sample`, so the padding rule
         // (shared with `ScopedSlices` / `ConservativeSeq2SeqV1`) must zero it.
@@ -8914,7 +8903,7 @@ mod tests {
 
         let samples = vec![0.05_f32; 61 * 16_000];
         let plan = plan_longform_slices(&samples, 16_000, &resolution.options, None)
-            .expect("fixed Whisper slices");
+            .expect("Whisper slices");
         assert!(plan.slices.len() >= 3);
         assert!(
             plan.slices
@@ -8952,11 +8941,15 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("whisper-xattn-dtw-no-padding"))
         );
-        // The generic window is narrowed to whisper's declared quality window,
-        // and the padding the buffer-absolute cross-attention-DTW word times
-        // would be biased by is zeroed.
+        // The generic target window is narrowed to whisper's declared quality
+        // window while the 30s invocation ceiling stays the max (a
+        // silence-aware cut may grow into (27, 30] to reach a pause), the
+        // mode is pinned to the energy planner family, and the padding the
+        // buffer-absolute cross-attention-DTW word times would be biased by
+        // is zeroed.
+        assert_eq!(resolution.options.mode, LongFormMode::EnergyAuto);
         assert_eq!(resolution.options.chunk_seconds, preferred);
-        assert_eq!(resolution.options.max_chunk_seconds, preferred);
+        assert_eq!(resolution.options.max_chunk_seconds, 30.0);
         assert_eq!(
             resolution.options.min_chunk_seconds,
             defaults.min_chunk_seconds.min(preferred)
@@ -8966,6 +8959,12 @@ mod tests {
                 .provenance
                 .iter()
                 .any(|entry| entry.contains("whisper-window=27"))
+        );
+        assert!(
+            resolution
+                .provenance
+                .iter()
+                .any(|entry| entry.contains("preferred-window-mode=energy_auto"))
         );
 
         let non_whisper = resolve_native_longform_policy_for_backend(
@@ -9376,7 +9375,13 @@ mod tests {
                 None => {
                     // No encoder-memory cap applies. The product slice shape
                     // supplies the base window and a semantic invocation span
-                    // may independently narrow it.
+                    // may independently narrow it. A family's declared
+                    // preferred quality window (whisper's 27s) narrows only
+                    // the *target* chunk on top of the two caps above: the
+                    // ceiling keeps its min(product window, semantic
+                    // invocation span) width so a silence-aware cut may grow
+                    // toward the ceiling to reach a natural pause, and the
+                    // preferred window never widens anything.
                     let product_window = match descriptor.execution_contract.longform_slice_shape {
                         crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
                             max_seconds,
@@ -9386,22 +9391,26 @@ mod tests {
                             crate::arch::DEFAULT_ENCODER_MAX_CHUNK_SECONDS
                         }
                     };
-                    let mut expected = descriptor
+                    let expected_max = descriptor
                         .max_single_invocation_seconds()
                         .map_or(product_window, |semantic_max| {
                             product_window.min(semantic_max)
                         });
-                    // A family's declared preferred quality window (whisper's
-                    // 27s) narrows the result on top of the two caps above; it
-                    // never widens.
-                    if let Some(preferred) = descriptor.preferred_longform_window_seconds() {
-                        expected = expected.min(preferred);
-                    }
                     assert_eq!(
-                        resolution.options.max_chunk_seconds, expected,
-                        "'{}' must keep the min(product window, semantic invocation span, and any family quality window)",
+                        resolution.options.max_chunk_seconds, expected_max,
+                        "'{}' must keep max_chunk_seconds at the min(product window, semantic invocation span)",
                         descriptor.identity.model_architecture
                     );
+                    if let Some(preferred) = descriptor.preferred_longform_window_seconds() {
+                        assert_eq!(
+                            resolution.options.chunk_seconds,
+                            preferred.min(expected_max),
+                            "'{}' must narrow the target chunk to the preferred quality window \
+                             (capped at the ceiling), got {}",
+                            descriptor.identity.model_architecture,
+                            resolution.options.chunk_seconds
+                        );
+                    }
                 }
             }
         }

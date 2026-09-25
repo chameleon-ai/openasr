@@ -18,6 +18,7 @@ pub use slicing::{
     LongFormVadSlice, plan_longform_slices,
 };
 pub(crate) use slicing::{
-    LongFormSlicePlanningError, plan_longform_slices_with_materialization_gate,
+    LongFormSlicePlanningError, VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES,
+    plan_longform_slices_with_materialization_gate, vad_speech_spans_overlap_samples,
 };
 pub use timeline::{TimelineAnchor, TimelineMap};

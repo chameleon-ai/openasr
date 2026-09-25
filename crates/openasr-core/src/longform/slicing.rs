@@ -57,6 +57,47 @@ pub struct LongFormVadSlice {
     pub end_sample: usize,
 }
 
+/// Minimum original-timeline VAD speech a slice must contain before the
+/// long-form decode gate will let it through, expressed in samples so the
+/// comparison is independent of the 16 kHz conversion (8000 samples at 16 kHz
+/// is half a second). A slice below this is decoded to nothing. Half a
+/// second is far below any real utterance and far above the sub-frame jitter
+/// the VAD emits, so a genuinely quiet slice that still holds a real word
+/// always clears it. The gate is only reached on plans that carried VAD
+/// speech spans ([`LongFormSlicePlan::vad_speech_spans`] planning attaches
+/// them for exactly the decode loops it is safe to gate); every other plan
+/// decodes every slice exactly as before. Planning's audibility veto (see
+/// `attach_energy_auto_decode_gate`) and the decode driver's gate must read
+/// this one constant so "the driver would skip this slice" and "the planner
+/// vetted this slice for skipping" never disagree.
+pub(crate) const VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES: usize = 8_000;
+
+/// Original-timeline sample count of VAD speech overlapping one slice -- or
+/// `None` when the plan carries no VAD spans, which is every mode and every
+/// packed (silence-omitting) plan that declines to carry them. `None` means
+/// "no gate" (decode normally); a `Some` count below
+/// [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`] means "suppress".
+pub(crate) fn vad_speech_spans_overlap_samples(
+    spans: Option<&[LongFormVadSlice]>,
+    slice: &AudioSlice,
+) -> Option<usize> {
+    let spans = spans?;
+    if spans.is_empty() {
+        return None;
+    }
+    let slice_start = slice.start_sample;
+    let slice_end = slice.end_sample;
+    let mut overlap_samples = 0usize;
+    for span in spans {
+        let overlap_start = span.start_sample.max(slice_start);
+        let overlap_end = span.end_sample.min(slice_end);
+        if overlap_end > overlap_start {
+            overlap_samples = overlap_samples.saturating_add(overlap_end - overlap_start);
+        }
+    }
+    Some(overlap_samples)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LongFormVadProviderKind {
     Custom,
@@ -134,11 +175,15 @@ pub struct LongFormSlicePlan {
     pub processed_audio: Option<Vec<f32>>,
     pub timeline: TimelineMap,
     pub stats: LongFormSliceStats,
-    /// The neural VAD's speech spans, in original-timeline samples, when the
-    /// winning plan is an identity timeline AND the VAD actually found speech.
-    /// Consumed by the slice decode loop, which uses it to skip decoding slices
-    /// the VAD found to hold no speech. `None` when the provider was absent, the
-    /// timeline is packed (spans would be meaningless), or the VAD saw no speech.
+    /// VAD speech spans, in original-timeline samples, when the winning plan
+    /// is an identity timeline AND the VAD actually found speech: the neural
+    /// VAD's spans under `Auto`, or the built-in energy VAD's spans under
+    /// `EnergyAuto` (subject to the audibility veto in
+    /// `attach_energy_auto_decode_gate`). Consumed by the slice decode loop,
+    /// which uses it to skip decoding slices the VAD found to hold no speech.
+    /// `None` when the provider was absent, the timeline is packed (spans
+    /// would be meaningless), the VAD saw no speech, or the audibility veto
+    /// refused to carry the energy spans.
     pub vad_speech_spans: Option<Vec<LongFormVadSlice>>,
 }
 
@@ -247,6 +292,9 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
         }
         LongFormMode::Energy => {
             layout_from_identity_slices(plan_energy_slices(samples, sample_rate_hz, options))
+        }
+        LongFormMode::EnergyAuto => {
+            plan_energy_auto_slices(samples, sample_rate_hz, options, canceled)?
         }
         LongFormMode::Vad => layout_from_identity_slices(plan_vad_slices(
             samples,
@@ -524,28 +572,13 @@ fn plan_auto_slices(
     }
 
     check_planning_canceled(canceled)?;
-    prune_dominated_vad_candidates(&mut candidates);
-    let mut selection_provenance =
-        enforce_coverage_dominance(&mut candidates, samples, sample_rate_hz);
-    selection_provenance.extend(apply_marginal_packed_penalties(
+    let selection_provenance = rank_auto_candidates(
         &mut candidates,
+        samples,
+        sample_rate_hz,
         total_samples,
-        sample_rate_hz,
         options,
-    ));
-    selection_provenance.extend(apply_marginal_vad_penalties(
-        &mut candidates,
-        total_samples,
-        sample_rate_hz,
-        options,
-    ));
-    selection_provenance.extend(apply_material_vad_boundary_credits(
-        &mut candidates,
-        sample_rate_hz,
-        options,
-    ));
-    candidates.sort_by(compare_auto_plan_candidates);
-    selection_provenance.extend(auto_selection_provenance(&candidates));
+    );
     check_planning_canceled(canceled)?;
     // Attach the neural VAD's speech spans to the winning layout so the slice
     // decode loop can skip decoding a slice the VAD found to hold no speech
@@ -570,6 +603,189 @@ fn plan_auto_slices(
             candidate.layout
         })
         .unwrap_or_else(|| layout_from_identity_slices(vec![full_slice(total_samples)])))
+}
+
+/// The full candidate discipline `Auto` applies before selection: prune
+/// dominated VAD candidates, disqualify any plan that drops audible content
+/// while a full-coverage alternative survives, apply the marginal packed/VAD
+/// score adjustments and boundary credits, then sort by score. Shared with
+/// [`plan_energy_auto_slices`] so a restricted candidate set is ranked by the
+/// exact same rules (the VAD-only steps are no-ops on an energy-only list).
+fn rank_auto_candidates(
+    candidates: &mut Vec<AutoPlanCandidate>,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    total_samples: usize,
+    options: &LongFormOptions,
+) -> Vec<String> {
+    prune_dominated_vad_candidates(candidates);
+    let mut selection_provenance = enforce_coverage_dominance(candidates, samples, sample_rate_hz);
+    selection_provenance.extend(apply_marginal_packed_penalties(
+        candidates,
+        total_samples,
+        sample_rate_hz,
+        options,
+    ));
+    selection_provenance.extend(apply_marginal_vad_penalties(
+        candidates,
+        total_samples,
+        sample_rate_hz,
+        options,
+    ));
+    selection_provenance.extend(apply_material_vad_boundary_credits(
+        candidates,
+        sample_rate_hz,
+        options,
+    ));
+    candidates.sort_by(compare_auto_plan_candidates);
+    selection_provenance.extend(auto_selection_provenance(candidates));
+    selection_provenance
+}
+
+/// `LongFormMode::EnergyAuto` planning: the contiguous full-coverage energy
+/// layout (see `plan_energy_slices`) against, when the energy VAD keeps at
+/// least two spans, the packed layout that elides the gaps between them. The
+/// winner is chosen by the same candidate discipline `plan_auto_slices`
+/// applies, minus the candidates this mode does not consider (the fixed
+/// grid, any neural-VAD layouts). A recording with no elidable gaps therefore
+/// takes the contiguous plan's silence-aware cuts; a music-bed recording takes
+/// the eliding packed plan.
+///
+/// The contiguous winner additionally carries the energy VAD's speech spans
+/// for the slice decode gate (`attach_energy_auto_decode_gate`), subject to
+/// the recording-relative audibility veto.
+fn plan_energy_auto_slices(
+    samples: &[f32],
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+    canceled: &dyn Fn() -> bool,
+) -> Result<LongFormPlanningLayout, LongFormSliceError> {
+    check_planning_canceled(canceled)?;
+    let total_samples = samples.len();
+    let chunk_samples = seconds_to_samples(options.chunk_seconds, sample_rate_hz);
+    let max_chunk_samples =
+        executor_window_limit_samples_checked(options.max_chunk_seconds, sample_rate_hz);
+    if total_samples <= chunk_samples.min(max_chunk_samples) {
+        return Ok(layout_from_identity_slices(vec![full_slice(total_samples)]));
+    }
+    let mut candidates = Vec::with_capacity(2);
+    candidates.push(build_auto_plan_candidate(
+        AudioSliceKind::Energy,
+        layout_from_identity_slices(plan_energy_slices(samples, sample_rate_hz, options)),
+        samples,
+        total_samples,
+        sample_rate_hz,
+        options,
+    ));
+    check_planning_canceled(canceled)?;
+    if let Some(packed_energy_layout) =
+        plan_packed_energy_layout(samples, sample_rate_hz, options, canceled)?
+    {
+        candidates.push(build_auto_plan_candidate(
+            AudioSliceKind::Energy,
+            packed_energy_layout,
+            samples,
+            total_samples,
+            sample_rate_hz,
+            options,
+        ));
+    }
+    let selection_provenance = rank_auto_candidates(
+        &mut candidates,
+        samples,
+        sample_rate_hz,
+        total_samples,
+        options,
+    );
+    check_planning_canceled(canceled)?;
+    let mut winner = candidates
+        .into_iter()
+        .next()
+        .map(|mut candidate| {
+            candidate.layout.selection_provenance = selection_provenance;
+            candidate.layout
+        })
+        .unwrap_or_else(|| layout_from_identity_slices(vec![full_slice(total_samples)]));
+    attach_energy_auto_decode_gate(&mut winner, samples, sample_rate_hz, options, canceled)?;
+    Ok(winner)
+}
+
+/// Carries the built-in energy VAD's speech spans onto `EnergyAuto`'s
+/// *identity* (non-packing) winner for the slice decode gate, under the same
+/// invariant `plan_auto_slices` applies to a neural VAD's spans -- plus an
+/// audibility veto the energy provider cannot supply on its own.
+///
+/// The decode driver skips exactly the slices whose carried span overlap
+/// falls below [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`]. For a neural VAD
+/// that call is trustworthy by construction; for the energy VAD it is not:
+/// on a uniformly quiet recording its relative gate sits just under the
+/// recording's own voice, so almost no window qualifies as "speech" and
+/// every slice of real (quiet) content would be suppressed. Carrying is
+/// therefore allowed only when no slice the driver *would* skip holds
+/// sustained audible content measured against this recording's own speech
+/// level ([`layout_audibility_reference`] -- a validation judgement that
+/// must not read the energy VAD's silence floor, or the check would be a
+/// closed loop). "Sustained" means two audible windows (a full second): a
+/// single 0.5s window in a below-gate slice is seam residue at a span edge,
+/// and the slice overlap guarantees the previous slice already re-reads it,
+/// so nothing is lost by skipping; two or more windows is content only the
+/// skipped slice carries (a uniformly quiet recording whose slice sits
+/// below the energy gate). Any such slice vetoes the carrier wholesale, and
+/// the plan then decodes every slice exactly as before.
+fn attach_energy_auto_decode_gate(
+    layout: &mut LongFormPlanningLayout,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+    canceled: &dyn Fn() -> bool,
+) -> Result<(), LongFormSliceError> {
+    if layout_uses_packed_timeline(layout) {
+        // A packed timeline remaps processed->original seconds, so these
+        // original-timeline spans are meaningless there.
+        return Ok(());
+    }
+    let provider = EnergyLongFormVadProvider;
+    let speech_spans = provider
+        .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+        .map_err(map_vad_provider_error)?;
+    check_planning_canceled(canceled)?;
+    if !speech_spans
+        .iter()
+        .any(|span| span.end_sample > span.start_sample)
+    {
+        // A VAD that saw no speech cannot gate anything on, so carrying its
+        // (empty) span list would suppress every slice.
+        return Ok(());
+    }
+    let reference = layout_audibility_reference(samples, sample_rate_hz, layout);
+    let would_skip_sustained_audible = layout.slices.iter().any(|slice| {
+        let Some(overlap) = vad_speech_spans_overlap_samples(Some(&speech_spans), slice) else {
+            return false;
+        };
+        if overlap >= VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES {
+            return false;
+        }
+        let Some(first) =
+            reference.find_audible_window(samples, slice.start_sample, slice.end_sample)
+        else {
+            return false;
+        };
+        reference
+            .find_audible_window(samples, first.1, slice.end_sample)
+            .is_some()
+    });
+    if would_skip_sustained_audible {
+        layout.selection_provenance.push(
+            "core.longform.energy_auto.vad-decode-gate:vetoed:audible_slice_below_decode_gate"
+                .to_string(),
+        );
+        return Ok(());
+    }
+    layout
+        .selection_provenance
+        .push("core.longform.energy_auto.vad-decode-gate:spans-carried".to_string());
+    layout.vad_speech_spans = Some(speech_spans);
+    Ok(())
 }
 
 fn plan_energy_slices(
@@ -686,6 +902,16 @@ fn plan_energy_slices_contiguous(
     slices
 }
 
+/// Tiles `[span_start, span_end)` with contiguous full-coverage energy
+/// slices. Each cut follows `choose_energy_split`'s preference order: the
+/// quietest frame near the soft target when it is a genuine pause, else the
+/// first genuine pause while growing toward the `max_chunk_seconds` ceiling,
+/// else the quietest near-target frame with a widened overlap (so a word
+/// forced through the cut is re-read whole in the next slice). On audio
+/// wholly above the silence floor the cut positions never move from the
+/// plain lowest-energy policy; only a genuine pause beyond the search window
+/// re-cuts a slice, and only to grow it toward the ceiling to reach that
+/// pause.
 fn extend_energy_slices_for_span(
     slices: &mut Vec<AudioSlice>,
     samples: &[f32],
@@ -703,6 +929,8 @@ fn extend_energy_slices_for_span(
     let overlap_samples = seconds_to_samples(options.overlap_seconds, sample_rate_hz);
     let min_chunk_samples = seconds_to_samples(options.min_chunk_seconds, sample_rate_hz);
     let search_samples = seconds_to_samples(options.energy_split_search_seconds, sample_rate_hz);
+    let forced_overlap_samples = forced_cut_overlap_samples(options, sample_rate_hz, chunk_samples);
+    let silence_threshold_linear = 10.0_f32.powf(options.energy_silence_threshold_db / 20.0);
     let total_samples = samples.len();
     let mut start = span_start.min(total_samples);
     let limit = span_end.min(total_samples);
@@ -728,14 +956,15 @@ fn extend_energy_slices_for_span(
             start = advance_window_start(start, end, overlap_samples);
             continue;
         }
-        let search_start = desired
-            .saturating_sub(search_samples)
-            .max(start + min_chunk_samples);
-        let search_end = (desired + search_samples).min(hard_end);
-        let split = find_lowest_energy_split(samples, search_start, search_end)
-            .unwrap_or(desired)
-            .max(start + min_chunk_samples)
-            .min(hard_end);
+        let floor = (start + min_chunk_samples).min(hard_end);
+        let (split, forced) = choose_energy_split(
+            samples,
+            desired,
+            hard_end,
+            floor,
+            search_samples,
+            silence_threshold_linear,
+        );
         slices.push(AudioSlice {
             index: slices.len(),
             kind: AudioSliceKind::Energy,
@@ -747,7 +976,12 @@ fn extend_energy_slices_for_span(
         if split >= limit {
             break;
         }
-        start = split.saturating_sub(overlap_samples);
+        let overlap = if forced {
+            forced_overlap_samples
+        } else {
+            overlap_samples
+        };
+        start = split.saturating_sub(overlap);
         if let Some(last) = slices.last()
             && start <= last.content_start_sample
         {
@@ -950,6 +1184,46 @@ fn choose_forced_cut(
     }
     let ceiling_lo = hard_end.saturating_sub(search_samples).max(floor);
     let split = find_lowest_energy_split(samples, ceiling_lo, hard_end).unwrap_or(hard_end);
+    (clamp(split), true)
+}
+
+/// Choose the silence-aware split for a contiguous energy window.
+///
+/// Preference order: the quietest frame near the soft target when it is a
+/// genuine pause (RMS at/below the silence threshold); else the first genuine
+/// pause while growing from that window toward the ceiling; else the quietest
+/// frame of the same near-target window, flagged forced so the caller widens
+/// the overlap and re-reads whatever word straddles the cut.
+///
+/// Unlike `choose_forced_cut` (the VAD path, whose forced fallback retargets
+/// at the ceiling so a grown region uses its whole budget), the forced
+/// fallback keeps the pre-growth near-target position: on audio wholly voiced
+/// above the silence floor a contiguous tiling must not leap to the ceiling,
+/// or every pauseless recording re-tiles into fewer, longer slices.
+fn choose_energy_split(
+    samples: &[f32],
+    desired: usize,
+    hard_end: usize,
+    floor: usize,
+    search_samples: usize,
+    silence_threshold_linear: f32,
+) -> (usize, bool) {
+    let clamp = |value: usize| value.max(floor).min(hard_end);
+    let window_lo = desired.saturating_sub(search_samples).max(floor);
+    let window_hi = (desired + search_samples).min(hard_end);
+    let Some((split, split_rms)) = lowest_energy_split_with_rms(samples, window_lo, window_hi)
+    else {
+        return (clamp(hard_end), true);
+    };
+    if split_rms <= silence_threshold_linear {
+        return (clamp(split), false);
+    }
+    if window_hi < hard_end
+        && let Some(paused) =
+            first_low_energy_split(samples, window_hi, hard_end, silence_threshold_linear)
+    {
+        return (clamp(paused), false);
+    }
     (clamp(split), true)
 }
 
@@ -4599,6 +4873,265 @@ mod tests {
         assert!(
             cut > 16_000 * 27 && cut < 16_000 * 28,
             "cut {cut} did not land on the 27s dip"
+        );
+    }
+
+    #[test]
+    fn energy_cut_reaches_pause_beyond_soft_target_within_ceiling() {
+        let mut options = options_with_mode(LongFormMode::Energy);
+        options.chunk_seconds = 27.0;
+        options.max_chunk_seconds = 30.0;
+        options.energy_split_search_seconds = 5.0;
+        // Unbroken tone except for a 1s dip at 28s -- past the 27s target but
+        // under the 30s ceiling. With the target below the ceiling the cut
+        // must grow to the pause instead of forcing through voicing at the
+        // soft target.
+        let mut samples = tone(16_000 * 45);
+        for sample in samples.iter_mut().take(16_000 * 29).skip(16_000 * 28) {
+            *sample = 0.0;
+        }
+        let slices = plan_energy_slices(&samples, 16_000, &options);
+        assert!(slices.len() >= 2, "{slices:#?}");
+        let cut = slices[0].content_end_sample;
+        assert!(
+            cut > 16_000 * 28 && cut < 16_000 * 29,
+            "expected growth to the 28s pause, got {cut}"
+        );
+        assert!(cut > 16_000 * 27, "region should grow past the 27s target");
+        assert!(cut <= 16_000 * 30, "cut must stay under the 30s ceiling");
+    }
+
+    #[test]
+    fn energy_cut_grows_past_search_window_toward_pause_within_ceiling() {
+        let mut options = options_with_mode(LongFormMode::Energy);
+        options.chunk_seconds = 30.0;
+        options.max_chunk_seconds = 55.0;
+        options.energy_split_search_seconds = 5.0;
+        // Pauseless through the 30s target and its +/-5s search window; the
+        // first real pause is a 1s dip at 40s, past the window but under the
+        // 55s ceiling. The growth step (not the near-target window) must find
+        // it.
+        let mut samples = tone(16_000 * 60);
+        for sample in samples.iter_mut().take(16_000 * 41).skip(16_000 * 40) {
+            *sample = 0.0;
+        }
+        let slices = plan_energy_slices(&samples, 16_000, &options);
+        assert!(slices.len() >= 2, "{slices:#?}");
+        let cut = slices[0].content_end_sample;
+        assert!(
+            cut > 16_000 * 40 && cut < 16_000 * 41,
+            "expected growth to the 40s pause, got {cut}"
+        );
+        assert!(
+            cut > 16_000 * 35,
+            "cut should grow past the 35s search-window edge"
+        );
+        assert!(cut < 16_000 * 55, "cut must stay under the 55s ceiling");
+    }
+
+    #[test]
+    fn energy_forced_pauseless_cut_widens_overlap() {
+        let mut options = options_with_mode(LongFormMode::Energy);
+        options.chunk_seconds = 27.0;
+        options.max_chunk_seconds = 30.0;
+        options.overlap_seconds = 0.5;
+        options.energy_split_search_seconds = 5.0;
+        // 90s of unbroken tone: no pause anywhere. The ceiling must still
+        // bound each slice, and the forced cut must widen the overlap to 1s
+        // so a straddling word is re-read whole in the next slice.
+        let samples = tone(16_000 * 90);
+        let slices = plan_energy_slices(&samples, 16_000, &options);
+        assert!(
+            slices.len() >= 2,
+            "pauseless region must still be split, got {}",
+            slices.len()
+        );
+        let max_chunk_samples = 16_000 * 30;
+        for slice in &slices {
+            assert!(
+                slice.content_duration_samples() <= max_chunk_samples,
+                "slice exceeds the ceiling: {slice:?}"
+            );
+        }
+        let overlap = slices[0].content_end_sample - slices[1].content_start_sample;
+        assert_eq!(
+            overlap, 16_000,
+            "forced overlap should widen to 1s, got {overlap}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_mode_prefers_packed_when_elision_pays() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // 27s tone + 12s silence + 27s tone: past one target window, with a
+        // real elidable gap, so the packed candidate must exist and beat the
+        // contiguous one.
+        let mut samples = tone(16_000 * 27);
+        samples.extend(vec![0.0; 16_000 * 12]);
+        samples.extend(tone(16_000 * 27));
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_some(),
+            "energy auto must take the packed (eliding) layout when it pays, \
+             slices {:?}, provenance: {}",
+            plan.slices
+                .iter()
+                .map(|slice| (slice.content_start_sample, slice.content_end_sample))
+                .collect::<Vec<_>>(),
+            plan.stats.provenance.join(" | ")
+        );
+    }
+
+    #[test]
+    fn energy_auto_mode_stays_contiguous_when_nothing_is_elidable() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // Unbroken tone: the energy VAD keeps one speech span, so no packed
+        // layout exists and the contiguous silence-aware plan must be taken.
+        let samples = tone(16_000 * 66);
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(plan.processed_audio.is_none());
+        assert_eq!(plan.slices.first().unwrap().content_start_sample, 0);
+        assert_eq!(
+            plan.slices.last().unwrap().content_end_sample,
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn energy_auto_identity_plan_carries_energy_spans_for_the_decode_gate() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        // Tone for the first 30 s, then digital silence, with a 0.5s seam
+        // overlap: the energy VAD keeps a single span (nothing to elide, so no
+        // packed candidate), the contiguous plan wins, and the trailing
+        // slices -- including the seam slice that re-reads the tone tail --
+        // are exactly what the decode gate should skip.
+        let mut samples = tone(16_000 * 30);
+        samples.extend(vec![0.0; 16_000 * 30]);
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        let Some(spans) = plan.vad_speech_spans.as_ref() else {
+            panic!(
+                "an identity EnergyAuto plan with speech must carry the energy \
+                 spans for the decode gate: {:?}",
+                plan.stats.provenance
+            );
+        };
+        assert!(spans.iter().any(|span| span.end_sample > span.start_sample));
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("vad-decode-gate:spans-carried")),
+            "provenance must record the carried gate spans: {:?}",
+            plan.stats.provenance
+        );
+        let reference = AudibilityReference::for_plan(&samples, 16_000, &[(0, samples.len())]);
+        let mut below_gate = 0usize;
+        for slice in &plan.slices {
+            let Some(overlap) = vad_speech_spans_overlap_samples(Some(spans.as_slice()), slice)
+            else {
+                continue;
+            };
+            if overlap >= VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES {
+                continue;
+            }
+            below_gate += 1;
+            // A below-gate slice may hold one audible window (seam residue the
+            // previous slice already re-reads) -- never two, which would be
+            // sustained content a skipped slice throws away.
+            let Some(first) =
+                reference.find_audible_window(&samples, slice.start_sample, slice.end_sample)
+            else {
+                continue;
+            };
+            assert!(
+                reference
+                    .find_audible_window(&samples, first.1, slice.end_sample)
+                    .is_none(),
+                "a below-gate slice must hold no sustained audible content: \
+                 {slice:?}"
+            );
+        }
+        assert!(
+            below_gate >= 1,
+            "expected at least one silent trailing slice for the gate: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_decode_gate_is_vetoed_for_an_audible_slice_below_the_energy_gate() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // Front half near -26 dBFS, back half a uniform low level near
+        // -42 dBFS. The tail sits under the absolute energy gate (-38 dBFS),
+        // so the energy VAD reads it as silence -- but it is within 20 dB of
+        // this recording's own speech level, so it is audible content and
+        // carrying the spans would let the gate strip it.
+        let mut samples = scaled_tone(16_000 * 30, 0.35);
+        samples.extend(scaled_tone(16_000 * 30, 0.057));
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.vad_speech_spans.is_none(),
+            "the audible below-gate tail must veto the carrier: {:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("vad-decode-gate:vetoed")),
+            "provenance must record the veto: {:?}",
+            plan.stats.provenance
+        );
+    }
+
+    #[test]
+    fn energy_auto_packed_plan_carries_no_spans_for_the_decode_gate() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // Mirror of `energy_auto_mode_prefers_packed_when_elision_pays`: the
+        // packed winner remaps the processed timeline, so the original-
+        // timeline spans must not be carried onto it.
+        let mut samples = tone(16_000 * 27);
+        samples.extend(vec![0.0; 16_000 * 12]);
+        samples.extend(tone(16_000 * 27));
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_some(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.vad_speech_spans.is_none(),
+            "packed timelines must not carry the original-timeline spans: {:?}",
+            plan.stats.provenance
+        );
+    }
+
+    #[test]
+    fn energy_auto_plan_carries_no_spans_when_the_energy_vad_seen_no_speech() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // Digital silence: the energy VAD finds no spans at all, so carrying
+        // its (empty) list would suppress every slice in the decode loop.
+        let samples = vec![0.0_f32; 16_000 * 60];
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.vad_speech_spans.is_none(),
+            "a span-free energy VAD must carry no spans: {:?}",
+            plan.stats.provenance
         );
     }
 
