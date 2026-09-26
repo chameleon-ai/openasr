@@ -3066,6 +3066,10 @@ fn run_native_transcription_impl(
             // run, as `index:dropped_words` facts for the provenance string
             // channel (see `drop_collapsed_word_runs`).
             let mut collapsed_run_drops: Vec<String> = Vec::new();
+            // Slices whose decode stopped cleanly inside a carried VAD span,
+            // as `index:[start..end]s` refill-window facts for the provenance
+            // string channel (see `midspan_refill_slice`).
+            let mut midspan_refills: Vec<String> = Vec::new();
             // Monotonic identity assigned to every slice that actually decoded
             // with an in-decoder speaker model. The assembler carries this
             // provenance beside each surviving segment through overlap trim and
@@ -3148,8 +3152,9 @@ fn run_native_transcription_impl(
                 })?;
             } else {
                 // The slices the loop actually decodes, in order: the planned
-                // slices, into which a guard-cut tail re-decode (see
-                // `guard_cut_tail_slice`) inserts itself directly behind the
+                // slices, into which a tail re-decode (guard cut:
+                // `guard_cut_tail_slice`, mid-span clean stop:
+                // `midspan_refill_slice`) inserts itself directly behind the
                 // slice it recovers, ahead of the next planned window.
                 let mut slices_to_run: Vec<(AudioSlice, bool)> = plan
                     .slices
@@ -3157,7 +3162,7 @@ fn run_native_transcription_impl(
                     .zip(vad_gated.iter())
                     .map(|(slice, &gated)| (slice.clone(), gated))
                     .collect();
-                let mut guard_tails_spawned = 0usize;
+                let mut recovery_tails_spawned = 0usize;
                 let mut run_cursor = 0usize;
                 while run_cursor < slices_to_run.len() {
                     let (slice, gated) = slices_to_run[run_cursor].clone();
@@ -3270,9 +3275,9 @@ fn run_native_transcription_impl(
                         &transcription,
                         plan.sample_rate_hz,
                         plan.slices.len(),
-                        plan.slices.len() + guard_tails_spawned,
+                        plan.slices.len() + recovery_tails_spawned,
                     ) {
-                        guard_tails_spawned += 1;
+                        recovery_tails_spawned += 1;
                         let rate = plan.sample_rate_hz as f64;
                         eprintln!(
                             "openasr_native_transcribe stage=longform event=guard_tail_spawned index={slice_index} parent=[{:.2}..{:.2}]s tail=[{:.2}..{:.2}]s",
@@ -3295,6 +3300,7 @@ fn run_native_transcription_impl(
                         &transcription,
                         plan.sample_rate_hz,
                     );
+                    let decode_truncated = decode_truncation.is_some();
                     if let Some(truncation) = decode_truncation {
                         // A slice whose decode gave up partway is a degraded
                         // result, not a normal one: the audio after this point is
@@ -3354,18 +3360,69 @@ fn run_native_transcription_impl(
                         );
                         collapsed_run_drops.push(format!("{slice_index}:{dropped_words}"));
                     }
+                    // A clean stop placed inside the slice's carried VAD span
+                    // abandons that span's tail (see `midspan_refill_slice`):
+                    // the VAD says speech is still ongoing where the model
+                    // stopped, and the next window cannot reach back to it.
+                    // Re-decode the abandoned tail right behind this slice --
+                    // before the carry update below consumes this slice's
+                    // output -- so it inherits exactly this slice's carry
+                    // prompt. A span that runs to the window end is not
+                    // abandoned (the next window decodes it with the same
+                    // carry), and a guard-cut slice is left to its own tail
+                    // rescue: a hard truncation and a clean stop are mutually
+                    // exclusive.
+                    let mut midspan_refill_commit_end: Option<usize> = None;
+                    if !decode_truncated
+                        && let Some(spans) = vad_speech_spans
+                        && let Some(word_end) =
+                            last_word_end_sample(&slice, &transcription, plan.sample_rate_hz)
+                        && let Some(span_end) = spans
+                            .iter()
+                            .filter(|span| {
+                                span.start_sample <= word_end && word_end < span.end_sample
+                            })
+                            .map(|span| span.end_sample)
+                            .max()
+                        && let Some(tail) = midspan_refill_slice(
+                            &slice,
+                            span_end,
+                            word_end,
+                            plan.sample_rate_hz,
+                            plan.slices.len(),
+                            plan.slices.len() + recovery_tails_spawned,
+                        )
+                    {
+                        recovery_tails_spawned += 1;
+                        let rate = plan.sample_rate_hz as f64;
+                        midspan_refills.push(format!(
+                            "{slice_index}:[{:.2}..{:.2}]s",
+                            tail.start_sample as f64 / rate,
+                            tail.end_sample as f64 / rate
+                        ));
+                        eprintln!(
+                            "openasr_native_transcribe stage=longform event=midspan_refill_spawned index={slice_index} parent=[{:.2}..{:.2}]s tail=[{:.2}..{:.2}]s",
+                            slice.start_sample as f64 / rate,
+                            slice.end_sample as f64 / rate,
+                            tail.start_sample as f64 / rate,
+                            tail.end_sample as f64 / rate,
+                        );
+                        slices_to_run.insert(run_cursor, (tail, false));
+                        midspan_refill_commit_end = Some(word_end);
+                    }
                     ran_any_slice = true;
                     // A tail re-decode slice is transparent to the carry chain:
-                    // it only recovers what the cut loop swallowed, while the
-                    // next planned window stays conditioned exactly as the cut
-                    // slice would have left it. Letting a recovery decode
-                    // re-route the carry would re-decode everything after it --
-                    // a far larger behavior change than restoring one span.
-                    let is_guard_tail = slice.index >= plan.slices.len();
+                    // it only recovers the audio its parent did not decode,
+                    // while the next planned window stays conditioned exactly
+                    // as the parent slice would have left it. Letting a
+                    // recovery decode re-route the carry would re-decode
+                    // everything after it -- a far larger behavior change than
+                    // restoring one span.
+                    let is_recovery_tail = slice.index >= plan.slices.len();
                     match carry_prompt_mode {
                         LongformPromptCarryMode::Disabled => {}
                         LongformPromptCarryMode::Text => {
-                            if !is_guard_tail && !transcription.text.trim().is_empty() {
+                            if !is_recovery_tail && !transcription.text.trim().is_empty() {
                                 rolling_prompt = append_context_tail(
                                     &rolling_prompt,
                                     &transcription.text,
@@ -3381,7 +3438,7 @@ fn run_native_transcription_impl(
                             // re-conditions greedy decode onto the same
                             // collapse, so the carry stays at the last
                             // slice that actually produced words.
-                            if !is_guard_tail
+                            if !is_recovery_tail
                                 && carry_text_has_meaningful_word(&transcription.text)
                                 && let Some(prompt_token_ids) =
                                     carry_context.and_then(|context| context.prompt_token_ids)
@@ -3391,7 +3448,15 @@ fn run_native_transcription_impl(
                         }
                     }
                     let mut transcript_slice = slice;
-                    if let Some(cut_end) = guard_cut_commit_end {
+                    // A slice whose words stop mid-window -- a guard cut or a
+                    // mid-span clean stop with a refill behind it -- describes
+                    // its audio only up to its last placed word. Remember that
+                    // end so the push below commits up to the words, not the
+                    // window end. Otherwise the assembler's overlap trim treats
+                    // the orphaned tail as a region this slice already owns and
+                    // deletes the recovery decode's words wholesale.
+                    let commit_end = guard_cut_commit_end.or(midspan_refill_commit_end);
+                    if let Some(cut_end) = commit_end {
                         transcript_slice.content_end_sample =
                             transcript_slice.content_end_sample.min(cut_end);
                     }
@@ -3452,6 +3517,12 @@ fn run_native_transcription_impl(
                 longform_provenance.push(format!(
                     "core.native.decode.collapsed-run-drop:slices={}",
                     collapsed_run_drops.join(";")
+                ));
+            }
+            if !midspan_refills.is_empty() {
+                longform_provenance.push(format!(
+                    "core.native.longform.midspan-refill:slices={}",
+                    midspan_refills.join(";")
                 ));
             }
             let (assembled, assemble_stats, speaker_scope_by_segment) =
@@ -3689,6 +3760,30 @@ const GUARD_TAIL_MIN_UNCOVERED_SECONDS: f32 = 1.0;
 /// width matches the planner's standard slice overlap.
 const GUARD_TAIL_OVERLAP_SECONDS: f32 = 0.5;
 
+/// The sample (in the slice's audio buffer) to which a decode's placed words
+/// end: the maximum word end across all segments. Word times are relative to
+/// the slice's chunk start (the range the decode ran over); the returned
+/// value is absolute in the same buffer the slice samples from. `None` when
+/// the family emitted no words -- a decode without intra-decode timestamps
+/// cannot measure where its coverage ended.
+fn last_word_end_sample(
+    slice: &AudioSlice,
+    transcription: &Transcription,
+    sample_rate_hz: u32,
+) -> Option<usize> {
+    let end_seconds = transcription
+        .segments
+        .iter()
+        .flat_map(|segment| segment.words.iter())
+        .map(|word| word.end)
+        .fold(0.0_f32, f32::max);
+    if !end_seconds.is_finite() || end_seconds <= 0.0 {
+        return None;
+    }
+    let end = slice.start_sample as f64 + f64::from(end_seconds) * f64::from(sample_rate_hz);
+    Some((end.round() as usize).min(slice.end_sample))
+}
+
 /// The sample (in the slice's audio buffer) to which a guard-cut decode's
 /// transcript still describes the audio: its last placed word's end, for a
 /// guard cut that has word timestamps. `None` when there is no guard
@@ -3709,20 +3804,7 @@ fn guard_cut_content_end_sample(
     if truncation.reason != DecodeTruncationReason::DegenerateRepeatGuard {
         return None;
     }
-    // Word times are relative to this slice's chunk start (the range the
-    // decode ran over); the returned value is absolute in the same buffer the
-    // slice samples from.
-    let cut_seconds = transcription
-        .segments
-        .iter()
-        .flat_map(|segment| segment.words.iter())
-        .map(|word| word.end)
-        .fold(0.0_f32, f32::max);
-    if !cut_seconds.is_finite() || cut_seconds <= 0.0 {
-        return None;
-    }
-    let cut = slice.start_sample as f64 + f64::from(cut_seconds) * f64::from(sample_rate_hz);
-    Some((cut.round() as usize).min(slice.end_sample))
+    last_word_end_sample(slice, transcription, sample_rate_hz)
 }
 
 /// The follow-up slice a guard cut mid-window turns into a tail re-decode, or
@@ -3775,6 +3857,85 @@ fn guard_cut_tail_slice(
         end_sample: parent.end_sample,
         content_start_sample: tail_start as usize,
         content_end_sample: parent.end_sample,
+    })
+}
+
+/// A mid-span clean stop abandons its carried VAD span's tail past the
+/// decode's last word: the model placed a stop token inside audio the VAD
+/// says is still speech. The abandoned span must end strictly before the
+/// parent window's end -- a span that reaches the end belongs to the next
+/// window, whose decode (fed by the same carry) owns it -- and the next
+/// planned window reaches back only as far as the standard overlap, so a span
+/// that dies before it has no decode at all. Smaller leftover spans are the
+/// normal late-stop jitter of a placed word end landing just before a VAD
+/// span end and get no recovery decode.
+const MIDSPAN_REFILL_MIN_UNCOVERED_SECONDS: f32 = 0.25;
+
+/// How far behind the last word a mid-span refill window starts. The overlap
+/// re-seats the decode on the parent's tail (whose audio is still there) and
+/// gives the assembler overlap to stitch the re-decoded words against; the
+/// width matches the planner's standard slice overlap.
+const MIDSPAN_REFILL_OVERLAP_SECONDS: f32 = 0.5;
+
+/// The follow-up slice a mid-span clean stop turns into a refill re-decode,
+/// or `None` when there is nothing to recover.
+///
+/// Unlike a guard cut, the decode was not hard-stopped: the model ended on
+/// its own while the slice's carried VAD span was still ongoing. That is the
+/// shape a short re-anchored window invites -- a soft or mumbled tail at the
+/// very end of the window that, without the prefix the re-anchor added,
+/// decodes to nothing rather than to the phrase the carry just finished. The
+/// rescue re-runs exactly the abandoned tail: it starts a little before the
+/// last word (see [`MIDSPAN_REFILL_OVERLAP_SECONDS`]), ends where the
+/// abandoned span ends (which the checks below require lies strictly inside
+/// the parent window), and -- queued directly behind the stopping slice by
+/// the caller -- inherits that slice's carry prompt, which resolves the tail
+/// against the phrase the model just emitted.
+///
+/// Serial path only: the concurrent pipeline enqueues all slice decodes up
+/// front and has no slot behind a slice to insert a recovery (guard tails
+/// included).
+///
+/// `planned_slice_count` is the planner's slice count; `index` is the index
+/// to assign the tail (planner indices are `0..planned_slice_count`, so a
+/// tail-of-tail -- which would chain re-decodes -- is refused by the origin
+/// check below).
+fn midspan_refill_slice(
+    parent: &AudioSlice,
+    abandoned_span_end_sample: usize,
+    word_end_sample: usize,
+    sample_rate_hz: u32,
+    planned_slice_count: usize,
+    index: usize,
+) -> Option<AudioSlice> {
+    if parent.index >= planned_slice_count {
+        return None;
+    }
+    // A span that continues to or past the parent window's end is not
+    // abandoned: the next planned window starts inside the standard overlap
+    // before this end and its own decode -- fed by the same carry this slice
+    // leaves behind -- owns the continuation. A refill capped at the window
+    // end would only stake its committed claim on audio the next window also
+    // decodes, where the seam de-dupers start treating legitimate
+    // continuations as re-reads of the refill.
+    if abandoned_span_end_sample >= parent.end_sample {
+        return None;
+    }
+    let rate = f64::from(sample_rate_hz);
+    let uncovered = (abandoned_span_end_sample as f64) - (word_end_sample as f64);
+    if uncovered < f64::from(MIDSPAN_REFILL_MIN_UNCOVERED_SECONDS) * rate {
+        return None;
+    }
+    let tail_end = abandoned_span_end_sample.min(parent.end_sample);
+    let tail_start = (word_end_sample as f64 - f64::from(MIDSPAN_REFILL_OVERLAP_SECONDS) * rate)
+        .max(parent.start_sample as f64) as usize;
+    Some(AudioSlice {
+        index,
+        kind: AudioSliceKind::Fixed,
+        start_sample: tail_start,
+        end_sample: tail_end,
+        content_start_sample: tail_start,
+        content_end_sample: tail_end,
     })
 }
 
@@ -5482,7 +5643,10 @@ mod vad_slice_gate_tests {
 
 #[cfg(test)]
 mod guard_tail_tests {
-    use super::{guard_cut_content_end_sample, guard_cut_tail_slice};
+    use super::{
+        guard_cut_content_end_sample, guard_cut_tail_slice, last_word_end_sample,
+        midspan_refill_slice,
+    };
     use crate::api::backend::{
         DecodeTruncation, DecodeTruncationReason, Segment, Transcription, WordTimestamp,
     };
@@ -5705,6 +5869,85 @@ mod guard_tail_tests {
                 RATE,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn last_word_end_reports_the_furthest_word() {
+        let parent = slice(221.0, 227.4);
+        let end = last_word_end_sample(&parent, &words_ending_at(&[1.0, 3.5, 5.5]), RATE)
+            .expect("a decode with words has a measurable coverage end");
+        assert_eq!(end, (221.0 * RATE as f32 + 5.5 * RATE as f32) as usize);
+    }
+
+    #[test]
+    fn last_word_end_without_words_is_unknown() {
+        let parent = slice(221.0, 227.4);
+        assert!(last_word_end_sample(&parent, &words_ending_at(&[]), RATE).is_none());
+    }
+
+    #[test]
+    fn midspan_stop_spawns_the_refill() {
+        // The malfina opening shape: a re-anchored window that stopped clean
+        // at 5.5 s while the carried span ran to 5.9 s (the second repeat of
+        // the phrase the decode had just emitted).
+        let parent = slice(221.0, 227.4);
+        let word_end = (221.0 * RATE as f32 + 5.5 * RATE as f32) as usize;
+        let span_end = (221.0 * RATE as f32 + 5.9 * RATE as f32) as usize;
+        let tail = midspan_refill_slice(&parent, span_end, word_end, RATE, 4, 4)
+            .expect("a clean stop inside a carried span must spawn a refill");
+        // The tail starts 0.5 s before the last word and ends where the
+        // abandoned span ends.
+        assert_eq!(tail.start_sample, (226.0 * RATE as f32) as usize);
+        assert_eq!(tail.end_sample, span_end);
+        assert_eq!(tail.start_sample, tail.content_start_sample);
+        assert_eq!(tail.end_sample, tail.content_end_sample);
+        assert_eq!(tail.index, 4);
+        assert!(matches!(tail.kind, AudioSliceKind::Fixed));
+    }
+
+    #[test]
+    fn midspan_stop_with_shallow_span_leftover_spawns_nothing() {
+        // A placed word end landing just before a VAD span end is the normal
+        // late-stop jitter, not an abandoned span.
+        let parent = slice(221.0, 227.4);
+        let word_end = (221.0 * RATE as f32 + 5.8 * RATE as f32) as usize;
+        let span_end = (221.0 * RATE as f32 + 5.9 * RATE as f32) as usize;
+        assert!(
+            midspan_refill_slice(&parent, span_end, word_end, RATE, 4, 4).is_none(),
+            "a leftover below the minimum uncovered span is jitter, not abandonment"
+        );
+    }
+
+    #[test]
+    fn midspan_refill_rejects_a_span_running_to_the_window_end() {
+        // A span that reaches the parent window's end (or continues past it)
+        // belongs to the next window: its decode, fed by the same carry,
+        // owns the continuation. A refill here would only stake a committed
+        // claim over audio the next window also decodes.
+        let parent = slice(221.0, 227.0);
+        let word_end = (221.0 * RATE as f32 + 5.5 * RATE as f32) as usize;
+        let span_end_at_boundary = (227.0 * RATE as f32) as usize;
+        assert!(
+            midspan_refill_slice(&parent, span_end_at_boundary, word_end, RATE, 4, 4).is_none(),
+            "a span dying exactly at the window end is the next window's to decode"
+        );
+        let span_end_past = (230.0 * RATE as f32) as usize;
+        assert!(
+            midspan_refill_slice(&parent, span_end_past, word_end, RATE, 4, 4).is_none(),
+            "a span continuing past the window end is the next window's to decode"
+        );
+    }
+
+    #[test]
+    fn midspan_refill_of_a_tail_is_refused() {
+        // A refill spawned from another tail would chain recovery decodes.
+        let parent = slice(221.0, 227.4); // index 3: a derived tail at planned 3
+        let word_end = (221.0 * RATE as f32 + 5.5 * RATE as f32) as usize;
+        let span_end = (221.0 * RATE as f32 + 5.9 * RATE as f32) as usize;
+        assert!(
+            midspan_refill_slice(&parent, span_end, word_end, RATE, 3, 3).is_none(),
+            "a derived tail slice (index >= planned count) must not chain further re-decodes"
         );
     }
 }
