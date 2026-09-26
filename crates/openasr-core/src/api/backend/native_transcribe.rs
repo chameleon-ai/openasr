@@ -699,6 +699,7 @@ struct ConcurrentSlicePipeline<'a> {
     suppressed_slice_count: &'a mut usize,
     degraded_slice_fallbacks: &'a mut Vec<(usize, SliceExecutionFallback)>,
     truncated_slices: &'a mut Vec<String>,
+    collapsed_run_drops: &'a mut Vec<String>,
     truncated_decodes: &'a mut Vec<TruncatedDecode>,
     speaker_scope_count: &'a mut usize,
 }
@@ -750,6 +751,7 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         suppressed_slice_count,
         degraded_slice_fallbacks,
         truncated_slices,
+        collapsed_run_drops,
         truncated_decodes,
         speaker_scope_count,
     } = pipeline;
@@ -948,8 +950,20 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
             continue;
         }
         match results[position].take() {
-            Some(Ok(decoded)) => {
+            Some(Ok(mut decoded)) => {
                 slice_index += 1;
+                let (dropped_words, dropped_spans) =
+                    drop_collapsed_word_runs(&mut decoded.text, &mut decoded.segments);
+                if dropped_words > 0 {
+                    log_collapsed_run_drop(
+                        slice_index,
+                        item.slice.start_sample,
+                        item.slice.content_end_sample,
+                        dropped_words,
+                        dropped_spans,
+                    );
+                    collapsed_run_drops.push(format!("{slice_index}:{dropped_words}"));
+                }
                 if let Some(fallback) = decoded.fallback {
                     degraded_slice_fallbacks.push((slice_index, fallback));
                 }
@@ -3048,6 +3062,10 @@ fn run_native_transcription_impl(
             // for the provenance string channel (see
             // `format_truncated_slice_provenance`).
             let mut truncated_slices: Vec<String> = Vec::new();
+            // Slices whose decoded word list held a collapsed (degenerate)
+            // run, as `index:dropped_words` facts for the provenance string
+            // channel (see `drop_collapsed_word_runs`).
+            let mut collapsed_run_drops: Vec<String> = Vec::new();
             // Monotonic identity assigned to every slice that actually decoded
             // with an in-decoder speaker model. The assembler carries this
             // provenance beside each surviving segment through overlap trim and
@@ -3124,6 +3142,7 @@ fn run_native_transcription_impl(
                     suppressed_slice_count: &mut suppressed_slice_count,
                     degraded_slice_fallbacks: &mut degraded_slice_fallbacks,
                     truncated_slices: &mut truncated_slices,
+                    collapsed_run_drops: &mut collapsed_run_drops,
                     truncated_decodes: &mut truncated_decodes,
                     speaker_scope_count: &mut speaker_scope_count,
                 })?;
@@ -3237,7 +3256,7 @@ fn run_native_transcription_impl(
                     // the fields are consumed below and nothing needs `result`
                     // as a whole afterwards, so there is nothing left to clone.
                     let GgmlAsrExecutionResult {
-                        transcription,
+                        mut transcription,
                         carry_context,
                         decode_truncation,
                     } = result;
@@ -3315,6 +3334,26 @@ fn run_native_transcription_impl(
                             longform_slice_transcript_debug_line(&transcription)
                         ),
                     );
+                    // A collapsed word run is a degenerate echo of the carried
+                    // prompt over audio that anchors no decode (a bed, a long
+                    // pause): its words carry no usable timing and its text is
+                    // prompt-derived, so it is dropped before the carry update
+                    // (a Text-carry run would otherwise feed the echo back in)
+                    // and before assembly.
+                    let (dropped_words, dropped_spans) = drop_collapsed_word_runs(
+                        &mut transcription.text,
+                        &mut transcription.segments,
+                    );
+                    if dropped_words > 0 {
+                        log_collapsed_run_drop(
+                            slice_index,
+                            slice.start_sample,
+                            slice.content_end_sample,
+                            dropped_words,
+                            dropped_spans,
+                        );
+                        collapsed_run_drops.push(format!("{slice_index}:{dropped_words}"));
+                    }
                     ran_any_slice = true;
                     // A tail re-decode slice is transparent to the carry chain:
                     // it only recovers what the cut loop swallowed, while the
@@ -3407,6 +3446,12 @@ fn run_native_transcription_impl(
                 longform_provenance.push(format!(
                     "core.native.decode.truncated:slices={}",
                     truncated_slices.join(";")
+                ));
+            }
+            if !collapsed_run_drops.is_empty() {
+                longform_provenance.push(format!(
+                    "core.native.decode.collapsed-run-drop:slices={}",
+                    collapsed_run_drops.join(";")
                 ));
             }
             let (assembled, assemble_stats, speaker_scope_by_segment) =
@@ -3733,11 +3778,168 @@ fn guard_cut_tail_slice(
     })
 }
 
+/// Thresholds for the per-slice collapsed-word-run drop (longform driver), in
+/// seconds. When a slice's audio gives the model no anchor -- a music bed, a
+/// long pause -- greedy decode can re-condition onto the carried prompt and
+/// emit that phrase verbatim: the carried words' DTW windows collapse to the
+/// alignment's degenerate floor and their starts pile onto one instant. Real
+/// speech cannot place three distinct words on one instant -- even the
+/// fastest fluent runs keep distinct starts -- so the signature is word
+/// geometry, no acoustic verdict. That is deliberate: the sound of the region
+/// is exactly what defeats the executor's acoustically-gated degenerate-tail
+/// splice (a bed is never silent), so a silence layer cannot arbitrate here.
+const DEGENERATE_RUN_MAX_WINDOW_SECONDS: f32 = 0.25;
+const DEGENERATE_RUN_MAX_SPREAD_SECONDS: f32 = 0.25;
+const DEGENERATE_RUN_MIN_WORDS: usize = 3;
+/// When a dropped run ends this close to the segment end, the drop extends to
+/// the segment end: a collapsed echo of a carried phrase leaves its closing
+/// token (the spread-out final punctuation word) outside the collapsed run,
+/// and that token is echo too. The bound keeps a mid-segment run from ever
+/// eating more than a couple of words past its own tail.
+const DEGENERATE_RUN_TAIL_ABSORB_WORDS: usize = 2;
+
+/// Maximal collapsed runs in a word list, as half-open index ranges: a run
+/// starts at a word whose window is at or below
+/// [`DEGENERATE_RUN_MAX_WINDOW_SECONDS`] and extends over the following words
+/// that stay within that window and within
+/// [`DEGENERATE_RUN_MAX_SPREAD_SECONDS`] of the run's first start; runs
+/// shorter than [`DEGENERATE_RUN_MIN_WORDS`] are not runs. A qualifying run
+/// whose tail sits within [`DEGENERATE_RUN_TAIL_ABSORB_WORDS`] words of the
+/// segment end is extended to the end (see that constant), and overlapping or
+/// adjacent extensions are merged.
+fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < words.len() {
+        if words[i].end - words[i].start > DEGENERATE_RUN_MAX_WINDOW_SECONDS {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < words.len()
+            && words[j].end - words[j].start <= DEGENERATE_RUN_MAX_WINDOW_SECONDS
+            && words[j].start - words[i].start <= DEGENERATE_RUN_MAX_SPREAD_SECONDS
+        {
+            j += 1;
+        }
+        if j - i >= DEGENERATE_RUN_MIN_WORDS {
+            let end = if words.len() - j <= DEGENERATE_RUN_TAIL_ABSORB_WORDS {
+                words.len()
+            } else {
+                j
+            };
+            runs.push((i, end));
+        }
+        i = j;
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for run in runs {
+        match merged.last_mut() {
+            Some((_, previous_end)) if run.0 <= *previous_end => {
+                *previous_end = (*previous_end).max(run.1);
+            }
+            _ => merged.push(run),
+        }
+    }
+    merged
+}
+
+/// Drop collapsed word runs from a slice's decoded segments, re-deriving each
+/// touched segment's text (and the top-level text) from the surviving words.
+/// The word strings carry the decode's tokens verbatim -- punctuation and
+/// case included -- so re-joining them loses nothing the run did not own.
+///
+/// The re-derive is verified before it happens: it replaces the decoded text
+/// only where it reproduces that text exactly, so a family whose text holds
+/// content beyond its word list keeps its text untouched and contributes only
+/// the dropped words. Returns the dropped word count and the slice-relative
+/// `(start, end)` span of each dropped run.
+fn drop_collapsed_word_runs(
+    text: &mut String,
+    segments: &mut [Segment],
+) -> (usize, Vec<(f32, f32)>) {
+    let pre_drop_join = crate::transcript_text::join_segment_texts(
+        segments
+            .iter()
+            .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
+    );
+    let mut dropped_words = 0usize;
+    let mut dropped_spans: Vec<(f32, f32)> = Vec::new();
+    for segment in segments.iter_mut() {
+        let runs = find_collapsed_word_runs(&segment.words);
+        if runs.is_empty() {
+            continue;
+        }
+        for &(lo, hi) in &runs {
+            let first = &segment.words[lo];
+            let last = &segment.words[hi - 1];
+            dropped_spans.push((first.start, last.end));
+            dropped_words += hi - lo;
+        }
+        let survivors: Vec<WordTimestamp> = segment
+            .words
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !runs.iter().any(|&(lo, hi)| *index >= lo && *index < hi))
+            .map(|(_, word)| word.clone())
+            .collect();
+        if crate::transcript_text::join_segment_texts(
+            segment.words.iter().map(|word| word.word.trim()),
+        )
+        .trim()
+            == segment.text.trim()
+        {
+            segment.text = crate::transcript_text::join_segment_texts(
+                survivors.iter().map(|word| word.word.trim()),
+            );
+        }
+        segment.words = survivors;
+    }
+    if dropped_words > 0 && pre_drop_join.trim() == text.trim() {
+        *text = crate::transcript_text::join_segment_texts(
+            segments
+                .iter()
+                .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
+        );
+    }
+    (dropped_words, dropped_spans)
+}
+
+/// `OPENASR_TIMING` event for a per-slice collapsed-run drop: which slice
+/// dropped how many words and over which slice-relative spans. The sibling
+/// `longform_slice_transcript` line shows the raw decode as decoded; this one
+/// records what the driver removed from it before the carry update and
+/// assembly.
+fn log_collapsed_run_drop(
+    slice_index: usize,
+    start_sample: usize,
+    end_sample: usize,
+    dropped_words: usize,
+    spans: Vec<(f32, f32)>,
+) {
+    crate::stage_timing::log_detail_event(
+        "native_transcribe",
+        format!(
+            "stage=longform_slice_degenerate_drop index={slice_index} \
+             slice=[{:.2}..{:.2}]s dropped={dropped_words} spans=[{}]",
+            start_sample as f32 / 16_000.0,
+            end_sample as f32 / 16_000.0,
+            spans
+                .iter()
+                .map(|(start, end)| format!("{start:.2}..{end:.2}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    );
+}
+
 /// One `OPENASR_TIMING` stderr line with a slice's raw decode output as the
-/// longform driver sees it (before the assembler trims/stitches): per-segment
-/// word spans in slice-relative seconds plus the full slice text. Tells an
-/// assembly-side drop (words present here, gone in the output) apart from one
-/// the decode never produced.
+/// longform driver sees it at decode time (before the collapsed-run drop, the
+/// carry update, and the assembler trims/stitches): per-segment word spans in
+/// slice-relative seconds plus the full slice text. A word present here but
+/// gone from the output was removed either by the driver's collapsed-run
+/// drop (recorded on its own `longform_slice_degenerate_drop` event) or by
+/// the assembler; the decode never produced it if it is absent here.
 fn longform_slice_transcript_debug_line(transcription: &Transcription) -> String {
     let mut line = String::new();
     for segment in &transcription.segments {
@@ -10729,6 +10931,7 @@ mod tests {
     /// exercise error routing.
     struct ConcurrentPipelineStubExecutor {
         fail_markers: std::collections::BTreeSet<i32>,
+        collapsing_markers: std::collections::BTreeSet<i32>,
         observed_views: Option<Arc<Mutex<Vec<(usize, std::ops::Range<usize>)>>>>,
     }
 
@@ -10736,6 +10939,7 @@ mod tests {
         fn echoing() -> Self {
             Self {
                 fail_markers: std::collections::BTreeSet::new(),
+                collapsing_markers: std::collections::BTreeSet::new(),
                 observed_views: None,
             }
         }
@@ -10743,6 +10947,18 @@ mod tests {
         fn failing_on(markers: &[i32]) -> Self {
             Self {
                 fail_markers: markers.iter().copied().collect(),
+                collapsing_markers: std::collections::BTreeSet::new(),
+                observed_views: None,
+            }
+        }
+
+        /// The listed slices decode a carried phrase collapsed onto one
+        /// instant: real head words, then the echo run and its spread-out
+        /// closing token (the driver must drop the run and keep the head).
+        fn collapsing_on(markers: &[i32]) -> Self {
+            Self {
+                fail_markers: std::collections::BTreeSet::new(),
+                collapsing_markers: markers.iter().copied().collect(),
                 observed_views: None,
             }
         }
@@ -10752,6 +10968,7 @@ mod tests {
         ) -> Self {
             Self {
                 fail_markers: std::collections::BTreeSet::new(),
+                collapsing_markers: std::collections::BTreeSet::new(),
                 observed_views: Some(observed_views),
             }
         }
@@ -10804,6 +11021,47 @@ mod tests {
                     executor_id: "concurrent-pipeline-stub",
                     adapter_id: request.selected_family.adapter_id,
                     reason: format!("stub failure marker={marker}"),
+                });
+            }
+            if self.collapsing_markers.contains(&marker) {
+                let words: Vec<WordTimestamp> = [
+                    ("No,", 2.44, 2.78),
+                    ("Did", 2.82, 3.02),
+                    ("you", 2.82, 3.02),
+                    ("guys", 2.82, 3.02),
+                    ("hear", 2.82, 3.02),
+                    ("the", 2.82, 3.02),
+                    ("\"no", 2.82, 3.02),
+                    ("you", 2.82, 3.02),
+                    ("dead", 2.82, 3.17),
+                    ("ne?\"", 2.97, 4.67),
+                ]
+                .into_iter()
+                .map(|(word, start, end)| WordTimestamp {
+                    word: word.to_string(),
+                    start,
+                    end,
+                    confidence: None,
+                })
+                .collect();
+                let text = crate::transcript_text::join_segment_texts(
+                    words.iter().map(|word| word.word.trim()),
+                );
+                let segment = segment(0.0, 6.2, &text);
+                let mut segment = segment;
+                segment.words = words;
+                return Ok(GgmlAsrExecutionResult {
+                    transcription: Transcription {
+                        truncated_decodes: Vec::new(),
+                        unnamed_speakers: Vec::new(),
+                        text,
+                        segments: vec![segment],
+                        longform: None,
+                        language: None,
+                        ..Default::default()
+                    },
+                    carry_context: None,
+                    decode_truncation: None,
                 });
             }
             Ok(GgmlAsrExecutionResult {
@@ -10877,6 +11135,7 @@ mod tests {
         let mut suppressed = 0usize;
         let mut degraded = Vec::new();
         let mut truncated_slices = Vec::new();
+        let mut collapsed_run_drops = Vec::new();
         let mut truncated_decodes = Vec::new();
         let mut speaker_scope_count = 0usize;
         let execution_services = native_execution_services_for_test();
@@ -10908,6 +11167,7 @@ mod tests {
             suppressed_slice_count: &mut suppressed,
             degraded_slice_fallbacks: &mut degraded,
             truncated_slices: &mut truncated_slices,
+            collapsed_run_drops: &mut collapsed_run_drops,
             truncated_decodes: &mut truncated_decodes,
             speaker_scope_count: &mut speaker_scope_count,
         })?;
@@ -11462,6 +11722,202 @@ mod tests {
             .expect("resume must let the paused pipeline finish, not hang")
             .expect("a resumed run completes successfully");
         assert_eq!(outcome.assembled.text, "w1 w2 w3 w4");
+        assert!(outcome.ran_any_slice);
+        assert_eq!(outcome.suppressed, 0);
+    }
+
+    fn word_at(word: &str, start: f32, end: f32) -> WordTimestamp {
+        WordTimestamp {
+            word: word.to_string(),
+            start,
+            end,
+            confidence: None,
+        }
+    }
+
+    fn segment_with_words(words: Vec<WordTimestamp>) -> (String, Segment) {
+        let text =
+            crate::transcript_text::join_segment_texts(words.iter().map(|word| word.word.trim()));
+        (
+            text.clone(),
+            Segment {
+                start: 0.0,
+                end: words.last().map(|word| word.end).unwrap_or(0.0),
+                text,
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words,
+            },
+        )
+    }
+
+    #[test]
+    fn collapsed_run_drop_removes_carry_echo_and_keeps_head_words() {
+        // The malfina shape: two real head words, then a carried phrase
+        // collapsed onto one instant with its spread-out closing token, which
+        // the tail absorb folds into the dropped run.
+        let words = vec![
+            word_at("No,", 2.44, 2.78),
+            word_at("Did", 2.82, 3.02),
+            word_at("you", 2.82, 3.02),
+            word_at("guys", 2.82, 3.02),
+            word_at("hear", 2.82, 3.02),
+            word_at("the", 2.82, 3.02),
+            word_at("\"no", 2.82, 3.02),
+            word_at("you", 2.82, 3.02),
+            word_at("dead", 2.82, 3.17),
+            word_at("ne?\"", 2.97, 4.67),
+        ];
+        let runs = find_collapsed_word_runs(&words);
+        assert_eq!(runs, vec![(1, 10)]);
+        let (mut text, segment) = segment_with_words(words);
+        let mut segments = vec![segment];
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        assert_eq!(dropped, 9);
+        assert_eq!(spans, vec![(2.82, 4.67)]);
+        assert_eq!(
+            segments[0]
+                .words
+                .iter()
+                .map(|w| w.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["No,"]
+        );
+        assert_eq!(segments[0].text, "No,");
+        assert_eq!(text, "No,");
+    }
+
+    #[test]
+    fn collapsed_run_drop_empties_a_pure_echo_slice() {
+        let words = vec![
+            word_at("Did", 10.42, 10.62),
+            word_at("you", 10.42, 10.62),
+            word_at("guys", 10.42, 10.62),
+            word_at("hear", 10.42, 10.62),
+            word_at("the", 10.42, 10.62),
+            word_at("\"no", 10.42, 10.62),
+            word_at("you", 10.42, 10.62),
+            word_at("dead", 10.42, 10.62),
+            word_at("ne?\"", 10.42, 10.62),
+        ];
+        let (mut text, segment) = segment_with_words(words);
+        let mut segments = vec![segment];
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        assert_eq!(dropped, 9);
+        assert_eq!(spans, vec![(10.42, 10.62)]);
+        assert!(segments[0].words.is_empty());
+        assert!(segments[0].text.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_fast_speech_with_distinct_starts() {
+        // Short windows alone are not the signal: a fast run keeps distinct
+        // starts, so no run forms and the decode stays byte-identical.
+        let words = vec![
+            word_at("so", 0.0, 0.2),
+            word_at("this", 0.3, 0.5),
+            word_at("is", 0.6, 0.8),
+            word_at("like", 0.9, 1.1),
+            word_at("that", 1.2, 1.4),
+        ];
+        let mut text =
+            crate::transcript_text::join_segment_texts(words.iter().map(|word| word.word.trim()));
+        let original = text.clone();
+        let segment = segment_with_words(words.clone()).1;
+        let mut segments = vec![segment];
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        assert_eq!(dropped, 0);
+        assert!(spans.is_empty());
+        assert_eq!(text, original);
+        assert_eq!(segments[0].words, words);
+        assert_eq!(segments[0].text, original);
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_chains_below_the_word_floor() {
+        let words = vec![
+            word_at("huh", 0.0, 0.2),
+            word_at("Tch!", 0.0, 0.2),
+            word_at("really", 1.0, 1.3),
+            word_at("?", 2.0, 2.2),
+        ];
+        assert!(find_collapsed_word_runs(&words).is_empty());
+    }
+
+    #[test]
+    fn collapsed_run_drop_mid_segment_run_drops_only_the_run() {
+        let words = vec![
+            word_at("echo", 0.0, 0.2),
+            word_at("echo", 0.0, 0.2),
+            word_at("echo", 0.0, 0.2),
+            word_at("real", 1.0, 1.3),
+            word_at("real", 2.0, 2.3),
+            word_at("real", 3.0, 3.3),
+        ];
+        let (mut text, segment) = segment_with_words(words);
+        let mut segments = vec![segment];
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        // Three surviving words sit past the tail-absorb reach, so the drop
+        // stops exactly at the run.
+        assert_eq!(dropped, 3);
+        assert_eq!(spans, vec![(0.0, 0.2)]);
+        assert_eq!(
+            segments[0]
+                .words
+                .iter()
+                .map(|w| w.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real", "real", "real"]
+        );
+        assert_eq!(text, "real real real");
+    }
+
+    #[test]
+    fn collapsed_run_drop_leaves_text_beyond_the_words_alone() {
+        let words = vec![
+            word_at("echo", 0.0, 0.2),
+            word_at("echo", 0.0, 0.2),
+            word_at("echo", 0.0, 0.2),
+            word_at("real", 1.0, 1.3),
+            word_at("real", 2.0, 2.3),
+            word_at("real", 3.0, 3.3),
+        ];
+        let text = String::from("Paragraph text the word list does not account for.");
+        let mut original_text = text.clone();
+        let mut segment = segment_with_words(words).1;
+        segment.text = text;
+        let mut segments = vec![segment];
+        let (dropped, _) = drop_collapsed_word_runs(&mut original_text, &mut segments);
+        assert_eq!(dropped, 3);
+        assert_eq!(segments[0].words.len(), 3);
+        // The text cannot be re-derived from the words, so it is untouched.
+        assert_eq!(segments[0].text, original_text);
+    }
+
+    #[test]
+    fn concurrent_pipeline_drops_collapsed_echo_slice_from_assembled_output() {
+        let _serial = progress_registry_test_lock();
+        clear_progress_registry_for_test();
+        let id = "concurrent-pipeline-collapsed-echo";
+        let _handle = ProgressRegistryHandle::new(Some(id.to_string()));
+        let (audio, slices) = concurrent_pipeline_slices(3);
+        let outcome = run_concurrent_pipeline_for_test(
+            2,
+            &audio,
+            slices,
+            Arc::new(ConcurrentPipelineStubExecutor::collapsing_on(&[1])),
+            &uncancellable_execution_context_for_test(),
+            &crate::LongFormOptions::default(),
+            Some(id.to_string()),
+        )
+        .expect("all slices decode successfully");
+        // The collapsed slice's echo run (and its spread-out closing token) is
+        // dropped before assembly: its head word survives, the echo is gone,
+        // and the other slices are untouched.
+        assert_eq!(outcome.assembled.text, "No, w2 w3");
         assert!(outcome.ran_any_slice);
         assert_eq!(outcome.suppressed, 0);
     }

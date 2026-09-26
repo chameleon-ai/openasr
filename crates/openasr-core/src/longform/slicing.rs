@@ -82,9 +82,18 @@ pub(crate) const VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES: usize = 8_000;
 /// continuous-speech slices (which start inside their span and end at a
 /// verified pause, i.e. with trailing silence beyond the tolerance) are left
 /// untouched.
+///
+/// The lead is not the minimum possible: a half-second cold start makes weak
+/// speech (a muted burst under a bed) collapse to a no-speech decode, while
+/// a 2.5 s sliver of the familiar prefix keeps the model's context -- the
+/// fixed-grid baseline decoded exactly those shapes with its multi-second
+/// heads, and this is the value it carried.
 const REANCHOR_MIN_PREFIX_SECONDS: f32 = 2.0;
 const REANCHOR_TAIL_TOLERANCE_SECONDS: f32 = 1.0;
-const REANCHOR_LEAD_SECONDS: f32 = 0.5;
+const REANCHOR_LEAD_SECONDS: f32 = 2.5;
+/// Sanity floor for a re-anchored window: it must not collapse to a sliver.
+/// The lead-in plus the slice's span keep it above this in practice.
+const REANCHOR_MIN_WINDOW_SECONDS: f32 = 1.0;
 
 /// Original-timeline sample count of VAD speech overlapping one slice -- or
 /// `None` when the plan carries no VAD spans, which is every mode and every
@@ -896,8 +905,9 @@ fn span_coverage_within(
 /// is still decoded in full -- and a small model fills exactly that prefix
 /// with fluent repetition before it reaches the speech. Moving the window
 /// start to `REANCHOR_LEAD_SECONDS` before the first span sample lands the
-/// speech at the head of a shorter window and hands the span-free prefix
-/// back to being undecoded in this plan.
+/// speech early in a shorter window, keeps enough of the familiar prefix for
+/// weak speech to survive the decode, and hands the rest of the span-free
+/// prefix back to being undecoded in this plan.
 ///
 /// Trust scope: this must only ever run on the request VAD's spans -- the
 /// same spans the decode gate is allowed to skip on, so `attach_energy_
@@ -927,6 +937,7 @@ fn reanchor_energy_auto_slice_heads(
     let min_prefix = seconds_to_samples(REANCHOR_MIN_PREFIX_SECONDS, sample_rate_hz);
     let tail_tolerance = seconds_to_samples(REANCHOR_TAIL_TOLERANCE_SECONDS, sample_rate_hz);
     let lead = seconds_to_samples(REANCHOR_LEAD_SECONDS, sample_rate_hz);
+    let min_window = seconds_to_samples(REANCHOR_MIN_WINDOW_SECONDS, sample_rate_hz);
     let mut reanchored = 0usize;
     for slice in slices.iter_mut() {
         let Some((first, last)) = span_coverage_within(spans, slice.start_sample, slice.end_sample)
@@ -940,9 +951,13 @@ fn reanchor_energy_auto_slice_heads(
             continue;
         }
         let new_start = first.saturating_sub(lead);
-        // Two leads is the sanity floor: the re-anchored window must hold the
-        // lead-in plus a real sliver of the span, not a near-zero remnant.
-        if slice.end_sample.saturating_sub(new_start) < 2 * lead {
+        // A re-anchor only lops the prefix, never extends the window: with a
+        // prefix shorter than the lead the cut would land before the current
+        // start, so no-op instead of regrowing the slice backwards.
+        if new_start <= slice.start_sample {
+            continue;
+        }
+        if slice.end_sample.saturating_sub(new_start) < min_window {
             continue;
         }
         slice.start_sample = new_start;
@@ -5345,8 +5360,8 @@ mod tests {
         );
         assert_eq!(
             plan.slices[1].start_sample,
-            16_000 * 44 - 16_000 / 2,
-            "the re-anchored head is the burst start minus the lead-in: {plan:?}"
+            16_000 * 41 + 16_000 / 2,
+            "the re-anchored head is the burst start minus the 2.5 s lead-in: {plan:?}"
         );
         assert_eq!(plan.slices[1].end_sample, samples.len());
         assert_eq!(
