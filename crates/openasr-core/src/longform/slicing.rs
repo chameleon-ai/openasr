@@ -72,6 +72,20 @@ pub struct LongFormVadSlice {
 /// vetted this slice for skipping" never disagree.
 pub(crate) const VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES: usize = 8_000;
 
+/// Head re-anchor thresholds for `EnergyAuto` identity slices (see
+/// `reanchor_energy_auto_slice_heads`), in seconds. A slice that grew
+/// through a span-free prefix of at least `REANCHOR_MIN_PREFIX_SECONDS` and
+/// ends inside -- or within `REANCHOR_TAIL_TOLERANCE_SECONDS` after -- its
+/// last carried span gets its decode window restarted `REANCHOR_LEAD_SECONDS`
+/// before its first span sample. The shape is deliberately narrow: it must
+/// be a speech island at the tail of a clearly span-free stretch, so
+/// continuous-speech slices (which start inside their span and end at a
+/// verified pause, i.e. with trailing silence beyond the tolerance) are left
+/// untouched.
+const REANCHOR_MIN_PREFIX_SECONDS: f32 = 2.0;
+const REANCHOR_TAIL_TOLERANCE_SECONDS: f32 = 1.0;
+const REANCHOR_LEAD_SECONDS: f32 = 0.5;
+
 /// Original-timeline sample count of VAD speech overlapping one slice -- or
 /// `None` when the plan carries no VAD spans, which is every mode and every
 /// packed (silence-omitting) plan that declines to carry them. `None` means
@@ -182,6 +196,11 @@ pub struct LongFormSlicePlan {
     /// provider was present (subject to the audibility veto in
     /// `attach_energy_auto_decode_gate`). Consumed by the slice decode loop,
     /// which uses it to skip decoding slices the VAD found to hold no speech.
+    /// Note: when these are the request VAD's spans under `EnergyAuto`, the
+    /// slice heads may have been re-anchored onto their trailing spans (
+    /// `reanchor_energy_auto_slice_heads`), so the slices need not tile the
+    /// recording contiguously; the spans and the slices are in the same
+    /// original-timeline samples.
     /// `None` when the provider was absent, the timeline is packed (spans
     /// would be meaningless), the VAD saw no speech, or the audibility veto
     /// refused to carry the energy spans.
@@ -657,6 +676,12 @@ fn rank_auto_candidates(
 /// own speech-detecting VAD's spans when one was provided (the same carriage
 /// `Auto` ships), else the built-in energy VAD's spans under the
 /// recording-relative audibility veto.
+///
+/// When the request VAD's spans are what got carried, identity slices whose
+/// spans hold speech only at the tail are additionally re-anchored at their
+/// head (`reanchor_energy_auto_slice_heads`): the span-free prefix a slice
+/// grew through returns to being undecoded in this plan, and the slice no
+/// longer tiles contiguously with its predecessor where that prefix sat.
 fn plan_energy_auto_slices(
     samples: &[f32],
     sample_rate_hz: u32,
@@ -782,6 +807,17 @@ fn attach_energy_auto_decode_gate(
                 "core.longform.energy_auto.vad-decode-gate:spans-carried:provider=request-vad"
                     .to_string(),
             );
+            // The request VAD is the only carrier trusted to call a slice's
+            // head region span-free, so it is also the only one the re-anchor
+            // runs under (see `reanchor_energy_auto_slice_heads`).
+            let reanchored =
+                reanchor_energy_auto_slice_heads(&mut layout.slices, &vad_spans, sample_rate_hz);
+            if reanchored > 0 {
+                layout.selection_provenance.push(format!(
+                    "core.longform.energy_auto.slice-head-reanchor:reanchored={reanchored}of{}/slices",
+                    layout.slices.len()
+                ));
+            }
             layout.vad_speech_spans = Some(vad_spans);
         }
         return Ok(());
@@ -829,6 +865,91 @@ fn attach_energy_auto_decode_gate(
     );
     layout.vad_speech_spans = Some(speech_spans);
     Ok(())
+}
+
+/// The span coverage inside `[start, end)`: the first and last covered
+/// samples, or `None` when the region holds no span coverage at all.
+fn span_coverage_within(
+    spans: &[LongFormVadSlice],
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    let (mut first, mut last): (Option<usize>, Option<usize>) = (None, None);
+    for span in spans {
+        if span.end_sample <= start || span.start_sample >= end {
+            continue;
+        }
+        let lo = span.start_sample.max(start);
+        let hi = span.end_sample.min(end);
+        first = Some(first.map_or(lo, |f| f.min(lo)));
+        last = Some(last.map_or(hi, |l| l.max(hi)));
+    }
+    first.zip(last)
+}
+
+/// Re-anchors the decode heads of the `EnergyAuto` identity slices whose
+/// carried spans hold speech only at the tail.
+///
+/// The decode gate is slice-granular: a slice that grew through a long
+/// span-free prefix (a music bed, a long pause) into a short trailing span
+/// clears its [`VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES`] gate on that speech and
+/// is still decoded in full -- and a small model fills exactly that prefix
+/// with fluent repetition before it reaches the speech. Moving the window
+/// start to `REANCHOR_LEAD_SECONDS` before the first span sample lands the
+/// speech at the head of a shorter window and hands the span-free prefix
+/// back to being undecoded in this plan.
+///
+/// Trust scope: this must only ever run on the request VAD's spans -- the
+/// same spans the decode gate is allowed to skip on, so `attach_energy_
+/// auto_decode_gate` calls it for exactly that carrier. A span the speech-
+/// detecting VAD missed is a span the gate would already have skipped, and
+/// `log_dropped_audible_regions` records any re-anchored gap that does in
+/// fact hold sustained audible content, so a VAD false negative costs words
+/// observably instead of silently. The energy-VAD carrier must never
+/// re-anchor: on a uniformly quiet recording its span starts sit under real
+/// (quiet) speech, and re-anchoring on them would delete exactly the audio
+/// the audibility veto protects.
+///
+/// Invariants preserved: the slice keeps its end and its kind;
+/// `content_start_sample` tracks the new start, so word mapping through the
+/// (identity) timeline is unchanged; the new length stays within
+/// `[2 * lead, max_chunk]`; and the span overlap with the slice is unchanged
+/// (the lopped prefix held no spans), so the gate decides for the re-anchored
+/// slice exactly as it decided for the grown one. The inter-slice overlap may
+/// shrink to a gap where the span-free stretch sat; the driver and the
+/// assembler work on per-slice windows and word times, never on slice-to-
+/// slice contiguity.
+fn reanchor_energy_auto_slice_heads(
+    slices: &mut [AudioSlice],
+    spans: &[LongFormVadSlice],
+    sample_rate_hz: u32,
+) -> usize {
+    let min_prefix = seconds_to_samples(REANCHOR_MIN_PREFIX_SECONDS, sample_rate_hz);
+    let tail_tolerance = seconds_to_samples(REANCHOR_TAIL_TOLERANCE_SECONDS, sample_rate_hz);
+    let lead = seconds_to_samples(REANCHOR_LEAD_SECONDS, sample_rate_hz);
+    let mut reanchored = 0usize;
+    for slice in slices.iter_mut() {
+        let Some((first, last)) = span_coverage_within(spans, slice.start_sample, slice.end_sample)
+        else {
+            continue;
+        };
+        if first.saturating_sub(slice.start_sample) < min_prefix {
+            continue;
+        }
+        if slice.end_sample.saturating_sub(last) > tail_tolerance {
+            continue;
+        }
+        let new_start = first.saturating_sub(lead);
+        // Two leads is the sanity floor: the re-anchored window must hold the
+        // lead-in plus a real sliver of the span, not a near-zero remnant.
+        if slice.end_sample.saturating_sub(new_start) < 2 * lead {
+            continue;
+        }
+        slice.start_sample = new_start;
+        slice.content_start_sample = new_start;
+        reanchored += 1;
+    }
+    reanchored
 }
 
 fn plan_energy_slices(
@@ -5150,6 +5271,263 @@ mod tests {
                 .any(|line| line.contains("vad-decode-gate:spans-carried:provider=request-vad")),
             "provenance must record the request-VAD carriage: {:?}",
             plan.stats.provenance
+        );
+    }
+
+    /// A request VAD that keeps a leading one-second span (like
+    /// `FixedVadProvider`) plus a tunable trailing burst: the fixture shape
+    /// for the head re-anchor tests, where the tail burst is what sits
+    /// behind the final slice's span-free prefix.
+    struct TrailingBurstProvider {
+        burst_start_seconds: f32,
+        burst_end_seconds: f32,
+    }
+
+    impl LongFormVadProvider for TrailingBurstProvider {
+        fn compute_speech_slices(
+            &self,
+            samples: &[f32],
+            sample_rate_hz: u32,
+            _options: &LongFormOptions,
+        ) -> Result<Vec<LongFormVadSlice>, String> {
+            Ok(vec![
+                LongFormVadSlice {
+                    start_sample: 0,
+                    end_sample: samples.len().min(16_000),
+                },
+                LongFormVadSlice {
+                    start_sample: (self.burst_start_seconds * sample_rate_hz as f32).round()
+                        as usize,
+                    end_sample: (self.burst_end_seconds * sample_rate_hz as f32).round() as usize,
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn energy_auto_identity_plan_reanchors_tail_span_slice_heads() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        // Zero padding so `apply_padding` (which runs after the re-anchor and
+        // would re-extend the head it moved) stays out of this assertion.
+        options.padding_seconds = 0.0;
+        // 45 s: tone for the first 30 s (loud for both VADs), digital
+        // silence to the end. The request speech-detecting VAD reads the
+        // tone as non-speech and keeps only a one-second burst at the very
+        // end: the final slice grew a long span-free prefix behind it (the
+        // bed shape), so its head is re-anchored onto the burst minus the
+        // 0.5 s lead-in; the leading slice starts inside its span and stays
+        // put.
+        let mut samples = tone(16_000 * 30);
+        samples.extend(vec![0.0; 16_000 * 15]);
+        let provider = TrailingBurstProvider {
+            burst_start_seconds: 44.0,
+            burst_end_seconds: 45.0,
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(plan.slices.len(), 2, "{:?}", plan.stats.provenance);
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor:reanchored=1of2/slices")),
+            "exactly the tail-span slice must be re-anchored: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices[0].start_sample, 0,
+            "a slice that starts inside its span must keep its head: {plan:?}"
+        );
+        assert_eq!(
+            plan.slices[1].start_sample,
+            16_000 * 44 - 16_000 / 2,
+            "the re-anchored head is the burst start minus the lead-in: {plan:?}"
+        );
+        assert_eq!(plan.slices[1].end_sample, samples.len());
+        assert_eq!(
+            plan.slices[1].content_start_sample, plan.slices[1].start_sample,
+            "content must track the re-anchored identity window: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_head_reanchor_leaves_short_prefix_slices_alone() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        let mut samples = tone(16_000 * 30);
+        samples.extend(vec![0.0; 16_000 * 15]);
+        // The burst runs to the slice end but starts under two seconds after
+        // the final slice's start: the span-free prefix is seam-scale, not a
+        // bed, so the geometry must stay byte-identical to the no-provider
+        // plan.
+        let base = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        let provider = TrailingBurstProvider {
+            burst_start_seconds: 31.0,
+            burst_end_seconds: 45.0,
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(
+            !plan
+                .stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor")),
+            "a short span-free prefix must not be re-anchored: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices, base.slices,
+            "geometry must be unchanged when no slice qualifies: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_head_reanchor_leaves_slices_ending_in_silence_alone() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        let mut samples = tone(16_000 * 30);
+        samples.extend(vec![0.0; 16_000 * 15]);
+        // Long span-free prefix, but the burst ends 1.5 s before the slice
+        // end: speech with a silent run after it is not the bed-prefix shape
+        // (the engine's slice-tail machinery owns silent tails), so the
+        // geometry must stay put.
+        let base = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        let provider = TrailingBurstProvider {
+            burst_start_seconds: 42.0,
+            burst_end_seconds: 43.5,
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(
+            !plan
+                .stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor")),
+            "a slice ending in silence beyond the tolerance must not be re-anchored: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices, base.slices,
+            "geometry must be unchanged: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_packed_plan_does_not_reanchor_slice_heads() {
+        let options = options_with_mode(LongFormMode::EnergyAuto);
+        // Mirror of `energy_auto_packed_plan_carries_no_spans_for_the_decode_
+        // gate`: the packed winner remaps the processed timeline, so even a
+        // request VAD reporting tail-span shapes must leave its geometry
+        // untouched.
+        let mut samples = tone(16_000 * 27);
+        samples.extend(vec![0.0; 16_000 * 12]);
+        samples.extend(tone(16_000 * 27));
+        let base = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            base.processed_audio.is_some(),
+            "{:?}",
+            base.stats.provenance
+        );
+        let provider = TrailingBurstProvider {
+            burst_start_seconds: 65.0,
+            burst_end_seconds: 66.0,
+        };
+        let plan = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(
+            plan.processed_audio.is_some(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            !plan
+                .stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor")),
+            "packed winners must never be re-anchored: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices, base.slices,
+            "geometry must be unchanged: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_head_reanchor_never_runs_on_the_energy_carrier() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        // Five seconds of digital silence, then tone to the end: the energy
+        // VAD's single span starts ~5 s in, making the leading slice
+        // re-anchor-eligible BY SHAPE (long span-free prefix, span running to
+        // and past the slice end). The energy carrier must not get the re-
+        // anchor -- on a uniformly quiet recording those span-free prefixes
+        // hold the recording's own (quiet) speech, the exact case the
+        // audibility veto protects.
+        let mut samples = vec![0.0_f32; 16_000 * 5];
+        samples.extend(tone(16_000 * 55));
+        let plan = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        assert!(
+            plan.processed_audio.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            plan.stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("vad-decode-gate:spans-carried:provider=builtin-energy")),
+            "the energy carrier must still be attached: {:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            !plan
+                .stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor")),
+            "the energy carrier must never re-anchor slice heads: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices[0].start_sample, 0,
+            "the silent-prefix slice must keep its head: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn energy_auto_head_reanchor_is_absent_when_the_request_vad_seen_no_speech() {
+        let mut options = options_with_mode(LongFormMode::EnergyAuto);
+        options.overlap_seconds = 0.5;
+        let mut samples = tone(16_000 * 30);
+        samples.extend(vec![0.0; 16_000 * 15]);
+        let base = plan_longform_slices(&samples, 16_000, &options, None).unwrap();
+        // A request VAD that saw no speech carries nothing, and there are no
+        // trusted spans to re-anchor on: the geometry stays as planned.
+        let plan =
+            plan_longform_slices(&samples, 16_000, &options, Some(&NoSpeechVadProvider)).unwrap();
+        assert!(
+            plan.vad_speech_spans.is_none(),
+            "{:?}",
+            plan.stats.provenance
+        );
+        assert!(
+            !plan
+                .stats
+                .provenance
+                .iter()
+                .any(|line| line.contains("slice-head-reanchor")),
+            "no carried spans, no re-anchor: {:?}",
+            plan.stats.provenance
+        );
+        assert_eq!(
+            plan.slices, base.slices,
+            "geometry must be unchanged: {plan:?}"
         );
     }
 
