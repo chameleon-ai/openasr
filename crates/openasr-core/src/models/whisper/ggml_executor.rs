@@ -4507,10 +4507,15 @@ fn build_whisper_carry_prompt_token_ids(
     // ambiguous or mumbled audio the whole decode locks onto the
     // SFX-annotation attractor instead of transcribing the slice.
     let cleaned_source = strip_whisper_asterisk_annotation_tokens(tokenizer, carry_source)?;
+    // Standalone ellipsis runs are the same kind of filler the annotation
+    // strip removes: re-prime the habit across slices and they accumulate,
+    // so the carried context drops them while the transcript keeps them.
+    let cleaned_source = strip_whisper_ellipsis_tokens(tokenizer, &cleaned_source)?;
     if cleaned_source.is_empty() {
-        // The stream held only asterisk annotations (a near-silence slice the
-        // model "commented" on): carry nothing, and the caller keeps the
-        // previous slice's carry, exactly as for a punctuation-only slice.
+        // The stream held only stripped side-commentary (a near-silence slice
+        // the model "commented" on or "paused" through): carry nothing, and
+        // the caller keeps the previous slice's carry, exactly as for a
+        // punctuation-only slice.
         return Ok(None);
     }
 
@@ -4605,6 +4610,37 @@ pub(super) fn strip_whisper_asterisk_annotation_tokens(
             }
         }
         if !span_touched {
+            kept.push(token_id);
+        }
+    }
+    Ok(kept)
+}
+
+/// Drop every token of a prior slice's stream that decodes to a standalone
+/// run of two or more periods (`..`, `...`, `....`) -- the model's filler
+/// ellipsis. GPT-2's byte BPE never fuses such a run into word content (a
+/// run of periods is an atomic token, a word's final full stop stays a
+/// separate single `.`), so each ellipsis is one droppable token. Carrying
+/// them into the next slice's `<|startofprev|>` prompt re-primes the habit:
+/// the ellipsis accumulates slice over slice, and on ambiguous audio the
+/// decode leans on the filler instead of transcribing. The transcript keeps
+/// the ellipsis (faithful output); only the carried context strips it. A
+/// single period is legitimate sentence-final punctuation and is kept.
+pub(super) fn strip_whisper_ellipsis_tokens(
+    tokenizer: &WhisperTokenizer,
+    token_ids: &[u32],
+) -> Result<Vec<u32>, WhisperGgmlExecutorError> {
+    let mut kept = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        let decoded = tokenizer
+            .decode_text_token_ids(std::slice::from_ref(&token_id))
+            .map_err(|error| WhisperGgmlExecutorError::TokenizerMissing {
+                reason: format!("could not decode carry token {token_id}: {error}"),
+            })?;
+        let trimmed = decoded.trim();
+        let period_count = trimmed.chars().filter(|&c| c == '.').count();
+        let standalone_ellipsis = period_count >= 2 && period_count == trimmed.chars().count();
+        if !standalone_ellipsis {
             kept.push(token_id);
         }
     }

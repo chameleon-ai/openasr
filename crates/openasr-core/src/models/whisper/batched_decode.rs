@@ -919,25 +919,40 @@ fn finish_whisper_serve_batch_output(
             words,
         }]
     };
-    // Asterisk-annotated spans are side-commentary, not transcript content:
-    // the executor's carry builder strips them before re-priming the next
-    // slice (see `strip_whisper_asterisk_annotation_tokens`), so keep the
-    // batch finish consistent with the same prune.
-    let carry_generated_tokens = super::ggml_executor::strip_whisper_asterisk_annotation_tokens(
+    // Asterisk-annotated spans and standalone ellipsis runs are
+    // side-commentary, not transcript content: the executor's carry builder
+    // strips both before re-priming the next slice (see
+    // `strip_whisper_asterisk_annotation_tokens` and
+    // `strip_whisper_ellipsis_tokens`), so keep the batch finish consistent
+    // with the same prune.
+    let stripped_generated = super::ggml_executor::strip_whisper_asterisk_annotation_tokens(
         tokenizer,
         &generated_tokens,
     )
     .map_err(|error| WhisperServeBatchError::DecodeFailed {
         reason: error.to_string(),
     })?;
-    let carry_prompt_token_ids = carry_prompt_seed_token_ids.and_then(|seed| {
-        build_longform_token_history_carry(
-            true,
-            seed,
-            &carry_generated_tokens,
-            WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
-        )
-    });
+    let carry_generated_tokens =
+        super::ggml_executor::strip_whisper_ellipsis_tokens(tokenizer, &stripped_generated)
+            .map_err(|error| WhisperServeBatchError::DecodeFailed {
+                reason: error.to_string(),
+            })?;
+    let carry_prompt_token_ids = if carry_generated_tokens.is_empty() {
+        // The stream held only pruned filler (a slice the model "paused"
+        // through): it holds no words to condition the next slice, so carry
+        // nothing and the caller keeps the previous slice's carry, exactly as
+        // for a punctuation-only slice.
+        None
+    } else {
+        carry_prompt_seed_token_ids.and_then(|seed| {
+            build_longform_token_history_carry(
+                true,
+                seed,
+                &carry_generated_tokens,
+                WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT,
+            )
+        })
+    };
     Ok(WhisperExecutionOutput {
         text,
         segments,

@@ -1865,9 +1865,11 @@ fn build_whisper_carry_prompt_token_ids_strips_a_guard_trip_cycle() {
 
 fn asterisk_span_tokenizer_fixture() -> WhisperTokenizer {
     // Text ids 0..10 ("h","e","l","o","w","r","s","i","g","*" and newline);
-    // 11 is EOT and 12..15 the usual controls, so the first timestamp id
-    // (notimestamps + 1 = 15) sits on the <|startofprev|> special, the same
-    // harmless overlap as the main fixture.
+    // 11..13 are the standalone period-run tokens (".", "..", "...") GPT-2's
+    // BPE emits for a final full stop and ellipsis runs; 14 is EOT and
+    // 15..18 the usual controls, so the first timestamp id (notimestamps + 1
+    // = 18) sits on the <|startofprev|> special, the same harmless overlap
+    // as the main fixture.
     let mut values = std::collections::BTreeMap::new();
     values.insert(
         TOKENIZER_GGML_MODEL_KEY.to_string(),
@@ -1887,6 +1889,9 @@ fn asterisk_span_tokenizer_fixture() -> WhisperTokenizer {
             "g".to_string(),
             "*".to_string(),
             "\u{010A}".to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            "...".to_string(),
             "<|endoftext|>".to_string(),
             "<|startoftranscript|>".to_string(),
             "<|transcribe|>".to_string(),
@@ -1900,23 +1905,23 @@ fn asterisk_span_tokenizer_fixture() -> WhisperTokenizer {
     );
     values.insert(
         TOKENIZER_GGML_SPECIAL_TOKEN_IDS_KEY.to_string(),
-        GgufMetadataValue::U32Array(vec![11, 12, 13, 14, 15]),
+        GgufMetadataValue::U32Array(vec![14, 15, 16, 17, 18]),
     );
     values.insert(
         TOKENIZER_GGML_SOT_TOKEN_ID_KEY.to_string(),
-        GgufMetadataValue::U32(12),
+        GgufMetadataValue::U32(15),
     );
     values.insert(
         TOKENIZER_GGML_EOT_TOKEN_ID_KEY.to_string(),
-        GgufMetadataValue::U32(11),
+        GgufMetadataValue::U32(14),
     );
     values.insert(
         TOKENIZER_GGML_TRANSCRIBE_TOKEN_ID_KEY.to_string(),
-        GgufMetadataValue::U32(13),
+        GgufMetadataValue::U32(16),
     );
     values.insert(
         TOKENIZER_GGML_NO_TIMESTAMPS_TOKEN_ID_KEY.to_string(),
-        GgufMetadataValue::U32(14),
+        GgufMetadataValue::U32(17),
     );
     let metadata = GgufMetadata::from_values_for_test(values);
     WhisperTokenizer::from_gguf_metadata(&metadata).expect("load asterisk fixture tokenizer")
@@ -1994,6 +1999,54 @@ fn build_whisper_carry_prompt_token_ids_strips_asterisk_annotations() {
             None
         )
         .expect("valid"),
+        None
+    );
+}
+
+#[test]
+fn strip_whisper_ellipsis_tokens_drops_standalone_period_runs() {
+    let tokenizer = asterisk_span_tokenizer_fixture();
+
+    // "h e l o ... w .": the standalone ellipsis runs (".." and "...") go,
+    // the single sentence-final full stop (".") stays, words keep order.
+    let stripped =
+        strip_whisper_ellipsis_tokens(&tokenizer, &[0, 1, 2, 3, 13, 4, 11]).expect("strip");
+    assert_eq!(stripped, vec![0, 1, 2, 3, 4, 11]);
+
+    // Two-dot runs are the same filler token family as the three-dot one.
+    let stripped = strip_whisper_ellipsis_tokens(&tokenizer, &[12, 13]).expect("strip");
+    assert!(stripped.is_empty(), "every standalone period run is filler");
+
+    // Tokens with no periods decode to themselves: byte-identical
+    // passthrough.
+    let stripped = strip_whisper_ellipsis_tokens(&tokenizer, &[0, 1, 2, 3]).expect("strip");
+    assert_eq!(stripped, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn build_whisper_carry_prompt_token_ids_strips_ellipsis_filler() {
+    let tokenizer = asterisk_span_tokenizer_fixture();
+    let request_options = GgmlAsrExecutionOptions {
+        prompt_token_ids: Some(vec![0, 1]),
+        longform: Some(crate::LongFormOptions::default()),
+        ..GgmlAsrExecutionOptions::default()
+    };
+
+    // seed [h, e] ++ "w r ... s i ..." -> the next prompt primes on the
+    // words only; the ellipsis habit is not carried forward.
+    let generated = vec![4, 5, 13, 6, 7, 13];
+    let carry =
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &generated, None)
+            .expect("valid")
+            .expect("carry token ids");
+    assert_eq!(carry, vec![0, 1, 4, 5, 6, 7]);
+
+    // A winner holding only ellipsis (a pause the model "hummed" through)
+    // carries nothing: the caller keeps the previous carry, even when a
+    // seed exists.
+    assert_eq!(
+        build_whisper_carry_prompt_token_ids(&tokenizer, &request_options, &[13, 13, 12, 13], None)
+            .expect("valid"),
         None
     );
 }
