@@ -180,6 +180,100 @@ fn refine_dtw_offsets_refuses_a_music_floor_back() {
     assert!((out[1].start - 2.0).abs() < 1e-4);
 }
 
+/// A word quiet enough to sit *below* the clip's absolute speech floor
+/// (0.0029 vs the 0.00316 threshold) is still retreated: the search floor
+/// drops to the region's own peak minus 12 dB, so the word's 0.0029 run reads
+/// against the 0.0005 quiet dip that caps its tail, and the pull lands at the
+/// run's end (2.4 s) even though the window's back half is a 0.0015 music bed
+/// that passed the hollow check. An absolute-floor-only search finds no run at
+/// all and leaves the word at its fold end.
+#[test]
+fn refine_dtw_offsets_pulls_a_word_below_the_absolute_floor() {
+    let mut env = vec![0.001778f32; 750];
+    env[400] = 0.5; // clip peak (sets the silence ceiling)
+    for s in env[100..120].iter_mut() {
+        *s = 0.0029; // word audio: below the 0.00316 absolute threshold
+    }
+    for s in env[120..124].iter_mut() {
+        *s = 0.0005; // quiet dip: below the 0.0029 - 12 dB relative floor
+    }
+    for s in env[124..150].iter_mut() {
+        *s = 0.0015; // music bed filling the window's back half
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 3.0),
+        word_ts("c", 3.0, 3.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.4).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A word's decaying tail broken by a short below-floor micro-pause (3 frames,
+/// the gap tolerance) is one run, not two: the offset lands at the *second*
+/// burst's end (2.26 s), not the first burst's (2.12 s, where the run would
+/// split without the tolerance).
+#[test]
+fn refine_dtw_offsets_tolerates_a_short_micro_gap_inside_the_run() {
+    let mut env = offset_fixture_envelope();
+    for s in env[100..130].iter_mut() {
+        *s = 0.001;
+    }
+    for s in env[100..106].iter_mut() {
+        *s = 0.25; // burst 1
+    }
+    for s in env[109..113].iter_mut() {
+        *s = 0.25; // burst 2, 3 below-floor frames after burst 1
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 3.0),
+        word_ts("c", 3.0, 3.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.26).abs() < 0.02, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A single envelope frame crossing the silence ceiling (a bed crackle) does
+/// not void an otherwise-true trailing pause; a sustained crossing would. The
+/// pull fires at the run's end, 2.6 s, instead of bailing the word.
+#[test]
+fn refine_dtw_offsets_survives_a_single_ceiling_crackle_frame() {
+    let mut env = offset_fixture_envelope();
+    env[165] = 0.03; // above the 0.025 silence ceiling (5% of the 0.5 clip peak)
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.6).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A word whose audio sits entirely *before* its window (the fold's late entry
+/// parked the window behind the word) is refused: the offset (2.4 s) would land
+/// before the word's own start (2.5 s) and invert the window, so a pull would
+/// be wrong -- the start is the onset pass's domain. The word is left
+/// untouched.
+#[test]
+fn refine_dtw_offsets_refuses_an_inverting_offset() {
+    let mut env = offset_fixture_envelope();
+    for s in env[120..130].iter_mut() {
+        *s = 0.001; // shave the fixture run to [2.0, 2.4), ahead of the window
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.5, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "inverting offset refused");
+    assert!((out[1].start - 2.5).abs() < 1e-4);
+}
+
 /// A middle word whose end maps to or past the last envelope frame -- common at
 /// a longform slice end where the frame array is shorter than
 /// `duration_s / seconds_per_frame` -- must not overrun the slice. The word is
@@ -191,27 +285,65 @@ fn refine_dtw_offsets_clamps_a_word_at_or_past_the_end() {
     let words = vec![
         word_ts("a", 0.5, 0.6),
         word_ts("b", 15.4, 16.0), // end past the 750-frame end, span 0.6 >= 0.3
-        word_ts("c", 16.0, 16.2), // the last word is skipped regardless
+        word_ts("c", 16.0, 16.2), // span 0.2 < 0.3: bailed by the span guard
     ];
     // duration_s larger than the envelope implies so `end_s / spf` overshoots.
     let out = whisper_refine_dtw_word_offsets(words, Some(&env), 16.0);
     assert_eq!(out[1].end, 16.0, "unrefined; must not panic");
 }
 
-/// The last word is never retreated: its true end is the audio end, so the
-/// silence after it is the clip's legitimate tail, not a fold leak.
+/// The last word is retreated *too* when its window ends well short of the
+/// slice's audio end: the trailing passage is verifiable silence inside the
+/// slice, not the clip's legitimate ending. The speech run here ends at 12.0 s,
+/// 1.5 s before the window's fold end and 3.0 s before the audio end at 15 s.
 #[test]
-fn refine_dtw_offsets_skips_the_last_word() {
+fn refine_dtw_offsets_pulls_a_last_word_short_of_the_tail() {
     let mut env = offset_fixture_envelope();
     for s in env[0..600].iter_mut() {
-        *s = 0.25; // trailing word's window [11.5, 13.5) sits in speech to its end
+        *s = 0.25; // run to 12.0 s, then silence to the 13.5 s fold end
     }
     let words = vec![
         word_ts("a", 0.5, 0.6),
-        word_ts("b", 11.5, 13.5), // the last word
+        word_ts("b", 11.5, 13.5), // the last word, ending 1.5 s short of the audio end
     ];
     let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
-    assert_eq!(out[1].end, 13.5, "last word untouched");
+    assert!((out[1].end - 12.0).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 11.5).abs() < 1e-4);
+}
+
+/// A last word whose window reaches the slice's own tail is retreated when its
+/// audio ended before the tail and the trailing passage is verifiable silence
+/// inside the slice: the fold pins the last word's end to the segment end, and
+/// an interior slice end past the word's audio is a fold leak, not a clip
+/// ending. The run here caps at 14.0 s with 0.7 s of silence to the fold end.
+#[test]
+fn refine_dtw_offsets_pulls_a_last_word_pinned_at_the_tail() {
+    let mut env = offset_fixture_envelope();
+    for s in env[690..700].iter_mut() {
+        *s = 0.25; // run [13.8, 14.0), then silence to the 14.7 s fold end
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 14.0, 14.7)];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 14.0).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 14.0).abs() < 1e-4);
+}
+
+/// A last word whose audio runs to the slice tail (a slice cut inside the
+/// word) is left untouched: its back half reads as speech, so the hollow check
+/// bails before any run search runs.
+#[test]
+fn refine_dtw_offsets_leaves_a_word_whose_audio_runs_to_the_tail() {
+    let mut env = offset_fixture_envelope();
+    for s in env[575..750].iter_mut() {
+        *s = 0.25; // speech from 11.5 s straight to the 15.0 s tail
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 11.5, 15.0)];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!(
+        (out[1].end - 15.0).abs() < 1e-4,
+        "audio-at-tail last word untouched"
+    );
+    assert!((out[1].start - 11.5).abs() < 1e-4);
 }
 
 /// No envelope (a run without cross-attention word timestamps) is a byte-exact

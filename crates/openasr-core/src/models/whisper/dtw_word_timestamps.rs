@@ -583,6 +583,26 @@ const WHISPER_DTW_OFFSET_MIN_SILENCE_S: f32 = 0.03;
 const WHISPER_DTW_OFFSET_MIN_PULL_S: f32 = 0.25;
 /// Upper bound on how far forward into a pause a word's end may be advanced.
 const WHISPER_DTW_OFFSET_MAX_PULL_S: f32 = 5.0;
+/// How far before the word's window the offset run search reaches. The fold's
+/// entry frame can land late -- in the gap after a word's own audio -- so the
+/// word's above-floor run sits partly before its window and is missed by an
+/// in-window search.
+const WHISPER_DTW_OFFSET_EDGE_LEAD_S: f32 = 0.5;
+/// dB below the search region's own peak that still counts as that word's
+/// audio. The search floor is the lower of the absolute speech floor and this
+/// relative one, so a quiet word over a music bed -- far below the clip-floor
+/// threshold, where no absolute-floor search can see it -- is judged against
+/// its own level.
+const WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB: f64 = 12.0;
+/// Below-floor frames tolerated inside a speech run before it splits. A word's
+/// offset tail decays through coarticulatory micro-silences shorter than this;
+/// without the tolerance the run shreds and no qualifying offset is found.
+const WHISPER_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES: usize = 3;
+/// Consecutive frames above the silence ceiling before a hollow region stops
+/// reading as silence. A single bed-crackle frame is not a music floor (that
+/// would void a legitimate pull on bed-backed clips), while a sustained floor
+/// crosses and still bails.
+const WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES: usize = 3;
 
 /// Pull a word that the center fold let run past its speech into the trailing
 /// silence back to its real audio offset.
@@ -601,12 +621,29 @@ const WHISPER_DTW_OFFSET_MAX_PULL_S: f32 = 5.0;
 /// pause sits instead of smearing this word across it, and never touches the next
 /// word -- the timeline stays monotone and non-overlapping by construction.
 ///
-/// As with onsets, the speech floor tracks the clip's own noise level and the
-/// back must stay below a small fraction of the clip's *peak*: a music or noise
-/// bed never reads as digital zero, so a low passage inside a music-backed clip is
-/// not a trusted trailing pause and a pull would only move a word that was already
-/// acceptable. The last word is skipped: its true end is the audio end, so the
-/// trailing silence after it is the clip's legitimate tail, not a fold leak.
+/// Two bed-backed realities the run search must survive. First, the fold's late
+/// entry can park a word's window *behind* its own audio (the window starts in
+/// the gap after the word), so the search reaches the
+/// [`WHISPER_DTW_OFFSET_EDGE_LEAD_S`] lead before the window; an offset that
+/// would land before the word's own start is refused rather than inverting the
+/// window. Second, a quiet word over a music bed sits far below the clip-floor
+/// threshold, so the search floor is the lower of the absolute floor and the
+/// region's own peak minus [`WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB`].
+///
+/// As with onsets, the back must stay below a small fraction of the clip's
+/// *peak*: a music or noise bed never reads as digital zero, so a low passage
+/// inside a music-backed clip is not a trusted trailing pause and a pull would
+/// only move a word that was already acceptable. A single bed-crackle frame
+/// crossing that ceiling does not void the pause; the crossing must be
+/// sustained for [`WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES`] frames.
+///
+/// The last word is no index-position special case: the fold pins its end to
+/// the slice's segment end, which is exactly where a fold leak is largest. A
+/// last word whose audio runs to the slice tail (a slice cut inside the word)
+/// reads its back half as speech and bails on the hollow check; a last word
+/// whose trailing passage is verifiable silence inside the slice retreats like
+/// any other, and a slice cut after the word's own pause is bounded by the
+/// minimum quiet run the offset must be followed by.
 fn whisper_refine_dtw_word_offsets(
     mut words: Vec<crate::WordTimestamp>,
     audio_rms_frames: Option<&[f32]>,
@@ -637,13 +674,7 @@ fn whisper_refine_dtw_word_offsets(
     let min_quiet_frames =
         ((WHISPER_DTW_OFFSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
     let last_frame = levels.len() - 1;
-    // The last word is skipped: its true end is the audio end, so the silence
-    // after it is the clip's legitimate tail, not a fold leak.
-    let last_index = words.len().saturating_sub(1);
-    for (index, word) in words.iter_mut().enumerate() {
-        if index >= last_index {
-            continue;
-        }
+    for word in words.iter_mut() {
         let raw_start = f64::from(word.start);
         let raw_end = f64::from(word.end);
         let span = raw_end - raw_start;
@@ -671,59 +702,109 @@ fn whisper_refine_dtw_word_offsets(
         // A hollow word: the back half sits in true silence, not just a quiet
         // passage. Three conditions on the back half of the window, mirroring the
         // onset pass's front-half check: (1) its *mean* is below the noise floor;
-        // (2) *no* back frame crosses the silence ceiling, so a music floor never
-        // masquerades as trailing silence; (3) fewer than half its frames are above
-        // the floor (no sustained speech leaking into the back).
+        // (2) no *sustained* run of back frames crosses the silence ceiling, so a
+        // music floor never masquerades as trailing silence while a single bed
+        // crackle does not void a legitimate pause; (3) fewer than half its frames
+        // are above the floor (no sustained speech leaking into the back).
         let back_mean = (back_start..window_len)
             .map(|i| f64::from(window[i]))
             .sum::<f64>()
             / back_len as f64;
-        let back_max = (back_start..window_len)
-            .map(|i| f64::from(window[i]))
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0);
+        let mut ceiling_sustained = false;
+        let mut ceiling_run = 0usize;
+        for &sample in window.iter().skip(back_start) {
+            ceiling_run = if f64::from(sample) > silence_ceiling {
+                ceiling_run + 1
+            } else {
+                0
+            };
+            if ceiling_run >= WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
         let back_above =
             (back_start..window_len).filter(|&i| is_above(i)).count() as f64 / back_len as f64;
         if back_mean >= threshold
-            || back_max > silence_ceiling
+            || ceiling_sustained
             || back_above > WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX as f64
         {
             continue;
         }
-        // The offset: the last speech run (>= sustain frames above the floor)
-        // followed by a quiet run of at least the minimum silence length, inside
-        // this word's own window; its end is that run's offset frame.
+        // The offset: the last speech run followed by a quiet run of at least the
+        // minimum silence length. The search covers the window plus the pre-window
+        // lead (the fold's late entry can park the window behind the word's own
+        // audio); run frames are counted above the search floor, and below-floor
+        // gaps up to the tolerance do not split a run (coarticulatory
+        // micro-silence in a decaying word tail).
+        let region_start_s = (start_s - WHISPER_DTW_OFFSET_EDGE_LEAD_S as f64).max(0.0);
+        let region_frame_start = ((region_start_s / seconds_per_frame) as usize)
+            .min(last_frame)
+            .min(frame_start);
+        let region = &levels[region_frame_start..frame_end + 1];
+        let region_len = region.len();
+        // The search floor: the lower of the absolute speech floor and the
+        // region's own peak below the relative margin, so a quiet word over a
+        // music bed is judged against its own level, not the clip floor.
+        let region_peak = region
+            .iter()
+            .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)));
+        let floor = threshold
+            .min(region_peak * 10.0_f64.powf(-WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB / 20.0));
+        // Gap-tolerant runs above the floor, gathered in order as (above-frame
+        // count, last above frame).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_above = 0usize;
+        let mut run_last = 0usize;
+        let mut in_run = false;
+        let mut below_gap = 0usize;
+        for (i, &sample) in region.iter().enumerate() {
+            if f64::from(sample) >= floor {
+                if !in_run {
+                    in_run = true;
+                    run_above = 0;
+                }
+                run_above += 1;
+                run_last = i;
+                below_gap = 0;
+            } else if in_run {
+                below_gap += 1;
+                if below_gap > WHISPER_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES {
+                    runs.push((run_above, run_last));
+                    in_run = false;
+                    below_gap = 0;
+                }
+            }
+        }
+        if in_run {
+            runs.push((run_above, run_last));
+        }
         let mut offset_rel: Option<usize> = None;
-        let mut index = Some(window_len - 1);
-        while let Some(i) = index {
-            if is_above(i) {
-                let mut run_start = i;
-                while run_start > 0 && is_above(run_start - 1) {
-                    run_start -= 1;
+        for &(run_count, run_end_index) in runs.iter().rev() {
+            if run_count >= WHISPER_DTW_OFFSET_SUSTAIN_FRAMES {
+                let mut quiet = 0usize;
+                let mut probe = run_end_index;
+                while probe + 1 < region_len && f64::from(region[probe + 1]) < floor {
+                    probe += 1;
+                    quiet += 1;
                 }
-                let run_len = i - run_start + 1;
-                if run_len >= WHISPER_DTW_OFFSET_SUSTAIN_FRAMES {
-                    let mut quiet = 0usize;
-                    let mut probe = i;
-                    while probe + 1 < window_len && !is_above(probe + 1) {
-                        probe += 1;
-                        quiet += 1;
-                    }
-                    if quiet >= min_quiet_frames {
-                        offset_rel = Some(i);
-                        break;
-                    }
+                if quiet >= min_quiet_frames {
+                    offset_rel = Some(run_end_index);
+                    break;
                 }
-                index = run_start.checked_sub(1);
-            } else {
-                index = i.checked_sub(1);
             }
         }
         let Some(rel) = offset_rel else {
             continue;
         };
-        // The run ends at `rel`; one frame past it is where the silence begins.
-        let offset_s = ((frame_start + rel + 1) as f64 * seconds_per_frame) as f32;
+        // The run ends at `rel`; one frame past it is where the silence begins. An
+        // offset before the word's own start would invert the window (its audio
+        // sits entirely earlier than the window -- the onset pass's domain), so
+        // such a word is refused.
+        let offset_s = ((region_frame_start + rel + 1) as f64 * seconds_per_frame) as f32;
+        if f64::from(offset_s) < raw_start {
+            continue;
+        }
         let pull = raw_end - f64::from(offset_s);
         // A word's end may only move earlier into prior audio, never past it. The
         // minimum pull guards against a sub-calibration-error wiggle; the maximum
@@ -1134,6 +1215,13 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     .iter()
                     .map(|row| row[band_start.min(row.len())..band_end.min(row.len())].to_vec())
                     .collect();
+                let run_is_content: Vec<bool> = (*lo..=*hi)
+                    .map(|index| {
+                        tokenizer
+                            .decode_text_token_ids(&[token_ids[index]])
+                            .is_ok_and(|text| token_text_carries_speech(&text))
+                    })
+                    .collect();
                 let Some(spans) = dtw_align_token_frames(&attention) else {
                     run_word_ranges.push((run_word_start, words.len()));
                     continue;
@@ -1157,13 +1245,6 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                 // at/inside the speech, so its onset falls within one margin of the
                 // bound and the anchor stays at the decoded bound, keeping those
                 // clips identical to baseline.
-                let run_is_content: Vec<bool> = (*lo..=*hi)
-                    .map(|index| {
-                        tokenizer
-                            .decode_text_token_ids(&[token_ids[index]])
-                            .is_ok_and(|text| token_text_carries_speech(&text))
-                    })
-                    .collect();
                 let band_front =
                     speech_band_from_rows(&full_window[*lo..=*hi], &run_is_content, None)
                         .map(|(onset, _)| onset);
