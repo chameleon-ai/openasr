@@ -2,6 +2,7 @@ use crate::api::backend::WordTimestamp;
 use crate::models::decode_policy_component_registry::{
     BuiltinDecodePolicySeq2SeqTextPostprocessKind, seq2seq_transcript_byte_start,
 };
+use crate::models::seq2seq_dtw_alignment::token_text_carries_speech;
 use crate::models::text_prefix::common_prefix_len;
 
 /// Boundary at the equidistant midpoint between two word centers
@@ -30,10 +31,12 @@ struct WordCenter {
 #[derive(Debug, Clone, Default)]
 struct WordAccumulator {
     text: String,
-    center_sum: f32,
-    center_count: usize,
-    probability_sum: f32,
-    probability_count: usize,
+    /// One entry per contributing piece: its center, its probability, and
+    /// whether the piece carries speech (a letter or digit). Punctuation-only
+    /// pieces are decided at `finish`, against the content mean, so a trailing
+    /// comma parked next to its word still marks the word's offset while one
+    /// the monotone path lingered seconds into a pause does not drag it.
+    pieces: Vec<(f32, Option<f32>, bool)>,
 }
 
 impl WordAccumulator {
@@ -46,31 +49,67 @@ impl WordAccumulator {
         ch: char,
         center_seconds: f32,
         probability: Option<f32>,
+        carries_speech: bool,
         contributed: &mut bool,
     ) {
         self.text.push(ch);
         if !*contributed {
-            self.center_sum += center_seconds;
-            self.center_count = self.center_count.saturating_add(1);
-            if let Some(probability) = probability {
-                self.probability_sum += probability;
-                self.probability_count = self.probability_count.saturating_add(1);
-            }
+            self.pieces
+                .push((center_seconds, probability, carries_speech));
             *contributed = true;
         }
     }
 
-    fn finish(&mut self, segment_start: f32, segment_end: f32) -> Option<WordCenter> {
+    fn finish(
+        &mut self,
+        segment_start: f32,
+        segment_end: f32,
+        punctuation_trust_radius_seconds: f32,
+    ) -> Option<WordCenter> {
         let word = self.text.trim().to_string();
-        if word.is_empty() || self.center_count == 0 {
+        let content: Vec<f32> = self
+            .pieces
+            .iter()
+            .filter(|(_, _, carries)| *carries)
+            .map(|(center, _, _)| *center)
+            .collect();
+        // The content mean anchors the word; a word with no content piece (a
+        // standalone "...") keeps the mean over all its pieces, so none is
+        // dropped.
+        let anchor = if content.is_empty() {
+            let sum: f32 = self.pieces.iter().map(|(center, _, _)| *center).sum();
+            if self.pieces.is_empty() {
+                *self = Self::default();
+                return None;
+            }
+            sum / self.pieces.len() as f32
+        } else {
+            content.iter().sum::<f32>() / content.len() as f32
+        };
+        let radius = punctuation_trust_radius_seconds.max(0.0);
+        let mut sum = 0.0_f32;
+        let mut count = 0_usize;
+        let mut probability_sum = 0.0_f32;
+        let mut probability_count = 0_usize;
+        for (center, probability, carries) in &self.pieces {
+            if *carries || content.is_empty() || (center - anchor).abs() <= radius {
+                sum += *center;
+                count += 1;
+                if let Some(probability) = probability {
+                    probability_sum += *probability;
+                    probability_count += 1;
+                }
+            }
+        }
+        if word.is_empty() || count == 0 {
             *self = Self::default();
             return None;
         }
-        let center_seconds = (self.center_sum / self.center_count as f32)
+        let center_seconds = (sum / count as f32)
             .clamp(segment_start, segment_end)
             .max(segment_start);
-        let confidence = (self.probability_count > 0)
-            .then(|| (self.probability_sum / self.probability_count as f32).clamp(0.0, 1.0));
+        let confidence = (probability_count > 0)
+            .then(|| (probability_sum / probability_count as f32).clamp(0.0, 1.0));
         *self = Self::default();
         Some(WordCenter {
             word,
@@ -116,6 +155,8 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
         f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
     )
 }
 
@@ -135,6 +176,29 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
 /// silence far from the edge word's center, that anchor smears the word across
 /// the whole gap. `f32::INFINITY` disables the clamp and reproduces the
 /// historical anchor exactly.
+///
+/// `punctuation_trust_radius_seconds` bounds how far a punctuation-only piece
+/// (no letter or digit) may sit from its word's content mean and still count
+/// toward the center. Such a piece carries no audible span of its own, but a
+/// comma parked next to its word is the path's best statement of the word's
+/// offset and is worth keeping, while one that lingered seconds into a pause
+/// drags the center off its speech and dislodges both neighbours' boundaries.
+/// `f32::INFINITY` reproduces the historical mean-over-all-pieces exactly;
+/// `0.0` excludes every punctuation piece. The whisper default keeps
+/// sub-two-second punctuation (arnold's offset-marking comma, dog's
+/// next-onset-adjacent comma) while excluding the multi-second pause linger
+/// behind the width-cap cluster shape. Words left with no content piece (a
+/// standalone "...") keep the mean over all their pieces, so none is dropped.
+///
+/// `max_interior_half_span_seconds` bounds how far an *interior* word's window
+/// may extend on either side of its own center. The boundary split otherwise
+/// hands each word up to half of an adjacent pause, so a word beside a real
+/// multi-second pause owns seconds of silence (the width-cap cluster shape).
+/// `f32::INFINITY` disables the clamp; a finite value leaves the pause between
+/// the clamped edges as real silence. Continuous speech never binds it: with
+/// the whisper 0.45 fraction only inter-center gaps past ~2.2 s reach a 1.0 s
+/// half-span, and the per-word affine fit TempErr uses absorbs the uniform
+/// shift either way.
 pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     token_times: &[Seq2SeqTokenTime],
     segment_start: f32,
@@ -144,6 +208,8 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     boundary_fraction: f32,
     onset_lead: f32,
     max_edge_word_span: f32,
+    punctuation_trust_radius_seconds: f32,
+    max_interior_half_span_seconds: f32,
 ) -> Result<Vec<WordTimestamp>, E> {
     let (segment_start, segment_end) = sanitize_segment_span(segment_start, segment_end);
 
@@ -201,6 +267,9 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     let mut byte_offset = 0usize;
     for piece in &pieces {
         let mut contributed_to_current = false;
+        // Whether the piece carries speech is decided at `finish`, against
+        // the word's content mean and `punctuation_trust_radius_seconds`.
+        let piece_carries_speech = token_text_carries_speech(&piece.text);
         for ch in piece.text.chars() {
             let ch_offset = byte_offset;
             byte_offset += ch.len_utf8();
@@ -208,14 +277,18 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
                 continue;
             }
             if ch.is_whitespace() {
-                if let Some(word) = current.finish(segment_start, segment_end) {
+                if let Some(word) =
+                    current.finish(segment_start, segment_end, punctuation_trust_radius_seconds)
+                {
                     words.push(word);
                 }
                 contributed_to_current = false;
                 continue;
             }
             if han_script_boundary_before(ch, current.last_char()) {
-                if let Some(word) = current.finish(segment_start, segment_end) {
+                if let Some(word) =
+                    current.finish(segment_start, segment_end, punctuation_trust_radius_seconds)
+                {
                     words.push(word);
                 }
                 contributed_to_current = false;
@@ -224,11 +297,13 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
                 ch,
                 piece.center_seconds,
                 piece.probability,
+                piece_carries_speech,
                 &mut contributed_to_current,
             );
         }
     }
-    if let Some(word) = current.finish(segment_start, segment_end) {
+    if let Some(word) = current.finish(segment_start, segment_end, punctuation_trust_radius_seconds)
+    {
         words.push(word);
     }
     Ok(word_centers_to_timestamps(
@@ -238,6 +313,7 @@ pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
         boundary_fraction,
         onset_lead,
         max_edge_word_span,
+        max_interior_half_span_seconds,
     ))
 }
 
@@ -285,6 +361,7 @@ fn word_centers_to_timestamps(
     boundary_fraction: f32,
     onset_lead: f32,
     max_edge_word_span: f32,
+    max_interior_half_span_seconds: f32,
 ) -> Vec<WordTimestamp> {
     if words.is_empty() {
         return Vec::new();
@@ -340,6 +417,18 @@ fn word_centers_to_timestamps(
     } else {
         segment_end
     };
+    // An interior word beside a real pause would otherwise own up to half the
+    // pause on each side (the width-cap cluster shape). Each side is bounded
+    // at this distance from the word's own center instead, leaving the pause
+    // between the clamped edges as real silence. Edges keep their
+    // edge-span/anchor behavior; interior clamping only ever moves a boundary
+    // toward the nearer center, so end[i-1] <= boundary <= start[i] still
+    // holds and the timeline stays monotone and non-overlapping.
+    let half_limit = if max_interior_half_span_seconds.is_finite() {
+        max_interior_half_span_seconds.max(0.0)
+    } else {
+        f32::INFINITY
+    };
     for (index, word) in words.iter().enumerate() {
         let start = if index == 0 {
             first_min_start
@@ -349,6 +438,7 @@ fn word_centers_to_timestamps(
                 word.center_seconds,
                 boundary_fraction,
             )
+            .max(word.center_seconds - half_limit)
         };
         let end = if index + 1 == words.len() {
             last_max_end
@@ -358,6 +448,7 @@ fn word_centers_to_timestamps(
                 words[index + 1].center_seconds,
                 boundary_fraction,
             )
+            .min(word.center_seconds + half_limit)
         };
         let start = start.clamp(segment_start, segment_end);
         let end = end.clamp(start, segment_end);
@@ -462,6 +553,8 @@ mod tests {
             MIDPOINT_BOUNDARY_FRACTION,
             NO_ONSET_LEAD,
             f32::INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
         )
         .unwrap();
 
@@ -518,6 +611,8 @@ mod tests {
             0.5,
             0.0,
             0.2,
+            f32::INFINITY,
+            f32::INFINITY,
         )
         .unwrap();
         assert_eq!(clamped.len(), 2);
@@ -536,6 +631,8 @@ mod tests {
             &pieces,
             0.5,
             0.0,
+            f32::INFINITY,
+            f32::INFINITY,
             f32::INFINITY,
         )
         .unwrap();
@@ -579,6 +676,8 @@ mod tests {
             0.5,
             0.0,
             0.2,
+            f32::INFINITY,
+            f32::INFINITY,
         )
         .unwrap();
         assert_eq!(words.len(), 2);
@@ -653,5 +752,346 @@ mod tests {
         assert_eq!(texts, ["你", "好，", "用", "Rust", "写", "代", "码"]);
         assert!(words.windows(2).all(|pair| pair[0].end <= pair[1].start));
         assert!((words[3].confidence.unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn punctuation_piece_does_not_move_the_word_center_when_ignored() {
+        // The tenma shape: " now" centers on its speech at 16.34 s while the
+        // word-final "." the DTW parked 6 s into the pause sits at 22.62 s.
+        // Averaging both drags the center to ~19.5 s and shoves the previous
+        // boundary 1.4 s late; ignoring the punctuation piece keeps the seam
+        // at the speech.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => " down",
+                        2 => " now",
+                        3 => ".",
+                        4 => " Alright",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 16.08,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 16.34,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 3,
+                center_seconds: 22.62,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 4,
+                center_seconds: 23.30,
+                probability: None,
+            },
+        ];
+        let fold = |radius: f32| {
+            seq2seq_word_timestamps_from_token_times(
+                &token_times,
+                0.0,
+                30.0,
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                &pieces,
+                0.45,
+                0.0,
+                f32::INFINITY,
+                radius,
+                f32::INFINITY,
+            )
+            .unwrap()
+        };
+        let dragged = fold(f32::INFINITY);
+        assert_eq!(dragged[1].word, "now.");
+        let dragged_start = 16.08 + 0.45 * (19.48 - 16.08);
+        assert!(
+            (dragged[1].start - dragged_start).abs() < 0.05,
+            "start={} want={dragged_start}",
+            dragged[1].start
+        );
+        let kept = fold(0.0);
+        assert_eq!(kept[1].word, "now.");
+        let kept_start = 16.08 + 0.45 * (16.34 - 16.08);
+        assert!(
+            (kept[1].start - kept_start).abs() < 1e-4,
+            "start={} want={kept_start}",
+            kept[1].start
+        );
+        // The previous word keeps the same seam in both modes.
+        assert!(
+            (kept[0].end - kept_start).abs() < 1e-4,
+            "down keeps the seam: end={}",
+            kept[0].end
+        );
+    }
+
+    #[test]
+    fn punctuation_trust_radius_keeps_near_punctuation_drops_far() {
+        // The dog shape (" Okay" at 2.72, "," parked 1.48 s later at 4.20)
+        // vs the tenma shape (" now" at 16.34, "." 6.28 s later at 22.62): a
+        // 1.75 s radius keeps the near comma -- the path's best statement of
+        // the word's offset -- while excluding the pause linger.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => " Okay",
+                        2 => ",",
+                        3 => " got",
+                        4 => " now",
+                        5 => ".",
+                        6 => " Alright",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 2.72,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 4.20,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 3,
+                center_seconds: 4.38,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 4,
+                center_seconds: 16.34,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 5,
+                center_seconds: 22.62,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 6,
+                center_seconds: 23.30,
+                probability: None,
+            },
+        ];
+        let fold = |radius: f32| {
+            seq2seq_word_timestamps_from_token_times(
+                &token_times,
+                0.0,
+                30.0,
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                &pieces,
+                0.45,
+                0.0,
+                f32::INFINITY,
+                radius,
+                f32::INFINITY,
+            )
+            .unwrap()
+        };
+        let words = fold(1.75);
+        assert_eq!(words[0].word, "Okay,");
+        // Near comma kept: center is the mean of 2.72 and 4.20.
+        let okay_center = (2.72 + 4.20) / 2.0;
+        let want_got_start = okay_center + 0.45 * (4.38 - okay_center);
+        assert!(
+            (words[1].start - want_got_start).abs() < 1e-4,
+            "got start={} want={want_got_start}",
+            words[1].start
+        );
+        // Far period excluded: "now." centers on its speech alone.
+        assert_eq!(words[2].word, "now.");
+        let want_now_end = 16.34 + 0.45 * (23.30 - 16.34);
+        assert!(
+            (words[2].end - want_now_end).abs() < 1e-4,
+            "now end={} want={want_now_end}",
+            words[2].end
+        );
+        // Radius zero excludes both; infinity keeps both.
+        let none = fold(0.0);
+        assert!((none[1].start - (2.72 + 0.45 * (4.38 - 2.72))).abs() < 1e-4);
+        let all = fold(f32::INFINITY);
+        assert!((all[1].start - want_got_start).abs() < 1e-4);
+        assert!((all[2].end - (19.48 + 0.45 * (23.30 - 19.48))).abs() < 1e-4);
+    }
+
+    #[test]
+    fn punctuation_only_word_keeps_a_fallback_center_when_ignored() {
+        // A standalone "..." has no content piece: it must keep the mean over
+        // its own pieces rather than being dropped.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "hi",
+                        2 => " ...",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 1.0,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 2.0,
+                probability: None,
+            },
+        ];
+        let words = seq2seq_word_timestamps_from_token_times(
+            &token_times,
+            0.0,
+            3.0,
+            BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+            &pieces,
+            0.5,
+            0.0,
+            f32::INFINITY,
+            0.0,
+            f32::INFINITY,
+        )
+        .unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].word, "...");
+        assert!((words[1].start - 1.5).abs() < 1e-6);
+        assert!((words[1].end - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interior_half_span_clamp_leaves_a_pause_as_silence() {
+        // Two words 7 s apart: the midpoint split would hand each ~3 s of
+        // pause. The clamp bounds each side at the half-span instead.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "now",
+                        2 => " Alright",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 16.34,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 23.30,
+                probability: None,
+            },
+        ];
+        let fold = |half: f32| {
+            seq2seq_word_timestamps_from_token_times(
+                &token_times,
+                0.0,
+                30.0,
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                &pieces,
+                0.45,
+                0.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                half,
+            )
+            .unwrap()
+        };
+        let split = fold(f32::INFINITY);
+        let seam = 16.34 + 0.45 * (23.30 - 16.34);
+        assert!((split[0].end - seam).abs() < 1e-4);
+        assert!((split[1].start - seam).abs() < 1e-4);
+        let clamped = fold(1.0);
+        assert!(
+            (clamped[0].end - 17.34).abs() < 1e-4,
+            "end={}",
+            clamped[0].end
+        );
+        assert!(
+            (clamped[1].start - 22.30).abs() < 1e-4,
+            "start={}",
+            clamped[1].start
+        );
+        // The pause between the clamped edges stays real silence, and the
+        // timeline stays monotone and non-overlapping.
+        assert!(clamped[0].end < clamped[1].start);
+        assert!(clamped[0].start <= clamped[0].end);
+    }
+
+    #[test]
+    fn interior_half_span_clamp_is_noop_in_continuous_speech() {
+        // Neighbours a normal 0.2 s apart: no boundary sits 1.0 s from a
+        // center, so the fold is byte-identical with the clamp on.
+        let pieces = |ids: &[u32]| {
+            Ok::<_, std::convert::Infallible>(
+                ids.iter()
+                    .map(|id| match id {
+                        1 => "going",
+                        2 => " this",
+                        3 => " way",
+                        other => panic!("unexpected token {other}"),
+                    })
+                    .collect::<String>(),
+            )
+        };
+        let token_times = vec![
+            Seq2SeqTokenTime {
+                token_id: 1,
+                center_seconds: 12.10,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 2,
+                center_seconds: 12.30,
+                probability: None,
+            },
+            Seq2SeqTokenTime {
+                token_id: 3,
+                center_seconds: 12.55,
+                probability: None,
+            },
+        ];
+        let fold = |half: f32| {
+            seq2seq_word_timestamps_from_token_times(
+                &token_times,
+                0.0,
+                30.0,
+                BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+                &pieces,
+                0.45,
+                0.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                half,
+            )
+            .unwrap()
+        };
+        let plain = fold(f32::INFINITY);
+        let clamped = fold(1.0);
+        assert_eq!(plain.len(), clamped.len());
+        for (a, b) in plain.iter().zip(clamped.iter()) {
+            assert!((a.start - b.start).abs() < 1e-6);
+            assert!((a.end - b.end).abs() < 1e-6);
+        }
     }
 }

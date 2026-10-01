@@ -114,6 +114,58 @@ fn refine_dtw_onsets_clamps_a_word_at_or_past_the_end() {
     assert_eq!(out[1].end, 16.0, "unrefined; must not panic");
 }
 
+/// A single envelope frame crossing the silence ceiling (a bed crackle) does
+/// not void an otherwise-true leading pause; a sustained crossing would. The
+/// push fires at the run's onset, 3.8 s, instead of bailing the word --
+/// mirroring the offset pass's crackle tolerance.
+#[test]
+fn refine_dtw_onsets_survives_a_single_ceiling_crackle_frame() {
+    let mut env = refine_fixture_envelope();
+    env[120] = 0.03; // above the 0.025 silence ceiling (5% of the 0.5 clip peak)
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+}
+
+/// A sustained run of frames above the silence ceiling in the front half is
+/// still a bed, not a pause: the push is refused and the word keeps its fold
+/// position. The thin fixture (median 0.001) isolates the ceiling gate: the
+/// front mean stays below both the threshold and the absolute quiet line
+/// while 4 consecutive frames cross the 0.025 ceiling.
+#[test]
+fn refine_dtw_onsets_refuses_a_sustained_ceiling_crossing() {
+    let mut env = refine_fixture_envelope();
+    for s in env[110..114].iter_mut() {
+        *s = 0.05; // 4 consecutive frames above the 0.025 ceiling
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+}
+
+/// A bed-level front half -- below the slice-relative threshold yet above the
+/// absolute quiet line -- is never trusted as a pause, even with no ceiling
+/// crossing and no active speech in it. The dense fixture (median 0.02) would
+/// otherwise proceed to the onset search and fire at the word's own run at
+/// 3.8 s; the absolute line bails it first and the word keeps its fold start.
+#[test]
+fn refine_dtw_onsets_refuses_a_bed_level_front() {
+    let mut env = vec![0.005f32; 750];
+    env[400] = 0.1; // clip peak; contrast 5x stays on the dense branch
+    for s in env[0..375].iter_mut() {
+        *s = 0.02; // dense floor elsewhere so the median is 0.02
+    }
+    for s in env[190..200].iter_mut() {
+        *s = 0.25; // the word's own onset run at [3.8, 4.0)
+    }
+    for s in env[100..150].iter_mut() {
+        *s = 0.03; // bed-level front: below the 0.0356 threshold, above quiet
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+}
+
 /// No envelope (a run without cross-attention word timestamps) is a byte-exact
 /// no-op.
 #[test]
@@ -207,6 +259,33 @@ fn refine_dtw_offsets_pulls_a_word_below_the_absolute_floor() {
     ];
     let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
     assert!((out[1].end - 2.4).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A bed-level back half -- below the slice-relative threshold yet above the
+/// absolute quiet line -- is never trusted as trailing silence. The dense
+/// fixture (median 0.02) would otherwise retreat the word to its run's offset
+/// at 2.6 s; the absolute line bails it first and the word keeps its fold end.
+#[test]
+fn refine_dtw_offsets_refuses_a_bed_level_back() {
+    let mut env = vec![0.005f32; 750];
+    env[400] = 0.1; // clip peak; contrast 5x stays on the dense branch
+    for s in env[0..375].iter_mut() {
+        *s = 0.02; // dense floor elsewhere so the median is 0.02
+    }
+    for s in env[100..130].iter_mut() {
+        *s = 0.25; // the word's own run at [2.0, 2.6)
+    }
+    for s in env[130..200].iter_mut() {
+        *s = 0.03; // bed-level back: below the 0.0356 threshold, above quiet
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
     assert!((out[1].start - 2.0).abs() < 1e-4);
 }
 
@@ -433,6 +512,19 @@ fn dtw_silence_ceiling_rises_off_the_floor_only_on_thin_floors() {
         (thin_peak_wins - 0.015).abs() < 1e-9,
         "thin_peak_wins={thin_peak_wins}"
     );
+}
+
+/// The edge-refiner ceiling never drops below twice the slice median: on a
+/// dense slice (median 0.02, peak 0.13) 5%-of-peak is 0.0065 -- below the
+/// floor itself, so every ordinary floor frame would void the hollow check.
+/// The edge floor raises it to 0.04. On a thin floor the shared ceiling
+/// already dominates and the edge ceiling matches it exactly.
+#[test]
+fn dtw_edge_silence_ceiling_floors_at_twice_the_median() {
+    let dense = whisper_dtw_edge_silence_ceiling(0.02, 0.13);
+    assert!((dense - 0.04).abs() < 1e-9, "dense={dense}");
+    let thin = whisper_dtw_edge_silence_ceiling(0.01, 0.20);
+    assert!((thin - 0.03).abs() < 1e-9, "thin={thin}");
 }
 
 // ---------------------------------------------------------------------------

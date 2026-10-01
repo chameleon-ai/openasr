@@ -229,6 +229,46 @@ fn whisper_dtw_onset_lead() -> f32 {
 /// and far below the runaway regime; only the tail is trimmed, never the start.
 const WHISPER_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// How far an interior word's window may extend on either side of its own
+/// center before the fold leaves the rest of an adjacent pause as real
+/// silence (see `max_interior_half_span_seconds`). Only inter-center gaps past
+/// ~2.2 s bind it, so continuous speech is untouched; the longest legitimate
+/// words on the test clips stay under twice this. Honored with the same
+/// deployment env-override convention as the other DTW tunables.
+const WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS: f32 = 1.0;
+
+/// The interior half-span in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS`]). A bare environment is
+/// byte-identical to the constant.
+fn whisper_dtw_max_interior_half_span_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS)
+}
+
+/// How far a punctuation-only token piece may sit from its word's content mean
+/// and still count toward the word's center (see
+/// `punctuation_trust_radius_seconds`). A comma parked within this of its
+/// word is the DTW path's best statement of the word's offset -- arnold's
+/// comma 0.48 s past "Rick", dog's 1.48 s past "Okay" next to the following
+/// onset -- while the multi-second pause linger behind the width-cap cluster
+/// (gilbert 2.2 s, mikan 2.6 s, tenma 6.3 s) is excluded. Honored with the
+/// same deployment env-override convention as the other DTW tunables.
+const WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS: f32 = 1.75;
+
+/// The punctuation trust radius in use, honoring the deployment env override
+/// so a tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS`]). A bare environment is
+/// byte-identical to the constant.
+fn whisper_dtw_punctuation_trust_radius_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS)
+}
+
 /// How far ahead of the decoded `<|start|>` bound a run's measured content onset
 /// must sit before the decoded bound is treated as bracketing leading silence
 /// and the first word's start is advanced to that onset (the leading-silence
@@ -419,6 +459,46 @@ fn whisper_dtw_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
     }
 }
 
+/// Absolute RMS level below which a word half reads as trusted digital
+/// silence, regardless of the slice's own noise floor.
+///
+/// The relative gates adapt to each slice, but on a dense slice (music bed,
+/// game audio, voice FX) a *relative* dip -- a bed-level passage at half the
+/// median -- passes every relative hollow check while still carrying
+/// sustained audio: the sakuracon slice reads 0.05-0.19 through the whole
+/// "pause", arnold's smoking tail 0.026, and trimming there shaves real
+/// speech. True pauses on the test clips read at or below 0.01, so requiring
+/// the hollow half's mean below this line keeps every genuine-silence
+/// refinement while refusing bed-level passages outright. When it refuses,
+/// the word keeps its fold position (an overshoot into the pause), which is
+/// the safe direction: coverage over precision.
+const WHISPER_DTW_ABSOLUTE_QUIET_RMS: f64 = 0.02;
+
+/// Multiple of the slice median (the noise floor) the edge-refiner silence
+/// ceiling never drops below.
+///
+/// The onset/offset hollow checks ask whether a word half sits in trusted
+/// silence. On a dense slice (continuous bed, game audio, voice FX) the median
+/// itself is a real level, and 5%-of-peak can sit far *below* it -- then every
+/// ordinary floor frame crosses the ceiling and no genuine pause ever reads as
+/// hollow, so the refiners go mute exactly on the noisy clips that stretch
+/// words across pauses. Flooring the edge ceiling at twice the median keeps a
+/// true pause (frames several times below the floor) trusted while a bed-level
+/// passage (at the median) still crosses it on sustained frames. This floor
+/// applies to the edge refiners only: the pre-fold reanchor walks *backward*
+/// through ceiling-quiet frames to a distant speech run, and treating a music
+/// bed as walkable silence there would attach punctuation to unrelated audio,
+/// so the reanchor keeps the conservative ceiling above untouched.
+const WHISPER_DTW_EDGE_SILENCE_FLOOR_MEDIAN_MULTIPLE: f64 = 2.0;
+
+/// The trusted-silence ceiling for the onset/offset edge refiners: the shared
+/// [`whisper_dtw_silence_ceiling`], floored at twice the slice median so it
+/// can never sit below the floor it judges against.
+fn whisper_dtw_edge_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
+    whisper_dtw_silence_ceiling(noise_floor, clip_peak)
+        .max(noise_floor * WHISPER_DTW_EDGE_SILENCE_FLOOR_MEDIAN_MULTIPLE)
+}
+
 /// Pull a word that the center fold landed in silence to its real audio onset.
 ///
 /// The DTW entry frame the fold treats as a word's center sits where the monotone
@@ -467,8 +547,10 @@ fn whisper_refine_dtw_word_onsets(
         return words;
     }
     // A front frame that reads at or above this is not true silence (see
-    // [`whisper_dtw_silence_ceiling`]).
-    let silence_ceiling = whisper_dtw_silence_ceiling(noise_floor, clip_peak);
+    // [`whisper_dtw_edge_silence_ceiling`]): the edge floor keeps the ceiling
+    // off the sub-median regime where ordinary floor frames would void every
+    // genuine pause on a dense slice.
+    let silence_ceiling = whisper_dtw_edge_silence_ceiling(noise_floor, clip_peak);
     let min_quiet_frames =
         ((WHISPER_DTW_ONSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
     for word in words.iter_mut().skip(1) {
@@ -498,23 +580,37 @@ fn whisper_refine_dtw_word_onsets(
         let is_above = |index: usize| f64::from(window[index]) >= threshold;
         let front_len = (window_len / 2).clamp(1, window_len);
         // A hollow word: the front half sits in true silence, not just a quiet
-        // passage. Three conditions on the front half of the window:
+        // passage. Four conditions on the front half of the window:
         //   1. its *mean* level is below the noise floor (not just a fraction of
         //      frames -- a single loud blip in a quiet front must not pass);
-        //   2. *no* front frame crosses the silence ceiling (5% of clip peak),
+        //   2. its mean is below the absolute quiet line, so a bed-level dip
+        //      on a dense slice (which clears every relative gate) never reads
+        //      as a pause (see [`WHISPER_DTW_ABSOLUTE_QUIET_RMS`]);
+        //   3. no *sustained* run of front frames crosses the silence ceiling,
         //      so a music floor never masquerades as a pause (see
-        //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]);
-        //   3. fewer than half its frames are above the floor (no sustained
+        //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]) while a single
+        //      bed-crackle frame does not void a legitimate pause;
+        //   4. fewer than half its frames are above the floor (no sustained
         //      speech leaking into the front).
         let front_mean =
             (0..front_len).map(|i| f64::from(window[i])).sum::<f64>() / front_len as f64;
-        let front_max = (0..front_len)
-            .map(|i| f64::from(window[i]))
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0);
+        let mut ceiling_sustained = false;
+        let mut ceiling_run = 0usize;
+        for &sample in window.iter().take(front_len) {
+            ceiling_run = if f64::from(sample) > silence_ceiling {
+                ceiling_run + 1
+            } else {
+                0
+            };
+            if ceiling_run >= WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
         let front_above = (0..front_len).filter(|&i| is_above(i)).count() as f64 / front_len as f64;
         if front_mean >= threshold
-            || front_max > silence_ceiling
+            || front_mean >= WHISPER_DTW_ABSOLUTE_QUIET_RMS
+            || ceiling_sustained
             || front_above > WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
         {
             continue;
@@ -668,9 +764,9 @@ fn whisper_refine_dtw_word_offsets(
         return words;
     }
     // A back frame that reads at or above this is not true silence (see
-    // [`whisper_dtw_silence_ceiling`], reused as the silence ceiling for the
-    // trailing half of a word).
-    let silence_ceiling = whisper_dtw_silence_ceiling(noise_floor, clip_peak);
+    // [`whisper_dtw_edge_silence_ceiling`], reused as the silence ceiling for
+    // the trailing half of a word).
+    let silence_ceiling = whisper_dtw_edge_silence_ceiling(noise_floor, clip_peak);
     let min_quiet_frames =
         ((WHISPER_DTW_OFFSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
     let last_frame = levels.len() - 1;
@@ -700,12 +796,15 @@ fn whisper_refine_dtw_word_offsets(
         let back_len = (window_len / 2).clamp(1, window_len);
         let back_start = window_len.saturating_sub(back_len);
         // A hollow word: the back half sits in true silence, not just a quiet
-        // passage. Three conditions on the back half of the window, mirroring the
+        // passage. Four conditions on the back half of the window, mirroring the
         // onset pass's front-half check: (1) its *mean* is below the noise floor;
-        // (2) no *sustained* run of back frames crosses the silence ceiling, so a
-        // music floor never masquerades as trailing silence while a single bed
-        // crackle does not void a legitimate pause; (3) fewer than half its frames
-        // are above the floor (no sustained speech leaking into the back).
+        // (2) its mean is below the absolute quiet line, so a bed-level dip on
+        // a dense slice never reads as trailing silence (see
+        // [`WHISPER_DTW_ABSOLUTE_QUIET_RMS`]); (3) no *sustained* run of back
+        // frames crosses the silence ceiling, so a music floor never
+        // masquerades as trailing silence while a single bed crackle does not
+        // void a legitimate pause; (4) fewer than half its frames are above
+        // the floor (no sustained speech leaking into the back).
         let back_mean = (back_start..window_len)
             .map(|i| f64::from(window[i]))
             .sum::<f64>()
@@ -726,6 +825,7 @@ fn whisper_refine_dtw_word_offsets(
         let back_above =
             (back_start..window_len).filter(|&i| is_above(i)).count() as f64 / back_len as f64;
         if back_mean >= threshold
+            || back_mean >= WHISPER_DTW_ABSOLUTE_QUIET_RMS
             || ceiling_sustained
             || back_above > WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX as f64
         {
@@ -1323,6 +1423,8 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
                     f32::INFINITY,
+                    whisper_dtw_punctuation_trust_radius_seconds(),
+                    whisper_dtw_max_interior_half_span_seconds(),
                 ) {
                     block_words = whisper_cap_dtw_word_spans(block_words, seconds_per_frame);
                     words.extend(block_words);
@@ -1417,7 +1519,7 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     seconds_per_frame,
                 );
                 let onset_lead = whisper_dtw_onset_lead();
-                let mut words = seq2seq_word_timestamps_from_token_times(
+                let fold_words = seq2seq_word_timestamps_from_token_times(
                     &token_times,
                     band_start_secs,
                     band_end_secs,
@@ -1426,8 +1528,10 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
                     f32::INFINITY,
-                )
-                .map_err(|error| {
+                    whisper_dtw_punctuation_trust_radius_seconds(),
+                    whisper_dtw_max_interior_half_span_seconds(),
+                );
+                let mut words = fold_words.map_err(|error| {
                     WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
                         reason: format!("whisper DTW word timestamp token decode failed: {error}"),
                     }
@@ -1470,6 +1574,8 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
         &decode_text,
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
+        f32::INFINITY,
+        f32::INFINITY,
         f32::INFINITY,
     )
     .map(|words| {

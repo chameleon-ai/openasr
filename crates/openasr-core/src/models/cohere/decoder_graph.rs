@@ -671,6 +671,8 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         COHERE_DTW_BOUNDARY_FRACTION,
         onset_lead,
         COHERE_DTW_MAX_WORD_SPAN_SECONDS,
+        f32::INFINITY,
+        f32::INFINITY,
     )?;
     // `word_centers_to_timestamps` anchors the first word's start to
     // `segment_start` (the band start) and the last word's end to
@@ -758,6 +760,8 @@ fn cohere_peak_fallback_word_timestamps<E>(
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
         COHERE_DTW_MAX_WORD_SPAN_SECONDS,
+        f32::INFINITY,
+        f32::INFINITY,
     )
 }
 
