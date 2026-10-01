@@ -467,12 +467,14 @@ fn whisper_dtw_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
 /// median -- passes every relative hollow check while still carrying
 /// sustained audio: the sakuracon slice reads 0.05-0.19 through the whole
 /// "pause", arnold's smoking tail 0.026, and trimming there shaves real
-/// speech. True pauses on the test clips read at or below 0.01, so requiring
-/// the hollow half's mean below this line keeps every genuine-silence
-/// refinement while refusing bed-level passages outright. When it refuses,
-/// the word keeps its fold position (an overshoot into the pause), which is
-/// the safe direction: coverage over precision.
-const WHISPER_DTW_ABSOLUTE_QUIET_RMS: f64 = 0.02;
+/// speech. True pauses on the test clips read at or below ~0.1× the slice's
+/// noise floor, while bed dips sit at 0.5–1.0× median. Requiring the hollow
+/// half's mean below a small multiple of the slice's own floor blocks bed-dip
+/// fires on dense clips without touching genuine-silence refiners on
+/// thin-floor clips (where the relative threshold is already tighter). When it
+/// refuses, the word keeps its fold position (an overshoot into the pause),
+/// which is the safe direction: coverage over precision.
+const WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE: f64 = 0.3;
 
 /// Multiple of the slice median (the noise floor) the edge-refiner silence
 /// ceiling never drops below.
@@ -583,9 +585,10 @@ fn whisper_refine_dtw_word_onsets(
         // passage. Four conditions on the front half of the window:
         //   1. its *mean* level is below the noise floor (not just a fraction of
         //      frames -- a single loud blip in a quiet front must not pass);
-        //   2. its mean is below the absolute quiet line, so a bed-level dip
-        //      on a dense slice (which clears every relative gate) never reads
-        //      as a pause (see [`WHISPER_DTW_ABSOLUTE_QUIET_RMS`]);
+        //   2. its mean is below a fraction of the slice's noise floor, so a
+        //      bed-level dip on a dense slice (which clears every relative gate)
+        //      never reads as a pause (see
+        //      [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]);
         //   3. no *sustained* run of front frames crosses the silence ceiling,
         //      so a music floor never masquerades as a pause (see
         //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]) while a single
@@ -594,6 +597,13 @@ fn whisper_refine_dtw_word_onsets(
         //      speech leaking into the front).
         let front_mean =
             (0..front_len).map(|i| f64::from(window[i])).sum::<f64>() / front_len as f64;
+        // The absolute quiet threshold scales with the slice's noise floor.
+        // On a dense slice (median ~0.03) a bed dip at 0.015 is 0.5× median
+        // and is blocked; on a quiet clip (median ~0.001) true silence at
+        // 0.001 is 1.0× median and passes the relative gate anyway.
+        let absolute_quiet_threshold = noise_floor * WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+        let is_dense_slice =
+            clip_peak / noise_floor.max(f64::EPSILON) < whisper_dtw_thin_floor_contrast();
         let mut ceiling_sustained = false;
         let mut ceiling_run = 0usize;
         for &sample in window.iter().take(front_len) {
@@ -609,7 +619,7 @@ fn whisper_refine_dtw_word_onsets(
         }
         let front_above = (0..front_len).filter(|&i| is_above(i)).count() as f64 / front_len as f64;
         if front_mean >= threshold
-            || front_mean >= WHISPER_DTW_ABSOLUTE_QUIET_RMS
+            || (is_dense_slice && front_mean >= absolute_quiet_threshold)
             || ceiling_sustained
             || front_above > WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
         {
@@ -798,10 +808,10 @@ fn whisper_refine_dtw_word_offsets(
         // A hollow word: the back half sits in true silence, not just a quiet
         // passage. Four conditions on the back half of the window, mirroring the
         // onset pass's front-half check: (1) its *mean* is below the noise floor;
-        // (2) its mean is below the absolute quiet line, so a bed-level dip on
-        // a dense slice never reads as trailing silence (see
-        // [`WHISPER_DTW_ABSOLUTE_QUIET_RMS`]); (3) no *sustained* run of back
-        // frames crosses the silence ceiling, so a music floor never
+        // (2) its mean is below a fraction of the slice's noise floor, so a
+        // bed-level dip on a dense slice never reads as trailing silence (see
+        // [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]); (3) no *sustained* run
+        // of back frames crosses the silence ceiling, so a music floor never
         // masquerades as trailing silence while a single bed crackle does not
         // void a legitimate pause; (4) fewer than half its frames are above
         // the floor (no sustained speech leaking into the back).
@@ -809,6 +819,17 @@ fn whisper_refine_dtw_word_offsets(
             .map(|i| f64::from(window[i]))
             .sum::<f64>()
             / back_len as f64;
+        // The absolute quiet threshold scales with the slice's noise floor.
+        // On a dense slice (median ~0.03) a bed dip at 0.015 is 0.5× median
+        // and is blocked; on a quiet clip (median ~0.001) true silence at
+        // 0.001 is 1.0× median and passes the relative gate anyway.
+        let absolute_quiet_threshold = noise_floor * WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+        // The absolute check only applies on dense slices (contrast < 8). On thin
+        // floors the relative threshold is already tight and the ceiling is
+        // raised to 3× median; the absolute check would only block genuine
+        // silence refiners on quiet clips.
+        let is_dense_slice =
+            clip_peak / noise_floor.max(f64::EPSILON) < whisper_dtw_thin_floor_contrast();
         let mut ceiling_sustained = false;
         let mut ceiling_run = 0usize;
         for &sample in window.iter().skip(back_start) {
@@ -825,7 +846,7 @@ fn whisper_refine_dtw_word_offsets(
         let back_above =
             (back_start..window_len).filter(|&i| is_above(i)).count() as f64 / back_len as f64;
         if back_mean >= threshold
-            || back_mean >= WHISPER_DTW_ABSOLUTE_QUIET_RMS
+            || (is_dense_slice && back_mean >= absolute_quiet_threshold)
             || ceiling_sustained
             || back_above > WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX as f64
         {

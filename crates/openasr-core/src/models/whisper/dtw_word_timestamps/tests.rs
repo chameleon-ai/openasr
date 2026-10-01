@@ -145,18 +145,19 @@ fn refine_dtw_onsets_refuses_a_sustained_ceiling_crossing() {
 
 /// A bed-level front half -- below the slice-relative threshold yet above the
 /// absolute quiet line -- is never trusted as a pause, even with no ceiling
-/// crossing and no active speech in it. The dense fixture (median 0.02) would
-/// otherwise proceed to the onset search and fire at the word's own run at
-/// 3.8 s; the absolute line bails it first and the word keeps its fold start.
+/// crossing and no active speech in it. The dense fixture (median 0.02, peak
+/// 0.1 → contrast 5) would otherwise proceed to the onset search and fire at
+/// the word's own run at 3.8 s; the absolute line bails it first and the word
+/// keeps its fold start.
 #[test]
 fn refine_dtw_onsets_refuses_a_bed_level_front() {
     let mut env = vec![0.005f32; 750];
-    env[400] = 0.1; // clip peak; contrast 5x stays on the dense branch
+    env[400] = 0.1; // clip peak = 0.1; contrast 5x stays on the dense branch
     for s in env[0..375].iter_mut() {
         *s = 0.02; // dense floor elsewhere so the median is 0.02
     }
     for s in env[190..200].iter_mut() {
-        *s = 0.25; // the word's own onset run at [3.8, 4.0)
+        *s = 0.1; // the word's own onset run at [3.8, 4.0)
     }
     for s in env[100..150].iter_mut() {
         *s = 0.03; // bed-level front: below the 0.0356 threshold, above quiet
@@ -269,12 +270,12 @@ fn refine_dtw_offsets_pulls_a_word_below_the_absolute_floor() {
 #[test]
 fn refine_dtw_offsets_refuses_a_bed_level_back() {
     let mut env = vec![0.005f32; 750];
-    env[400] = 0.1; // clip peak; contrast 5x stays on the dense branch
+    env[400] = 0.1; // clip peak = 0.1; contrast 5x stays on the dense branch
     for s in env[0..375].iter_mut() {
         *s = 0.02; // dense floor elsewhere so the median is 0.02
     }
     for s in env[100..130].iter_mut() {
-        *s = 0.25; // the word's own run at [2.0, 2.6)
+        *s = 0.1; // the word's own run at [2.0, 2.6)
     }
     for s in env[130..200].iter_mut() {
         *s = 0.03; // bed-level back: below the 0.0356 threshold, above quiet
