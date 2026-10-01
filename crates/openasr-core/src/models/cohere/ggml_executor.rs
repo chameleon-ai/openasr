@@ -16,6 +16,7 @@ use super::decoder_graph::{
     CohereDecoderGraphError, CohereDecoderGraphRuntime,
     run_cohere_decoder_graph_short_form_with_runtime,
 };
+use super::dtw_word_timestamps::audio_onset_seconds;
 use super::encoder_graph::{CohereTranscribeEncoderError, CohereTranscribeEncoderGraphRuntime};
 use super::frontend::{
     CohereTranscribeFrontendError, CohereTranscribeMelFeatures,
@@ -767,55 +768,6 @@ fn cohere_runtime_cache_slot_unavailable() -> CohereTranscribeGgmlExecutorError 
 
 fn audio_duration_seconds(prepared_audio: &GgmlAsrPreparedAudioView) -> f32 {
     prepared_audio.samples_f32.len() as f32 / prepared_audio.sample_rate_hz.max(1) as f32
-}
-
-/// Window (seconds) and relative-to-peak level drop (dB) used to detect where
-/// real audio content begins inside a chunk. 0.1s isolates a word from
-/// surrounding silence at 16kHz, and a 16 dB drop below the chunk's loudest
-/// window clears genuine room tone while catching even a quiet opener.
-const COHERE_ONSET_WINDOW_SECONDS: f32 = 0.1;
-const COHERE_ONSET_RELATIVE_DROP_DB: f32 = 16.0;
-
-/// Seconds from the start of the chunk at which measurable audio energy first
-/// appears, or `0.0` when none does. Used to anchor the DTW speech band when the
-/// sink strip has displaced the first word's attention peak (see
-/// `cohere_dtw_word_timestamps`): a chunk that opens with silence but whose
-/// first token's peak was substituted away must not have its alignment band
-/// start past the real audio onset. Measured on the raw chunk samples -- the
-/// same source `audio_duration_seconds` reads.
-fn audio_onset_seconds(samples: &[f32], sample_rate_hz: u32) -> f32 {
-    let rate = sample_rate_hz.max(1) as f32;
-    let window = (COHERE_ONSET_WINDOW_SECONDS * rate) as usize;
-    if samples.is_empty() || window == 0 {
-        return 0.0;
-    }
-    let mut rms = Vec::new();
-    let mut peak: f32 = 0.0;
-    let mut cursor = 0usize;
-    while cursor + window <= samples.len() {
-        let mut energy = 0.0f64;
-        for &s in &samples[cursor..cursor + window] {
-            let f = s as f64;
-            energy += f * f;
-        }
-        let value = (energy / window as f64).sqrt() as f32;
-        peak = peak.max(value);
-        rms.push(value);
-        cursor += window;
-    }
-    let Some(first) = rms.first().copied() else {
-        return 0.0;
-    };
-    let threshold = peak * 10f32.powf(-COHERE_ONSET_RELATIVE_DROP_DB / 20.0);
-    if peak <= 0.0 || first > threshold {
-        return 0.0;
-    }
-    for (index, &value) in rms.iter().enumerate() {
-        if value > threshold {
-            return index as f32 * COHERE_ONSET_WINDOW_SECONDS;
-        }
-    }
-    0.0
 }
 
 impl CohereTranscribeGgmlExecutor {
@@ -2506,41 +2458,5 @@ mod tests {
                 .expect("mode=off single-window transcribe must succeed, not fail closed");
             assert_eq!(result.transcription.text, BASELINE_TEXT);
         });
-    }
-
-    #[test]
-    fn audio_onset_seconds_tracks_the_first_non_silent_window() {
-        let rate = 16_000;
-        let silent = 16_000; // 1.0s
-        let speech = 32_000; // 2.0s
-        let mut samples = vec![0.001_f32; silent];
-        // A gentle low-frequency tone so every window after onset is clearly
-        // above the relative drop threshold.
-        for i in 0..speech {
-            samples.push(0.5 * ((i as f32 * 0.02).sin()));
-        }
-        let onset = audio_onset_seconds(&samples, rate);
-        assert!(
-            (0.9..=1.15).contains(&onset),
-            "onset should sit at the 1.0s silence-to-speech boundary, got {onset}"
-        );
-    }
-
-    #[test]
-    fn audio_onset_seconds_at_chunk_edge_is_zero() {
-        // Speech begins immediately: the first window already clears the
-        // relative threshold, so the onset collapses to the chunk start.
-        let rate = 16_000;
-        let samples: Vec<f32> = (0..48_000u32)
-            .map(|i| 0.5 * ((i as f32 * 0.02).sin()))
-            .collect();
-        assert_eq!(audio_onset_seconds(&samples, rate), 0.0);
-    }
-
-    #[test]
-    fn audio_onset_seconds_all_silent_is_zero() {
-        let rate = 16_000;
-        let samples = vec![0.0_f32; 16_000 * 5];
-        assert_eq!(audio_onset_seconds(&samples, rate), 0.0);
     }
 }

@@ -31,6 +31,7 @@ pub(crate) mod capacity;
 mod decode_budget;
 mod decoder_graph;
 mod decoder_weights;
+mod dtw_word_timestamps;
 pub(crate) mod encoder_graph;
 mod encoder_weights;
 mod frontend;
