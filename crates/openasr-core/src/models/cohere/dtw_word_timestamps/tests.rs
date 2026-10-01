@@ -122,7 +122,7 @@ fn cohere_dtw_onset_lead_caps_at_max_seconds() {
 fn cohere_dtw_word_timestamps_returns_empty_without_alignments() {
     let metadata = cohere_transcribe_metadata_fixture();
     let decode_text = |_token_ids: &[u32]| Ok(String::new());
-    let words = cohere_dtw_word_timestamps::<()>(&[], metadata, &[], 1.0, 0.0, &decode_text)
+    let words = cohere_dtw_word_timestamps::<()>(&[], metadata, &[], 1.0, 0.0, None, &decode_text)
         .expect("dtw words");
     assert!(words.is_empty(), "no alignments -> no words");
 }
@@ -157,6 +157,7 @@ fn cohere_dtw_word_timestamps_places_word_at_earlier_attention() {
         &[0.99, 0.99],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -171,14 +172,14 @@ fn cohere_dtw_word_timestamps_places_word_at_earlier_attention() {
         (words[0].start - 0.0).abs() < 1e-3,
         "first word must start at the band start, got {words:?}"
     );
-    // The last word's end is no longer pinned to the segment end; the edge
-    // clamp bounds it to `last_center + COHERE_DTW_MAX_WORD_SPAN_SECONDS/2`.
-    // Here both centers are 0.0 so the last word ends at 0.75s instead of
-    // stretching the full band end at 0.96s.
-    let expected_last_end = COHERE_DTW_MAX_WORD_SPAN_SECONDS / 2.0;
+    // The last word's end is anchored to the band end: the fold's edge clamp is
+    // deliberately disabled (`max_edge_word_span = INF`), so what keeps an edge
+    // word off the surrounding silence is the audible onset/offset refiner, not a
+    // blind positional bound. With no envelope supplied here those passes are
+    // no-ops, so the end stays where the fold put it.
     assert!(
-        (words[1].end - expected_last_end).abs() < 1e-3,
-        "last word must end within COHERE_DTW_MAX_WORD_SPAN_SECONDS/2 of its center, got {words:?}"
+        (words[1].end - duration).abs() < 1e-3,
+        "last word must end at the band end, got {words:?}"
     );
     // The timeline stays monotone and non-overlapping.
     assert!(words[1].start >= words[0].end - 1e-6);
@@ -473,6 +474,7 @@ fn cohere_dtw_word_timestamps_uses_dtw_when_sink_strip_restores_order() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -536,6 +538,7 @@ fn cohere_dtw_word_timestamps_falls_back_when_sink_strip_cannot_save_order() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -590,6 +593,7 @@ fn cohere_dtw_word_timestamps_uses_tolerant_dtw_when_strip_leaves_minor_zigzag_o
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -643,6 +647,7 @@ fn cohere_dtw_word_timestamps_falls_back_when_strip_zigzag_fits_short_window() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -684,6 +689,7 @@ fn cohere_dtw_word_timestamps_falls_back_when_peaks_not_aligned() {
         &[0.99, 0.99],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -778,6 +784,7 @@ fn cohere_dtw_word_timestamps_caps_a_word_span_swallowed_by_a_pause() {
         &[0.99, 0.99],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -844,6 +851,7 @@ fn cohere_dtw_word_timestamps_band_skips_stripped_sink_on_long_window() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -920,6 +928,7 @@ fn cohere_dtw_word_timestamps_advances_band_on_measured_leading_silence() {
         &probs,
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -942,6 +951,7 @@ fn cohere_dtw_word_timestamps_advances_band_on_measured_leading_silence() {
         &probs,
         duration,
         onset,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -1000,6 +1010,7 @@ fn cohere_dtw_word_timestamps_uses_peak_fallback_on_long_zigzag_window() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("peak fallback words");
@@ -1026,6 +1037,20 @@ fn cohere_dtw_word_timestamps_uses_peak_fallback_on_long_zigzag_window() {
             "timeline must be monotone"
         );
         assert!(pair[0].end - 1e-6 <= pair[1].start, "no overlaps");
+    }
+    // The tier's per-word span cap applies here too. Without it a head token
+    // whose peak sits seconds into the chunk leaves the first word owning the
+    // whole lead-in (a ~15s-wide window on a 30s longform chunk), and the
+    // longform assembler reads word windows when it decides its seam trims --
+    // so one runaway window changes which words survive at a seam, i.e. the
+    // emitted text. Regression test for that coupling.
+    for word in &words {
+        assert!(
+            word.end - word.start <= COHERE_DTW_MAX_WORD_SPAN_SECONDS + 1e-3,
+            "peak-fallback word {:?} spans {}s, above the {COHERE_DTW_MAX_WORD_SPAN_SECONDS}s cap",
+            word.word,
+            word.end - word.start
+        );
     }
 }
 
@@ -1057,6 +1082,7 @@ fn cohere_dtw_word_timestamps_falls_back_to_uniform_on_short_zigzag_window() {
         &vec![0.99; token_ids.len()],
         duration,
         0.0,
+        None,
         &decode_text,
     )
     .expect("dtw words");
@@ -1064,4 +1090,417 @@ fn cohere_dtw_word_timestamps_falls_back_to_uniform_on_short_zigzag_window() {
         words.is_empty(),
         "short window below the peak-fallback threshold must fall back to uniform (empty), got {words:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// cohere_dtw_word_audio_rms_frames
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cohere_dtw_word_audio_rms_frames_hits_its_own_frame_grid() {
+    // 320 samples (0.02 s) per frame at 16 kHz: two frames of silence at the
+    // floor, one at a known level, and a short tail frame that must still be
+    // emitted rather than dropped.
+    let samples = vec![0.0f32; COHERE_DTW_ENVELOPE_FRAME_COUNT * 2 + 10];
+    let envelope = cohere_dtw_word_audio_rms_frames(&samples, 16_000).expect("envelope");
+    assert_eq!(envelope.len(), 3, "a short tail frame is still measured");
+    assert!(envelope.iter().all(|level| level.abs() < f32::EPSILON));
+
+    // A full frame of constant amplitude measures its own amplitude.
+    let loud = vec![0.5f32; COHERE_DTW_ENVELOPE_FRAME_COUNT * 3];
+    let envelope = cohere_dtw_word_audio_rms_frames(&loud, 16_000).expect("envelope");
+    assert_eq!(envelope.len(), 3);
+    assert!(envelope.iter().all(|level| (level - 0.5).abs() < 1e-6));
+}
+
+#[test]
+fn cohere_dtw_word_audio_rms_frames_declines_unusable_audio() {
+    // A non-16 kHz rate would break the fixed 0.02 s frame geometry the
+    // refiners index on, and a non-finite sample would poison every derived
+    // floor: both refuse rather than act on garbage.
+    assert!(cohere_dtw_word_audio_rms_frames(&[0.5f32; 1_000], 22_050).is_none());
+    assert!(cohere_dtw_word_audio_rms_frames(&[], 16_000).is_none());
+    let mut poisoned = vec![0.5f32; COHERE_DTW_ENVELOPE_FRAME_COUNT * 2];
+    poisoned[COHERE_DTW_ENVELOPE_FRAME_COUNT + 3] = f32::NAN;
+    assert!(cohere_dtw_word_audio_rms_frames(&poisoned, 16_000).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// cohere_dtw_silence_ceiling / cohere_dtw_edge_silence_ceiling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cohere_dtw_silence_ceiling_rises_off_the_floor_only_on_thin_floors() {
+    // A dense bed (peak within the contrast gate of the median) keeps the
+    // conservative 5%-of-peak ceiling.
+    let dense = cohere_dtw_silence_ceiling(0.10, 0.40);
+    assert!((dense - 0.02).abs() < 1e-9, "dense={dense}");
+    // A thin floor (20x contrast) where the floor multiple (3x) beats the peak
+    // fraction (5%).
+    let thin = cohere_dtw_silence_ceiling(0.01, 0.20);
+    assert!((thin - 0.03).abs() < 1e-9, "thin={thin}");
+    // A thin floor where the peak fraction still dominates.
+    let thin_peak_wins = cohere_dtw_silence_ceiling(0.005, 0.20);
+    assert!(
+        (thin_peak_wins - 0.015).abs() < 1e-9,
+        "thin={thin_peak_wins}"
+    );
+}
+
+#[test]
+fn cohere_dtw_edge_silence_ceiling_floors_at_twice_the_median() {
+    // On a dense chunk (median 0.02, peak 0.13) 5%-of-peak is 0.0065 -- below
+    // the floor itself, so every ordinary floor frame would void the hollow
+    // check. The edge floor raises it to 0.04.
+    let dense = cohere_dtw_edge_silence_ceiling(0.02, 0.13);
+    assert!((dense - 0.04).abs() < 1e-9, "dense={dense}");
+    // On a thin floor the shared ceiling already dominates, so the edge ceiling
+    // matches it exactly.
+    let thin = cohere_dtw_edge_silence_ceiling(0.01, 0.20);
+    assert!((thin - 0.03).abs() < 1e-9, "thin={thin}");
+}
+
+// ---------------------------------------------------------------------------
+// cohere_refine_dtw_word_onsets
+// ---------------------------------------------------------------------------
+
+/// A 15 s, 0.02 s/frame envelope (750 frames) at a 0.001 noise floor with a
+/// single 0.5 peak at 8 s that sets the chunk peak (and so the 5% silence
+/// ceiling). The [2.0, 4.0) word window is filled from 0.001 up to 3.8 s and a
+/// 0.25 speech onset occupies [3.8, 4.0).
+fn refine_fixture_envelope() -> Vec<f32> {
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[190..200].iter_mut() {
+        *level = 0.25;
+    }
+    envelope
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_pushes_true_silence_word_to_its_onset() {
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let envelope = refine_fixture_envelope();
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+    // The first word is never modified.
+    assert!((out[0].start - 0.5).abs() < 1e-4 && (out[0].end - 0.6).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_a_music_floor_front() {
+    // A low music floor filling the front half (a sustained level, so the
+    // front's mean sits above the floor) is not trusted as a pause.
+    let mut envelope = refine_fixture_envelope();
+    for level in envelope[100..190].iter_mut() {
+        *level = 0.021;
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+    assert!((out[1].end - 4.0).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_a_sustained_ceiling_crossing() {
+    // Four consecutive frames above the 0.025 ceiling (5% of the 0.5 peak) are
+    // a bed, not a pause, so the word keeps its fold position.
+    let mut envelope = refine_fixture_envelope();
+    for level in envelope[110..114].iter_mut() {
+        *level = 0.05;
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_survives_a_single_ceiling_crackle_frame() {
+    // One frame crossing the ceiling is a bed crackle, not a bed: the push still
+    // fires at the run's onset.
+    let mut envelope = refine_fixture_envelope();
+    envelope[120] = 0.03;
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_a_bed_level_front() {
+    // A dense chunk (median 0.02, peak 0.1 -> contrast 5) whose front half sits
+    // at a bed level: below the relative threshold yet above the absolute quiet
+    // line, so the word keeps its fold start rather than moving.
+    let mut envelope = vec![0.005f32; 750];
+    envelope[400] = 0.1;
+    for level in envelope[0..375].iter_mut() {
+        *level = 0.02;
+    }
+    for level in envelope[190..200].iter_mut() {
+        *level = 0.1;
+    }
+    for level in envelope[100..150].iter_mut() {
+        *level = 0.03;
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_clamps_a_word_at_or_past_the_end() {
+    // A word whose start maps past the last envelope frame (a longform chunk end)
+    // must not overrun the array; it is clamped and left unrefined.
+    let envelope = refine_fixture_envelope();
+    let words = vec![word("a", 0.5, 0.6), word("b", 15.5, 16.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 16.0);
+    assert_eq!(out[1].start, 15.5, "unrefined; must not panic");
+    assert_eq!(out[1].end, 16.0, "unrefined; must not panic");
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_noop_without_envelope() {
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, None, 15.0);
+    assert_eq!(out[0].start, 0.5);
+    assert_eq!(out[1].start, 2.0);
+    assert_eq!(out[1].end, 4.0);
+}
+
+// ---------------------------------------------------------------------------
+// cohere_refine_dtw_word_offsets
+// ---------------------------------------------------------------------------
+
+/// A 15 s, 0.02 s/frame envelope (750 frames) at a 0.001 noise floor with a
+/// single 0.5 peak at 8 s. The [2.0, 4.0) word window has a 0.25 speech run in
+/// [2.0, 2.6) followed by digital-zero silence to 4.0 s.
+fn offset_fixture_envelope() -> Vec<f32> {
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[100..130].iter_mut() {
+        *level = 0.25;
+    }
+    envelope
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_pulls_true_silence_word_to_its_offset() {
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let envelope = offset_fixture_envelope();
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 2.6).abs() < 0.05, "end={}", out[1].end);
+    // The start is untouched, as is the next word.
+    assert!((out[1].start - 2.0).abs() < 1e-4 && (out[2].end - 4.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_refuses_a_music_floor_back() {
+    let mut envelope = offset_fixture_envelope();
+    for level in envelope[150..200].iter_mut() {
+        *level = 0.021;
+    }
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_tolerates_a_short_micro_gap_inside_the_run() {
+    // A decaying tail broken by a 3-frame below-floor micro-pause (the gap
+    // tolerance) is one run, so the offset lands at the second burst's end.
+    let mut envelope = offset_fixture_envelope();
+    for level in envelope[100..130].iter_mut() {
+        *level = 0.001;
+    }
+    for level in envelope[100..106].iter_mut() {
+        *level = 0.25;
+    }
+    for level in envelope[109..113].iter_mut() {
+        *level = 0.25;
+    }
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 3.0),
+        word("c", 3.0, 3.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 2.26).abs() < 0.02, "end={}", out[1].end);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_refuses_an_inverting_offset() {
+    // A word whose audio sits entirely before its window (the fold's late entry
+    // parked the window behind the word) would invert if pulled, so it is refused.
+    let mut envelope = offset_fixture_envelope();
+    for level in envelope[120..130].iter_mut() {
+        *level = 0.001;
+    }
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.5, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "inverting offset refused");
+    assert!((out[1].start - 2.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_pulls_a_last_word_pinned_at_the_tail() {
+    // The last word is not a special case: when its window reaches the chunk
+    // tail but its audio ended earlier, the trailing passage is verifiable
+    // silence inside the chunk and the end retreats.
+    let mut envelope = offset_fixture_envelope();
+    for level in envelope[690..700].iter_mut() {
+        *level = 0.25;
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 14.0, 14.7)];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 14.0).abs() < 0.05, "end={}", out[1].end);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_leaves_a_word_whose_audio_runs_to_the_tail() {
+    // A last word whose audio runs to the chunk tail (a cut inside the word) has
+    // a back half that reads as speech, so the hollow check bails.
+    let mut envelope = offset_fixture_envelope();
+    for level in envelope[575..750].iter_mut() {
+        *level = 0.25;
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 11.5, 15.0)];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!(
+        (out[1].end - 15.0).abs() < 1e-4,
+        "audio-at-tail last word untouched"
+    );
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_noop_without_envelope() {
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, None, 15.0);
+    assert_eq!(out[1].end, 4.0);
+}
+
+// ---------------------------------------------------------------------------
+// cohere_reanchor_dtw_token_centers
+// ---------------------------------------------------------------------------
+
+fn reanchor_token(token_id: u32, center_seconds: f32) -> Seq2SeqTokenTime {
+    Seq2SeqTokenTime {
+        token_id,
+        center_seconds,
+        probability: None,
+    }
+}
+
+/// 15 s of 0.02 s frames at a 0.01 thin noise floor with a sustained 0.20
+/// speech run over [1.0, 1.8) (frames 50..90). Peak/median contrast is 20x, so
+/// the silence ceiling is 3x the floor (0.03), not 5% of the peak (0.01).
+fn reanchor_fixture_envelope() -> Vec<f32> {
+    let mut envelope = vec![0.01f32; 750];
+    for level in envelope[50..90].iter_mut() {
+        *level = 0.20;
+    }
+    envelope
+}
+
+#[test]
+fn cohere_reanchor_dtw_token_centers_pulls_word_final_punctuation_off_a_pause() {
+    let decode = |ids: &[u32]| -> Result<String, ()> {
+        match ids {
+            [100] => Ok("it".to_string()),
+            [100, 101] => Ok("it?".to_string()),
+            _ => Err(()),
+        }
+    };
+    // The "?" is parked 1.0 s past its word's run, inside a thin-floor pause.
+    let out = cohere_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 2.8)],
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+    );
+    assert!(
+        (out[0].center_seconds - 1.2).abs() < 1e-3,
+        "word content keeps its center"
+    );
+    assert!(
+        (out[1].center_seconds - 1.8).abs() < 1e-3,
+        "center should land one frame past the run's end, got {}",
+        out[1].center_seconds
+    );
+}
+
+#[test]
+fn cohere_reanchor_dtw_token_centers_refuses_an_entry_on_speech() {
+    let decode = |ids: &[u32]| -> Result<String, ()> {
+        match ids {
+            [100] => Ok("it".to_string()),
+            [100, 101] => Ok("it?".to_string()),
+            _ => Err(()),
+        }
+    };
+    // The "?" entry sits inside the speech run, so the quiet-region test fails.
+    let out = cohere_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 0.8), reanchor_token(101, 1.4)],
+        &decode,
+        Some(&reanchor_fixture_envelope()),
+    );
+    assert_eq!(
+        out[1].center_seconds, 1.4,
+        "entry on speech keeps its center"
+    );
+}
+
+#[test]
+fn cohere_reanchor_dtw_token_centers_refuses_without_a_preceding_speech_run() {
+    let mut envelope = vec![0.01f32; 750];
+    for level in envelope[250..300].iter_mut() {
+        *level = 0.20; // run [5.0, 6.0) sits AFTER the center
+    }
+    let decode = |ids: &[u32]| -> Result<String, ()> {
+        match ids {
+            [100] => Ok("it".to_string()),
+            [100, 101] => Ok("it?".to_string()),
+            _ => Err(()),
+        }
+    };
+    let out = cohere_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 2.0), reanchor_token(101, 3.0)],
+        &decode,
+        Some(&envelope),
+    );
+    assert_eq!(
+        out[1].center_seconds, 3.0,
+        "no preceding speech run keeps the center"
+    );
+}
+
+#[test]
+fn cohere_reanchor_dtw_token_centers_noop_without_envelope() {
+    let decode = |ids: &[u32]| -> Result<String, ()> {
+        match ids {
+            [100] => Ok("it".to_string()),
+            [100, 101] => Ok("it?".to_string()),
+            _ => Err(()),
+        }
+    };
+    let out = cohere_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 1.2), reanchor_token(101, 2.8)],
+        &decode,
+        None,
+    );
+    assert_eq!(out[1].center_seconds, 2.8);
 }

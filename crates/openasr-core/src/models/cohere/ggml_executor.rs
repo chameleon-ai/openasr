@@ -16,7 +16,7 @@ use super::decoder_graph::{
     CohereDecoderGraphError, CohereDecoderGraphRuntime,
     run_cohere_decoder_graph_short_form_with_runtime,
 };
-use super::dtw_word_timestamps::audio_onset_seconds;
+use super::dtw_word_timestamps::{audio_onset_seconds, cohere_dtw_word_audio_rms_frames};
 use super::encoder_graph::{CohereTranscribeEncoderError, CohereTranscribeEncoderGraphRuntime};
 use super::frontend::{
     CohereTranscribeFrontendError, CohereTranscribeMelFeatures,
@@ -603,6 +603,18 @@ impl CohereTranscribeGgmlExecutor {
         } else {
             0.0
         };
+        // The 0.02 s RMS envelope the DTW word-timing refiners read (the
+        // punctuation reanchor, the onset and offset refiners). Built from the
+        // same prepared 16 kHz PCM the onset above reads; `None` whenever it is
+        // not applicable, which turns every refinement into a no-op.
+        let audio_rms_frames = if request.request_options.word_timestamps {
+            cohere_dtw_word_audio_rms_frames(
+                &request.prepared_audio.samples_f32,
+                prepared_runtime.metadata.sample_rate_hz,
+            )
+        } else {
+            None
+        };
         let decode = if let Some(actor) = unified_gpu_runtime.as_ref() {
             self.decode_with_unified_gpu_runtime(
                 actor,
@@ -616,6 +628,7 @@ impl CohereTranscribeGgmlExecutor {
                 request.request_options.word_timestamps,
                 audio_duration,
                 audio_onset,
+                audio_rms_frames,
                 &request.execution_context.control,
                 request.execution_context.decode_work_progress_observer(),
                 request.execution_context.unstable_decode_text_observer(),
@@ -698,6 +711,7 @@ impl CohereTranscribeGgmlExecutor {
                 request.request_options.word_timestamps,
                 audio_duration,
                 audio_onset,
+                audio_rms_frames,
                 &request.execution_context.control,
                 request.execution_context.decode_work_progress_observer(),
                 request.execution_context.unstable_decode_text_observer(),
@@ -1116,6 +1130,7 @@ impl CohereTranscribeGgmlExecutor {
         word_timestamps: bool,
         audio_duration_seconds: f32,
         audio_onset_seconds: f32,
+        audio_rms_frames: Option<Vec<f32>>,
         control: &Arc<crate::TranscriptionControl>,
         decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
         unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
@@ -1156,6 +1171,7 @@ impl CohereTranscribeGgmlExecutor {
                     word_timestamps,
                     audio_duration_seconds,
                     audio_onset_seconds,
+                    audio_rms_frames,
                     &control,
                     decode_work_progress.as_ref(),
                     unstable_decode_text.as_ref(),
@@ -1180,6 +1196,7 @@ impl CohereTranscribeGgmlExecutor {
         word_timestamps: bool,
         audio_duration_seconds: f32,
         audio_onset_seconds: f32,
+        audio_rms_frames: Option<Vec<f32>>,
         control: &Arc<crate::TranscriptionControl>,
         decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
         unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
@@ -1205,6 +1222,7 @@ impl CohereTranscribeGgmlExecutor {
                     word_timestamps,
                     audio_duration_seconds,
                     audio_onset_seconds,
+                    audio_rms_frames,
                     &control,
                     decode_work_progress.as_ref(),
                     unstable_decode_text.as_ref(),

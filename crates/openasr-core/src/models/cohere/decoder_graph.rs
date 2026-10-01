@@ -175,6 +175,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
     word_timestamps: bool,
     audio_duration_seconds: f32,
     audio_onset_seconds: f32,
+    audio_rms_frames: Option<Vec<f32>>,
     control: &Arc<crate::TranscriptionControl>,
     decode_work_progress: Option<&crate::api::backend::WorkProgressObserver>,
     unstable_decode_text: Option<&crate::api::backend::UnstableDecodeTextObserver>,
@@ -264,6 +265,7 @@ pub(crate) fn run_cohere_decoder_graph_short_form_with_runtime(
                 &decode.generated_probabilities,
                 audio_duration_seconds,
                 audio_onset_seconds,
+                audio_rms_frames.as_deref(),
                 &decode_text_token_ids,
             )
             .map_err(|error| CohereDecoderGraphError::InvalidInput {

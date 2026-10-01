@@ -7,7 +7,11 @@
 //! speech band derived from the unmasked rows with the stripped sinks skipped
 //! -> the audio-onset anchors that repair a band start displaced by the sink
 //! substitution or bracketing leading silence -> the monotone DTW alignment of
-//! token frames -> the center fold into word windows -> the per-word span cap.
+//! token frames -> the pre-fold reanchor that pulls word-final punctuation off
+//! a pause -> the center fold into word windows -> the per-word span cap -> the
+//! onset refiner -> the offset refiner -> the caller's symmetric window pad.
+//! The reanchor and the two refiners read the chunk's 0.02 s RMS envelope and
+//! are no-ops when it is absent, so the fold's own windows stand unchanged.
 //! Each gate failure has its own degrade: the per-word peak placement for long
 //! windows, and the caller's uniform post-hoc baseline when the attention
 //! cannot be trusted at all. That order is what the test suite validates end
@@ -27,9 +31,10 @@ use crate::models::seq2seq_dtw_alignment::{
     token_text_carries_speech,
 };
 use crate::models::seq2seq_word_timestamps::{
-    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenTime,
+    MIDPOINT_BOUNDARY_FRACTION, NO_ONSET_LEAD, Seq2SeqTokenTime, han_script_boundary_before,
     seq2seq_word_timestamps_from_token_times,
 };
+use crate::models::text_prefix::common_prefix_len;
 
 use super::runtime_contract::CohereTranscribeExecutionMetadata;
 
@@ -39,6 +44,225 @@ use super::runtime_contract::CohereTranscribeExecutionMetadata;
 /// window clears genuine room tone while catching even a quiet opener.
 const COHERE_ONSET_WINDOW_SECONDS: f32 = 0.1;
 const COHERE_ONSET_RELATIVE_DROP_DB: f32 = 16.0;
+
+/// Sample rate the audio envelope runs at, in Hz.
+const COHERE_DTW_ENVELOPE_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// Length of one audio-envelope RMS window, in samples (0.02 s at 16 kHz). The
+/// envelope is expressed in the same absolute 0.02 s time base the whisper
+/// refiners use, independent of cohere's coarser 0.08 s cross-attention frame,
+/// so the sustain/min-silence frame counts below keep their whisper meaning
+/// (5 frames = 0.1 s of speech, 2 frames = 0.04 s of pause).
+const COHERE_DTW_ENVELOPE_FRAME_COUNT: usize = 320;
+
+/// Seconds covered by one envelope frame.
+const fn cohere_dtw_envelope_seconds_per_frame() -> f64 {
+    COHERE_DTW_ENVELOPE_FRAME_COUNT as f64 / COHERE_DTW_ENVELOPE_SAMPLE_RATE_HZ as f64
+}
+
+/// How far a punctuation-only token piece may sit from its word's content mean
+/// and still count toward the word's center. Mirrors whisper's fold: a comma
+/// parked close to its word is the DTW path's best statement of the word's
+/// offset, while one the path lingered seconds into a following pause drags the
+/// center off the speech. Honored with whisper's env-override convention so a
+/// deployment can retune it without a rebuild.
+const COHERE_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS: f32 = 1.75;
+
+/// How far an interior word's window may extend on either side of its own
+/// center before the fold leaves the rest of an adjacent pause as real silence.
+/// Mirrors whisper's clamp. Continuous speech never binds it: with cohere's
+/// 0.35 boundary fraction only inter-center gaps well past a second reach it.
+const COHERE_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS: f32 = 1.0;
+
+/// The punctuation trust radius in use, honoring the deployment env override so
+/// a tuning pass can sweep it without a rebuild (see
+/// [`COHERE_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS`]). A bare environment is
+/// byte-identical to the constant.
+fn cohere_dtw_punctuation_trust_radius_seconds() -> f32 {
+    std::env::var("OPENASR_COHERE_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(COHERE_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS)
+}
+
+/// The interior half-span in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`COHERE_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS`]).
+fn cohere_dtw_max_interior_half_span_seconds() -> f32 {
+    std::env::var("OPENASR_COHERE_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(COHERE_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS)
+}
+
+/// Share of a word's front (resp. back) half tolerated above the floor before the
+/// word is no longer hollow (speech bleeding into that half).
+const COHERE_DTW_HOLLOW_FRONT_ACTIVE_MAX: f32 = 0.5;
+const COHERE_DTW_HOLLOW_BACK_ACTIVE_MAX: f32 = 0.5;
+
+/// Maximum of the front half may sit, as a fraction of the chunk's peak envelope
+/// level, before the silence is no longer trusted as a real pause. A music or
+/// noise background never reads as digital zero -- its floor is a real level --
+/// so without this a quiet pause in a music-backed chunk looks hollow and the
+/// onset push fires on the music floor. Mirrors whisper's swept value.
+const COHERE_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION: f64 = 0.05;
+
+/// Absolute RMS level below which a word half reads as trusted digital silence,
+/// regardless of the chunk's own noise floor, scaled by this multiple of the
+/// median. On a dense chunk (music bed, voice FX) a *relative* dip passes every
+/// relative hollow check while still carrying sustained audio, so bed-level
+/// passages must also sit well below the chunk's own median to read as a pause.
+const COHERE_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE: f64 = 0.3;
+
+/// Multiple of the chunk median (the noise floor) the edge-refiner silence
+/// ceiling never drops below. Without the floor, 5%-of-peak can sit *below* the
+/// median on a dense chunk, so every ordinary floor frame crosses the ceiling and
+/// no genuine pause ever reads as hollow, muting the refiners exactly on the
+/// noisy chunks that stretch words across pauses.
+const COHERE_DTW_EDGE_SILENCE_FLOOR_MEDIAN_MULTIPLE: f64 = 2.0;
+
+/// Peak-to-median contrast above which a chunk's median is a *thin noise floor*
+/// rather than a continuous bed, so the silence ceiling may rise off the peak
+/// and onto the floor (see [`cohere_dtw_silence_ceiling`]). A dense music bed
+/// sits within a few times of its loudest frame; a recording with room tone, a
+/// distant bed, or a line hum carries speech peaks an order of magnitude above
+/// its floor. In between, neither reading of "quiet" is safe, so the conservative
+/// peak fraction is kept.
+const COHERE_DTW_THIN_FLOOR_CONTRAST: f64 = 8.0;
+
+/// How far above the floor a single frame in a region may read before the region
+/// stops being silence, on a thin-floor chunk only. 3.0 is just under 5 dB over
+/// the floor -- the same margin the speech threshold already applies.
+const COHERE_DTW_THIN_FLOOR_PEAK_OF_MEDIAN: f64 = 3.0;
+
+/// Deployment env override for the thin-floor contrast
+/// ([`COHERE_DTW_THIN_FLOOR_CONTRAST`]).
+fn cohere_dtw_thin_floor_contrast() -> f64 {
+    std::env::var("OPENASR_COHERE_DTW_THIN_FLOOR_CONTRAST")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(COHERE_DTW_THIN_FLOOR_CONTRAST)
+}
+
+/// Deployment env override for the thin-floor floor multiple
+/// ([`COHERE_DTW_THIN_FLOOR_PEAK_OF_MEDIAN`]).
+fn cohere_dtw_thin_floor_peak_of_median() -> f64 {
+    std::env::var("OPENASR_COHERE_DTW_THIN_FLOOR_PEAK_OF_MEDIAN")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(COHERE_DTW_THIN_FLOOR_PEAK_OF_MEDIAN)
+}
+
+/// dB above the chunk's own noise floor (the median envelope level) that counts
+/// as real speech, for the onset pass.
+const COHERE_DTW_ONSET_FLOOR_MARGIN_DB: f64 = 5.0;
+/// dB below the search region's own peak that still counts as that word's audio
+/// for the offset pass, so a quiet word over a music bed is judged against its
+/// own level rather than the chunk-wide floor.
+const COHERE_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB: f64 = 12.0;
+
+/// Minimum duration of the speech run above the floor that qualifies as the
+/// word's onset / offset, in envelope frames of 0.02 s (0.1 s of speech).
+const COHERE_DTW_ONSET_SUSTAIN_FRAMES: usize = 5;
+const COHERE_DTW_OFFSET_SUSTAIN_FRAMES: usize = 5;
+
+/// Minimum run of silence between two speech runs, in seconds, so a run that
+/// merely touches a brief inter-word glottal gap is not treated as a real pause.
+const COHERE_DTW_ONSET_MIN_SILENCE_S: f32 = 0.03;
+const COHERE_DTW_OFFSET_MIN_SILENCE_S: f32 = 0.03;
+
+/// The onset/offset must differ from the fold's own edge by at least this much,
+/// or the adjustment is smaller than the fold's calibration error and the word is
+/// left as-is. Mirrors whisper's floor.
+const COHERE_DTW_ONSET_MIN_PUSH_S: f32 = 0.25;
+const COHERE_DTW_OFFSET_MIN_PULL_S: f32 = 0.25;
+
+/// Upper bound on how far into a pause the envelope is trusted to lead/pull a
+/// word.
+const COHERE_DTW_ONSET_MAX_PUSH_S: f32 = 5.0;
+const COHERE_DTW_OFFSET_MAX_PULL_S: f32 = 5.0;
+
+/// Shortest word span, in seconds, the onset/offset refiners examine at all --
+/// below it the window is too short to split into halves meaningfully.
+const COHERE_DTW_REFINE_MIN_SPAN_S: f64 = 0.3;
+
+/// How far before the word's window the offset run search reaches. The fold's
+/// entry frame can land late -- in the gap *after* a word's own audio -- so the
+/// word's above-floor run sits partly before its window and an in-window search
+/// would miss it.
+const COHERE_DTW_OFFSET_EDGE_LEAD_S: f32 = 0.5;
+
+/// Below-floor frames tolerated inside a speech run before it splits. A word's
+/// offset tail decays through coarticulatory micro-silences shorter than this;
+/// without the tolerance the run shreds and no qualifying offset is found.
+const COHERE_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES: usize = 3;
+
+/// Consecutive frames above the silence ceiling before a hollow region stops
+/// reading as silence. A single bed-crackle frame is not a music floor (that
+/// would void a legitimate refinement on bed-backed chunks), while a sustained
+/// floor crosses and still bails.
+const COHERE_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES: usize = 3;
+
+/// Minimum distance, in seconds, between the end of the nearest preceding
+/// sustained speech run and a token's center before the center is treated as
+/// parked in the pause after its word's own audio (the word-final punctuation
+/// reanchor). Below it the center is inside the fold's own calibration error.
+const COHERE_DTW_REANCHOR_MIN_GAP_SECONDS: f32 = 0.15;
+
+/// Maximum distance the reanchor may pull a token's center back. Farther than a
+/// plausible intra-word linger the move cannot be trusted to land the word on its
+/// own speech, so the center stays where the path put it.
+const COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS: f32 = 3.5;
+
+/// Envelope frames read forward from the token's center before the center is
+/// treated as sitting in a pause.
+const COHERE_DTW_REANCHOR_ENTRY_QUIET_FRAMES: usize = 4;
+
+/// Deployment env override for the reanchor minimum gap
+/// ([`COHERE_DTW_REANCHOR_MIN_GAP_SECONDS`]).
+fn cohere_dtw_reanchor_min_gap_seconds() -> f32 {
+    std::env::var("OPENASR_COHERE_DTW_REANCHOR_MIN_GAP_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(COHERE_DTW_REANCHOR_MIN_GAP_SECONDS)
+}
+
+/// Deployment env override for the reanchor maximum jump
+/// ([`COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS`]).
+fn cohere_dtw_reanchor_max_jump_seconds() -> f32 {
+    std::env::var("OPENASR_COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS)
+}
+
+/// The level a region may reach before it stops reading as trusted silence.
+///
+/// The base ceiling is a small fraction of the chunk's *peak*: a music or noise
+/// bed never reads as digital zero, so a region that still carries a substantial
+/// fraction of the loudest frame is a bed, not a pause. On a chunk with a *thin*
+/// background floor (room tone, a distant bed) the floor's own transients can
+/// cross the peak fraction even though it is acoustically silence; the chunk's
+/// own peak/median contrast tells the two apart, raising the ceiling onto the
+/// floor for thin-floor chunks only. Dense-bed chunks keep the conservative peak
+/// fraction exactly as before.
+fn cohere_dtw_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
+    let peak_fraction = clip_peak * COHERE_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION;
+    let contrast = clip_peak / noise_floor.max(f64::EPSILON);
+    if contrast >= cohere_dtw_thin_floor_contrast() {
+        peak_fraction.max(noise_floor * cohere_dtw_thin_floor_peak_of_median())
+    } else {
+        peak_fraction
+    }
+}
+
+/// The trusted-silence ceiling for the onset/offset edge refiners: the shared
+/// [`cohere_dtw_silence_ceiling`], floored at twice the chunk median so it can
+/// never sit below the floor it judges against.
+fn cohere_dtw_edge_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
+    cohere_dtw_silence_ceiling(noise_floor, clip_peak)
+        .max(noise_floor * COHERE_DTW_EDGE_SILENCE_FLOOR_MEDIAN_MULTIPLE)
+}
 
 /// Seconds from the start of the chunk at which measurable audio energy first
 /// appears, or `0.0` when none does. Used to anchor the DTW speech band when the
@@ -82,6 +306,608 @@ pub(crate) fn audio_onset_seconds(samples: &[f32], sample_rate_hz: u32) -> f32 {
     0.0
 }
 
+/// Per-frame RMS envelope of the request audio on a 0.02 s grid -- the time base
+/// the word-timing refiners are expressed in, and finer than cohere's 0.08 s
+/// cross-attention frame. `None` when the audio is not the 16 kHz mono PCM this
+/// path assumes, or carries a non-finite sample, so every refinement below
+/// degrades to a clean no-op instead of acting on garbage.
+///
+/// A clip fully below the f32 dynamic range (all zeros) yields a median of zero
+/// and the hollow predicate refuses to fire for a non-positive floor, so
+/// all-silent input is left exactly as the fold produced it -- no words move.
+pub(crate) fn cohere_dtw_word_audio_rms_frames(
+    samples: &[f32],
+    sample_rate_hz: u32,
+) -> Option<Vec<f32>> {
+    if sample_rate_hz != COHERE_DTW_ENVELOPE_SAMPLE_RATE_HZ {
+        // The refiners index the envelope on a fixed 0.02 s grid; a different
+        // rate means the caller is misusing this helper.
+        return None;
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(samples.len().div_ceil(COHERE_DTW_ENVELOPE_FRAME_COUNT));
+    for frame_start in (0..samples.len()).step_by(COHERE_DTW_ENVELOPE_FRAME_COUNT) {
+        let frame_end = (frame_start + COHERE_DTW_ENVELOPE_FRAME_COUNT).min(samples.len());
+        let mut sum = 0.0_f64;
+        for &sample in &samples[frame_start..frame_end] {
+            if !sample.is_finite() {
+                return None;
+            }
+            let value = f64::from(sample);
+            sum += value * value;
+        }
+        out.push((sum / (frame_end - frame_start) as f64).sqrt() as f32);
+    }
+    Some(out)
+}
+
+/// The chunk's noise floor (median envelope level) and peak, or `None` when
+/// either is non-positive/non-finite -- which covers a fully silent chunk and any
+/// degenerate envelope. Shared by the reanchor and both edge refiners so they
+/// all judge against one reading of "speech" and "silence".
+fn cohere_dtw_envelope_floor_and_peak(levels: &[f32]) -> Option<(f64, f64)> {
+    if levels.len() < 4 {
+        return None;
+    }
+    let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    ranked.sort_by(f64::total_cmp);
+    let noise_floor = ranked[ranked.len() / 2];
+    if !(noise_floor > 0.0 && noise_floor.is_finite()) {
+        return None;
+    }
+    let clip_peak = *ranked.last().unwrap_or(&0.0);
+    if !(clip_peak > 0.0 && clip_peak.is_finite()) {
+        return None;
+    }
+    Some((noise_floor, clip_peak))
+}
+
+/// Pull a word-final punctuation token the DTW path parked in the pause after its
+/// word back to the word's own audio offset.
+///
+/// The fold counts each token's path *entry* frame as its center and takes a
+/// word's center as the mean of the contributing tokens. A word-final punctuation
+/// token ("it?", "life.") has no audio of its own, and its monotone path entry
+/// lingers in the pause after the word, so the word's center becomes the mean of
+/// the word's own center and that pause. The fold's seam at the word's end -- and
+/// the next word's start, which is the same seam -- smears across the following
+/// silence instead of sitting at the word's offset. When the next word's audio
+/// fills the smeared half of the window the edge refiners see no hollow half
+/// either, and cannot trim what is left.
+///
+/// The model's own statement of which tokens carry no audio is their text. A
+/// token whose fold piece has no letter or digit is punctuation, and only one
+/// that is the *last* contributor to its fold word ends a word (an opening quote
+/// or a lone dash contributes to the word it opens, and pulling that token back
+/// would smear the *next* word's start instead). For such a word-final
+/// punctuation token, when its center sits in trusted silence and the nearest
+/// preceding sustained speech run ended a plausible pause before it, the center
+/// is replaced by the frame just past that run's end, before the fold runs. The
+/// fold itself is untouched: it re-derives the word's seams around the corrected
+/// center.
+///
+/// The trusted-silence requirement is the edge refiners' own (same floor, same
+/// thin-floor ceiling): the center region's mean below the floor, no frame above
+/// the silence ceiling, fewer than half its frames above the floor, and every
+/// frame between the run's end and the center at or below the ceiling. On a
+/// clean chunk there is no pause-long punctuation entry to pull, and on a music
+/// bed the ceiling tests fail the way the edge refiners' do, so the pass is a
+/// no-op there.
+fn cohere_reanchor_dtw_token_centers<E>(
+    mut token_times: Vec<Seq2SeqTokenTime>,
+    decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
+    audio_rms_frames: Option<&[f32]>,
+) -> Vec<Seq2SeqTokenTime> {
+    let Some(levels) = audio_rms_frames else {
+        return token_times;
+    };
+    if token_times.is_empty() {
+        return token_times;
+    }
+    let Some((noise_floor, clip_peak)) = cohere_dtw_envelope_floor_and_peak(levels) else {
+        return token_times;
+    };
+    let threshold = noise_floor * 10.0_f64.powf(COHERE_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    // The reanchor walks *backward* through ceiling-quiet frames to reach a
+    // distant speech run, so it keeps the conservative (unfloored) ceiling: a
+    // music bed must never be walkable silence here, or the pass would attach
+    // punctuation to unrelated audio.
+    let silence_ceiling = cohere_dtw_silence_ceiling(noise_floor, clip_peak);
+    let envelope_spf = cohere_dtw_envelope_seconds_per_frame();
+    let last_frame = levels.len() - 1;
+    let min_gap = f64::from(cohere_dtw_reanchor_min_gap_seconds());
+    let max_jump = f64::from(cohere_dtw_reanchor_max_jump_seconds());
+
+    // Pass 1 (mirrors the fold's): the incremental prefix decode gives every
+    // token the text piece the fold will attribute to it -- the all-punctuation
+    // pieces are the ones the fold can smear.
+    let mut pieces = Vec::with_capacity(token_times.len());
+    let mut prefix = Vec::with_capacity(token_times.len());
+    let mut previous_decoded = String::new();
+    for token_time in &token_times {
+        prefix.push(token_time.token_id);
+        let Ok(decoded) = decode_text(&prefix) else {
+            // The fold will surface the decode failure; keep the path's centers
+            // untouched.
+            return token_times;
+        };
+        let piece = match decoded.strip_prefix(&previous_decoded) {
+            Some(rest) => rest.to_string(),
+            None => {
+                let shared = common_prefix_len(&previous_decoded, &decoded);
+                decoded[shared..].to_string()
+            }
+        };
+        previous_decoded = decoded;
+        pieces.push(piece);
+    }
+
+    for (index, token_time) in token_times.iter_mut().enumerate() {
+        let piece = &pieces[index];
+        // The token's center reaches the fold only through the piece's
+        // non-whitespace characters. A piece with none is timing-inert, and a
+        // piece carrying a letter or digit is real word content: neither is a
+        // candidate.
+        let mut has_content = false;
+        let mut has_alphanumeric = false;
+        for ch in piece.chars() {
+            if !ch.is_whitespace() {
+                has_content = true;
+                if ch.is_alphanumeric() {
+                    has_alphanumeric = true;
+                }
+            }
+        }
+        if !has_content || has_alphanumeric {
+            continue;
+        }
+        // Word-final punctuation only: a later piece carrying a character of the
+        // same fold word means this token opens a word, not ends one, and pulling
+        // it back would smear the next word's start.
+        if later_piece_contributes_to_same_word(index, &pieces) {
+            continue;
+        }
+        let entry_secs = f64::from(token_time.center_seconds);
+        if !entry_secs.is_finite() || entry_secs < 0.0 {
+            continue;
+        }
+        let entry_frame = ((entry_secs / envelope_spf) as usize).min(last_frame);
+        // Trusted pause at the center: the same mean / ceiling / active-fraction
+        // tests the edge refiners apply to a word half, over a short run of
+        // frames from the center.
+        let quiet_end = (entry_frame + COHERE_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        let quiet = &levels[entry_frame..=quiet_end];
+        let quiet_mean =
+            quiet.iter().map(|sample| f64::from(*sample)).sum::<f64>() / quiet.len() as f64;
+        let quiet_max = quiet
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .fold(0.0_f64, f64::max);
+        let quiet_above = quiet
+            .iter()
+            .filter(|sample| f64::from(**sample) >= threshold)
+            .count() as f64
+            / quiet.len() as f64;
+        if quiet_mean >= threshold || quiet_max > silence_ceiling || quiet_above > 0.5 {
+            continue;
+        }
+        // The nearest preceding sustained speech run: walk back over the
+        // trusted-silence frames that separate the center from it. The walk
+        // stops at the frame-array edge (no preceding speech) or at a frame above
+        // the silence ceiling (a music bed, not a pause).
+        let mut scan = entry_frame;
+        let mut run_end: Option<usize> = None;
+        while scan > 0 {
+            let level = f64::from(levels[scan - 1]);
+            if level >= threshold {
+                run_end = Some(scan - 1);
+                break;
+            }
+            if level > silence_ceiling {
+                break;
+            }
+            scan -= 1;
+        }
+        let Some(end) = run_end else {
+            continue;
+        };
+        let mut run_start = end;
+        while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
+            run_start -= 1;
+        }
+        // The anchor must be real speech, not a noise blip: at least the onset
+        // sustain length of frames above the floor.
+        if end - run_start + 1 < COHERE_DTW_ONSET_SUSTAIN_FRAMES {
+            continue;
+        }
+        // The silent gap between the run's end and the center must be a real
+        // pause: clearly past the fold's calibration error, and short enough to be
+        // an intra-word linger rather than a larger drift.
+        let gap_secs = entry_secs - (end as f64 + 1.0) * envelope_spf;
+        if !(min_gap..=max_jump).contains(&gap_secs) {
+            continue;
+        }
+        // One frame past the run's last speech frame: the word's own offset. The
+        // fold clamps centers non-decreasing, so the pulled center can never run
+        // ahead of the previous word's.
+        let target_secs = (end as f64 + 1.0) * envelope_spf;
+        if std::env::var_os("OPENASR_COHERE_DEBUG_REANCHOR").is_some() {
+            eprintln!(
+                "cohere reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (preceding run ends at frame {end})"
+            );
+        }
+        token_time.center_seconds = target_secs as f32;
+    }
+    token_times
+}
+
+/// Whether a piece after `index` contributes a character to the same fold word as
+/// the piece at `index`. The walk mirrors the fold's character pass -- whitespace
+/// closes a word, a Han ideograph (or an alphanumeric after a Han-final word)
+/// starts a new one -- so the eligibility matches the fold's own word split.
+fn later_piece_contributes_to_same_word(index: usize, pieces: &[String]) -> bool {
+    // The fold's `last_char()` once the candidate piece has contributed: its last
+    // word-constituting character (a candidate piece is all punctuation, so its
+    // non-whitespace characters all constitute the word). One character of the
+    // first following piece decides: it either closes the word (whitespace or a
+    // Han boundary) or is a same-word contribution.
+    let last = pieces[index].chars().rev().find(|ch| !ch.is_whitespace());
+    for piece in &pieces[index + 1..] {
+        // The first character of the first non-empty following piece decides: it
+        // either closes the word (whitespace or a Han boundary) or is a same-word
+        // contribution from a later piece.
+        if let Some(ch) = piece.chars().next() {
+            return !(ch.is_whitespace()
+                || last.is_some_and(|previous| han_script_boundary_before(ch, Some(previous))));
+        }
+    }
+    false
+}
+
+/// Pull a word the center fold landed in silence to its real audio onset.
+///
+/// The DTW entry frame the fold treats as a word's center sits where the monotone
+/// path first *enters* a token's row. After an intra-segment pause that entry is
+/// at the tail of the preceding word or part-way into the pause, not on the next
+/// word's audio; the `boundary_fraction` split that follows places the next
+/// word's start early across the gap -- into audio that is silent.
+///
+/// This pass recovers the onset from the audio when the fold could not: a word
+/// whose front half is true silence (its energy only begins later inside its own
+/// window) is advanced to that first sustained speech run. Because the fold's
+/// adjacent boundaries coincide (the previous word's end equals this word's old
+/// start), advancing the start opens a real gap where the pause actually sits
+/// instead of smearing the word across it, while leaving the timeline monotone
+/// and non-overlapping by construction -- no neighbour is ever touched.
+///
+/// The speech floor is `10^(margin/20)` times the *median* frame RMS, tracking a
+/// quiet recording down to its own level. Crucially the front must also stay
+/// within a small fraction of the chunk's *peak*: a music or noise bed never
+/// reads as digital zero, so a quiet passage inside a music-backed chunk is *not*
+/// a trusted pause and a push would only move a word that was already acceptable.
+/// That ceiling is what separates a genuine zero-silence pause (fire) from a low
+/// music floor (skip).
+fn cohere_refine_dtw_word_onsets(
+    mut words: Vec<WordTimestamp>,
+    audio_rms_frames: Option<&[f32]>,
+    duration_s: f32,
+) -> Vec<WordTimestamp> {
+    let Some(levels) = audio_rms_frames else {
+        return words;
+    };
+    if duration_s <= 0.0 || words.len() < 2 {
+        return words;
+    }
+    let Some((noise_floor, clip_peak)) = cohere_dtw_envelope_floor_and_peak(levels) else {
+        return words;
+    };
+    let threshold = noise_floor * 10.0_f64.powf(COHERE_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    // A front frame that reads at or above this is not true silence (see
+    // `cohere_dtw_edge_silence_ceiling`): the edge floor keeps the ceiling off
+    // the sub-median regime where ordinary floor frames would void every genuine
+    // pause on a dense chunk.
+    let silence_ceiling = cohere_dtw_edge_silence_ceiling(noise_floor, clip_peak);
+    let envelope_spf = cohere_dtw_envelope_seconds_per_frame();
+    let min_quiet_frames = (COHERE_DTW_ONSET_MIN_SILENCE_S as f64 / envelope_spf).ceil() as usize;
+    // The absolute quiet check only applies on dense chunks (contrast < 8). On
+    // thin floors the relative threshold is already tight and the ceiling is
+    // raised to 3x median; the absolute check would only block genuine-silence
+    // refiners on quiet chunks.
+    let is_dense_chunk =
+        clip_peak / noise_floor.max(f64::EPSILON) < cohere_dtw_thin_floor_contrast();
+    let absolute_quiet_threshold = noise_floor * COHERE_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+    for word in words.iter_mut().skip(1) {
+        let raw_start = f64::from(word.start);
+        let raw_end = f64::from(word.end);
+        if raw_end - raw_start < COHERE_DTW_REFINE_MIN_SPAN_S {
+            continue;
+        }
+        let start_s = raw_start.max(0.0).min(f64::from(duration_s));
+        let end_s = raw_end.max(start_s).min(f64::from(duration_s));
+        // A boundary word whose start maps to or past the last envelope frame
+        // (common at a longform chunk end) must not overrun the frame array;
+        // clamp both indices into range, letting the window-length guard below
+        // bail the word without refinement rather than panic.
+        let last_frame = levels.len() - 1;
+        let frame_start = ((start_s / envelope_spf) as usize).min(last_frame);
+        let frame_end = ((end_s / envelope_spf) as usize)
+            .min(last_frame)
+            .max(frame_start + 1)
+            .min(last_frame);
+        let window = &levels[frame_start..frame_end + 1];
+        if window.len() < 4 {
+            continue;
+        }
+        let window_len = window.len();
+        let is_above = |index: usize| f64::from(window[index]) >= threshold;
+        let front_len = (window_len / 2).clamp(1, window_len);
+        // A hollow word: the front half sits in true silence, not just a quiet
+        // passage. Four conditions on the front half of the window:
+        //   1. its *mean* level is below the noise floor (not just a fraction of
+        //      frames -- a single loud blip in a quiet front must not pass);
+        //   2. on a dense chunk its mean is also below a fraction of the noise
+        //      floor, so a bed-level dip never reads as a pause;
+        //   3. no *sustained* run of front frames crosses the silence ceiling, so
+        //      a music floor never masquerades as a pause while a single
+        //      bed-crackle frame does not void a legitimate pause;
+        //   4. fewer than half its frames are above the floor (no sustained
+        //      speech leaking into the front).
+        let front_mean =
+            (0..front_len).map(|i| f64::from(window[i])).sum::<f64>() / front_len as f64;
+        let mut ceiling_sustained = false;
+        let mut ceiling_run = 0usize;
+        for &sample in window.iter().take(front_len) {
+            ceiling_run = if f64::from(sample) > silence_ceiling {
+                ceiling_run + 1
+            } else {
+                0
+            };
+            if ceiling_run >= COHERE_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
+        let front_above = (0..front_len).filter(|&i| is_above(i)).count() as f64 / front_len as f64;
+        if front_mean >= threshold
+            || (is_dense_chunk && front_mean >= absolute_quiet_threshold)
+            || ceiling_sustained
+            || front_above > COHERE_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
+        {
+            continue;
+        }
+        // The onset: the first speech run (>= sustain frames above the floor)
+        // preceded by a quiet run of at least the minimum silence length, inside
+        // this word's own window.
+        let mut onset_rel: Option<usize> = None;
+        let mut index = 0usize;
+        while index < window_len && onset_rel.is_none() {
+            if is_above(index) {
+                let mut run_end = index;
+                while run_end + 1 < window_len && is_above(run_end + 1) {
+                    run_end += 1;
+                }
+                if run_end - index + 1 >= COHERE_DTW_ONSET_SUSTAIN_FRAMES {
+                    let mut quiet = 0usize;
+                    let mut probe = index;
+                    while probe > 0 && !is_above(probe - 1) {
+                        probe -= 1;
+                        quiet += 1;
+                    }
+                    if quiet >= min_quiet_frames {
+                        onset_rel = Some(index);
+                    }
+                }
+                index = run_end + 1;
+            } else {
+                index += 1;
+            }
+        }
+        let Some(rel) = onset_rel else {
+            continue;
+        };
+        let onset_s = ((frame_start + rel) as f64 * envelope_spf) as f32;
+        let push = onset_s - raw_start as f32;
+        // A word's start may only move forward into later audio, never backward.
+        // The minimum push guards against a sub-calibration-error wiggle; the
+        // maximum caps how deep into a pause we trust the envelope to lead us.
+        if !(COHERE_DTW_ONSET_MIN_PUSH_S..=COHERE_DTW_ONSET_MAX_PUSH_S).contains(&push) {
+            continue;
+        }
+        word.start = onset_s;
+    }
+    words
+}
+
+/// Pull a word the center fold let run past its speech into the trailing silence
+/// back to its real audio offset.
+///
+/// The mirror of [`cohere_refine_dtw_word_onsets`]: where that pass recovers a
+/// word's *start* from a hollow front, this one recovers its *end* from a hollow
+/// back. The fold gives a word the boundary a fixed fraction of the way to the
+/// next center, so a word beside a real pause extends across part of it and, with
+/// the `boundary` pad, its end lands a good deal past the last audible frame of
+/// the word.
+///
+/// A word whose back half is true silence is retreated to its last sustained
+/// speech run. Because the fold's seams are continuous only between *words the
+/// audio actually carries* (the next word's start is its own audio, set by its own
+/// onset refinement), pulling this word's end back opens the real gap where the
+/// pause sits instead of smearing this word across it, and never touches the next
+/// word -- the timeline stays monotone and non-overlapping by construction.
+///
+/// Two bed-backed realities the run search must survive. First, the fold's late
+/// entry can park a word's window *behind* its own audio (the window starts in the
+/// gap after the word), so the search reaches the
+/// [`COHERE_DTW_OFFSET_EDGE_LEAD_S`] lead before the window; an offset that would
+/// land before the word's own start is refused rather than inverting the window.
+/// Second, a quiet word over a music bed sits far below the chunk-floor threshold,
+/// so the search floor is the lower of the absolute floor and the region's own
+/// peak minus [`COHERE_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB`].
+///
+/// As with onsets, the back must stay below a small fraction of the chunk's
+/// *peak*: a music or noise bed never reads as digital zero, so a low passage
+/// inside a music-backed chunk is not a trusted trailing pause and a pull would
+/// only move a word that was already acceptable. A single bed-crackle frame
+/// crossing that ceiling does not void the pause; the crossing must be sustained
+/// for [`COHERE_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES`] frames.
+fn cohere_refine_dtw_word_offsets(
+    mut words: Vec<WordTimestamp>,
+    audio_rms_frames: Option<&[f32]>,
+    duration_s: f32,
+) -> Vec<WordTimestamp> {
+    let Some(levels) = audio_rms_frames else {
+        return words;
+    };
+    if duration_s <= 0.0 || words.len() < 2 {
+        return words;
+    }
+    let Some((noise_floor, clip_peak)) = cohere_dtw_envelope_floor_and_peak(levels) else {
+        return words;
+    };
+    let threshold = noise_floor * 10.0_f64.powf(COHERE_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let silence_ceiling = cohere_dtw_edge_silence_ceiling(noise_floor, clip_peak);
+    let envelope_spf = cohere_dtw_envelope_seconds_per_frame();
+    let min_quiet_frames = (COHERE_DTW_OFFSET_MIN_SILENCE_S as f64 / envelope_spf).ceil() as usize;
+    let is_dense_chunk =
+        clip_peak / noise_floor.max(f64::EPSILON) < cohere_dtw_thin_floor_contrast();
+    let absolute_quiet_threshold = noise_floor * COHERE_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+    let last_frame = levels.len() - 1;
+    for word in words.iter_mut() {
+        let raw_start = f64::from(word.start);
+        let raw_end = f64::from(word.end);
+        if raw_end - raw_start < COHERE_DTW_REFINE_MIN_SPAN_S {
+            continue;
+        }
+        let start_s = raw_start.max(0.0).min(f64::from(duration_s));
+        let end_s = raw_end.max(start_s).min(f64::from(duration_s));
+        let frame_start = ((start_s / envelope_spf) as usize).min(last_frame);
+        let frame_end = ((end_s / envelope_spf) as usize)
+            .min(last_frame)
+            .max(frame_start + 1)
+            .min(last_frame);
+        let window = &levels[frame_start..frame_end + 1];
+        if window.len() < 4 {
+            continue;
+        }
+        let window_len = window.len();
+        let is_above = |index: usize| f64::from(window[index]) >= threshold;
+        let back_len = (window_len / 2).clamp(1, window_len);
+        let back_start = window_len.saturating_sub(back_len);
+        // The same four hollow conditions as the onset pass, over the back half.
+        let back_mean = (back_start..window_len)
+            .map(|i| f64::from(window[i]))
+            .sum::<f64>()
+            / back_len as f64;
+        let mut ceiling_sustained = false;
+        let mut ceiling_run = 0usize;
+        for &sample in window.iter().skip(back_start) {
+            ceiling_run = if f64::from(sample) > silence_ceiling {
+                ceiling_run + 1
+            } else {
+                0
+            };
+            if ceiling_run >= COHERE_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
+        let back_above =
+            (back_start..window_len).filter(|&i| is_above(i)).count() as f64 / back_len as f64;
+        if back_mean >= threshold
+            || (is_dense_chunk && back_mean >= absolute_quiet_threshold)
+            || ceiling_sustained
+            || back_above > COHERE_DTW_HOLLOW_BACK_ACTIVE_MAX as f64
+        {
+            continue;
+        }
+        // The offset: the last speech run followed by a quiet run of at least the
+        // minimum silence length. The search covers the window plus the pre-window
+        // lead (the fold's late entry can park the window behind the word's own
+        // audio); run frames are counted above the search floor, and below-floor
+        // gaps up to the tolerance do not split a run (coarticulatory
+        // micro-silence in a decaying word tail).
+        let region_start_s = (start_s - COHERE_DTW_OFFSET_EDGE_LEAD_S as f64).max(0.0);
+        let region_frame_start = ((region_start_s / envelope_spf) as usize)
+            .min(last_frame)
+            .min(frame_start);
+        let region = &levels[region_frame_start..frame_end + 1];
+        let region_len = region.len();
+        // The search floor: the lower of the absolute speech floor and the
+        // region's own peak below the relative margin, so a quiet word over a
+        // music bed is judged against its own level, not the chunk floor.
+        let region_peak = region
+            .iter()
+            .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)));
+        let floor = threshold
+            .min(region_peak * 10.0_f64.powf(-COHERE_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB / 20.0));
+        // Gap-tolerant runs above the floor, gathered in order as (above-frame
+        // count, last above frame).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_above = 0usize;
+        let mut run_last = 0usize;
+        let mut in_run = false;
+        let mut below_gap = 0usize;
+        for (i, &sample) in region.iter().enumerate() {
+            if f64::from(sample) >= floor {
+                if !in_run {
+                    in_run = true;
+                    run_above = 0;
+                }
+                run_above += 1;
+                run_last = i;
+                below_gap = 0;
+            } else if in_run {
+                below_gap += 1;
+                if below_gap > COHERE_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES {
+                    runs.push((run_above, run_last));
+                    in_run = false;
+                    below_gap = 0;
+                }
+            }
+        }
+        if in_run {
+            runs.push((run_above, run_last));
+        }
+        let mut offset_rel: Option<usize> = None;
+        for &(run_count, run_end_index) in runs.iter().rev() {
+            if run_count >= COHERE_DTW_OFFSET_SUSTAIN_FRAMES {
+                let mut quiet = 0usize;
+                let mut probe = run_end_index;
+                while probe + 1 < region_len && f64::from(region[probe + 1]) < floor {
+                    probe += 1;
+                    quiet += 1;
+                }
+                if quiet >= min_quiet_frames {
+                    offset_rel = Some(run_end_index);
+                    break;
+                }
+            }
+        }
+        let Some(rel) = offset_rel else {
+            continue;
+        };
+        // The run ends at `rel`; one frame past it is where the silence begins. An
+        // offset before the word's own start would invert the window (its audio
+        // sits entirely earlier than the window -- the onset pass's domain), so
+        // such a word is refused.
+        let offset_s = ((region_frame_start + rel + 1) as f64 * envelope_spf) as f32;
+        if f64::from(offset_s) < raw_start {
+            continue;
+        }
+        let pull = raw_end - f64::from(offset_s);
+        // A word's end may only move earlier into prior audio, never past it. The
+        // minimum pull guards against a sub-calibration-error wiggle; the maximum
+        // caps how deep into a pause we trust the envelope to lead us.
+        if !(COHERE_DTW_OFFSET_MIN_PULL_S..=COHERE_DTW_OFFSET_MAX_PULL_S).contains(&(pull as f32)) {
+            continue;
+        }
+        word.end = offset_s;
+    }
+    words
+}
+
 /// Align per-token cross-attention frame rows to the audio timeline with a
 /// monotone DTW pass and fold them into word timestamps, mirroring whisper's
 /// no-timestamp DTW degrade. `token_alignments` pairs each generated (non-EOT)
@@ -90,12 +916,23 @@ pub(crate) fn audio_onset_seconds(samples: &[f32], sample_rate_hz: u32) -> f32 {
 /// is bracketed on the content tokens' own attention peaks (leading/trailing
 /// silence the model ignored is never bracketed by a peak, so it stays off the
 /// timeline), and each content-token peak still owns its real audio span.
+///
+/// Once the band is aligned the window goes through the same refinement chain as
+/// whisper's DTW path: the pre-fold reanchor that pulls word-final punctuation
+/// off a trailing pause -> the center fold (punctuation trust radius, interior
+/// half-span) -> the per-word span cap -> the onset refiner -> the offset
+/// refiner. The audio-driven passes read `audio_rms_frames`, the chunk's 0.02 s
+/// RMS envelope (see [`cohere_dtw_word_audio_rms_frames`]); when it is absent
+/// every one of them is a no-op and the fold's own windows stand. The caller's
+/// symmetric window pad runs after this function returns, so it also covers the
+/// degrade tiers.
 pub(crate) fn cohere_dtw_word_timestamps<E>(
     token_alignments: &[(u32, Vec<f32>)],
     metadata: CohereTranscribeExecutionMetadata,
     generated_probabilities: &[f32],
     duration: f32,
     audio_onset_seconds: f32,
+    audio_rms_frames: Option<&[f32]>,
     decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
 ) -> Result<Vec<WordTimestamp>, E> {
     let frame_count = token_alignments
@@ -203,6 +1040,8 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
                         token_alignments,
                         generated_probabilities,
                         seconds_per_frame,
+                        audio_rms_frames,
+                        duration,
                         decode_text,
                     );
                 }
@@ -249,6 +1088,8 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
                     token_alignments,
                     generated_probabilities,
                     seconds_per_frame,
+                    audio_rms_frames,
+                    duration,
                     decode_text,
                 );
             } else {
@@ -403,10 +1244,22 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
             probability: probabilities_aligned.then(|| generated_probabilities[index]),
         })
         .collect();
+    // A word-final punctuation token carries no audio of its own and its center
+    // can sit in the pause after its word; pull it back to the word's own offset
+    // before the fold turns these centers into word windows.
+    let token_times = cohere_reanchor_dtw_token_centers(token_times, decode_text, audio_rms_frames);
     let onset_lead = cohere_dtw_onset_lead(
         band_end_secs - band_start_secs,
         is_content.iter().filter(|flag| **flag).count(),
     );
+    // `max_edge_word_span` stays infinite so the fold anchors the first word's
+    // start at the band start and the last word's end at the band end, exactly as
+    // this fold has always been calibrated; what keeps those edges off the
+    // surrounding silence is now the audible refiners below rather than a
+    // blind positional clamp. The punctuation trust radius stops a word-final
+    // comma the path lingered seconds into a following pause from dragging the
+    // word's center off its speech, and the interior half-span bounds how much of
+    // an adjacent pause a word may own on either side of its own center.
     let words = seq2seq_word_timestamps_from_token_times(
         &token_times,
         band_start_secs,
@@ -415,9 +1268,9 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
         decode_text,
         COHERE_DTW_BOUNDARY_FRACTION,
         onset_lead,
-        COHERE_DTW_MAX_WORD_SPAN_SECONDS,
         f32::INFINITY,
-        f32::INFINITY,
+        cohere_dtw_punctuation_trust_radius_seconds(),
+        cohere_dtw_max_interior_half_span_seconds(),
     )?;
     // `word_centers_to_timestamps` anchors the first word's start to
     // `segment_start` (the band start) and the last word's end to
@@ -426,9 +1279,15 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
     // between two centers (`COHERE_DTW_BOUNDARY_FRACTION`, pulled earlier by
     // `COHERE_DTW_ONSET_LEAD_SECONDS`) lands where the following word's speech
     // begins. The timeline is monotone and non-overlapping by construction, so
-    // the only remaining correction is capping any word that swallowed a real
-    // pause (its tail would otherwise run across the following gap).
+    // the remaining corrections are all audible: cap any word that swallowed a
+    // real pause, then pull the hollow-front and hollow-back words onto the
+    // audio they actually sit on.
     let words = cohere_cap_dtw_word_spans(words, seconds_per_frame);
+    let words = cohere_refine_dtw_word_offsets(
+        cohere_refine_dtw_word_onsets(words, audio_rms_frames, duration),
+        audio_rms_frames,
+        duration,
+    );
     if std::env::var_os("OPENASR_COHERE_DEBUG_CROSS").is_some() {
         eprintln!(
             "cohere cross dtw midpoint fold: {} words over band {}..{}s",
@@ -456,12 +1315,24 @@ pub(crate) fn cohere_dtw_word_timestamps<E>(
 /// chunk. Returns `Ok(Vec::new())` when no content-token peak exists, so the
 /// caller keeps the uniform baseline rather than emitting a single degenerate
 /// word.
+///
+/// This tier gets the same per-word span cap and the same audible edge refiners
+/// as the DTW path. The cap is load-bearing here, not merely tidying: this fold's
+/// boundary fraction is the midpoint and its first word is anchored to the
+/// window front, so a first token whose peak sits seconds into the chunk leaves
+/// that word owning the whole lead-in. On a 30s longform chunk that is a
+/// ~15s-wide head word, and because the longform assembler decides its seam trims
+/// and phantom/reread drops from word windows, one such window changes which
+/// words survive at the seam -- so the emitted *text* shifts, not just its
+/// timing.
 fn cohere_peak_fallback_word_timestamps<E>(
     full_window: &[Vec<f32>],
     is_content: &[bool],
     token_alignments: &[(u32, Vec<f32>)],
     generated_probabilities: &[f32],
     seconds_per_frame: f32,
+    audio_rms_frames: Option<&[f32]>,
+    duration: f32,
     decode_text: &dyn Fn(&[u32]) -> Result<String, E>,
 ) -> Result<Vec<WordTimestamp>, E> {
     let token_count = token_alignments.len();
@@ -496,7 +1367,13 @@ fn cohere_peak_fallback_word_timestamps<E>(
     let Some(segment_end) = last_content_peak_center else {
         return Ok(Vec::new());
     };
-    seq2seq_word_timestamps_from_token_times(
+    // `max_edge_word_span` stays infinite and the interior half-span with it, so
+    // this tier's seams stay exactly the equidistant split it was tuned with; the
+    // span cap below is what bounds the resulting windows. The punctuation trust
+    // radius does apply: a word-final punctuation token's peak can land in the
+    // silence the window brackets past the speech, and a radius keeps it from
+    // dragging the word's center back into it.
+    let words = seq2seq_word_timestamps_from_token_times(
         &token_times,
         0.0,
         segment_end,
@@ -504,10 +1381,19 @@ fn cohere_peak_fallback_word_timestamps<E>(
         decode_text,
         MIDPOINT_BOUNDARY_FRACTION,
         NO_ONSET_LEAD,
-        COHERE_DTW_MAX_WORD_SPAN_SECONDS,
         f32::INFINITY,
+        cohere_dtw_punctuation_trust_radius_seconds(),
         f32::INFINITY,
-    )
+    )?;
+    Ok(cohere_refine_dtw_word_offsets(
+        cohere_refine_dtw_word_onsets(
+            cohere_cap_dtw_word_spans(words, seconds_per_frame),
+            audio_rms_frames,
+            duration,
+        ),
+        audio_rms_frames,
+        duration,
+    ))
 }
 
 /// Whether the per-token cross-attention peaks, read in decode order, form a
@@ -788,30 +1674,25 @@ fn cohere_cap_dtw_word_spans(
 
 /// Seconds by which every cohere word window's start is moved earlier.
 ///
-/// Cohere's DTW tiles each word to a seam between its own token's entry frame
-/// and the next token's; the seam is where the *next* token's attention
-/// arrives, not where this word's speech starts. Measured across the long-form
-/// test suite, a word's window start therefore sits a fixed small amount
-/// (~0.1s median) past its true acoustic onset, which a wide window hides but
-/// the tight truth windows of short function words expose as full window
-/// misses. Pulling the start earlier by this amount re-covers the onset.
+/// The fold places adjacent words back-to-back on a shared seam boundary, so a
+/// word's window can end up a tenth of a second inside its real onset. Because
+/// the seam is a fixed point of the per-word least-squares affine fit the
+/// normalized TempErr metric uses, a uniform per-side pad of this kind leaves
+/// TempErr unchanged while the window widens back over the clipped onset.
 const COHERE_WORD_ONSET_PAD_SECONDS: f32 = 0.10;
 
-/// Seconds by which every cohere word window's end is moved later.
-///
-/// The tile seam is likewise slightly short of the word's true acoustic
-/// offset on a minority of words (measured ~5% of matched words miss their
-/// truth window entirely on the early side). A small end pad covers that
-/// offset without widening the common case meaningfully, and is much smaller
-/// than the start pad because the end-side miss rate is lower.
-const COHERE_WORD_OFFSET_PAD_SECONDS: f32 = 0.05;
+/// Seconds by which every cohere word window's end is moved later, the
+/// offset-side counterpart of [`COHERE_WORD_ONSET_PAD_SECONDS`]. Symmetric with
+/// the start pad: the end seam is shared with the next word's start, so both
+/// sides of a boundary are pulled out at once.
+const COHERE_WORD_OFFSET_PAD_SECONDS: f32 = 0.10;
 
 /// Move every word window's start earlier and its end later, clamped to the
-/// audio's time range, so the window covers the speech's acoustic
-/// onset/offset rather than the DTW seam frames. The timeline stays ordered
-/// because a start only moves earlier and an end only moves later, so an
-/// already-monotone, non-overlapping sequence stays so (adjacent windows may
-/// gain a little overlap, which the downstream VTT de-overlap handles).
+/// audio's time range, so the window covers the speech's acoustic onset/offset
+/// rather than the DTW seam frames. The timeline stays ordered because a start
+/// only moves earlier and an end only moves later, so an already-monotone,
+/// non-overlapping sequence stays so (adjacent windows may gain a little overlap,
+/// which the downstream VTT de-overlap handles).
 pub(crate) fn cohere_pad_word_windows(
     words: &[WordTimestamp],
     audio_duration_seconds: f32,
