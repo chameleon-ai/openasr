@@ -801,3 +801,49 @@ fn reanchor_dtw_token_centers_noop_without_envelope() {
         whisper_reanchor_dtw_token_centers(vec![reanchor_token(100, 1.4)], &decode, None, 0.02);
     assert_eq!(out[0].center_seconds, 1.4);
 }
+
+/// Two-word fixture tokenizer: token 5 decodes to `hi`, token 6 to ` there`
+/// (`\u{120}`, the byte-level space escape, is how real whisper vocab entries
+/// carry the leading space).
+fn cross_attention_fixture_tokenizer() -> WhisperTokenizer {
+    const PAYLOAD: &str = r#"{"version":"1.0","added_tokens":[],"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"hi":5,"Ġthere":6},"merges":[]}}"#;
+    WhisperTokenizer::from_tokenizer_payload_bytes(PAYLOAD.as_bytes()).expect("fixture tokenizer")
+}
+
+#[test]
+fn cross_attention_com_fallback_caps_a_word_stretched_to_the_tail() {
+    // Empty per-token frame_probs (a zero-frame encoder failure) leaves
+    // frame_resolution at 0, so both DTW tiers are skipped and the per-token
+    // center-of-mass degrade runs. Its fold parks every center at 0.0 and
+    // anchors the last word's end at `duration`, so the last word is
+    // stretched across the whole trailing silence before the width cap.
+    let tokenizer = cross_attention_fixture_tokenizer();
+    let alignments = [5u32, 6].map(|token_id| WhisperGeneratedTokenAlignment {
+        token_id,
+        frame_probs: Vec::new(),
+    });
+    let (words, ranges) =
+        whisper_cross_attention_word_timestamps(&tokenizer, &alignments, &[], 20.0, None)
+            .expect("center-of-mass degrade decodes");
+    assert_eq!(words.len(), 2);
+    assert_eq!(ranges, vec![(0, 2)]);
+    assert_eq!(words[0].word, "hi");
+    assert_eq!(words[1].word, "there");
+    // The first word is the 0.0/0.0 mid-point window the pad widens by its
+    // onset constant.
+    assert!((words[0].start - 0.0).abs() < 1e-6);
+    assert!((words[0].end - WHISPER_WORD_ONSET_PAD_SECONDS).abs() < 1e-6);
+    // The last word: the cap trims the tail at 1.5 s, the pad then moves the
+    // start back by 0.1 s (clamped at 0.0) and the end to 1.6 s. Uncapped,
+    // its end would be 20.0.
+    assert!((words[1].start - 0.0).abs() < 1e-6);
+    assert!(
+        (words[1].end - (WHISPER_DTW_MAX_WORD_SPAN_SECONDS + WHISPER_WORD_OFFSET_PAD_SECONDS))
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        words[1].end - words[1].start <= WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS,
+        "com fallback must honor the family word-width bound"
+    );
+}

@@ -1296,15 +1296,17 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
         .first()
         .map(|a| a.frame_probs.len())
         .unwrap_or(0);
+    // The cross-attention window is the padded encoder window at a fixed
+    // 0.02s/frame (160-sample hop doubled through two strided convs, then
+    // downsampled 2x by the encoder: 1500 frames for a 30s window), so
+    // frames map to absolute wall-clock time from clip start, NOT a fraction
+    // of `duration`. Stretching the axis to `[0, duration]` (as a
+    // center-of-mass midpoint map does) would compress every timestamp for
+    // any clip shorter than the 30s window, which is the common case. The
+    // center-of-mass degrade below reuses the frame length as its width cap's
+    // per-frame floor.
+    let seconds_per_frame = 2.0_f32 * WHISPER_HOP_LENGTH as f32 / WHISPER_SAMPLE_RATE_HZ as f32;
     if frame_resolution > 0 {
-        // The cross-attention window is the padded encoder window at a fixed
-        // 0.02s/frame (160-sample hop doubled through two strided convs, then
-        // downsampled 2x by the encoder: 1500 frames for a 30s window), so
-        // frames map to absolute wall-clock time from clip start, NOT a fraction
-        // of `duration`. Stretching the axis to `[0, duration]` (as a
-        // center-of-mass midpoint map does) would compress every timestamp for
-        // any clip shorter than the 30s window, which is the common case.
-        let seconds_per_frame = 2.0_f32 * WHISPER_HOP_LENGTH as f32 / WHISPER_SAMPLE_RATE_HZ as f32;
         let full_window = token_alignments
             .iter()
             .map(|alignment| alignment.frame_probs.clone())
@@ -1609,7 +1611,19 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
         f32::INFINITY,
     )
     .map(|words| {
-        let words = whisper_pad_dtw_word_windows(words, duration);
+        // Cap before the pad, like the two DTW tiers: the fold anchors the
+        // last word's end at `duration`, so a degraded row set (no DTW
+        // alignment) can leave a word stretched across the whole trailing
+        // silence. Without the cap this tier is the only whisper word source
+        // with no width bound of its own. As in the DTW tiers, only the tail
+        // is trimmed and the pad then widens each side back by its constant,
+        // so a capping word ends up exactly
+        // `WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS` wide where the pad is not
+        // clamped.
+        let words = whisper_pad_dtw_word_windows(
+            whisper_cap_dtw_word_spans(words, seconds_per_frame),
+            duration,
+        );
         let word_count = words.len();
         (words, vec![(0, word_count)])
     })
