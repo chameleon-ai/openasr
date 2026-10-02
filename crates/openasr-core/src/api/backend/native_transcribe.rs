@@ -3585,8 +3585,15 @@ fn run_native_transcription_impl(
                     })
                     .into_iter()
                     .collect();
+                let mut fallback_transcription = fallback.into_transcription();
+                clamp_word_spans_to_family_limit(
+                    &mut fallback_transcription,
+                    crate::arch::max_word_span_original_seconds_for_model_architecture(
+                        selected_family.model_architecture,
+                    ),
+                );
                 let transcription = prepare_native_transcription(
-                    fallback.into_transcription(),
+                    fallback_transcription,
                     audio_duration_seconds,
                     Some(run_metadata),
                     reported_language.clone(),
@@ -3697,8 +3704,15 @@ fn run_native_transcription_impl(
             truncation,
         });
     }
+    let mut single_pass_transcription = transcription.into_transcription();
+    clamp_word_spans_to_family_limit(
+        &mut single_pass_transcription,
+        crate::arch::max_word_span_original_seconds_for_model_architecture(
+            selected_family.model_architecture,
+        ),
+    );
     let transcription = prepare_native_transcription(
-        transcription.into_transcription(),
+        single_pass_transcription,
         audio_duration_seconds,
         longform_metadata,
         reported_language,
@@ -4200,6 +4214,28 @@ fn longform_slice_transcript_debug_line(transcription: &Transcription) -> String
     line.push_str("text=");
     line.push_str(&transcription.text.replace('\n', "\\n"));
     line
+}
+
+/// Enforce the family's declared per-word width bound on paths that never
+/// build a `TranscriptAssembler` (short-audio / single-slice decodes and the
+/// suppressed-whole-file fallback). The assembler clamps in
+/// `map_word_time_to_original`; this mirrors its plain end-trim semantics
+/// (`word.end = word.start + limit`) so the declared post-pad contract holds
+/// no matter which path produced the words.
+fn clamp_word_spans_to_family_limit(
+    transcription: &mut Transcription,
+    max_word_span_original_seconds: Option<f32>,
+) {
+    let Some(limit) = max_word_span_original_seconds else {
+        return;
+    };
+    for segment in &mut transcription.segments {
+        for word in &mut segment.words {
+            if word.end - word.start > limit {
+                word.end = word.start + limit;
+            }
+        }
+    }
 }
 
 /// Normalize decode output before transcript-aware post-processing. Punctuation
@@ -10434,6 +10470,46 @@ mod tests {
                 confidence: Some(0.9),
             }],
         }
+    }
+
+    #[test]
+    fn word_spans_clamp_to_family_limit_end_trim() {
+        let make = || Transcription {
+            text: "wide".to_string(),
+            language: Some("English".to_string()),
+            segments: vec![Segment {
+                start: 0.0,
+                end: 30.0,
+                text: "wide".to_string(),
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words: vec![
+                    WordTimestamp {
+                        word: "ok".to_string(),
+                        start: 0.0,
+                        end: 1.0,
+                        confidence: None,
+                    },
+                    WordTimestamp {
+                        word: "wide".to_string(),
+                        start: 1.0,
+                        end: 29.0,
+                        confidence: None,
+                    },
+                ],
+            }],
+            ..Transcription::default()
+        };
+        let mut clamped = make();
+        clamp_word_spans_to_family_limit(&mut clamped, Some(1.7));
+        let words = &clamped.segments[0].words;
+        assert_eq!(words[0].end - words[0].start, 1.0, "narrow word untouched");
+        assert!((words[1].end - (1.0 + 1.7)).abs() < 1e-6);
+        let mut unbounded = make();
+        clamp_word_spans_to_family_limit(&mut unbounded, None);
+        assert_eq!(unbounded.segments[0].words[1].end, 29.0);
     }
 
     /// A single decode unit stays one scope, so its source's own numbering is
