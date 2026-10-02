@@ -1497,6 +1497,15 @@ const COHERE_DTW_PEAK_FALLBACK_MIN_SECONDS: f32 = 20.0;
 /// runaway regime; only the span's tail is trimmed, never its start.
 const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// Upper bound on a single word window's width in *original* time: the
+/// processed-time cap plus the fixed pad applied after it. The longform
+/// assembler enforces this as the post-timeline-map invariant so a word
+/// straddling an elided span cannot be stretched past the family's own
+/// post-pad width.
+pub(crate) const COHERE_MAX_WORD_SPAN_ORIGINAL_SECONDS: f32 = COHERE_DTW_MAX_WORD_SPAN_SECONDS
+    + COHERE_WORD_ONSET_PAD_SECONDS
+    + COHERE_WORD_OFFSET_PAD_SECONDS;
+
 /// Where the boundary between two consecutive DTW words lands, as a fraction of
 /// the gap between their centers: `prev + fraction * (this - prev)`. The
 /// equidistant midpoint (0.5, the plain fold) assumes a word's center -- the

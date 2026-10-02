@@ -48,6 +48,7 @@ mod weights;
 
 pub const COHERE_TRANSCRIBE_MODEL_FAMILY: &str = "cohere-transcribe";
 
+pub(crate) use dtw_word_timestamps::COHERE_MAX_WORD_SPAN_ORIGINAL_SECONDS;
 pub(crate) use ggml_executor::CohereTranscribeGgmlExecutor;
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;
 pub use package_import::{

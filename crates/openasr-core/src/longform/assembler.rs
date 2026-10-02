@@ -143,6 +143,11 @@ pub struct TranscriptAssembler {
     /// is trimmed by time before it can survive into the transcript.
     committed_end_original: Option<f32>,
     approximate_word_timestamps: bool,
+    /// Post-timeline-map invariant on word widths, in original seconds. The
+    /// per-family processed-time span cap does not survive a packed timeline,
+    /// so the assembler re-clamps mapped words to this bound. `None` leaves
+    /// word widths unclamped.
+    max_word_span_original_seconds: Option<f32>,
 }
 
 impl TranscriptAssembler {
@@ -155,6 +160,7 @@ impl TranscriptAssembler {
             stats: LongFormAssembleStats::default(),
             committed_end_original: None,
             approximate_word_timestamps: false,
+            max_word_span_original_seconds: None,
         }
     }
 
@@ -162,6 +168,11 @@ impl TranscriptAssembler {
     /// after stitching. Acoustic/native anchors retain their original times.
     pub(crate) fn with_approximate_word_timestamps(mut self, approximate: bool) -> Self {
         self.approximate_word_timestamps = approximate;
+        self
+    }
+
+    pub(crate) fn with_max_word_span_original_seconds(mut self, max_span: Option<f32>) -> Self {
+        self.max_word_span_original_seconds = max_span;
         self
     }
 
@@ -371,6 +382,7 @@ impl TranscriptAssembler {
                     &self.timeline,
                     original_start,
                     original_end,
+                    self.max_word_span_original_seconds,
                 )
             })
             .collect();
@@ -938,6 +950,7 @@ fn map_word_time_to_original(
     timeline: &TimelineMap,
     segment_start: f32,
     segment_end: f32,
+    max_word_span_original_seconds: Option<f32>,
 ) -> Option<WordTimestamp> {
     let text = word.word.trim();
     if text.is_empty() || !word.start.is_finite() || !word.end.is_finite() {
@@ -949,19 +962,92 @@ fn map_word_time_to_original(
         start += content_offset;
         end += content_offset;
     }
-    let original_start = timeline
+    let mut original_start = timeline
         .map_processed_to_original_seconds(start)
         .clamp(segment_start, segment_end);
-    let original_end = timeline
+    let mut original_end = timeline
         .map_processed_to_original_seconds(end)
         .max(original_start)
         .clamp(original_start, segment_end);
+    // Re-clamp the width in original time. A packed timeline stretches a word
+    // straddling an elision by the elided length, so first crop the window to
+    // the retained flank its processed-time center occupies; then any
+    // remaining overflow (a genuinely wide window, or no elision junction) is
+    // settled with a plain end trim, mirroring the family cap's
+    // `word.end = word.start + limit` semantics.
+    if let Some(limit) = max_word_span_original_seconds
+        && original_end - original_start > limit
+    {
+        if let Some((cropped_start, cropped_end)) =
+            crop_processed_window_to_elision_flank(start, end, timeline)
+        {
+            let cropped_original_start = timeline
+                .map_processed_to_original_seconds(cropped_start)
+                .clamp(segment_start, segment_end);
+            let cropped_original_end = timeline
+                .map_processed_to_original_seconds(cropped_end)
+                .max(cropped_original_start)
+                .clamp(cropped_original_start, segment_end);
+            if cropped_original_end > cropped_original_start {
+                original_start = cropped_original_start;
+                original_end = cropped_original_end;
+            }
+        }
+        if original_end - original_start > limit {
+            original_end = original_start + limit;
+        }
+    }
     Some(WordTimestamp {
         word: text.to_string(),
         start: original_start,
         end: original_end,
         confidence: word.confidence,
     })
+}
+
+/// Crop a processed-time window to the retained flank of an eliding
+/// (packed-timeline) junction that it straddles. A packed `TimelineMap` lays
+/// retained spans back-to-back with a short padding seam at the junction;
+/// the anchor pair across that junction has a small processed delta but a
+/// large original delta (the elided region). A decoded word window that
+/// crosses it would be stretched by the elided region after mapping; its
+/// true audio must sit on one of the two flanks, so the window is trimmed
+/// to the flank its center occupies.
+fn crop_processed_window_to_elision_flank(
+    start: f32,
+    end: f32,
+    timeline: &TimelineMap,
+) -> Option<(f32, f32)> {
+    let anchors = timeline.anchors();
+    let mut best: Option<(f32, f32, f32)> = None;
+    for pair in anchors.windows(2) {
+        let processed_span = pair[1].processed_seconds - pair[0].processed_seconds;
+        let original_span = pair[1].original_seconds - pair[0].original_seconds;
+        if original_span < 0.5 || original_span <= 2.0 * processed_span.max(0.0) {
+            continue; // not an eliding junction
+        }
+        if pair[0].processed_seconds >= end || pair[1].processed_seconds <= start {
+            continue; // junction does not overlap the word window
+        }
+        match best {
+            Some((_, _, best_span)) if best_span >= original_span => {}
+            _ => {
+                best = Some((
+                    pair[0].processed_seconds,
+                    pair[1].processed_seconds,
+                    original_span,
+                ))
+            }
+        }
+    }
+    let (junction_start, junction_end, _) = best?;
+    let center = (start + end) / 2.0;
+    let trimmed = if center >= (junction_start + junction_end) / 2.0 {
+        (junction_end.max(start), end)
+    } else {
+        (start, junction_start.min(end))
+    };
+    (trimmed.1 > trimmed.0 + 1e-6).then_some(trimmed)
 }
 
 /// Trim the part of a mapped segment that lies in the audio region a prior slice
@@ -1465,6 +1551,199 @@ mod tests {
         assert_eq!(transcription.segments[0].words[0].word, "hello");
         assert!(transcription.segments[0].words[0].start >= 1.1);
         assert!(transcription.segments[0].words[0].end <= 1.4);
+    }
+
+    #[test]
+    fn map_word_time_to_original_clamps_width_across_an_elision() {
+        // An eliding (packed) timeline: processed 4.9..5.0s covers original
+        // 4.9..25.0s, so any processed-time word straddling 5.0s would be
+        // stretched by the elided ~20s. Mirrors the lobster-uvr D2 shape.
+        let timeline = TimelineMap::from_anchors(vec![
+            TimelineAnchor {
+                processed_seconds: 0.0,
+                original_seconds: 0.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 4.9,
+                original_seconds: 4.9,
+            },
+            TimelineAnchor {
+                processed_seconds: 5.0,
+                original_seconds: 25.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 10.0,
+                original_seconds: 30.0,
+            },
+        ]);
+        let word = WordTimestamp {
+            word: "stretch".to_string(),
+            start: 4.95,
+            end: 6.45,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &word,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            30.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        // The window's center is past the elision slot, so it is cropped to
+        // the post-elision retained flank (its true audio lives there).
+        assert!(
+            (mapped.start - 25.0).abs() < 1e-4,
+            "onset snapped to the post-elision flank, got {}",
+            mapped.start
+        );
+        assert!(
+            mapped.end - mapped.start <= 1.7 + 1e-6,
+            "width within the post-pad limit, got {}",
+            mapped.end - mapped.start
+        );
+    }
+
+    #[test]
+    fn map_word_time_to_original_crops_to_the_pre_elision_flank_when_center_precedes() {
+        let timeline = TimelineMap::from_anchors(vec![
+            TimelineAnchor {
+                processed_seconds: 0.0,
+                original_seconds: 0.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 4.9,
+                original_seconds: 4.9,
+            },
+            TimelineAnchor {
+                processed_seconds: 5.0,
+                original_seconds: 25.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 10.0,
+                original_seconds: 30.0,
+            },
+        ]);
+        let word = WordTimestamp {
+            word: "stretch".to_string(),
+            start: 4.0,
+            end: 5.05,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &word,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            30.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        assert!(
+            (mapped.end - 4.9).abs() < 1e-4,
+            "offset snapped to the pre-elision flank, got {}",
+            mapped.end
+        );
+        assert!(mapped.start >= 4.0 - 1e-6);
+    }
+
+    #[test]
+    fn map_word_time_to_original_leaves_legal_widths_untouched() {
+        // Identity timeline: a word at exactly the post-pad width (whisper
+        // cap 1.5 + 0.2) must not shrink; a sub-limit word maps through.
+        let timeline = TimelineMap::identity();
+        let at_limit = WordTimestamp {
+            word: "wide".to_string(),
+            start: 2.0,
+            end: 3.7,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &at_limit,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            10.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        assert_eq!(mapped.start, 2.0);
+        assert_eq!(mapped.end, 3.7);
+
+        let narrow = WordTimestamp {
+            word: "narrow".to_string(),
+            start: 4.0,
+            end: 4.3,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &narrow,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            10.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        assert_eq!(mapped.start, 4.0);
+        assert_eq!(mapped.end, 4.3);
+    }
+
+    #[test]
+    fn assembler_clamps_assembled_words_via_policy() {
+        let timeline = TimelineMap::from_anchors(vec![
+            TimelineAnchor {
+                processed_seconds: 0.0,
+                original_seconds: 0.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 4.9,
+                original_seconds: 4.9,
+            },
+            TimelineAnchor {
+                processed_seconds: 5.0,
+                original_seconds: 25.0,
+            },
+            TimelineAnchor {
+                processed_seconds: 10.0,
+                original_seconds: 30.0,
+            },
+        ]);
+        let mut assembler = TranscriptAssembler::new(timeline, SegmentMergePolicy::default())
+            .with_max_word_span_original_seconds(Some(1.7));
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 160_000),
+            text: "stretch".to_string(),
+            segments: vec![Segment {
+                start: 0.0,
+                end: 10.0,
+                text: "stretch".to_string(),
+                speaker: None,
+                speaker_label: None,
+                speaker_person_id: None,
+                speaker_snapshot_label: None,
+                words: vec![WordTimestamp {
+                    word: "stretch".to_string(),
+                    start: 4.95,
+                    end: 6.45,
+                    confidence: None,
+                }],
+            }],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 1);
+        let word = &transcription.segments[0].words[0];
+        assert!(
+            word.end - word.start <= 1.7 + 1e-6,
+            "assembled word width {}s must respect the post-map limit",
+            word.end - word.start
+        );
     }
 
     #[test]

@@ -3018,7 +3018,12 @@ fn run_native_transcription_impl(
                     == crate::arch::OpenAsrWordTimestampStrategy::DecodeInvariant;
             let mut assembler =
                 TranscriptAssembler::new(plan.timeline.clone(), SegmentMergePolicy::default())
-                    .with_approximate_word_timestamps(seam_rederives_word_spans);
+                    .with_approximate_word_timestamps(seam_rederives_word_spans)
+                    .with_max_word_span_original_seconds(
+                        crate::arch::max_word_span_original_seconds_for_model_architecture(
+                            selected_family.model_architecture,
+                        ),
+                    );
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
             let mut rolling_prompt_token_ids: Vec<u32> = Vec::new();
             let carry_prompt_mode =

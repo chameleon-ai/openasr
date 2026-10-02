@@ -229,6 +229,15 @@ fn whisper_dtw_onset_lead() -> f32 {
 /// and far below the runaway regime; only the tail is trimmed, never the start.
 const WHISPER_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// Upper bound on a single word window's width in *original* time: the
+/// processed-time cap plus the fixed pad applied after it. The longform
+/// assembler enforces this as the post-timeline-map invariant so a word
+/// straddling an elided span cannot be stretched past the family's own
+/// post-pad width.
+pub(crate) const WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS: f32 = WHISPER_DTW_MAX_WORD_SPAN_SECONDS
+    + WHISPER_WORD_ONSET_PAD_SECONDS
+    + WHISPER_WORD_OFFSET_PAD_SECONDS;
+
 /// How far an interior word's window may extend on either side of its own
 /// center before the fold leaves the rest of an adjacent pause as real
 /// silence (see `max_interior_half_span_seconds`). Only inter-center gaps past

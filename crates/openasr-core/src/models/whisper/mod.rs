@@ -20,6 +20,7 @@ mod prompt;
 pub(crate) mod runtime_contract;
 mod tokenizer;
 
+pub(crate) use dtw_word_timestamps::WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS;
 pub use frontend::whisper_log_mel_spectrogram_16khz_mono_v0;
 pub(crate) use ggml_executor::WhisperGgmlExecutor;
 pub(crate) use package_import::TENSOR_QUANTIZATION_CONTRACT;

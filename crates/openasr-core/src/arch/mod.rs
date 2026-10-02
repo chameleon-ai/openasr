@@ -836,6 +836,12 @@ pub(crate) struct OpenAsrExecutionContract {
     /// decode-side reason and is handled separately.
     pub dtw_word_times_buffer_sensitive: bool,
     pub emits_punctuation: Option<bool>,
+    /// Upper bound (seconds) on one word window's width after the longform
+    /// timeline map back to original time. The family's processed-time span
+    /// cap and pad do not survive a packed (eliding) timeline: a word
+    /// straddling an excised span would be stretched by the elided length.
+    /// `None` leaves assembled word widths unclamped.
+    pub max_word_span_original_seconds: Option<f32>,
 }
 
 /// Decoder topology and shared-driver selection for one native family.
@@ -1049,6 +1055,19 @@ pub(crate) fn longform_slice_shape_for_model_architecture(
         .find_by_model_architecture(model_architecture)
         .map(|descriptor| descriptor.execution_contract.longform_slice_shape)
         .unwrap_or(OpenAsrLongformSliceShape::SharedWindow)
+}
+
+/// Upper bound on one word window's width (seconds) after the longform
+/// timeline map back to original time, looked up by GGUF
+/// `model_architecture`. The longform assembler enforces it so a word
+/// straddling an elided span cannot be stretched past the family's own
+/// post-pad width; `None` leaves word widths unclamped.
+pub(crate) fn max_word_span_original_seconds_for_model_architecture(
+    model_architecture: &str,
+) -> Option<f32> {
+    OpenAsrArchitectureRegistry::with_builtins()
+        .find_by_model_architecture(model_architecture)
+        .and_then(|descriptor| descriptor.execution_contract.max_word_span_original_seconds)
 }
 
 /// Which GPU-class backend(s) a builtin family's Auto execution may select
@@ -1746,6 +1765,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: Some(
+                crate::models::cohere::COHERE_MAX_WORD_SPAN_ORIGINAL_SECONDS,
+            ),
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology:
@@ -1868,6 +1890,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 30.0 },
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: Some(
+                crate::models::whisper::WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS,
+            ),
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology:
@@ -1955,6 +1980,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
@@ -2062,6 +2088,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // per-family fact. The generated inventory therefore exports an
             // unclaimed value for catalog tooling.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2162,6 +2189,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // punctuation and capitalization; the generated inventory projects
             // this declaration into catalog authoring.
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2249,6 +2277,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             invocation_span: OpenAsrInvocationSpan::Elastic,
             // Character CTC: same BYO-checkpoint reasoning as parakeet-ctc above.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2341,6 +2370,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2444,6 +2474,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology:
@@ -2551,6 +2582,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // without punctuation and the model has no punctuation-prediction
             // head/token to enable -- honestly unpunctuated, not "unknown".
             emits_punctuation: Some(false),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2650,6 +2682,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             longform_slice_shape: OpenAsrLongformSliceShape::SharedWindow,
             invocation_span: OpenAsrInvocationSpan::Elastic,
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::None,
@@ -2747,6 +2780,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // entries (char + SPM vocab trained on unpunctuated Mandarin ASR
             // corpora); verified on the golden-diff fixture transcript.
             emits_punctuation: Some(false),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology:
@@ -2851,6 +2885,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // char+SPM vocab); leave unclaimed rather than assert an unverified
             // capability.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
@@ -2950,6 +2985,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // leave unclaimed rather than assert a capability beyond the two golden
             // clips.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
@@ -3040,6 +3076,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // firered-aed's punctuation-free vocab) -- leave unclaimed rather
             // than assert an unverified capability.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
@@ -3159,6 +3196,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // but this has not been verified against enough real transcripts to
             // assert as a capability -- leave unclaimed rather than guess.
             emits_punctuation: None,
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
@@ -3281,6 +3319,7 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // come out correctly punctuated -- unlike `MIMO_ASR`'s "not
             // characterized yet" case above, this one has been observed.
             emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
         },
         topology_contract: OpenAsrTopologyContract {
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
