@@ -250,6 +250,26 @@ fn json_segments(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegme
     map_json_segments(&transcription.segments, with_ids)
 }
 
+/// Round word confidence to milliseconds' worth of resolution, so the
+/// persisted/emitted JSON is stable run-to-run (the raw f32 carries
+/// quantization noise in its trailing bits).
+fn round_confidence(confidence: Option<f32>) -> Option<f32> {
+    confidence.map(|value| (value * 1000.0).round() / 1000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_confidence;
+
+    #[test]
+    fn confidence_is_serialized_at_millisecond_resolution() {
+        assert_eq!(round_confidence(Some(0.999_953_7)), Some(1.0));
+        assert_eq!(round_confidence(Some(0.874_5)), Some(0.875));
+        assert_eq!(round_confidence(Some(0.0)), Some(0.0));
+        assert_eq!(round_confidence(None), None);
+    }
+}
+
 fn json_subtitle_cues(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegment<'_>> {
     map_json_segments(&transcription.subtitle_cues, with_ids)
 }
@@ -277,7 +297,7 @@ fn map_json_segments(
                     word: &word.word,
                     start: word.start,
                     end: word.end,
-                    confidence: word.confidence,
+                    confidence: round_confidence(word.confidence),
                 })
                 .collect(),
         })
@@ -302,7 +322,7 @@ fn flattened_words(transcription: &Transcription) -> Vec<JsonWord<'_>> {
             word: &word.word,
             start: word.start,
             end: word.end,
-            confidence: word.confidence,
+            confidence: round_confidence(word.confidence),
         })
         .collect()
 }
