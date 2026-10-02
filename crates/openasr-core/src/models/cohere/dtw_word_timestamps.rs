@@ -192,6 +192,23 @@ const COHERE_DTW_REFINE_MIN_SPAN_S: f64 = 0.3;
 /// would miss it.
 const COHERE_DTW_OFFSET_EDGE_LEAD_S: f32 = 0.5;
 
+/// How far after the word's window the onset run search reaches. A slice-edge
+/// word the fold pinned at the band start (`max_edge` unbounded anchors word 0
+/// there) can sit ahead of its own audio, so the word's first above-floor run
+/// starts at or past the window end and an in-window search would count only
+/// the run's truncated head, short of the sustain requirement. Mirrors
+/// [`COHERE_DTW_OFFSET_EDGE_LEAD_S`].
+const COHERE_DTW_ONSET_EDGE_LEAD_S: f32 = 0.5;
+
+/// Deployment env override for the onset edge lead
+/// ([`COHERE_DTW_ONSET_EDGE_LEAD_S`]).
+fn cohere_dtw_onset_edge_lead_s() -> f32 {
+    std::env::var("OPENASR_COHERE_DTW_ONSET_EDGE_LEAD_S")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(COHERE_DTW_ONSET_EDGE_LEAD_S)
+}
+
 /// Below-floor frames tolerated inside a speech run before it splits. A word's
 /// offset tail decays through coarticulatory micro-silences shorter than this;
 /// without the tolerance the run shreds and no qualifying offset is found.
@@ -589,6 +606,21 @@ fn later_piece_contributes_to_same_word(index: usize, pieces: &[String]) -> bool
 /// a trusted pause and a push would only move a word that was already acceptable.
 /// That ceiling is what separates a genuine zero-silence pause (fire) from a low
 /// music floor (skip).
+///
+/// Two deliberate breaks from whisper's parity here. Whisper's longform
+/// assembler never consumes the DTW word windows, so its onset refiner may skip
+/// the chunk's first word and search only inside a word's own window. Cohere's
+/// longform assembler keys its seam trims and re-read drops off those windows,
+/// so a head word pinned at the band start -- still starting seconds before its
+/// own audio -- changes which words survive the seam: it is corrected here like
+/// any other word. And its first-run search reaches
+/// [`COHERE_DTW_ONSET_EDGE_LEAD_S`] past the window's end, the mirror of the
+/// offset pass' pre-window lead, so a speech run straddling the window end
+/// counts at full length against the sustain requirement. A run that lies
+/// *entirely* past the window end is refused, though: landing the start on it
+/// would invert the window, and a word wholly ahead of its audio needs its end
+/// moved too -- a rehouse, not an edge correction (the offset pass refuses its
+/// mirror case the same way).
 fn cohere_refine_dtw_word_onsets(
     mut words: Vec<WordTimestamp>,
     audio_rms_frames: Option<&[f32]>,
@@ -618,7 +650,11 @@ fn cohere_refine_dtw_word_onsets(
     let is_dense_chunk =
         clip_peak / noise_floor.max(f64::EPSILON) < cohere_dtw_thin_floor_contrast();
     let absolute_quiet_threshold = noise_floor * COHERE_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
-    for word in words.iter_mut().skip(1) {
+    // Unlike whisper's parity (the `skip(1)` it carries), word 0 is refined
+    // here too: the unbounded-edge fold anchors it at the band start, the
+    // longform assembler consumes the window, and nothing else audio-side
+    // corrects the head.
+    for word in words.iter_mut() {
         let raw_start = f64::from(word.start);
         let raw_end = f64::from(word.end);
         if raw_end - raw_start < COHERE_DTW_REFINE_MIN_SPAN_S {
@@ -678,20 +714,32 @@ fn cohere_refine_dtw_word_onsets(
             continue;
         }
         // The onset: the first speech run (>= sustain frames above the floor)
-        // preceded by a quiet run of at least the minimum silence length, inside
-        // this word's own window.
+        // preceded by a quiet run of at least the minimum silence length. The
+        // search covers the window plus the post-window edge lead: a slice-edge
+        // word pinned at the band start reads hollow across its whole window,
+        // with its own run starting at or just past the window end, so a run
+        // straddling that end must count at full length rather than as a
+        // truncated head. The quiet requirement still spans the lead, so a run
+        // is trusted only with real silence ahead of it.
+        let region_end_s = (end_s + cohere_dtw_onset_edge_lead_s() as f64).max(end_s);
+        let region_frame_end = ((region_end_s / envelope_spf) as usize)
+            .min(last_frame)
+            .max(frame_end);
+        let region = &levels[frame_start..region_frame_end + 1];
+        let region_len = region.len();
+        let region_above = |index: usize| f64::from(region[index]) >= threshold;
         let mut onset_rel: Option<usize> = None;
         let mut index = 0usize;
-        while index < window_len && onset_rel.is_none() {
-            if is_above(index) {
+        while index < region_len && onset_rel.is_none() {
+            if region_above(index) {
                 let mut run_end = index;
-                while run_end + 1 < window_len && is_above(run_end + 1) {
+                while run_end + 1 < region_len && region_above(run_end + 1) {
                     run_end += 1;
                 }
                 if run_end - index + 1 >= COHERE_DTW_ONSET_SUSTAIN_FRAMES {
                     let mut quiet = 0usize;
                     let mut probe = index;
-                    while probe > 0 && !is_above(probe - 1) {
+                    while probe > 0 && !region_above(probe - 1) {
                         probe -= 1;
                         quiet += 1;
                     }
@@ -708,6 +756,13 @@ fn cohere_refine_dtw_word_onsets(
             continue;
         };
         let onset_s = ((frame_start + rel) as f64 * envelope_spf) as f32;
+        // A run that lies entirely past the window end would land the start at
+        // or beyond the word's own end, inverting the window; the word's end
+        // would have to move too -- a rehouse, not an edge correction. Refuse it
+        // (the offset pass refuses its mirror case the same way).
+        if f64::from(onset_s) >= raw_end {
+            continue;
+        }
         let push = onset_s - raw_start as f32;
         // A word's start may only move forward into later audio, never backward.
         // The minimum push guards against a sub-calibration-error wiggle; the

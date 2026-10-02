@@ -1183,8 +1183,55 @@ fn cohere_refine_dtw_word_onsets_pushes_true_silence_word_to_its_onset() {
     let envelope = refine_fixture_envelope();
     let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
     assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
-    // The first word is never modified.
+    // The first word is examined now (whisper's `skip(1)` is a deliberate
+    // parity break here); its 0.1s span is below the refine minimum, so it is
+    // untouched for span reasons rather than by position.
     assert!((out[0].start - 0.5).abs() < 1e-4 && (out[0].end - 0.6).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refines_the_first_word_of_the_chunk() {
+    // The unbounded-edge fold anchors word 0's start at the band start, and
+    // cohere's longform assembler consumes the window -- so the head word gets
+    // the same hollow-front correction as any other word. Same fixture as the
+    // interior-word test, the hollow window at [2.0, 4.0) now held by word 0.
+    let words = vec![word("a", 2.0, 4.0), word("b", 4.5, 5.0)];
+    let envelope = refine_fixture_envelope();
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 3.8).abs() < 0.05, "start={}", out[0].start);
+    assert!((out[1].start - 4.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_counts_a_run_straddling_the_window_end() {
+    // A head word pinned at the band start with its own run starting just
+    // before the window end: the in-window portion (4 frames) is short of the
+    // sustain requirement, but the post-window lead counts the run at full
+    // length (18 frames) and the onset lands inside the window.
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[172..=189].iter_mut() {
+        *level = 0.25;
+    }
+    let words = vec![word("a", 2.0, 3.5), word("b", 4.0, 4.5)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 3.44).abs() < 0.03, "start={}", out[0].start);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_an_onset_entirely_past_the_window_end() {
+    // The run lies wholly in the post-window lead: landing the start on it
+    // would invert the window (its end would have to move too -- a rehouse, not
+    // an edge correction), so the word keeps its fold position.
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[180..=195].iter_mut() {
+        *level = 0.25;
+    }
+    let words = vec![word("a", 2.0, 3.5), word("b", 4.0, 4.5)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
+    assert!((out[0].end - 3.5).abs() < 1e-4);
 }
 
 #[test]
