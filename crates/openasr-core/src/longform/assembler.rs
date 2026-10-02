@@ -1695,6 +1695,98 @@ mod tests {
     }
 
     #[test]
+    fn map_word_time_to_original_end_trims_com_stretched_word_on_identity_timeline() {
+        // Identity timeline (a Fixed/Energy plan with no elision junction,
+        // so the flank crop cannot fire): an uncapped COM-tier word
+        // stretched across the trailing silence of a 20 s decode - the
+        // pre-C1 shape, normally kept out by the cap call inside the tier -
+        // reaches the post-map clamp at full width. The plain end trim must
+        // settle it at exactly start + limit (whisper cap 1.5 + 0.2 pad),
+        // touching only the end.
+        let timeline = TimelineMap::identity();
+        let stretched = WordTimestamp {
+            word: "tail".to_string(),
+            start: 0.0,
+            end: 20.0,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &stretched,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            20.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        assert_eq!(mapped.start, 0.0);
+        assert_eq!(mapped.end, 1.7);
+
+        // A wide window away from both clamps keeps its start exactly and
+        // trims only its end.
+        let mid = WordTimestamp {
+            word: "mid".to_string(),
+            start: 8.0,
+            end: 15.0,
+            confidence: None,
+        };
+        let mapped = map_word_time_to_original(
+            &mid,
+            0.0,
+            SegmentTimeDomain::AbsoluteOriginal,
+            &timeline,
+            0.0,
+            20.0,
+            Some(1.7),
+        )
+        .expect("mapped word");
+        assert_eq!(mapped.start, 8.0);
+        assert!(
+            (mapped.end - (8.0 + 1.7)).abs() < 1e-6,
+            "end trimmed to the bound, got {}",
+            mapped.end
+        );
+    }
+
+    #[test]
+    fn map_word_time_to_original_end_trims_uniform_tiles_on_identity_timeline() {
+        // Uniform-tier shape (the no-cross-attention fallback that tiles
+        // centers evenly over the segment): a sparse window hands every word
+        // ~duration/tokens of width, past the family bound on any identity
+        // timeline. Each over-wide tile must end-trim to the bound and keep
+        // its own start, so the tiles stay ordered and distinct instead of
+        // collapsing onto the band head.
+        let timeline = TimelineMap::identity();
+        const TILE_SECONDS: f32 = 2.5;
+        for index in 0..8 {
+            let word = WordTimestamp {
+                word: format!("word{index}"),
+                start: index as f32 * TILE_SECONDS,
+                end: (index + 1) as f32 * TILE_SECONDS,
+                confidence: None,
+            };
+            let mapped = map_word_time_to_original(
+                &word,
+                0.0,
+                SegmentTimeDomain::AbsoluteOriginal,
+                &timeline,
+                0.0,
+                20.0,
+                Some(1.7),
+            )
+            .expect("mapped word");
+            assert_eq!(mapped.start, index as f32 * TILE_SECONDS);
+            assert!(
+                (mapped.end - (mapped.start + 1.7)).abs() < 1e-6,
+                "tile {} end-trimmed to the bound, got {}",
+                index,
+                mapped.end
+            );
+        }
+    }
+
+    #[test]
     fn assembler_clamps_assembled_words_via_policy() {
         let timeline = TimelineMap::from_anchors(vec![
             TimelineAnchor {
