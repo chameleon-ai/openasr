@@ -7328,6 +7328,58 @@ fn whisper_slice_head_is_audible(
     }
 }
 
+/// The carry head-skip recovery's graft decision as pure data, so tests pin
+/// the graft/abort boundary: `None` (no hole words) grafts nothing and leaves
+/// the carried decode untouched — the same postcondition every abort path
+/// (failed re-decode, non-stop reason, missing base prompt) holds by
+/// construction, since none of them reaches this decision.
+#[derive(Debug)]
+enum WhisperCarryHeadSkipGraft {
+    /// Prepend these head words to the carried decode; the carried words and
+    /// everything downstream of them (text tail, carry, stop reason) stay
+    /// verbatim.
+    Splice {
+        hole_words: Vec<crate::WordTimestamp>,
+    },
+    /// The carried decode holds no real content after the skip and the
+    /// re-decode genuinely covers the head: adopt its words and text wholesale.
+    Swap,
+}
+
+/// The re-decode's words whose majority time sits before the carried decode's
+/// first word, and whether they earn a wholesale swap or a head-only splice.
+/// Pure punctuation/symbol stamps (a lone ".", "-", or a mojibake token) are
+/// DTW artifacts, not words, so a grafted set holding only those grafts
+/// nothing.
+fn whisper_carry_head_skip_graft(
+    carried_words: &[crate::WordTimestamp],
+    recovered_words: &[crate::WordTimestamp],
+    carried_first_start: f32,
+) -> Option<WhisperCarryHeadSkipGraft> {
+    let hole_words: Vec<crate::WordTimestamp> = recovered_words
+        .iter()
+        .filter(|word| {
+            0.5 * (word.start + word.end) < carried_first_start
+                && word.word.trim().chars().any(|c| c.is_alphanumeric())
+        })
+        .cloned()
+        .collect();
+    if hole_words.is_empty() {
+        return None;
+    }
+    let carried_is_all_degenerate = carried_words
+        .iter()
+        .all(|word| word.end - word.start < WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH);
+    let recovered_covers_head = recovered_words.first().is_some_and(|word| {
+        word.start + WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS < carried_first_start
+    });
+    if carried_is_all_degenerate && recovered_covers_head {
+        Some(WhisperCarryHeadSkipGraft::Swap)
+    } else {
+        Some(WhisperCarryHeadSkipGraft::Splice { hole_words })
+    }
+}
+
 /// The tail mirror of [`whisper_slice_head_is_audible`], for the ladder's
 /// audible-tail coverage re-race: does the audio AFTER the last placed word
 /// carry comparable signal to what the window decoded? Compares the tail
@@ -8325,77 +8377,98 @@ fn run_whisper_decode_loop(
                 .ok()
                 .map(|base_max_generated_tokens| (base_prompt_tokens, base_max_generated_tokens))
             });
-            if let Some((base_prompt_tokens, base_max_generated_tokens)) = base
-                && let Ok((recovered_candidate, recovered_decode)) = decode_round(
+            if let Some((base_prompt_tokens, base_max_generated_tokens)) = base {
+                match decode_round(
                     &base_prompt_tokens,
                     base_max_generated_tokens,
                     0.0,
                     WHISPER_TEMPERATURE_LADDER_BASE_SEED,
                     0,
-                )
-                && whisper_stop_reason_is_stop_token(&recovered_decode.stop_reason)
-            {
-                let (recovered_words, _) = whisper_cross_attention_word_timestamps(
-                    tokenizer,
-                    &recovered_candidate.token_alignments,
-                    &recovered_decode.generated_probabilities,
-                    audio_duration_seconds,
-                    Some(rms_frames),
-                )
-                .unwrap_or_default();
-                // The hole words: the re-decode's words whose majority
-                // time sits before the carried decode's first word.
-                // Pure punctuation/symbol stamps (a lone ".", "-", or a
-                // mojibake token) are DTW artifacts, not words, so a
-                // grafted set holding only those grafts nothing.
-                let hole_words: Vec<crate::WordTimestamp> = recovered_words
-                    .iter()
-                    .filter(|word| {
-                        0.5 * (word.start + word.end) < carried_first_start
-                            && word.word.trim().chars().any(|c| c.is_alphanumeric())
-                    })
-                    .cloned()
-                    .collect();
-                if !hole_words.is_empty() {
-                    let carried_is_all_degenerate = words.iter().all(|word| {
-                        word.end - word.start < WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH
-                    });
-                    let recovered_covers_head = recovered_words.first().is_some_and(|word| {
-                        word.start + WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS < carried_first_start
-                    });
-                    if carried_is_all_degenerate && recovered_covers_head {
-                        let recovered_text = recovered_decode.text.trim().to_string();
-                        if !recovered_text.is_empty()
-                            && recovered_text.chars().any(|c| c.is_alphanumeric())
-                        {
+                ) {
+                    Err(error) => {
+                        if whisper_ladder_debug_enabled() {
                             eprintln!(
-                                "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
-                                recovered_words[0].start,
-                                recovered_words.len(),
-                                words.len()
+                                "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=redecode_failed carried_first_word={carried_first_start:.2}s error={error:?}"
                             );
-                            text = recovered_text;
-                            words = recovered_words;
                         }
-                    } else {
-                        // Head-only splice: the grafted words precede the
-                        // carried first word, the rest of the carried
-                        // decode (and its token stream, which feeds the
-                        // next slice's carry) is preserved verbatim.
-                        let prefix = crate::transcript_text::join_segment_texts(
-                            hole_words.iter().map(|word| word.word.trim()),
-                        );
-                        eprintln!(
-                            "openasr_whisper_greedy_decode stage=carry_head_skip event=head_spliced carried_first_word={carried_first_start:.2}s grafted_words={} first_grafted_word={:.2}s",
-                            hole_words.len(),
-                            hole_words[0].start
-                        );
-                        let mut spliced = hole_words;
-                        spliced.extend_from_slice(&words);
-                        words = spliced;
-                        text = format!("{prefix} {text}");
+                    }
+                    Ok((recovered_candidate, recovered_decode)) => {
+                        if !whisper_stop_reason_is_stop_token(&recovered_decode.stop_reason) {
+                            if whisper_ladder_debug_enabled() {
+                                eprintln!(
+                                    "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=redecode_not_clean stop_reason={:?} text_len={} carried_first_word={carried_first_start:.2}s",
+                                    recovered_decode.stop_reason,
+                                    recovered_decode.text.len(),
+                                );
+                            }
+                        } else {
+                            let (recovered_words, _) = whisper_cross_attention_word_timestamps(
+                                tokenizer,
+                                &recovered_candidate.token_alignments,
+                                &recovered_decode.generated_probabilities,
+                                audio_duration_seconds,
+                                Some(rms_frames),
+                            )
+                            .unwrap_or_default();
+                            match whisper_carry_head_skip_graft(
+                                &words,
+                                &recovered_words,
+                                carried_first_start,
+                            ) {
+                                None => {
+                                    if whisper_ladder_debug_enabled() {
+                                        let recovered_first = recovered_words
+                                            .first()
+                                            .map(|word| word.start)
+                                            .unwrap_or(f32::NAN);
+                                        eprintln!(
+                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=no_hole_words stop_reason={:?} recovered_words={} recovered_first_word={recovered_first:.2}s carried_first_word={carried_first_start:.2}s",
+                                            recovered_decode.stop_reason,
+                                            recovered_words.len(),
+                                        );
+                                    }
+                                }
+                                Some(WhisperCarryHeadSkipGraft::Swap) => {
+                                    let recovered_text = recovered_decode.text.trim().to_string();
+                                    if !recovered_text.is_empty()
+                                        && recovered_text.chars().any(|c| c.is_alphanumeric())
+                                    {
+                                        eprintln!(
+                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
+                                            recovered_words[0].start,
+                                            recovered_words.len(),
+                                            words.len()
+                                        );
+                                        text = recovered_text;
+                                        words = recovered_words;
+                                    }
+                                }
+                                Some(WhisperCarryHeadSkipGraft::Splice { hole_words }) => {
+                                    // Head-only splice: the grafted words precede the
+                                    // carried first word, the rest of the carried
+                                    // decode (and its token stream, which feeds the
+                                    // next slice's carry) is preserved verbatim.
+                                    let prefix = crate::transcript_text::join_segment_texts(
+                                        hole_words.iter().map(|word| word.word.trim()),
+                                    );
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_head_skip event=head_spliced carried_first_word={carried_first_start:.2}s grafted_words={} first_grafted_word={:.2}s",
+                                        hole_words.len(),
+                                        hole_words[0].start
+                                    );
+                                    let mut spliced = hole_words;
+                                    spliced.extend_from_slice(&words);
+                                    words = spliced;
+                                    text = format!("{prefix} {text}");
+                                }
+                            }
+                        }
                     }
                 }
+            } else if whisper_ladder_debug_enabled() {
+                eprintln!(
+                    "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=base_prompt_unavailable carried_first_word={carried_first_start:.2}s"
+                );
             }
         }
     }

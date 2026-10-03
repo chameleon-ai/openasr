@@ -3556,3 +3556,103 @@ fn dominant_cycle_stripping_shapes() {
     let short = [9u32, 9, 9, 9, 9];
     assert_eq!(super::whisper_stream_without_dominant_cycle(&short), short);
 }
+
+fn head_skip_word(word: &str, start: f32, end: f32) -> crate::WordTimestamp {
+    crate::WordTimestamp {
+        word: word.to_string(),
+        start,
+        end,
+        confidence: None,
+    }
+}
+
+#[test]
+fn carry_head_skip_graft_aborts_leave_carried_decode_untouched() {
+    // A `None` graft is the abort postcondition: the caller keeps the carried
+    // words/text verbatim, exactly as the failed-re-decode, non-stop-reason
+    // and missing-prompt paths do by never reaching the decision.
+    let carried = vec![
+        head_skip_word("Relax.", 6.02, 6.58),
+        head_skip_word("You", 22.21, 23.39),
+    ];
+    // The ploomet slice-3 shape: the re-decode reproduces the carried skip,
+    // so no re-decode word has its majority time before the carried first
+    // word and there is nothing to graft.
+    let reproduced = vec![
+        head_skip_word("Relax.", 6.02, 6.58),
+        head_skip_word("Relax.", 9.15, 10.55),
+    ];
+    assert!(whisper_carry_head_skip_graft(&carried, &reproduced, 6.02).is_none());
+    // An empty re-decode grafts nothing.
+    assert!(whisper_carry_head_skip_graft(&carried, &[], 6.02).is_none());
+    // Pure punctuation/symbol stamps are DTW artifacts, not hole words.
+    let stamps = vec![
+        head_skip_word(".", 1.00, 1.20),
+        head_skip_word("-", 2.00, 2.10),
+    ];
+    assert!(whisper_carry_head_skip_graft(&carried, &stamps, 6.02).is_none());
+    // A word whose majority time sits exactly on the carried first word is
+    // past the hole (strictly-before filter), not in it.
+    let straddler = vec![head_skip_word("Relax.", 5.50, 6.50)];
+    assert!(whisper_carry_head_skip_graft(&carried, &straddler, 6.00).is_none());
+}
+
+#[test]
+fn carry_head_skip_graft_splices_only_pre_skip_words() {
+    let carried = vec![
+        head_skip_word("You", 22.21, 23.39),
+        head_skip_word("deserve", 23.19, 24.89),
+    ];
+    let recovered = vec![
+        head_skip_word("Wow!", 8.46, 8.79),
+        head_skip_word("so", 9.05, 10.23),
+        head_skip_word("heat", 22.50, 22.70),
+    ];
+    // The carried decode holds real words, so even a covering head earns a
+    // head-only splice, never a wholesale swap — and the re-decode word at
+    // the carried first word is not a hole word.
+    match whisper_carry_head_skip_graft(&carried, &recovered, 22.21) {
+        Some(WhisperCarryHeadSkipGraft::Splice { hole_words }) => {
+            assert_eq!(
+                hole_words
+                    .iter()
+                    .map(|word| word.word.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Wow!", "so"]
+            );
+        }
+        other => panic!("expected a head-only splice, got {other:?}"),
+    }
+}
+
+#[test]
+fn carry_head_skip_graft_swaps_only_degenerate_covered_heads() {
+    // Zero-width tag placements carry no real content after the skip, and the
+    // re-decode starts far ahead of the carried first word: wholesale swap.
+    let tags = vec![
+        head_skip_word("*sad", 14.08, 14.08),
+        head_skip_word("singing*", 15.66, 15.66),
+    ];
+    let covering = vec![
+        head_skip_word("Rock", 1.06, 1.61),
+        head_skip_word("lobster", 1.61, 2.64),
+    ];
+    assert!(matches!(
+        whisper_carry_head_skip_graft(&tags, &covering, 14.08),
+        Some(WhisperCarryHeadSkipGraft::Swap)
+    ));
+    // One real carried word anywhere keeps the conservative splice ...
+    let mut mixed = vec![head_skip_word("You", 22.21, 23.39)];
+    mixed.extend_from_slice(&tags);
+    assert!(matches!(
+        whisper_carry_head_skip_graft(&mixed, &covering, 22.21),
+        Some(WhisperCarryHeadSkipGraft::Splice { .. })
+    ));
+    // ... as does a re-decode that starts its own late onset instead of
+    // covering the skipped head (first word within 0.5 s of the carried one).
+    let late_onset = vec![head_skip_word("Rock", 13.90, 14.20)];
+    assert!(matches!(
+        whisper_carry_head_skip_graft(&tags, &late_onset, 14.08),
+        Some(WhisperCarryHeadSkipGraft::Splice { .. })
+    ));
+}
