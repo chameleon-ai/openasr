@@ -3326,6 +3326,134 @@ fn slice_head_deficit_bound_sits_at_six_db() {
 }
 
 #[test]
+fn slice_tail_is_audible_when_tail_matches_speech_level() {
+    // 100 x 20 ms frames = 2 s of flat, speech-level envelope.
+    let rms = vec![0.5_f32; 100];
+    // Last word ends at 1.0 s, window ends at 2.0 s: tail and decoded region
+    // at equal level, so the decode stopped mid-sentence.
+    assert!(super::whisper_slice_tail_is_audible(&rms, 1.0, 2.0));
+    // A louder tail (music or applause under a dropped clause) is audible too.
+    let rms_tail_louder = {
+        let mut rms = vec![0.5_f32; 100];
+        rms[50..].copy_from_slice(&[2.0_f32; 50]);
+        rms
+    };
+    assert!(super::whisper_slice_tail_is_audible(
+        &rms_tail_louder,
+        1.0,
+        2.0
+    ));
+}
+
+#[test]
+fn slice_tail_is_silent_when_tail_is_quiet_or_empty() {
+    // Silent tail, speech-level decoded region: an honest stop, not a hole.
+    let mut rms = vec![0.5_f32; 100];
+    rms[50..].copy_from_slice(&[0.0_f32; 50]);
+    assert!(!super::whisper_slice_tail_is_audible(&rms, 1.0, 2.0));
+
+    // Degenerate inputs fail closed.
+    assert!(!super::whisper_slice_tail_is_audible(&[], 1.0, 2.0));
+    assert!(!super::whisper_slice_tail_is_audible(&[0.5_f32], 1.0, 2.0));
+    assert!(!super::whisper_slice_tail_is_audible(
+        &[0.5_f32; 100],
+        0.0,
+        1.0
+    ));
+    assert!(!super::whisper_slice_tail_is_audible(
+        &[0.5_f32; 100],
+        2.0,
+        2.0
+    ));
+}
+
+#[test]
+fn slice_tail_deficit_bound_sits_at_six_db() {
+    // 2 s of 20 ms frames; the decoded region is [0, 1.0] s, the tail after.
+    let mut rms = vec![0.0_f32; 100];
+    let region = 0.5_f32;
+    rms[..50].copy_from_slice(&[region; 50]);
+    // 3 dB below the region: within the bound, still talking.
+    let tail_3db = region * 10.0_f32.powf(-3.0 / 20.0);
+    rms[50..].copy_from_slice(&[tail_3db; 50]);
+    assert!(super::whisper_slice_tail_is_audible(&rms, 1.0, 2.0));
+    // 10 dB below the region: outside the bound, a real pause.
+    let tail_10db = region * 10.0_f32.powf(-10.0 / 20.0);
+    rms[50..].copy_from_slice(&[tail_10db; 50]);
+    assert!(!super::whisper_slice_tail_is_audible(&rms, 1.0, 2.0));
+}
+
+#[test]
+fn tail_coverage_challenger_picks_the_round_reaching_furthest() {
+    // Winner (T=1.0) stopped at 19.89 s; only the second round reaches past
+    // the tail, and it decoded cooler than the winner, so it qualifies.
+    let pool = [
+        (0.4_f32, Some(19.5_f32), false),
+        (0.4, Some(23.12), false),
+        (0.4, Some(18.0), false),
+    ];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 1.0, 19.89),
+        Some(1)
+    );
+
+    // Nothing reaches the progress margin: no round covered new audio, so the
+    // ladder's own winner stands.
+    let same_audio = [
+        (0.4_f32, Some(19.5_f32), false),
+        (0.4, Some(20.0), false),
+        (0.4, Some(18.0), false),
+    ];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&same_audio, 1.0, 19.89),
+        None
+    );
+
+    // A hotter round never challenges, however far it reaches: running to the
+    // end of a window is exactly what a drifting high-temperature decode does.
+    // This is the bonnie shape -- a garbled T=1.0 tail must not displace a
+    // clean T=0.4 one that the ordinary race already preferred.
+    let hotter_only = [(1.0_f32, Some(23.12_f32), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&hotter_only, 0.4, 19.89),
+        None
+    );
+    // Against a hotter winner the same round is admissible.
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&hotter_only, 1.0, 19.89),
+        Some(0)
+    );
+
+    // A collapsed round (no measurable span) cannot claim a tail even when it
+    // places words furthest; the real-coverage round takes it instead.
+    let collapsed_leads = [(0.4_f32, Some(24.9_f32), true), (0.4, Some(21.0), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&collapsed_leads, 1.0, 19.89),
+        Some(1)
+    );
+
+    // An unplaceable round (no words) is skipped, not treated as frontier 0.
+    let unplaceable = [(0.4_f32, None, false), (0.4, Some(23.12), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&unplaceable, 1.0, 19.89),
+        Some(1)
+    );
+
+    // A tie keeps the earlier round, so pool order alone never decides.
+    let tie = [(0.4_f32, Some(23.12_f32), false), (0.4, Some(23.12), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&tie, 1.0, 19.89),
+        Some(0)
+    );
+
+    // An empty pool has no challenger.
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&[], 1.0, 19.89),
+        None
+    );
+}
+
+#[test]
 fn token_stream_subsequence_shapes() {
     // In-order, non-contiguous: the longer stream carries everything the
     // shorter one says, in the same order, with more around it.

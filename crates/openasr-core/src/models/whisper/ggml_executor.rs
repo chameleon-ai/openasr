@@ -7093,6 +7093,29 @@ const WHISPER_LADDER_CARRY_LESS_COVERAGE_SLACK_SECONDS: f32 = 1.0;
 /// covers.
 const WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS: f32 = 0.5;
 
+/// How much untranscribed audio the ladder's winner must leave at the end of
+/// its window (slice-relative seconds, last placed word to window end) before
+/// its placed-word frontier counts as short. A window normally ends on its own
+/// trailing silence, which the slicer leaves well under a second wide, so 2.0 s
+/// clears every honest offset by a wide margin while sitting far below the
+/// multi-second holes this recovers. Paired with the audible-tail gate
+/// ([`whisper_slice_tail_is_audible`]), a winner this far short has stopped
+/// while the speaker was still talking.
+const WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS: f32 = 2.0;
+
+/// How much further into the window a ladder round must reach, past the
+/// winner's last placed word, before it may take the window off the winner:
+/// the challenger has to genuinely cover audio the winner left out, not merely
+/// re-stamp the same audio a hair later. 0.5 s is about one word, so a round
+/// that adds no new audio never triggers the swap.
+const WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS: f32 = 0.5;
+
+/// How far below the decoded region the window's trailing envelope may sit
+/// (dB) and still count as speech the winner failed to transcribe. Mirrors
+/// [`WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB`]: the same 6 dB tolerance the
+/// head-skip recovery accepts as "still talking".
+const WHISPER_LADDER_TAIL_MAX_DEFICIT_DB: f32 = 6.0;
+
 /// Minimum count of salvaged (letters/digits-bearing) content tokens the
 /// ladder's incumbent must hold before the carry-less round may replace it.
 /// The subsequence check is only a content-preservation rule when the
@@ -7200,6 +7223,86 @@ const WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS: f32 = 0.5;
 /// conservative head-only splice.
 const WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH: f32 = 0.05;
 
+/// One temperature-ladder round's decode, kept so the ladder's races can hand
+/// the whole set around without re-decoding. `round` is its 1-based rung (1 =
+/// the guard-tripped temperature-0 incumbent, `WHISPER_TEMPERATURE_LADDER.len()
+/// + 2` = the carry-less round) and `temperature` the sampling temperature it
+/// actually ran at, which the audible-tail coverage re-race caps challengers
+/// by. `evidence` is its cross-attention span (see
+/// [`whisper_ladder_evidence_span_seconds`]).
+struct WhisperLadderRound {
+    round: usize,
+    temperature: f32,
+    candidate: WhisperDecodeCandidate,
+    result: WhisperGreedyDecodeResult,
+    evidence: Option<f32>,
+}
+
+/// The pool position of the round that covers the most audio past the race
+/// winner's placed-word frontier, or `None` when no round covers anything the
+/// winner left out. `pool` holds one `(temperature, placed_frontier,
+/// collapsed)` entry per pool member in round order: the frontier is `None` for
+/// a round whose words could not be placed at all, and `collapsed` marks a
+/// round that rides no measurable audio (the refusal
+/// [`WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS`] applies everywhere else),
+/// which can never claim to cover a tail.
+///
+/// Only a strict improvement in frontier counts, so a round that merely
+/// re-stamps the winner's last word loses and the earliest round keeps a tie --
+/// the choice stays a function of the audio, not of pool order.
+///
+/// The challenger must also decode at no higher temperature than the winner.
+/// Coverage alone is not licence to trade a cool decode for a hot one: a hot
+/// round reaches the end of a window precisely because it drifts off the audio
+/// and fills the rest with plausible filler ("heat can you ear haha ..."), so
+/// it covers more audio while transcribing less of it. Capping the challenger's
+/// temperature keeps the re-race pointed at the one swap it exists for -- a
+/// LESS perturbed round that also went further -- and leaves the existing
+/// incumbent alone when the only further-reaching round is a hotter one.
+fn whisper_tail_coverage_challenger(
+    pool: &[(f32, Option<f32>, bool)],
+    winner_temperature: f32,
+    winner_frontier: f32,
+) -> Option<usize> {
+    let min_frontier = winner_frontier + WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS;
+    let mut challenger: Option<(usize, f32)> = None;
+    for (index, (temperature, frontier, collapsed)) in pool.iter().enumerate() {
+        let Some(frontier) = frontier.filter(|_| !*collapsed) else {
+            continue;
+        };
+        if *temperature > winner_temperature
+            || frontier < min_frontier
+            || challenger.is_some_and(|(_, covered)| frontier <= covered)
+        {
+            continue;
+        }
+        challenger = Some((index, frontier));
+    }
+    challenger.map(|(index, _)| index)
+}
+
+/// Root-mean-square of the slice's RMS envelope frames over the
+/// slice-relative seconds `[lo, hi)`. The frames are already RMS values, so
+/// this is a dB-stable mean level for the region. `None` when the range is
+/// empty, falls outside the measured envelope, or carries no signal.
+fn whisper_slice_envelope_level(rms_frames: &[f32], lo: f32, hi: f32) -> Option<f32> {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    if rms_frames.len() < 2 || hi <= lo || lo < 0.0 {
+        return None;
+    }
+    let lo_frame = (lo as f64 / FRAME_SECONDS).floor() as usize;
+    let hi_frame = (hi as f64 / FRAME_SECONDS).floor() as usize;
+    let lo_frame = lo_frame.min(rms_frames.len());
+    let hi_frame = hi_frame.min(rms_frames.len());
+    if hi_frame <= lo_frame {
+        return None;
+    }
+    let window = &rms_frames[lo_frame..hi_frame];
+    let rms = (window.iter().map(|value| value * value).sum::<f32>() / window.len() as f32).sqrt();
+    (rms > 0.0_f32 && rms.is_finite()).then_some(rms)
+}
+
 /// Acoustic gate for the carry head-skip recovery: does the slice audio ahead
 /// of the first placed word carry comparable signal to the decoded region?
 /// Compares the RMS envelope levels of the head `[0, first_word_start)` and
@@ -7211,31 +7314,40 @@ fn whisper_slice_head_is_audible(
     first_word_start: f32,
     last_word_end: f32,
 ) -> bool {
-    const FRAME_SECONDS: f64 =
-        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
-    if rms_frames.len() < 2 || first_word_start <= 0.0 || last_word_end <= first_word_start {
+    if first_word_start <= 0.0 || last_word_end <= first_word_start {
         return false;
     }
-    // Root-mean-square of the envelope frames over a range: the frames are
-    // already RMS values, so this is a dB-stable mean level for the region.
-    let level = |lo: usize, hi: usize| -> Option<f32> {
-        let lo = lo.min(rms_frames.len());
-        let hi = hi.min(rms_frames.len());
-        if hi <= lo {
-            return None;
+    match (
+        whisper_slice_envelope_level(rms_frames, 0.0, first_word_start),
+        whisper_slice_envelope_level(rms_frames, first_word_start, last_word_end),
+    ) {
+        (Some(head), Some(speech)) => {
+            20.0_f32 * (speech / head).log10() <= WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB
         }
-        let window = &rms_frames[lo..hi];
-        let rms =
-            (window.iter().map(|value| value * value).sum::<f32>() / window.len() as f32).sqrt();
-        (rms > 0.0_f32 && rms.is_finite()).then_some(rms)
-    };
-    let head_end = ((first_word_start as f64 / FRAME_SECONDS).floor() as usize).max(1);
-    let speech_end = (last_word_end as f64 / FRAME_SECONDS).floor() as usize;
-    let (head, speech) = match (level(0, head_end), level(head_end, speech_end)) {
-        (Some(head), Some(speech)) => (head, speech),
-        _ => return false,
-    };
-    20.0_f32 * (speech / head).log10() <= WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB
+        _ => false,
+    }
+}
+
+/// The tail mirror of [`whisper_slice_head_is_audible`], for the ladder's
+/// audible-tail coverage re-race: does the audio AFTER the last placed word
+/// carry comparable signal to what the window decoded? Compares the tail
+/// `[last_word_end, window_end)` against the decoded `[0, last_word_end)`
+/// under the same tolerance, so a decode that stopped while the speaker was
+/// still talking is told apart from one that stopped at a real pause. Levels
+/// that cannot be measured fail closed (no re-race).
+fn whisper_slice_tail_is_audible(rms_frames: &[f32], last_word_end: f32, window_end: f32) -> bool {
+    if last_word_end <= 0.0 || window_end <= last_word_end {
+        return false;
+    }
+    match (
+        whisper_slice_envelope_level(rms_frames, last_word_end, window_end),
+        whisper_slice_envelope_level(rms_frames, 0.0, last_word_end),
+    ) {
+        (Some(tail), Some(decoded)) => {
+            20.0_f32 * (decoded / tail).log10() <= WHISPER_LADDER_TAIL_MAX_DEFICIT_DB
+        }
+        _ => false,
+    }
 }
 
 /// Run one temperature-0 (or re-decode) greedy pass over an already-encoded
@@ -7668,6 +7780,10 @@ fn run_whisper_decode_loop(
         let mut best = (candidate, decode);
         let mut best_evidence =
             whisper_ladder_evidence_span_seconds(&best.0, audio_duration_seconds);
+        // Which ladder round `best` came from and the temperature it decoded
+        // at, for the re-race logs and its temperature cap below.
+        let mut best_round = 1usize;
+        let mut best_temperature = 0.0_f32;
         if whisper_ladder_debug_enabled() {
             eprintln!(
                 "openasr_whisper_greedy_decode stage=temperature_ladder event=ladder_start initial_prompt_text={:?}",
@@ -7680,18 +7796,7 @@ fn run_whisper_decode_loop(
                 best.0.text_trimmed
             );
         }
-        // The clean (non guard-cut) rounds that lost the span race against
-        // the incumbent, in round order. When the round-1 stub out-races
-        // every one of them (its loop tokens attend to every real instance
-        // of the repeated sound, so its measured span inflates to the whole
-        // window), the span race is void and they re-compete amongst
-        // themselves instead.
-        let mut clean_rounds: Vec<(
-            usize,
-            WhisperDecodeCandidate,
-            WhisperGreedyDecodeResult,
-            Option<f32>,
-        )> = Vec::new();
+        let mut clean_rounds: Vec<WhisperLadderRound> = Vec::new();
         for (i, &temperature) in WHISPER_TEMPERATURE_LADDER.iter().enumerate() {
             let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
                 .wrapping_add(i as u64)
@@ -7714,10 +7819,18 @@ fn run_whisper_decode_loop(
             if whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence) {
                 best = (cand, result);
                 best_evidence = cand_evidence;
+                best_round = i + 2;
+                best_temperature = temperature;
             } else {
                 // Losers of the span race stay candidates for the stub
                 // re-race below, which needs every clean round.
-                clean_rounds.push((i + 2, cand, result, cand_evidence));
+                clean_rounds.push(WhisperLadderRound {
+                    round: i + 2,
+                    temperature,
+                    candidate: cand,
+                    result,
+                    evidence: cand_evidence,
+                });
             }
         }
         // The temperature rounds keep decoding the SAME carry prompt, so when
@@ -7800,51 +7913,58 @@ fn run_whisper_decode_loop(
                 if best.1.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
                     let mut entrants = std::mem::take(&mut clean_rounds);
                     if cl_has_content {
-                        entrants.push((cl_round, cand, result, cl_evidence));
+                        entrants.push(WhisperLadderRound {
+                            round: cl_round,
+                            temperature: 0.0,
+                            candidate: cand,
+                            result,
+                            evidence: cl_evidence,
+                        });
                     }
                     // A collapsed candidate (no measured span, or one pinned to
                     // a single frame) has no audio behind its words and is
                     // refused before the race: keeping the stub is always as
                     // good as, and usually better than, adopting it.
-                    let entrants: Vec<_> = entrants
+                    let mut entrants: Vec<_> = entrants
                         .into_iter()
-                        .filter(|(_, _, _, evidence)| {
-                            evidence.is_some_and(|secs| {
+                        .filter(|round| {
+                            round.evidence.is_some_and(|secs| {
                                 secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
                             })
                         })
                         .collect();
                     // The race: the first clean round stands as incumbent,
                     // each later one must win by the ordinary rule.
-                    let mut winner: Option<(
-                        usize,
-                        WhisperDecodeCandidate,
-                        WhisperGreedyDecodeResult,
-                        Option<f32>,
-                    )> = None;
-                    let mut entrants = entrants.into_iter();
-                    if let Some((round, cand, result, evidence)) = entrants.next() {
-                        let mut w = (round, cand, result, evidence);
-                        for (candidate_round, cand, result, evidence) in entrants {
-                            if whisper_decode_candidate_better(&cand, &w.1, evidence, w.3) {
-                                w = (candidate_round, cand, result, evidence);
+                    if !entrants.is_empty() {
+                        let mut winner_index = 0usize;
+                        for index in 1..entrants.len() {
+                            if whisper_decode_candidate_better(
+                                &entrants[index].candidate,
+                                &entrants[winner_index].candidate,
+                                entrants[index].evidence,
+                                entrants[winner_index].evidence,
+                            ) {
+                                winner_index = index;
                             }
                         }
-                        winner = Some(w);
-                    }
-                    if let Some((winner_round, winner_cand, winner_result, winner_evidence)) =
-                        winner
-                    {
+                        let winner = entrants.remove(winner_index);
                         // Log before `best` takes ownership of the winner.
                         eprintln!(
-                            "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={winner_round} stop_reason={:?} evidence_secs={:?} text={:?}",
-                            winner_result.stop_reason,
-                            winner_evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
-                            winner_cand.text_trimmed
+                            "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={} temperature={} stop_reason={:?} evidence_secs={:?} text={:?}",
+                            winner.round,
+                            winner.temperature,
+                            winner.result.stop_reason,
+                            winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                            winner.candidate.text_trimmed
                         );
-                        best = (winner_cand, winner_result);
-                        best_evidence = winner_evidence;
-                        carry_less_round_won = winner_round == cl_round;
+                        best_round = winner.round;
+                        best_temperature = winner.temperature;
+                        carry_less_round_won = winner.round == cl_round;
+                        best = (winner.candidate, winner.result);
+                        best_evidence = winner.evidence;
+                        // The rounds that lost this race stay in the pool for
+                        // the audible-tail coverage re-race below.
+                        clean_rounds = entrants;
                     }
                 } else if cl_has_content {
                     let coverage_ok = match (best_evidence, cl_evidence) {
@@ -7912,8 +8032,88 @@ fn run_whisper_decode_loop(
                         );
                         best = (cand, result);
                         best_evidence = cl_evidence;
+                        best_round = cl_round;
+                        best_temperature = 0.0;
                         carry_less_round_won = true;
                     }
+                }
+            }
+        }
+        // Audible-tail coverage re-race. Every round that reached this point
+        // was judged on how much audio its token cross-attention SPREADS
+        // across, which cannot see a decode that stops early: the round that
+        // keeps re-emitting the window's repeated phrase measures the widest
+        // spread (its loop tokens attend to every instance of the repeated
+        // sound, so they pin to both ends of the window at once) while its
+        // words stop seconds before the audio does, and it wins the race with
+        // speech-level audio behind it untranscribed. So measure the thing
+        // the resulting hole actually is -- where each round's placed words
+        // END relative to the window -- and, when the winner leaves a
+        // speech-level tail unclaimed, hand the window to the round that
+        // reaches furthest into it. Fail-open at every step: no word
+        // placements, no measurable tail, or no qualifying challenger leaves
+        // the ladder's own winner exactly as the race picked it.
+        if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
+            && !clean_rounds.is_empty()
+        {
+            // The last placed word's end, in slice-relative seconds: where
+            // this round's transcription of the window stops.
+            let placed_frontier = |cand: &WhisperDecodeCandidate,
+                                   result: &WhisperGreedyDecodeResult|
+             -> Option<f32> {
+                whisper_cross_attention_word_timestamps(
+                    tokenizer,
+                    &cand.token_alignments,
+                    &result.generated_probabilities,
+                    audio_duration_seconds,
+                    word_audio_rms_frames,
+                )
+                .ok()
+                .and_then(|(words, _)| words.last().map(|word| word.end))
+            };
+            let window_end = audio_duration_seconds.max(0.0);
+            let winner_frontier = placed_frontier(&best.0, &best.1);
+            let tail_shortfall = winner_frontier
+                .filter(|frontier| {
+                    window_end - frontier >= WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS
+                })
+                .zip(word_audio_rms_frames)
+                .filter(|(frontier, rms_frames)| {
+                    whisper_slice_tail_is_audible(rms_frames, *frontier, window_end)
+                })
+                .map(|(frontier, _)| window_end - frontier);
+            if let Some(tail_shortfall) = tail_shortfall {
+                let winner_frontier = winner_frontier.expect("audible tail implies a frontier");
+                let pool_frontiers: Vec<(f32, Option<f32>, bool)> = clean_rounds
+                    .iter()
+                    .map(|round| {
+                        (
+                            round.temperature,
+                            placed_frontier(&round.candidate, &round.result),
+                            !round.evidence.is_some_and(|secs| {
+                                secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
+                            }),
+                        )
+                    })
+                    .collect();
+                if let Some(index) = whisper_tail_coverage_challenger(
+                    &pool_frontiers,
+                    best_temperature,
+                    winner_frontier,
+                ) {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_coverage_won round={} temperature={} replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} challenger_frontier_secs={:.2}",
+                        clean_rounds[index].round,
+                        clean_rounds[index].temperature,
+                        pool_frontiers[index].1.unwrap_or_default(),
+                    );
+                    let challenger = clean_rounds.swap_remove(index);
+                    best = (challenger.candidate, challenger.result);
+                    best_evidence = challenger.evidence;
+                    // Every pool member but the carry-less round decoded the
+                    // carry prompt, so a swap back onto one leaves the carry
+                    // head-skip recovery below free to run.
+                    carry_less_round_won = false;
                 }
             }
         }
