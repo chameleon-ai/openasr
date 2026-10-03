@@ -257,19 +257,6 @@ fn round_confidence(confidence: Option<f32>) -> Option<f32> {
     confidence.map(|value| (value * 1000.0).round() / 1000.0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::round_confidence;
-
-    #[test]
-    fn confidence_is_serialized_at_millisecond_resolution() {
-        assert_eq!(round_confidence(Some(0.999_953_7)), Some(1.0));
-        assert_eq!(round_confidence(Some(0.874_5)), Some(0.875));
-        assert_eq!(round_confidence(Some(0.0)), Some(0.0));
-        assert_eq!(round_confidence(None), None);
-    }
-}
-
 fn json_subtitle_cues(transcription: &Transcription, with_ids: bool) -> Vec<JsonSegment<'_>> {
     map_json_segments(&transcription.subtitle_cues, with_ids)
 }
@@ -392,5 +379,18 @@ fn verbose_longform_metadata(
         skipped_silent_chunks: metadata.skipped_silent_chunks,
         duplicate_merge_count: metadata.duplicate_merge_count,
         provenance: metadata.provenance.as_slice(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_confidence;
+
+    #[test]
+    fn confidence_is_serialized_at_millisecond_resolution() {
+        assert_eq!(round_confidence(Some(0.999_953_7)), Some(1.0));
+        assert_eq!(round_confidence(Some(0.874_5)), Some(0.875));
+        assert_eq!(round_confidence(Some(0.0)), Some(0.0));
+        assert_eq!(round_confidence(None), None);
     }
 }
