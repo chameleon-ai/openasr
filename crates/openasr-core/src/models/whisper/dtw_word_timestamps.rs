@@ -229,6 +229,17 @@ fn whisper_dtw_onset_lead() -> f32 {
 /// and far below the runaway regime; only the tail is trimmed, never the start.
 const WHISPER_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 
+/// The word span cap in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_MAX_WORD_SPAN_SECONDS`]). A bare environment is
+/// byte-identical to the constant.
+fn whisper_dtw_max_word_span_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_MAX_WORD_SPAN_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_MAX_WORD_SPAN_SECONDS)
+}
+
 /// Upper bound on a single word window's width in *original* time: the
 /// processed-time cap plus the fixed pad applied after it. The longform
 /// assembler enforces this as the post-timeline-map invariant so a word
@@ -240,11 +251,18 @@ pub(crate) const WHISPER_MAX_WORD_SPAN_ORIGINAL_SECONDS: f32 = WHISPER_DTW_MAX_W
 
 /// How far an interior word's window may extend on either side of its own
 /// center before the fold leaves the rest of an adjacent pause as real
-/// silence (see `max_interior_half_span_seconds`). Only inter-center gaps past
-/// ~2.2 s bind it, so continuous speech is untouched; the longest legitimate
-/// words on the test clips stay under twice this. Honored with the same
-/// deployment env-override convention as the other DTW tunables.
-const WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS: f32 = 1.0;
+/// silence (see `max_interior_half_span_seconds`). At 0.6 s an interior word
+/// beside a real pause is bounded at a ~1.4 s post-pad window instead of
+/// inheriting half the pause on each side and pinning at the word span cap;
+/// continuous speech is untouched (the 0.45 fraction only reaches the clamp
+/// on inter-center gaps past ~1.3 s), and the longest legitimate words on the
+/// test clips stay clear of it. Swept over the test corpus: 0.6 s keeps the
+/// whole-suite InWin at baseline while still cutting the local-misplacement
+/// and stretched-word SUMs and the residual tail mass (0.4 s buys a little
+/// more of the same, at a visible InWin cost on speech-dense clips).
+/// Honored with the same deployment env-override convention as the other DTW
+/// tunables.
+const WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS: f32 = 0.6;
 
 /// The interior half-span in use, honoring the deployment env override so a
 /// tuning pass can sweep it without a rebuild (see
@@ -255,6 +273,20 @@ fn whisper_dtw_max_interior_half_span_seconds() -> f32 {
         .ok()
         .and_then(|raw| raw.parse::<f32>().ok())
         .unwrap_or(WHISPER_DTW_MAX_INTERIOR_HALF_SPAN_SECONDS)
+}
+
+/// How far a band-edge word's window may extend from its own center: the
+/// fold's grant to the first and last word of every band (each bound is
+/// capped at this value's half from the edge word's center). Historical
+/// behavior anchors the edge words to the band edges unboundedly, so the
+/// default is `f32::INFINITY` and a bare environment is byte-identical to
+/// it; a finite override leaves the pause between the clamped edge and the
+/// word's own center as real silence.
+fn whisper_dtw_max_edge_word_span_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_MAX_EDGE_WORD_SPAN_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(f32::INFINITY)
 }
 
 /// How far a punctuation-only token piece may sit from its word's content mean
@@ -346,8 +378,7 @@ fn whisper_cap_dtw_word_spans(
     words: Vec<crate::WordTimestamp>,
     seconds_per_frame: f32,
 ) -> Vec<crate::WordTimestamp> {
-    const MAX_SECONDS: f32 = WHISPER_DTW_MAX_WORD_SPAN_SECONDS;
-    let limit = MAX_SECONDS.max(seconds_per_frame);
+    let limit = whisper_dtw_max_word_span_seconds().max(seconds_per_frame);
     let mut capped_words = words;
     for word in &mut capped_words {
         let span = word.end - word.start;
@@ -387,6 +418,18 @@ const WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION: f64 = 0.05;
 // `pub(crate)`: the decode-side tail-repeat acoustic gate reuses the same
 // speech-vs-floor margin.
 pub(crate) const WHISPER_DTW_ONSET_FLOOR_MARGIN_DB: f64 = 5.0;
+
+/// The onset floor margin in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_ONSET_FLOOR_MARGIN_DB`]). A bare environment is
+/// byte-identical to the constant.
+fn whisper_dtw_onset_floor_margin_db() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_ONSET_FLOOR_MARGIN_DB")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB)
+}
+
 /// Minimum duration of the speech run above the floor that qualifies as the
 /// word's onset (expressed in envelope frames of 0.02 s).
 // `pub(crate)`: the decode-side silence checks reuse the same sustained-speech
@@ -648,7 +691,7 @@ fn whisper_refine_dtw_word_onsets(
     if !(noise_floor > 0.0 && noise_floor.is_finite()) {
         return words;
     }
-    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let threshold = noise_floor * 10.0_f64.powf(whisper_dtw_onset_floor_margin_db() / 20.0);
     let clip_peak = *ranked.last().unwrap_or(&0.0);
     if !(clip_peak > 0.0 && clip_peak.is_finite()) {
         return words;
@@ -915,6 +958,18 @@ const WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX: f32 = 0.5;
 /// as real speech; the trailing-silence counterpart of
 /// [`WHISPER_DTW_ONSET_FLOOR_MARGIN_DB`].
 const WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB: f64 = 5.0;
+
+/// The offset floor margin in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB`]). A bare environment is
+/// byte-identical to the constant.
+fn whisper_dtw_offset_floor_margin_db() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB)
+}
+
 /// Minimum duration of the speech run above the floor that qualifies as the
 /// word's offset (expressed in envelope frames of 0.02 s).
 const WHISPER_DTW_OFFSET_SUSTAIN_FRAMES: usize = 5;
@@ -1007,7 +1062,7 @@ fn whisper_refine_dtw_word_offsets(
     if !(noise_floor > 0.0 && noise_floor.is_finite()) {
         return words;
     }
-    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB / 20.0);
+    let threshold = noise_floor * 10.0_f64.powf(whisper_dtw_offset_floor_margin_db() / 20.0);
     let clip_peak = *ranked.last().unwrap_or(&0.0);
     if !(clip_peak > 0.0 && clip_peak.is_finite()) {
         return words;
@@ -1274,7 +1329,7 @@ fn whisper_reanchor_dtw_token_centers(
     if !(noise_floor > 0.0 && noise_floor.is_finite()) {
         return token_times;
     }
-    let threshold = noise_floor * 10.0_f64.powf(WHISPER_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let threshold = noise_floor * 10.0_f64.powf(whisper_dtw_onset_floor_margin_db() / 20.0);
     let clip_peak = *ranked.last().unwrap_or(&0.0);
     if !(clip_peak > 0.0 && clip_peak.is_finite()) {
         return token_times;
@@ -1684,7 +1739,7 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
-                    f32::INFINITY,
+                    whisper_dtw_max_edge_word_span_seconds(),
                     whisper_dtw_punctuation_trust_radius_seconds(),
                     whisper_dtw_max_interior_half_span_seconds(),
                 ) {
@@ -1789,7 +1844,7 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     &decode_text,
                     WHISPER_DTW_BOUNDARY_FRACTION,
                     onset_lead,
-                    f32::INFINITY,
+                    whisper_dtw_max_edge_word_span_seconds(),
                     whisper_dtw_punctuation_trust_radius_seconds(),
                     whisper_dtw_max_interior_half_span_seconds(),
                 );

@@ -195,10 +195,12 @@ pub(crate) fn seq2seq_word_timestamps_from_generated_tokens<E>(
 /// hands each word up to half of an adjacent pause, so a word beside a real
 /// multi-second pause owns seconds of silence (the width-cap cluster shape).
 /// `f32::INFINITY` disables the clamp; a finite value leaves the pause between
-/// the clamped edges as real silence. Continuous speech never binds it: with
-/// the whisper 0.45 fraction only inter-center gaps past ~2.2 s reach a 1.0 s
-/// half-span, and the per-word affine fit TempErr uses absorbs the uniform
-/// shift either way.
+/// the clamped edges as real silence. Normal continuous speech stays clear of
+/// it: with the 0.45 boundary fraction each word's half-span is a little
+/// under half the tighter inter-center gap, so the clamp binds only on gaps
+/// roughly twice the value (e.g. ~1.3 s gaps at whisper's 0.6 s, ~2.2 s gaps
+/// at cohere's 1.0 s), and the per-word affine fit TempErr uses absorbs the
+/// uniform shift either way.
 pub(crate) fn seq2seq_word_timestamps_from_token_times<E>(
     token_times: &[Seq2SeqTokenTime],
     segment_start: f32,
