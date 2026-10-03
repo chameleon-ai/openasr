@@ -1556,7 +1556,9 @@ const COHERE_DTW_MAX_WORD_SPAN_SECONDS: f32 = 1.5;
 /// processed-time cap plus the fixed pad applied after it. The longform
 /// assembler enforces this as the post-timeline-map invariant so a word
 /// straddling an elided span cannot be stretched past the family's own
-/// post-pad width.
+/// post-pad width. Derived from the compiled pad defaults: the runtime env
+/// overrides of the pads may widen the effective pad, in which case this bound
+/// stays conservative (the clamp end-trims at the compiled width).
 pub(crate) const COHERE_MAX_WORD_SPAN_ORIGINAL_SECONDS: f32 = COHERE_DTW_MAX_WORD_SPAN_SECONDS
     + COHERE_WORD_ONSET_PAD_SECONDS
     + COHERE_WORD_OFFSET_PAD_SECONDS;
@@ -1736,7 +1738,8 @@ fn cohere_cap_dtw_word_spans(
     capped_words
 }
 
-/// Seconds by which every cohere word window's start is moved earlier.
+/// Compiled default for the seconds by which every cohere word window's start
+/// is moved earlier.
 ///
 /// The fold places adjacent words back-to-back on a shared seam boundary, so a
 /// word's window can end up a tenth of a second inside its real onset. Because
@@ -1745,11 +1748,40 @@ fn cohere_cap_dtw_word_spans(
 /// TempErr unchanged while the window widens back over the clipped onset.
 const COHERE_WORD_ONSET_PAD_SECONDS: f32 = 0.10;
 
-/// Seconds by which every cohere word window's end is moved later, the
-/// offset-side counterpart of [`COHERE_WORD_ONSET_PAD_SECONDS`]. Symmetric with
-/// the start pad: the end seam is shared with the next word's start, so both
-/// sides of a boundary are pulled out at once.
+/// Compiled default for the seconds by which every cohere word window's end is
+/// moved later, the offset-side counterpart of
+/// [`COHERE_WORD_ONSET_PAD_SECONDS`]. Symmetric with the start pad: the end
+/// seam is shared with the next word's start, so both sides of a boundary are
+/// pulled out at once.
 const COHERE_WORD_OFFSET_PAD_SECONDS: f32 = 0.10;
+
+/// The pads to apply in this run: the compiled defaults unless either side is
+/// overridden through `OPENASR_COHERE_WORD_ONSET_PAD_SECONDS` /
+/// `OPENASR_COHERE_WORD_OFFSET_PAD_SECONDS`. Each element falls back to its
+/// compiled default when unset or unparsable, so a bare environment is
+/// byte-identical to the historical behavior. The override is a sweep knob:
+/// the longform post-timeline-map clamp keeps the compiled
+/// [`COHERE_MAX_WORD_SPAN_ORIGINAL_SECONDS`], so a widened pad stays bounded by
+/// it on the clamping paths (conservative -- narrower than the padded width,
+/// never wider).
+fn cohere_word_pad_seconds() -> (f32, f32) {
+    let read = |name: &str, fallback: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    (
+        read(
+            "OPENASR_COHERE_WORD_ONSET_PAD_SECONDS",
+            COHERE_WORD_ONSET_PAD_SECONDS,
+        ),
+        read(
+            "OPENASR_COHERE_WORD_OFFSET_PAD_SECONDS",
+            COHERE_WORD_OFFSET_PAD_SECONDS,
+        ),
+    )
+}
 
 /// Move every word window's start earlier and its end later, clamped to the
 /// audio's time range, so the window covers the speech's acoustic onset/offset
@@ -1761,13 +1793,22 @@ pub(crate) fn cohere_pad_word_windows(
     words: &[WordTimestamp],
     audio_duration_seconds: f32,
 ) -> Vec<WordTimestamp> {
+    cohere_pad_word_windows_with_pads(words, audio_duration_seconds, cohere_word_pad_seconds())
+}
+
+/// The pad with explicit pads, so the behavior is unit-testable without env.
+fn cohere_pad_word_windows_with_pads(
+    words: &[WordTimestamp],
+    audio_duration_seconds: f32,
+    (onset_pad, offset_pad): (f32, f32),
+) -> Vec<WordTimestamp> {
     words
         .iter()
         .map(|word| {
-            let end = (word.end + COHERE_WORD_OFFSET_PAD_SECONDS).min(audio_duration_seconds);
+            let end = (word.end + offset_pad).min(audio_duration_seconds);
             WordTimestamp {
                 word: word.word.clone(),
-                start: (0.0f32.max(word.start - COHERE_WORD_ONSET_PAD_SECONDS)).min(end),
+                start: (0.0f32.max(word.start - onset_pad)).min(end),
                 end,
                 confidence: word.confidence,
             }

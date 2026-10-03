@@ -109,6 +109,33 @@ fn cohere_pad_word_windows_widens_toward_the_edges_and_clamps_to_the_audio() {
 }
 
 #[test]
+fn cohere_pad_word_windows_with_pads_applies_explicit_pads_and_clamps() {
+    // Asymmetric pads (0.15 onset / 0.20 offset) prove each side is read from
+    // its own argument, not a shared constant.
+    let words = vec![
+        word("a", 0.0, 0.4),
+        word("b", 0.4, 0.9),
+        word("c", 9.95, 10.0),
+    ];
+    let padded = cohere_pad_word_windows_with_pads(&words, 10.0, (0.15, 0.20));
+    assert_eq!(padded[0].start, 0.0, "start clamps at 0");
+    assert!(
+        (padded[0].end - (0.4 + 0.20)).abs() < f32::EPSILON,
+        "offset pad applied"
+    );
+    assert!(
+        (padded[1].start - (0.4 - 0.15)).abs() < f32::EPSILON,
+        "onset pad applied"
+    );
+    assert!(
+        (padded[1].end - (0.9 + 0.20)).abs() < f32::EPSILON,
+        "offset pad applied (end)"
+    );
+    assert!(padded[2].start < 9.95, "start pulled earlier");
+    assert_eq!(padded[2].end, 10.0, "end clamps at the audio duration");
+}
+
+#[test]
 fn cohere_dtw_onset_lead_caps_at_max_seconds() {
     // A very dense band (30 word/s) adds more lead than the cap allows; the
     // result is exactly the cap, not the unbounded density term. The density
