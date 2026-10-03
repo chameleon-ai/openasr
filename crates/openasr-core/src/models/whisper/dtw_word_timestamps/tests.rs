@@ -10,6 +10,25 @@ fn whisper_dtw_onset_lead_is_the_flat_baseline() {
 }
 
 #[test]
+fn whisper_dtw_onset_edge_lead_is_the_half_second_default() {
+    // The onset edge lead mirrors the offset pass' pre-window lead (0.5s); the
+    // runtime reads it via whisper_dtw_onset_edge_lead_s, whose env-override
+    // fallback is the compiled default. Pin the constant here rather than
+    // mutating process env, which is unsafe in this edition and races under
+    // parallel nextest.
+    assert!((WHISPER_DTW_ONSET_EDGE_LEAD_S - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn whisper_dtw_onset_head_margin_is_the_low_default() {
+    // The head line sits just over the noise floor (1.5 dB, ~1.19x), far
+    // below the 5 dB speech line the sustained-run search uses. Pin the
+    // constant here rather than mutating process env, which is unsafe in this
+    // edition and races under parallel nextest.
+    assert!((WHISPER_DTW_ONSET_HEAD_MARGIN_DB - 1.5).abs() < 1e-9);
+}
+
+#[test]
 fn whisper_dtw_lead_silence_advance_fires_only_on_a_leading_leak() {
     let spf = 0.02_f32; // 1500 frames over a 30s window.
     let min_gap = WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS; // 0.2s -> 10 frames.
@@ -74,8 +93,209 @@ fn refine_dtw_onsets_pushes_true_silence_word_to_its_onset() {
     let env = refine_fixture_envelope();
     let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
     assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
-    // The first word is never modified.
+    // The first word is examined now (the `skip(1)` is dropped); its 0.1s
+    // span is below the refine minimum, so it is untouched for span reasons
+    // rather than by position.
     assert!((out[0].start - 0.5).abs() < 1e-4 && (out[0].end - 0.6).abs() < 1e-4);
+}
+
+/// The fold pins word 0's start at the band start (`max_edge` unbounded), and
+/// the leading-silence anchor only covers the window-front leak -- so the head
+/// word gets the same hollow-front correction as any other word. Same fixture
+/// as the interior-word test, the hollow window at [2.0, 4.0) now held by
+/// word 0.
+#[test]
+fn refine_dtw_onsets_refines_the_first_word_of_the_window() {
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let env = refine_fixture_envelope();
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.8).abs() < 0.05, "start={}", out[0].start);
+    assert!((out[1].start - 4.5).abs() < 1e-4);
+}
+
+/// A head word pinned at the band start with its own run starting just before
+/// the window end: the in-window portion (4 frames) is short of the sustain
+/// requirement, but the post-window lead counts the run at full length
+/// (18 frames) and the onset lands inside the window.
+#[test]
+fn refine_dtw_onsets_counts_a_run_straddling_the_window_end() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    for s in env[172..=189].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 3.5), word_ts("b", 4.0, 4.5)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.44).abs() < 0.03, "start={}", out[0].start);
+}
+
+/// The run lies wholly in the post-window lead: landing the start on it would
+/// invert the window (its end would have to move too -- a rehouse, not an edge
+/// correction), so the word keeps its fold position.
+#[test]
+fn refine_dtw_onsets_refuses_an_onset_entirely_past_the_window_end() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    for s in env[180..=195].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 3.5), word_ts("b", 4.0, 4.5)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
+    assert!((out[0].end - 3.5).abs() < 1e-4);
+}
+
+/// A word the fold already placed on its onset head: a dense near-floor
+/// cluster (a fricative head at 1.6x the floor, below the 1.78x speech line)
+/// spans the window's own start, and the loud run ahead (straddling the
+/// window end, the edge-lead shape) is the word's core. The head hunt refuses
+/// the push instead of parking the start mid-word.
+#[test]
+fn refine_dtw_onsets_refuses_when_the_window_opens_on_a_quiet_head() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The head: 12 dense frames at the window start, above the 1.19x head
+    // line but below the speech threshold -- and at a level comparable to the
+    // core's, the way a fricative head belongs to its word.
+    for s in env[100..112].iter_mut() {
+        *s = 0.0017;
+    }
+    // The loud core straddles the window end (the run the edge lead counts),
+    // only a little above the speech threshold so the head's peak compares.
+    for s in env[128..134].iter_mut() {
+        *s = 0.002;
+    }
+    let words = vec![word_ts("a", 2.0, 2.6), word_ts("b", 4.0, 4.5)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
+    assert!((out[0].end - 2.6).abs() < 1e-4);
+}
+
+/// A long dense cluster at the window start that is far weaker than the core
+/// is breath or room noise, not a head: the peak ratio keeps it from vetoing
+/// a genuine parked-word push to the loud core.
+#[test]
+fn refine_dtw_onsets_fires_the_core_past_a_weak_window_start_cluster() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The noise: 14 dense frames at the window start, above the head line but
+    // far below the core's level.
+    for s in env[100..114].iter_mut() {
+        *s = 0.0016;
+    }
+    for s in env[150..156].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.0).abs() < 0.05, "start={}", out[0].start);
+}
+
+/// A head that reads only a step above the floor is breath or room noise, not
+/// the word's speech: the peak ratio rejects it, so the push lands on the loud
+/// core instead of the noise patch's start. Regression for the shape where the
+/// weak patch used to win the push bounds and strand the word short of its core.
+#[test]
+fn refine_dtw_onsets_fires_the_core_past_a_weak_mid_window_patch() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The noise: 4 frames above the speech floor mid-window -- one short of the
+    // strict run's sustain, so the core search skips it -- but far below the
+    // core's level.
+    for s in env[115..119].iter_mut() {
+        *s = 0.002;
+    }
+    // The loud core mid-window at 3.0s.
+    for s in env[150..156].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.0).abs() < 0.05, "start={}", out[0].start);
+}
+
+/// An unusable mid-window cluster -- dense and at the core's own level, but too
+/// close to the window start to clear the minimum push -- is no head at all: it
+/// must not re-target the push, and must not suppress the window-start veto
+/// that would otherwise keep a genuinely parked word on its fold position.
+#[test]
+fn refine_dtw_onsets_ignores_a_head_that_cannot_produce_a_legal_push() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The head's own audio at the window start: dense, and at the core's level.
+    for s in env[100..112].iter_mut() {
+        *s = 0.25;
+    }
+    // A second cluster a few hundredths in -- dense and loud enough to pass
+    // every head test, but too near the window start to push.
+    for s in env[115..119].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    // The window opens on the word's own audio (a window-start head), so the
+    // fold position stands: 2.0s, not a push into the later cluster.
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
+}
+
+/// A short burst at the window start is breath, not a head: below the span
+/// floor, so it cannot veto the genuine parked-word push to the loud core.
+#[test]
+fn refine_dtw_onsets_fires_the_core_past_a_short_window_start_burst() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The burst: 8 dense frames just inside the window start, below the
+    // speech threshold.
+    for s in env[101..109].iter_mut() {
+        *s = 0.0016;
+    }
+    // The core, mid-window at 3.0s.
+    for s in env[150..156].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.0).abs() < 0.05, "start={}", out[0].start);
+}
+
+/// A fragmented but dense head inside the skipped region (4 above-threshold
+/// frames -- short of the strict five the core search needs) with real
+/// silence ahead of it is the word's real onset: the start lands on the head
+/// at 2.3s instead of the loud core at 2.8s.
+#[test]
+fn refine_dtw_onsets_retargets_to_a_mid_window_quiet_head() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The head at frame 115 (2.3s): 4 consecutive above-threshold frames -- one
+    // short of the strict run's sustain, so the core search skips it.
+    for s in env[115..119].iter_mut() {
+        *s = 0.005;
+    }
+    // The loud core at frame 140 (2.8s), a step below the head's peak as a
+    // fricative burst usually is.
+    for s in env[140..146].iter_mut() {
+        *s = 0.004;
+    }
+    let words = vec![word_ts("a", 2.0, 3.2), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.3).abs() < 0.05, "start={}", out[0].start);
+}
+
+/// A sparse mid-window patch at the head line -- below the dense fraction --
+/// is breath or room tone, not a head: the core stands.
+#[test]
+fn refine_dtw_onsets_ignores_a_sparse_mid_window_patch() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // Scattered frames above the head line but mostly below it (2 of 10).
+    env[120] = 0.0016;
+    env[129] = 0.0016;
+    for s in env[150..156].iter_mut() {
+        *s = 0.25;
+    }
+    let words = vec![word_ts("a", 2.0, 4.0), word_ts("b", 4.5, 5.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 3.0).abs() < 0.05, "start={}", out[0].start);
 }
 
 /// The same window with a low music floor filling the front half (a sustained

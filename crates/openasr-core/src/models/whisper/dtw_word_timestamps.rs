@@ -403,6 +403,76 @@ const WHISPER_DTW_ONSET_MIN_PUSH_S: f32 = 0.25;
 /// Upper bound on how far back into a pause a word's start may be pulled.
 const WHISPER_DTW_ONSET_MAX_PUSH_S: f32 = 5.0;
 
+/// How far after the word's window the onset run search reaches. A head word
+/// the fold pinned at the band start (`max_edge` unbounded anchors word 0
+/// there) can sit ahead of its own audio, so the word's first above-floor run
+/// starts at or past the window end and an in-window search would count only
+/// the run's truncated head, short of the sustain requirement. Mirrors
+/// [`WHISPER_DTW_OFFSET_EDGE_LEAD_S`].
+const WHISPER_DTW_ONSET_EDGE_LEAD_S: f32 = 0.5;
+
+/// Deployment env override for the onset edge lead
+/// ([`WHISPER_DTW_ONSET_EDGE_LEAD_S`]). A bare environment falls back to the
+/// compiled default, staying byte-identical to it.
+fn whisper_dtw_onset_edge_lead_s() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_ONSET_EDGE_LEAD_S")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_EDGE_LEAD_S)
+}
+
+/// Minimum level, relative to the word's own loud core, for a detected head
+/// cluster to count as the word's onset head. Both head rules gate on it: an
+/// onset head is speech of the same utterance as the core (measured 0.5-1.4x
+/// of the core's peak on the head words), while a dense patch of pause noise
+/// or breath reads far weaker (measured 0.1-0.66x). Raising it makes the head
+/// hunt stricter -- fewer words re-targeted, and fewer parked words lose a
+/// good core push to a noise "head".
+const WHISPER_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO: f64 = 0.7;
+
+/// dB above the slice's own noise floor (the median envelope level) that a
+/// word's quiet onset head may sit at and still be recognized as speech. A
+/// fricative or aspirate head (the /f/ of "fingers", the /m/ of "manager")
+/// reads at a small multiple of the floor -- far below the
+/// [`WHISPER_DTW_ONSET_FLOOR_MARGIN_DB`] line the sustained-run search uses --
+/// so the head hunt is judged against this lower line. Kept deliberately
+/// close to the floor: higher, and scattered breath or room tone chains into
+/// false heads; lower, and real heads on dense slices read as silence.
+const WHISPER_DTW_ONSET_HEAD_MARGIN_DB: f64 = 1.5;
+
+/// Deployment env override for the head margin
+/// ([`WHISPER_DTW_ONSET_HEAD_MARGIN_DB`]). A bare environment falls back to
+/// the compiled default, staying byte-identical to it.
+fn whisper_dtw_onset_head_margin_db() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_ONSET_HEAD_MARGIN_DB")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_HEAD_MARGIN_DB)
+}
+
+/// Minimum frames above the head line in a head cluster (0.08 s of audio).
+/// Shorter than the sustained-run requirement: an onset head rises and dips
+/// through frication, so a real head (3-4 above-threshold frames) shreds
+/// under the core's five-consecutive test.
+const WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES: usize = 4;
+
+/// Below-line frames tolerated inside a head cluster before it splits.
+/// Mirrors the offset pass's run gap tolerance: a word's onset head rises
+/// through fricative micro-silences shorter than this.
+const WHISPER_DTW_ONSET_HEAD_GAP_TOLERANCE_FRAMES: usize = 3;
+
+/// Share of frames within a head cluster's span that must sit above the head
+/// line. A real head is dense; scattered breath or room tone hovers at the
+/// floor without forming a dense cluster.
+const WHISPER_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION: f64 = 0.55;
+
+/// Minimum span, in envelope frames (0.2 s), of a dense cluster at the
+/// window's own start before it proves the fold placed the word on its onset
+/// head and the push to the loud core is refused. A shorter burst at the edge
+/// is breath or bleed-through, not a head -- parked words whose pauses carry
+/// scattered noise must still fire.
+const WHISPER_DTW_ONSET_HEAD_WINDOW_START_SPAN_FRAMES: usize = 10;
+
 /// Peak-to-median contrast above which a slice's median is a *thin noise
 /// floor* rather than a continuous bed, so the silence ceiling may rise off
 /// the peak and onto the floor (see [`whisper_dtw_silence_ceiling`]).
@@ -534,6 +604,32 @@ fn whisper_dtw_edge_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
 /// quiet passage inside a music-backed clip is *not* a trusted pause and a push
 /// would only move a word that was already acceptable. That ceiling is what
 /// separates a genuine zero-silence pause (fire) from a low music floor (skip).
+///
+/// Every word is examined, the window's first included: the fold pins word 0's
+/// start at the band start (`max_edge` unbounded), and while the
+/// leading-silence advance anchor corrects a window-front leading leak before
+/// the fold, a head word the anchor cannot reach (a mid-run decoded bound, or
+/// no usable content band) would otherwise keep a start parked ahead of its
+/// audio. The first-run search reaches [`WHISPER_DTW_ONSET_EDGE_LEAD_S`] past
+/// the window's end, the mirror of the offset pass' pre-window lead, so a
+/// speech run straddling the window end counts at full length against the
+/// sustain requirement. A run that lies *entirely* past the window end is
+/// refused, though: landing the start on it would invert the window, and a
+/// word wholly ahead of its audio needs its end moved too -- a rehouse, not an
+/// edge correction (the offset pass refuses its mirror case the same way).
+///
+/// The sustained run the search accepts can still be the word's loud *core*
+/// rather than its onset: a word that begins with a quiet or fragmented head
+/// (a fricative or aspirate dipping in and out of the speech floor) fails the
+/// five-consecutive test until its vowel, and landing there parks the start
+/// mid-word. Two gap-tolerant cluster rules guard the landing, both gating on
+/// the cluster's peak reaching a share of the loud core's (an onset head is
+/// speech of the same utterance as the core; a pause-noise patch is not) and
+/// on the landing clearing the push bounds: a dense cluster at the full speech
+/// floor inside the skipped region is the real onset, and the start lands
+/// there instead of the core; when no such head exists, a dense near-floor
+/// cluster spanning the window's own start means the fold already placed the
+/// word on its head, so the push is refused outright.
 fn whisper_refine_dtw_word_onsets(
     mut words: Vec<crate::WordTimestamp>,
     audio_rms_frames: Option<&[f32]>,
@@ -564,7 +660,11 @@ fn whisper_refine_dtw_word_onsets(
     let silence_ceiling = whisper_dtw_edge_silence_ceiling(noise_floor, clip_peak);
     let min_quiet_frames =
         ((WHISPER_DTW_ONSET_MIN_SILENCE_S as f64) / seconds_per_frame).ceil() as usize;
-    for word in words.iter_mut().skip(1) {
+    // Word 0 is refined like any other: the fold pins its start at the band
+    // start (`max_edge` unbounded), and the leading-silence advance anchor only
+    // covers the window-front leak shape, so nothing else audio-side corrects
+    // a head word the anchor cannot reach.
+    for word in words.iter_mut() {
         let raw_start = f64::from(word.start);
         let raw_end = f64::from(word.end);
         let span = raw_end - raw_start;
@@ -635,21 +735,32 @@ fn whisper_refine_dtw_word_onsets(
             continue;
         }
         // The onset: the first speech run (>= sustain frames above the floor)
-        // preceded by a quiet run of at least the minimum silence length,
-        // inside this word's own window.
+        // preceded by a quiet run of at least the minimum silence length. The
+        // search covers the window plus the post-window edge lead: a head word
+        // pinned at the band start reads hollow across its whole window, with
+        // its own run starting at or just past the window end, so a run
+        // straddling that end must count at full length rather than as a
+        // truncated head. The quiet requirement still spans the lead, so a run
+        // is trusted only with real silence ahead of it.
+        let region_end_s = (end_s + whisper_dtw_onset_edge_lead_s() as f64).max(end_s);
+        let region_frame_end = ((region_end_s / seconds_per_frame) as usize)
+            .min(last_frame)
+            .max(frame_end);
+        let region = &levels[frame_start..region_frame_end + 1];
+        let region_len = region.len();
+        let region_above = |index: usize| f64::from(region[index]) >= threshold;
         let mut onset_rel: Option<usize> = None;
         let mut index = 0usize;
-        while index < window_len && onset_rel.is_none() {
-            if is_above(index) {
+        while index < region_len && onset_rel.is_none() {
+            if region_above(index) {
                 let mut run_end = index;
-                while run_end + 1 < window_len && is_above(run_end + 1) {
+                while run_end + 1 < region_len && region_above(run_end + 1) {
                     run_end += 1;
                 }
-                let run_len = run_end - index + 1;
-                if run_len >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+                if run_end - index + 1 >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
                     let mut quiet = 0usize;
                     let mut probe = index;
-                    while probe > 0 && !is_above(probe - 1) {
+                    while probe > 0 && !region_above(probe - 1) {
                         probe -= 1;
                         quiet += 1;
                     }
@@ -665,7 +776,126 @@ fn whisper_refine_dtw_word_onsets(
         let Some(rel) = onset_rel else {
             continue;
         };
-        let onset_s = ((frame_start + rel) as f64 * seconds_per_frame) as f32;
+        // A word that begins with a quiet or fragmented onset head (a
+        // fricative or aspirate that dips in and out of the speech floor)
+        // defeats the strict sustained-run test: the first qualifying run is
+        // the word's loud core, and landing the start there parks it
+        // mid-word. Two head-hunt rules guard the core landing, both using
+        // gap-tolerant clusters (coarticulatory dips do not split them,
+        // mirroring the offset pass's run tolerance). A cluster is
+        // (above-line frame count, span from its first above-line frame):
+        let head_cluster = |line: f64, first: usize| -> (usize, usize) {
+            let mut above = 0usize;
+            let mut last_above = first;
+            let mut below_gap = 0usize;
+            let mut probe = first;
+            while probe < rel {
+                if f64::from(region[probe]) >= line {
+                    above += 1;
+                    last_above = probe;
+                    below_gap = 0;
+                } else {
+                    below_gap += 1;
+                    if below_gap > WHISPER_DTW_ONSET_HEAD_GAP_TOLERANCE_FRAMES {
+                        break;
+                    }
+                }
+                probe += 1;
+            }
+            (above, last_above - first + 1)
+        };
+        // The core's own strict run (its first frames can still be the vowel's
+        // ramp): long enough to reach its level, short enough to exclude the
+        // next word's audio. Both head rules compare their cluster's peak
+        // against it -- a real onset head is speech of the same utterance as
+        // the core, a noise patch is not.
+        let mut core_end = rel;
+        while core_end + 1 < region.len() && region_above(core_end + 1) {
+            core_end += 1;
+        }
+        let core_peak = region[rel..=core_end]
+            .iter()
+            .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)));
+        let cluster_peak = |first: usize, span: usize| -> f64 {
+            region[first..first + span]
+                .iter()
+                .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)))
+        };
+        // A head landing is legal only if it clears the push bounds and does
+        // not invert the window -- the same test the core landing must pass.
+        // A cluster that cannot produce a legal push is not the word's onset at
+        // all (a patch of pause noise sitting a few hundredths in), and is
+        // treated as no head rather than as one.
+        let legal_landing = |landing: usize| -> bool {
+            let landing_s = ((frame_start + landing) as f64 * seconds_per_frame) as f32;
+            let push = landing_s - raw_start as f32;
+            f64::from(landing_s) < raw_end
+                && (WHISPER_DTW_ONSET_MIN_PUSH_S..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push)
+        };
+        // Rule 1 -- a head inside the skipped region: a dense cluster at the
+        // full speech floor is the word's real onset; land on it instead of
+        // the core. Clusters are maximal by construction, so one starting at
+        // or past `min_quiet_frames` always has a real below-floor run ahead
+        // of it -- the previous word's decaying tail can never qualify. The
+        // peak gate keeps a dense *noise* patch in a parked word's front from
+        // reading as the word's head, and the legality test keeps an
+        // unusable candidate from both re-targeting the push and (below)
+        // suppressing the window-start veto.
+        let mut head_rel: Option<usize> = None;
+        let mut index = min_quiet_frames;
+        while index < rel && head_rel.is_none() {
+            if f64::from(region[index]) >= threshold {
+                let (above, span) = head_cluster(threshold, index);
+                if above >= WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES
+                    && above as f64 / span as f64 >= WHISPER_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION
+                    && cluster_peak(index, span)
+                        >= core_peak * WHISPER_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
+                    && legal_landing(index)
+                {
+                    head_rel = Some(index);
+                }
+                index += span;
+            } else {
+                index += 1;
+            }
+        }
+        let core_s = ((frame_start + rel) as f64 * seconds_per_frame) as f32;
+        let onset_s = head_rel.map_or(core_s, |head| {
+            ((frame_start + head) as f64 * seconds_per_frame) as f32
+        });
+        // Rule 2 -- the window already opens on the head: a dense cluster of
+        // near-floor audio spanning the window's own start proves the fold
+        // placed the word on its onset head, so the loud run ahead is the
+        // word's core and the push is refused. Only consulted when no legal
+        // mid-region head qualified: a window-start cluster coexisting with a
+        // real onset deeper in the region is pre-onset noise, not the word.
+        // The span floor keeps a short breath burst at the edge from vetoing
+        // a genuine parked-word push, and the peak ratio keeps pause noise
+        // (far weaker than the core) from masquerading as a head even when it
+        // chains into a long cluster.
+        if head_rel.is_none() {
+            let head_line = noise_floor * 10.0_f64.powf(whisper_dtw_onset_head_margin_db() / 20.0);
+            if let Some(first) =
+                (0..min_quiet_frames.min(rel)).find(|&i| f64::from(region[i]) >= head_line)
+            {
+                let (above, span) = head_cluster(head_line, first);
+                if above >= WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES
+                    && span >= WHISPER_DTW_ONSET_HEAD_WINDOW_START_SPAN_FRAMES
+                    && above as f64 / span as f64 >= WHISPER_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION
+                    && cluster_peak(first, span)
+                        >= core_peak * WHISPER_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
+                {
+                    continue;
+                }
+            }
+        }
+        // A run that lies entirely past the window end would land the start at
+        // or beyond the word's own end, inverting the window; the word's end
+        // would have to move too -- a rehouse, not an edge correction. Refuse
+        // it (the offset pass refuses its mirror case the same way).
+        if f64::from(onset_s) >= raw_end {
+            continue;
+        }
         let push = onset_s - raw_start as f32;
         // A word's start may only move forward into later audio, never backward.
         // The minimum push guards against a sub-calibration-error wiggle; the
