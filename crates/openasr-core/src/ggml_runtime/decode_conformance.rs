@@ -1503,8 +1503,17 @@ struct DiagnosticGraphLifecycleStats {
     kv_commits: BTreeSet<u64>,
     capture_before: usize,
     capture_after: usize,
+    /// A `CaptureStateObserved(BeforeCompute)` has arrived and no compute has
+    /// consumed it yet.
     capture_before_pending: bool,
     capture_before_computes: BTreeSet<u64>,
+    /// Computes whose `CaptureStateObserved(AfterCompute)` has been recorded.
+    /// Non-empty means this graph has already proven it runs under native
+    /// capture, so a later compute on it inherits that evidence: capture
+    /// support is a backend-handle constant and the emitter deliberately stops
+    /// re-probing after the first `AfterCompute` rather than inflate HIP RTF
+    /// with one observation per decode step (`GgmlGraphLifecycleState::
+    /// skip_further_native_capture`).
     capture_after_computes: BTreeSet<u64>,
     active_compute: Option<u64>,
     capture_supported: Option<bool>,
@@ -1623,7 +1632,9 @@ fn summarize_lifecycle(
                         .iter()
                         .any(|(observed, ..)| observed == compute_sequence)
                     || stats.capture_generation != *capture_executable_generation
-                    || (stats.capture_supported.is_some() && !stats.capture_before_pending)
+                    || (stats.capture_supported.is_some()
+                        && !stats.capture_before_pending
+                        && stats.capture_after_computes.is_empty())
                 {
                     return Err(GgmlCpuGraphError::UnsupportedInputs {
                         reason: "conformance lifecycle contains an invalid compute start",
@@ -1650,7 +1661,8 @@ fn summarize_lifecycle(
             } => {
                 if stats.active_compute != Some(*compute_sequence)
                     || (stats.capture_supported.is_some()
-                        && !stats.capture_after_computes.contains(compute_sequence))
+                        && !stats.capture_after_computes.contains(compute_sequence)
+                        && stats.capture_before_computes.is_empty())
                     || stats
                         .computes_completed
                         .insert(*compute_sequence, *output_generation)
@@ -1861,8 +1873,20 @@ fn validate_computed_graph(
     if require_capture_observation && !capture_observed {
         return false;
     }
+    // Capture support is a backend-handle constant, so the emitter observes the
+    // graph's first compute and then settles (see
+    // `GgmlGraphLifecycleState::skip_further_native_capture`): a further probe
+    // cannot change planner reuse and only inflates HIP RTF. Coverage
+    // therefore means the FIRST compute is bracketed by real before/after
+    // observations, and every later compute inherits that evidence -- not one
+    // observation pair per compute, which no settle-once backend can produce.
+    // Requiring the first compute specifically keeps this fail-closed: an
+    // observation attached only to a later compute does not admit a graph.
     if capture_observed
-        && (stats.capture_before != expected_computes || stats.capture_after != expected_computes)
+        && !stats.computes_started.first().is_some_and(|(compute, ..)| {
+            stats.capture_before_computes.contains(compute)
+                && stats.capture_after_computes.contains(compute)
+        })
     {
         return false;
     }
@@ -2516,6 +2540,228 @@ mod tests {
             .expect(
                 "HIP feature build must enumerate a live HIP GPU; on Windows use --features hip,legacy-windows-static-sidecar so the probe is compiled into the test binary",
             )
+    }
+
+    /// One settle-once native-capture graph: capture support is observed
+    /// around compute 1 only, so compute 2 inherits that evidence exactly as a
+    /// HIP backend that stops re-probing after its first `AfterCompute` emits
+    /// it. `capture_generation` is the executable generation the backend
+    /// instantiates during compute 1 and every later compute must name.
+    fn settle_once_capture_lifecycle() -> GgmlGraphLifecycleSnapshot {
+        use std::sync::Arc;
+
+        use super::super::GgmlGraphLifecycleEvent as Event;
+        use super::super::GgmlGraphLifecycleEventKind as Kind;
+        use super::super::{GgmlCaptureExecutableChange, GgmlCaptureObservationPhase};
+        let generation = 65;
+        let event = |sequence, kind| Event {
+            schema: Arc::from(super::super::GGML_GRAPH_LIFECYCLE_SCHEMA),
+            sequence,
+            provider: Arc::from("hip"),
+            device: Arc::from("ROCm0"),
+            graph_instance: 7,
+            graph_generation: generation,
+            kind,
+        };
+        let kinds = vec![
+            Kind::Created {
+                scheduler_enabled: false,
+            },
+            Kind::Prepared {
+                prepare_generation: 66,
+            },
+            Kind::CaptureStateObserved {
+                phase: GgmlCaptureObservationPhase::BeforeCompute,
+                capture_supported: true,
+                graph_tracked: false,
+                capture_enabled: None,
+                executable_present: false,
+            },
+            Kind::ComputeStarted {
+                compute_sequence: 1,
+                prepare_generation: Some(66),
+                input_generation_consumed: Some(67),
+                capture_executable_generation: None,
+            },
+            Kind::CaptureStateObserved {
+                phase: GgmlCaptureObservationPhase::AfterCompute,
+                capture_supported: true,
+                graph_tracked: true,
+                capture_enabled: Some(true),
+                executable_present: true,
+            },
+            Kind::CaptureExecutableCreated {
+                capture_executable_generation: 2,
+                change: GgmlCaptureExecutableChange::Instantiated,
+            },
+            Kind::ComputeCompleted {
+                compute_sequence: 1,
+                output_generation: 68,
+            },
+            Kind::OutputRead {
+                compute_sequence: 1,
+                output_generation_consumed: 68,
+                bytes: 16,
+            },
+            // No CaptureStateObserved pair: the emitter has settled.
+            Kind::ComputeStarted {
+                compute_sequence: 2,
+                prepare_generation: Some(66),
+                input_generation_consumed: Some(69),
+                capture_executable_generation: Some(2),
+            },
+            Kind::ComputeCompleted {
+                compute_sequence: 2,
+                output_generation: 70,
+            },
+            Kind::OutputRead {
+                compute_sequence: 2,
+                output_generation_consumed: 70,
+                bytes: 16,
+            },
+            Kind::Dropped,
+        ];
+        GgmlGraphLifecycleSnapshot {
+            events: kinds
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| event(index as u64 + 1, kind))
+                .collect(),
+            overflowed: false,
+        }
+    }
+
+    #[test]
+    fn settled_capture_evidence_carries_later_computes() {
+        let lifecycle = settle_once_capture_lifecycle();
+        // The summarize pass must accept both computes: the second inherits
+        // the first's capture evidence instead of demanding a re-probe.
+        let summary = super::summarize_lifecycle(&lifecycle).expect("settled capture summarizes");
+        let computed: Vec<_> = summary
+            .graphs
+            .values()
+            .filter(|stats| !stats.computes_started.is_empty())
+            .collect();
+        assert_eq!(computed.len(), 1, "one computed graph");
+        let stats = computed[0];
+        assert_eq!(stats.computes_started.len(), 2);
+        assert_eq!(stats.capture_before_computes.len(), 1);
+        assert_eq!(stats.capture_after_computes.len(), 1);
+        assert!(
+            super::validate_computed_graph(stats, 2, false, true),
+            "a graph whose first compute is bracketed by capture observations \
+             admits its later compute by inherited evidence"
+        );
+    }
+
+    #[test]
+    fn capture_enabled_graph_without_any_observation_is_refused() {
+        // Same two-compute shape with every capture event stripped. Compute 2
+        // still claims the executable generation the stripped
+        // CaptureExecutableCreated would have established, so the summarize
+        // pass must refuse: a graph can never claim capture evidence it never
+        // recorded.
+        let lifecycle = GgmlGraphLifecycleSnapshot {
+            events:
+                settle_once_capture_lifecycle()
+                    .events
+                    .into_iter()
+                    .filter(|event| {
+                        !matches!(
+                        event.kind,
+                        super::super::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                            | super::super::GgmlGraphLifecycleEventKind::CaptureExecutableCreated {
+                                ..
+                            }
+                    )
+                    })
+                    .collect(),
+            overflowed: false,
+        };
+        assert!(
+            super::summarize_lifecycle(&lifecycle).is_err(),
+            "a compute claiming an unrecorded capture generation must be refused"
+        );
+    }
+
+    #[test]
+    fn capture_observation_required_graph_without_evidence_is_refused() {
+        // The same graph, but with the compute-start claims normalized so the
+        // summarize pass accepts the shape and the gate itself is what must
+        // refuse it: `require_capture_observation` with zero observations.
+        let mut events = settle_once_capture_lifecycle()
+            .events
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event.kind,
+                    super::super::GgmlGraphLifecycleEventKind::CaptureStateObserved { .. }
+                        | super::super::GgmlGraphLifecycleEventKind::CaptureExecutableCreated { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        // Compute 2 no longer names an executable generation, so the stream is
+        // internally consistent; it simply carries no capture evidence.
+        for event in &mut events {
+            if let super::super::GgmlGraphLifecycleEventKind::ComputeStarted {
+                compute_sequence: 2,
+                capture_executable_generation,
+                ..
+            } = &mut event.kind
+            {
+                *capture_executable_generation = None;
+            }
+        }
+        let lifecycle = GgmlGraphLifecycleSnapshot {
+            events,
+            overflowed: false,
+        };
+        let summary = super::summarize_lifecycle(&lifecycle).expect("no-capture stream summarizes");
+        let stats = summary
+            .graphs
+            .values()
+            .find(|stats| !stats.computes_started.is_empty())
+            .expect("computed graph");
+        assert_eq!(stats.capture_before, 0);
+        assert_eq!(stats.capture_after, 0);
+        assert!(
+            !super::validate_computed_graph(stats, 2, false, true),
+            "requiring capture observation must stay fail-closed"
+        );
+        assert!(
+            super::validate_computed_graph(stats, 2, false, false),
+            "the same graph is admissible when the provider does not require \
+             capture observation (the CPU route)"
+        );
+    }
+
+    #[test]
+    fn capture_observation_on_a_later_compute_only_is_refused() {
+        // Compute 1 runs unobserved and only compute 2 is bracketed. Coverage
+        // requires the FIRST compute to carry the observation, so an
+        // observation that arrives late cannot admit the graph.
+        let mut lifecycle = settle_once_capture_lifecycle();
+        let observation_at = lifecycle
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.kind,
+                    super::super::GgmlGraphLifecycleEventKind::CaptureStateObserved {
+                        phase: super::super::GgmlCaptureObservationPhase::BeforeCompute,
+                        ..
+                    }
+                )
+            })
+            .expect("before-compute observation");
+        // Move the pair from compute 1 onto compute 2 by swapping the event
+        // order: compute 1's start now precedes any observation.
+        lifecycle.events.swap(observation_at, observation_at + 1);
+        let summary = super::summarize_lifecycle(&lifecycle);
+        assert!(
+            summary.is_err(),
+            "an unobserved first compute must not be admitted by a later observation"
+        );
     }
 
     fn lifecycle_event_label(kind: &crate::GgmlGraphLifecycleEventKind) -> &'static str {

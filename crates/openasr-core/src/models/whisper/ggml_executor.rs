@@ -7809,10 +7809,18 @@ fn run_whisper_decode_loop(
                 i + 2,
             )
             .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
-            // A ladder round that STILL hits the repeat guard was cut short, so
-            // it cannot have recovered more than the incumbent -- skip it (do
-            // not replace the incumbent with a shorter guard-cut slice).
-            if result.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
+            // A ladder round that stopped short was cut short, so it cannot
+            // have recovered more than the incumbent -- skip it (do not
+            // replace the incumbent with a truncated slice). Truncation has
+            // two sources and both must be excluded: the repeat guard, and
+            // the generation budget running out before any stop token. A
+            // budget-exhausted round is the more dangerous of the two here,
+            // because its text length is the TOKEN CAP rather than recovered
+            // audio, so it wins the length tie-break in
+            // `whisper_decode_candidate_better` while having transcribed
+            // nothing extra. On a fixture whose decode loops, that promotes a
+            // full-budget run of repeated tokens over the real transcript.
+            if result.stop_reason.is_truncated() {
                 continue;
             }
             let cand_evidence = whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
@@ -7903,8 +7911,10 @@ fn run_whisper_decode_loop(
                 })?;
                 let cl_evidence =
                     whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
-                let cl_clean =
-                    result.stop_reason != Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard;
+                // Same refusal as the temperature rounds above: a round that
+                // stopped short offers nothing over the stub, whatever its
+                // length says.
+                let cl_clean = !result.stop_reason.is_truncated();
                 // Real content, not just stamps or periods: a decode whose
                 // whole text is `.` or `*Squeak*` has salvaged nothing and
                 // cannot take over from any other round.

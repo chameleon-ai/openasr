@@ -3229,6 +3229,20 @@ fn ladder_falls_back_to_length_when_evidence_unmeasurable() {
 }
 
 #[test]
+fn ladder_candidate_admission_refuses_every_truncated_stop_reason() {
+    use crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStopReason as Stop;
+
+    // The ladder admits a round only when it ended on its own terms. Both
+    // truncation reasons must be refused: a guard-cut round lost its tail, and
+    // a budget-exhausted round's length is the TOKEN CAP, not recovered audio
+    // -- which is exactly what let a full-budget run of repeated tokens win the
+    // length tie-break over the real transcript.
+    assert!(!Stop::StopToken.is_truncated());
+    assert!(Stop::DegenerateRepeatGuard.is_truncated());
+    assert!(Stop::BudgetExhausted.is_truncated());
+}
+
+#[test]
 fn carry_loop_dominance_shapes() {
     // The lobster shape: a short phrase recited over a groove, stopped
     // mid-cycle (3 full cycles + 2 of the 6 tokens).
