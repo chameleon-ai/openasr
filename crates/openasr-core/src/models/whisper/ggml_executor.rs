@@ -7877,10 +7877,28 @@ fn run_whisper_decode_loop(
             }
             let cand_evidence = whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
             if whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence) {
-                best = (cand, result);
-                best_evidence = cand_evidence;
-                best_round = i + 2;
-                best_temperature = temperature;
+                // A clean round being replaced is still a challenger for the
+                // audible-tail coverage re-race below; it must not vanish just
+                // because it lost the span race. (A guard-tripped incumbent has
+                // no salvageable audio left, so it is kept out of the pool.)
+                if !best.1.stop_reason.is_truncated() && best.0.text_trimmed.len() > 0 {
+                    let prev = std::mem::replace(&mut best, (cand, result));
+                    clean_rounds.push(WhisperLadderRound {
+                        round: best_round,
+                        temperature: best_temperature,
+                        candidate: prev.0,
+                        result: prev.1,
+                        evidence: best_evidence,
+                    });
+                    best_evidence = cand_evidence;
+                    best_round = i + 2;
+                    best_temperature = temperature;
+                } else {
+                    best = (cand, result);
+                    best_evidence = cand_evidence;
+                    best_round = i + 2;
+                    best_temperature = temperature;
+                }
             } else {
                 // Losers of the span race stay candidates for the stub
                 // re-race below, which needs every clean round.

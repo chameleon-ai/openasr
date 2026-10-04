@@ -28,7 +28,7 @@ pub(crate) const MAX_REPEAT_NGRAM: usize = 64;
 /// never repeats a 3+ token phrase four times running, so it keeps the
 /// original bound. Short cycles get more room - see
 /// [`default_max_consecutive_ngram_repeats`].
-pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 4;
+pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 8;
 
 /// Consecutive identical cycles that mark a greedy loop as degenerate, as a
 /// function of the cycle length `ngram_len`. Returning 0 for a length disables
