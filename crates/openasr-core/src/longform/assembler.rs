@@ -201,11 +201,13 @@ impl TranscriptAssembler {
         // slice's own span is folded into the boundary afterwards so the next
         // slice trims against it (even if this slice is silent / emits nothing).
         let trim_boundary = self.committed_end_original;
+        let previous_committed_end = self.committed_end_original;
         let slice_committed_end = self.slice_content_end_original(&transcript.slice);
-        self.committed_end_original = Some(match self.committed_end_original {
+        self.committed_end_original = Some(match previous_committed_end {
             Some(previous) => previous.max(slice_committed_end),
             None => slice_committed_end,
         });
+        let segment_start_index = self.segments.len();
         transcript.text = transcript.text.trim().to_string();
         if transcript.text.is_empty()
             && transcript
@@ -304,6 +306,26 @@ impl TranscriptAssembler {
             // dropped above.
             self.segments.push(mapped);
             self.speaker_scope_by_segment.push(speaker_scope);
+        }
+        // A cap-pinned tail word is a stretched placement artifact: its
+        // stamped window reaches the family max because the edge grant
+        // inherited the band tail and the cap clamped it, so the region it
+        // claims is padded tail, not speech. Committing that window would
+        // let the next slice's midpoint trim eat the head of a genuine
+        // re-read whose words begin inside the stretched window. Only
+        // advance the boundary over trustworthy extents.
+        if let Some(limit) = self.max_word_span_original_seconds
+            && let Some(tail) = self.segments[segment_start_index..]
+                .iter()
+                .flat_map(|segment| segment.words.iter())
+                .max_by(|left, right| left.end.total_cmp(&right.end))
+            && tail.end - tail.start >= limit - 0.05
+        {
+            let discounted = tail.start.max(0.0);
+            self.committed_end_original = Some(match previous_committed_end {
+                Some(previous) => previous.max(discounted),
+                None => discounted,
+            });
         }
     }
 
@@ -486,6 +508,7 @@ impl TranscriptAssembler {
             time_overlap,
             SEGMENT_STITCH_MAX_REGAP_SECONDS,
             self.approximate_word_timestamps,
+            self.max_word_span_original_seconds,
         );
         if stitched && self.approximate_word_timestamps {
             // A prior seam may already have advanced these estimates beyond
@@ -711,6 +734,7 @@ fn apply_suffix_prefix_stitch(
     time_overlap_seconds: f32,
     max_seam_regap_seconds: f32,
     approximate_word_timestamps: bool,
+    max_word_span_original_seconds: Option<f32>,
 ) -> bool {
     let Some(overlap) = suffix_prefix_overlap(
         &previous.text,
@@ -780,6 +804,17 @@ fn apply_suffix_prefix_stitch(
             (Some(prev_match_last), Some(curr_match_first)) => {
                 let regap_seconds = curr_match_first.start - prev_match_last.end;
                 if regap_seconds > max_seam_regap_seconds {
+                    return false;
+                }
+                // A committed word pinned at the family span cap is a
+                // stretched placement artifact (band-final edge grant
+                // inherited the band tail, then the cap clamped it), not a
+                // genuine re-read anchor. Letting it stand as one makes the
+                // overlap look like a seam re-read and lets the stitch eat
+                // the current slice's real head.
+                if let Some(limit) = max_word_span_original_seconds
+                    && prev_match_last.end - prev_match_last.start >= limit - 0.05
+                {
                     return false;
                 }
                 // A re-read is audio the previous slice already covered, so the
@@ -921,7 +956,15 @@ fn apply_suffix_prefix_stitch(
                     .is_none_or(|next_start| {
                         curr_word.start - next_start <= SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
                     });
-                past_previous_read && contiguous_restart && keeps_stream_order
+                // A cap-pinned committed word is a stretched artifact: its
+                // stamped window covers silence-padded tail, not speech, so
+                // re-homing it onto the current slice's windows would anchor
+                // the text to an occurrence it does not own.
+                let stretched_artifact = max_word_span_original_seconds
+                    .is_some_and(|limit| {
+                        prev_word.end - prev_word.start >= limit - 0.05
+                    });
+                past_previous_read && contiguous_restart && keeps_stream_order && !stretched_artifact
             })
             .collect::<Vec<_>>();
         for ((prev_word, curr_word), do_rehome) in matched_prev
@@ -2278,6 +2321,105 @@ mod tests {
         assert_eq!(transcription.segments[1].text, "next words here");
         assert_eq!(transcription.segments[1].words.len(), 3);
         assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_refuses_seam_stitch_when_committed_tail_word_is_cap_pinned() {
+        // Malfina seam shape: slice 1's band-final word inherits the band
+        // tail and is cap-pinned at the family max span, so its stretched
+        // window overlaps slice 2's complete re-decode. Treating the pin
+        // as a genuine re-read anchor would let the stitch consume slice
+        // 2's head and orphan the copy's tail; both copies must survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_max_word_span_original_seconds(Some(1.7));
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hear the dead ne?".to_string(),
+            segments: vec![absolute_segment(
+                "hear the dead ne?",
+                0.1,
+                3.4,
+                vec![
+                    word("hear", 0.1, 0.4),
+                    word("the", 0.5, 0.7),
+                    word("dead", 0.8, 1.0),
+                    word("ne?", 1.7, 3.4),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(48_000, 64_000),
+            text: "dead ne? again".to_string(),
+            segments: vec![absolute_segment(
+                "dead ne? again",
+                1.9,
+                3.0,
+                vec![
+                    word("dead", 1.9, 2.1),
+                    word("ne?", 2.15, 2.4),
+                    word("again", 2.6, 3.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[0].text, "hear the dead ne?");
+        assert_eq!(transcription.segments[1].text, "dead ne? again");
+        assert_eq!(transcription.segments[1].words.len(), 3);
+        assert_eq!(transcription.text, "hear the dead ne? dead ne? again");
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_does_not_commit_through_a_cap_pinned_tail_word() {
+        // The refill shape: slice 1's last placed word is the band-final
+        // word, inherited the band tail and got cap-pinned (1.7s). The
+        // assembler must not bank that stretched window as committed
+        // territory: using it as the trim boundary eats the midpoint of
+        // the refill slice's first words, since they genuinely begin
+        // inside the stretched window.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_max_word_span_original_seconds(Some(1.7));
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 54_400),
+            text: "hear the dead ne?".to_string(),
+            segments: vec![absolute_segment(
+                "hear the dead ne?",
+                0.1,
+                3.4,
+                vec![
+                    word("hear", 0.1, 0.4),
+                    word("the", 0.5, 0.7),
+                    word("dead", 0.8, 1.0),
+                    word("ne?", 1.7, 3.4),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(28_800, 46_400),
+            text: "No you dead ne?".to_string(),
+            segments: vec![absolute_segment(
+                "No you dead ne?",
+                1.71,
+                2.9,
+                vec![
+                    word("No", 1.71, 1.95),
+                    word("you", 2.0, 2.3),
+                    word("dead", 2.35, 2.6),
+                    word("ne?", 2.65, 2.9),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "No you dead ne?");
+        assert_eq!(transcription.segments[1].words.len(), 4);
     }
 
     #[test]
