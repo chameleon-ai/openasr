@@ -24,10 +24,13 @@ pub(crate) const MAX_REPEAT_NGRAM: usize = 64;
 
 /// Consecutive identical cycles that mark a multi-token phrase loop as
 /// degenerate. This is the shape the original field degeneration took (a ~5
-/// token CJK phrase emitted back to back), and legitimate speech essentially
-/// never repeats a 3+ token phrase four times running, so it keeps the
-/// original bound. Short cycles get more room - see
-/// [`default_max_consecutive_ngram_repeats`].
+/// token CJK phrase emitted back to back). The 3+ token tier trips at 8
+/// consecutive cycles: a true loop is unbounded so it still trips (four
+/// cycles later, with a byte-identical truncated transcript), while a human
+/// repeating a phrase four to seven times and stopping is left intact.
+/// Short cycles get their own room - see
+/// [`default_max_consecutive_ngram_repeats`]. This const feeds ONLY the 3+
+/// tier there (the 1- and 2-cycle tiers are separate literals).
 pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 8;
 
 /// Consecutive identical cycles that mark a greedy loop as degenerate, as a
@@ -59,10 +62,12 @@ pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 8;
 ///
 /// Hence single-token stutters and two-token cycles - where Mandarin
 /// backchannel, laughter and emphatic agreement routinely run four to six
-/// cycles - get room, while longer cycles keep the original bound. The 3+ tier
-/// (the flat 4) therefore also governs clause-length cycles of 9-64 tokens up
-/// to [`MAX_REPEAT_NGRAM`]: legitimate speech repeats a 3+ token unit at most
-/// a few times running, and that is if anything even rarer for a clause.
+/// cycles - get room, and longer cycles trip at eight rather than four, so a
+/// human repeating a phrase up to seven times is left intact while an
+/// unbounded loop still trips. The 3+ tier (the flat 8) therefore also governs
+/// clause-length cycles of 9-64 tokens up to [`MAX_REPEAT_NGRAM`]: a loop
+/// that never stops is degenerate at any bound, and the truncation keeps one
+/// occurrence either way.
 pub(crate) fn default_max_consecutive_ngram_repeats(ngram_len: usize) -> usize {
     match ngram_len {
         0 => 0,
@@ -1578,7 +1583,7 @@ mod tests {
     /// so a silent edit to one tier fails here.
     #[test]
     fn degenerate_repeat_guard_tiers_bound_each_cycle_length() {
-        for (ngram_len, bound) in [(1usize, 8usize), (2, 6), (3, 4), (5, 4)] {
+        for (ngram_len, bound) in [(1usize, 8usize), (2, 6), (3, 8), (5, 8)] {
             let ngram: Vec<u32> = (0..ngram_len as u32).map(|i| i + 100).collect();
             let repeat = |times: usize| -> Vec<u32> {
                 std::iter::repeat_n(ngram.as_slice(), times)
@@ -1648,9 +1653,9 @@ mod tests {
     }
 
     /// Clause-length cycles (9-64 token units) are the same degenerate shape:
-    /// a locked loop of one phrase is not "a human repeating a sentence four
+    /// a locked loop of one phrase is not "a human repeating a sentence eight
     /// times running", so the scan cap must reach over them. The per-length
-    /// bound (the flat 4 for 3+) is what still lets legitimate short human
+    /// bound (the flat 8 for 3+) is what still lets legitimate shorter human
     /// repetition survive.
     #[test]
     fn degenerate_repeat_guard_catches_clause_length_cycles() {
@@ -1665,22 +1670,22 @@ mod tests {
 
             assert_eq!(
                 detect_degenerate_ngram_repeat(
-                    &repeat(3),
+                    &repeat(7),
                     MAX_REPEAT_NGRAM,
                     default_max_consecutive_ngram_repeats,
                 ),
                 None,
-                "n={ngram_len}: 3 cycles is one under the bound and must survive"
+                "n={ngram_len}: 7 cycles is one under the bound and must survive"
             );
 
             let hit = detect_degenerate_ngram_repeat(
-                &repeat(4),
+                &repeat(8),
                 MAX_REPEAT_NGRAM,
                 default_max_consecutive_ngram_repeats,
             )
-            .unwrap_or_else(|| panic!("n={ngram_len}: 4 cycles must trip"));
+            .unwrap_or_else(|| panic!("n={ngram_len}: 8 cycles must trip"));
             assert_eq!(hit.ngram_len, ngram_len);
-            assert_eq!(hit.repeats, 4);
+            assert_eq!(hit.repeats, 8);
             assert_eq!(hit.keep_len, ngram_len, "must keep exactly one cycle");
         }
     }
