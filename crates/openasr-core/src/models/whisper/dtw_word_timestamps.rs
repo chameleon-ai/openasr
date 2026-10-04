@@ -6,7 +6,8 @@
 //! band the pipeline is: DTW alignment of token centers -> the pre-fold
 //! reanchor that pulls word-final punctuation off pauses -> the center fold
 //! into word windows -> the per-word span cap -> the onset refiner -> the
-//! offset refiner -> the symmetric pad. That order is what the test suite
+//! offset refiner -> the word pad (onset side only by default; the offset
+//! side swept to zero). That order is what the test suite
 //! validates end to end; do not reorder passes without rerunning it.
 //!
 //! Every function here is pure over `f32` and token slices (no graph state,
@@ -1498,10 +1499,44 @@ fn later_piece_contributes_to_same_word(index: usize, pieces: &[String]) -> bool
 const WHISPER_WORD_ONSET_PAD_SECONDS: f32 = 0.10;
 
 /// Seconds each whisper word window's end is moved later, the offset-side
-/// counterpart of [`WHISPER_WORD_ONSET_PAD_SECONDS`]. The end seam is shared
-/// with the next word's start, so both sides of a boundary are pulled out by the
-/// pad at once.
-const WHISPER_WORD_OFFSET_PAD_SECONDS: f32 = 0.10;
+/// counterpart of [`WHISPER_WORD_ONSET_PAD_SECONDS`]. Swept to zero: the
+/// offset pad bought only ~0.1 pt of suite InWin while owning half the
+/// systematic 0.200 s neighbor overlap, so the default keeps the full onset
+/// pad (worth ~0.5 pt InWin) and no offset pad. Override with
+/// `OPENASR_WHISPER_WORD_OFFSET_PAD_SECONDS` (see
+/// [`whisper_word_offset_pad_seconds`]).
+const WHISPER_WORD_OFFSET_PAD_SECONDS: f32 = 0.0;
+
+/// The onset pad in use, honoring the deployment env override so a tuning
+/// pass can sweep it without a rebuild (see
+/// [`WHISPER_WORD_ONSET_PAD_SECONDS`]). A bare environment is byte-identical
+/// to the constant.
+fn whisper_word_onset_pad_seconds() -> f32 {
+    parse_whisper_word_pad_override(
+        std::env::var("OPENASR_WHISPER_WORD_ONSET_PAD_SECONDS").ok(),
+        WHISPER_WORD_ONSET_PAD_SECONDS,
+    )
+}
+
+/// The offset pad in use, honoring the deployment env override so a tuning
+/// pass can sweep it without a rebuild (see
+/// [`WHISPER_WORD_OFFSET_PAD_SECONDS`]). A bare environment is byte-identical
+/// to the constant.
+fn whisper_word_offset_pad_seconds() -> f32 {
+    parse_whisper_word_pad_override(
+        std::env::var("OPENASR_WHISPER_WORD_OFFSET_PAD_SECONDS").ok(),
+        WHISPER_WORD_OFFSET_PAD_SECONDS,
+    )
+}
+
+/// Parse one side's pad override: a set-and-parseable value wins, anything
+/// else (unset or unparsable) falls back to the compiled default. Pure so
+/// unit tests can pin the parsing without mutating process env (unsafe in
+/// this edition and racy under parallel nextest).
+fn parse_whisper_word_pad_override(raw: Option<String>, fallback: f32) -> f32 {
+    raw.and_then(|text| text.parse::<f32>().ok())
+        .unwrap_or(fallback)
+}
 
 /// Widen each word window back over the true speech span: start earlier by
 /// [`WHISPER_WORD_ONSET_PAD_SECONDS`], end later by
@@ -1528,11 +1563,11 @@ fn whisper_pad_dtw_word_windows(
         return words;
     }
     let duration = audio_duration_seconds.max(0.0);
+    let onset_pad = whisper_word_onset_pad_seconds();
+    let offset_pad = whisper_word_offset_pad_seconds();
     for word in &mut words {
-        let new_start = (word.start - WHISPER_WORD_ONSET_PAD_SECONDS)
-            .max(0.0)
-            .min(duration);
-        let new_end = (word.end + WHISPER_WORD_OFFSET_PAD_SECONDS).min(duration);
+        let new_start = (word.start - onset_pad).max(0.0).min(duration);
+        let new_end = (word.end + offset_pad).min(duration);
         word.start = new_start;
         word.end = new_end.max(new_start);
     }

@@ -663,9 +663,10 @@ fn refine_dtw_offsets_noop_without_envelope() {
 // whisper_pad_dtw_word_windows
 // ---------------------------------------------------------------------------
 
-/// An interior word is widened on both sides by exactly the pads, while the
-/// first word's start is clamped to 0.0 and the last word's end is clamped to
-/// the audio duration; interior order is preserved.
+/// An interior word is widened on the onset side by exactly the onset pad
+/// (the offset pad defaults to zero, so ends stay on the fold seam), while
+/// the first word's start is clamped to 0.0 and the last word's end is
+/// clamped to the audio duration; interior order is preserved.
 #[test]
 fn pad_dtw_word_windows_widens_toward_the_edges_and_clamps_to_the_audio() {
     let words = vec![
@@ -679,19 +680,19 @@ fn pad_dtw_word_windows_widens_toward_the_edges_and_clamps_to_the_audio() {
         "a.start={}",
         out[0].start
     );
-    assert!((out[0].end - 0.80).abs() < 1e-4, "a.end={}", out[0].end);
+    assert!((out[0].end - 0.70).abs() < 1e-4, "a.end={}", out[0].end);
     assert!(
         (out[1].start - 0.60).abs() < 1e-4,
         "b.start={}",
         out[1].start
     );
-    assert!((out[1].end - 1.40).abs() < 1e-4, "b.end={}", out[1].end);
+    assert!((out[1].end - 1.30).abs() < 1e-4, "b.end={}", out[1].end);
     assert!(
         (out[2].start - 1.20).abs() < 1e-4,
         "c.start={}",
         out[2].start
     );
-    assert!((out[2].end - 15.0).abs() < 1e-4, "c.end={}", out[2].end);
+    assert!((out[2].end - 14.98).abs() < 1e-4, "c.end={}", out[2].end);
     for (index, word) in out.iter().enumerate() {
         assert!(word.start <= word.end, "word[{index}] inverted");
         if index + 1 < out.len() {
@@ -709,6 +710,33 @@ fn pad_dtw_word_windows_is_a_noop_when_empty_and_clamps_zero_duration() {
     let zero = whisper_pad_dtw_word_windows(vec![word_ts("a", 0.30, 0.90)], 0.0);
     assert_eq!(zero[0].start, 0.0);
     assert_eq!(zero[0].end, 0.0);
+}
+
+/// The compiled pad defaults are asymmetric: a 0.10 s onset pad with a zero
+/// offset pad (the offset side bought ~0.1 pt InWin for half the overlap
+/// mass, so it swept to zero). The runtime reads them through the
+/// env-override fns, so a bare environment is byte-identical to the
+/// constants.
+#[test]
+fn word_pad_seconds_fall_back_to_the_compiled_defaults() {
+    assert!((WHISPER_WORD_ONSET_PAD_SECONDS - 0.10).abs() < 1e-6);
+    assert!((WHISPER_WORD_OFFSET_PAD_SECONDS - 0.0).abs() < 1e-6);
+    // Pin the parsing without mutating process env (unsafe in this edition
+    // and racy under parallel nextest): unset and unparsable fall back, a
+    // parseable value wins.
+    assert!(
+        (parse_whisper_word_pad_override(None, WHISPER_WORD_ONSET_PAD_SECONDS) - 0.10).abs() < 1e-6
+    );
+    assert!(
+        (parse_whisper_word_pad_override(
+            Some("not-a-number".to_string()),
+            WHISPER_WORD_OFFSET_PAD_SECONDS,
+        ) - 0.0)
+            .abs()
+            < 1e-6
+    );
+    assert!((parse_whisper_word_pad_override(Some("0.05".to_string()), 0.10) - 0.05).abs() < 1e-6);
+    assert!((parse_whisper_word_pad_override(Some("0.0".to_string()), 0.10) - 0.0).abs() < 1e-6);
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,13 +1077,14 @@ fn cross_attention_com_fallback_caps_a_word_stretched_to_the_tail() {
     assert_eq!(ranges, vec![(0, 2)]);
     assert_eq!(words[0].word, "hi");
     assert_eq!(words[1].word, "there");
-    // The first word is the 0.0/0.0 mid-point window the pad widens by its
-    // onset constant.
+    // The first word is the 0.0/0.0 mid-point window the pad widens: the
+    // start clamps at 0.0 (the onset pad has nowhere to go) and the end
+    // moves by the offset constant.
     assert!((words[0].start - 0.0).abs() < 1e-6);
-    assert!((words[0].end - WHISPER_WORD_ONSET_PAD_SECONDS).abs() < 1e-6);
+    assert!((words[0].end - WHISPER_WORD_OFFSET_PAD_SECONDS).abs() < 1e-6);
     // The last word: the cap trims the tail at 1.5 s, the pad then moves the
-    // start back by 0.1 s (clamped at 0.0) and the end to 1.6 s. Uncapped,
-    // its end would be 20.0.
+    // start back by the onset constant (clamped at 0.0) while the zero
+    // offset pad leaves the end at 1.5 s. Uncapped, its end would be 20.0.
     assert!((words[1].start - 0.0).abs() < 1e-6);
     assert!(
         (words[1].end - (WHISPER_DTW_MAX_WORD_SPAN_SECONDS + WHISPER_WORD_OFFSET_PAD_SECONDS))
