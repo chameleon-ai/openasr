@@ -24,14 +24,14 @@ pub(crate) const MAX_REPEAT_NGRAM: usize = 64;
 
 /// Consecutive identical cycles that mark a multi-token phrase loop as
 /// degenerate. This is the shape the original field degeneration took (a ~5
-/// token CJK phrase emitted back to back). The 3+ token tier trips at 8
-/// consecutive cycles: a true loop is unbounded so it still trips (four
+/// token CJK phrase emitted back to back). The 3+ token tier trips at 12
+/// consecutive cycles: a true loop is unbounded so it still trips (eight
 /// cycles later, with a byte-identical truncated transcript), while a human
-/// repeating a phrase four to seven times and stopping is left intact.
+/// repeating a phrase four to eleven times and stopping is left intact.
 /// Short cycles get their own room - see
 /// [`default_max_consecutive_ngram_repeats`]. This const feeds ONLY the 3+
 /// tier there (the 1- and 2-cycle tiers are separate literals).
-pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 8;
+pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 12;
 
 /// Consecutive identical cycles that mark a greedy loop as degenerate, as a
 /// function of the cycle length `ngram_len`. Returning 0 for a length disables
@@ -62,9 +62,9 @@ pub(crate) const MAX_CONSECUTIVE_NGRAM_REPEATS: usize = 8;
 ///
 /// Hence single-token stutters and two-token cycles - where Mandarin
 /// backchannel, laughter and emphatic agreement routinely run four to six
-/// cycles - get room, and longer cycles trip at eight rather than four, so a
-/// human repeating a phrase up to seven times is left intact while an
-/// unbounded loop still trips. The 3+ tier (the flat 8) therefore also governs
+/// cycles - get room, and longer cycles trip at twelve rather than four, so a
+/// human repeating a phrase up to eleven times is left intact while an
+/// unbounded loop still trips. The 3+ tier (the flat 12) therefore also governs
 /// clause-length cycles of 9-64 tokens up to [`MAX_REPEAT_NGRAM`]: a loop
 /// that never stops is degenerate at any bound, and the truncation keeps one
 /// occurrence either way.
@@ -623,7 +623,7 @@ pub(crate) struct DegenerateNgramRepeat {
 pub(crate) fn detect_degenerate_ngram_repeat(
     tokens: &[u32],
     max_ngram: usize,
-    max_consecutive_repeats: fn(usize) -> usize,
+    max_consecutive_repeats: impl Fn(usize) -> usize,
 ) -> Option<DegenerateNgramRepeat> {
     if max_ngram == 0 {
         return None;
@@ -1583,7 +1583,7 @@ mod tests {
     /// so a silent edit to one tier fails here.
     #[test]
     fn degenerate_repeat_guard_tiers_bound_each_cycle_length() {
-        for (ngram_len, bound) in [(1usize, 8usize), (2, 6), (3, 8), (5, 8)] {
+        for (ngram_len, bound) in [(1usize, 8usize), (2, 6), (3, 12), (5, 12)] {
             let ngram: Vec<u32> = (0..ngram_len as u32).map(|i| i + 100).collect();
             let repeat = |times: usize| -> Vec<u32> {
                 std::iter::repeat_n(ngram.as_slice(), times)
@@ -1670,22 +1670,22 @@ mod tests {
 
             assert_eq!(
                 detect_degenerate_ngram_repeat(
-                    &repeat(7),
+                    &repeat(11),
                     MAX_REPEAT_NGRAM,
                     default_max_consecutive_ngram_repeats,
                 ),
                 None,
-                "n={ngram_len}: 7 cycles is one under the bound and must survive"
+                "n={ngram_len}: 11 cycles is one under the bound and must survive"
             );
 
             let hit = detect_degenerate_ngram_repeat(
-                &repeat(8),
+                &repeat(12),
                 MAX_REPEAT_NGRAM,
                 default_max_consecutive_ngram_repeats,
             )
-            .unwrap_or_else(|| panic!("n={ngram_len}: 8 cycles must trip"));
+            .unwrap_or_else(|| panic!("n={ngram_len}: 12 cycles must trip"));
             assert_eq!(hit.ngram_len, ngram_len);
-            assert_eq!(hit.repeats, 8);
+            assert_eq!(hit.repeats, 12);
             assert_eq!(hit.keep_len, ngram_len, "must keep exactly one cycle");
         }
     }
@@ -1790,6 +1790,40 @@ mod tests {
             detect_degenerate_ngram_repeat(&[5, 5, 5, 5, 5], 0, |_| 4),
             None
         );
+    }
+
+    #[test]
+    fn guard_leaves_a_bounded_hook_run_intact_but_trips_a_longer_one() {
+        // Nine cycles of a 6-token phrase (the coming-hook shape) stop on
+        // their own inside the 3+ tier floor of 12 and must not trip;
+        // thirteen cycles exceed it and trip, keeping the same
+        // single-occurrence prefix either way.
+        let mut nine: Vec<u32> = Vec::new();
+        for _ in 0..9 {
+            nine.extend_from_slice(&[5, 5, 5, 5, 5, 6]);
+        }
+        assert_eq!(
+            detect_degenerate_ngram_repeat(
+                &nine,
+                MAX_REPEAT_NGRAM,
+                default_max_consecutive_ngram_repeats
+            ),
+            None,
+            "nine 6-cycles stop inside the 12 floor"
+        );
+        let mut thirteen: Vec<u32> = Vec::new();
+        for _ in 0..13 {
+            thirteen.extend_from_slice(&[5, 5, 5, 5, 5, 6]);
+        }
+        let tripped = detect_degenerate_ngram_repeat(
+            &thirteen,
+            MAX_REPEAT_NGRAM,
+            default_max_consecutive_ngram_repeats,
+        )
+        .expect("thirteen 6-cycles exceed the 12 floor");
+        assert_eq!(tripped.ngram_len, 6);
+        assert_eq!(tripped.repeats, 13);
+        assert_eq!(tripped.keep_len, 6);
     }
 
     #[test]

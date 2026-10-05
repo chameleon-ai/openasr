@@ -6419,6 +6419,94 @@ fn whisper_ladder_debug_enabled() -> bool {
     std::env::var_os("OPENASR_WHISPER_DEBUG_LADDER").is_some()
 }
 
+/// Guard-trip-aware span race (C1): when the ladder incumbent is guard-cut,
+/// its evidence span is loop-inflated by construction, so a clean challenger
+/// takes the window only on placed-word merit -- the same repeated phrase at
+/// an equal-or-higher copy count with a covering frontier (a same-loop
+/// extension), or clearly more audio with different content. Every other hand
+/// keeps the stub, which holds the transcript's placed copies. See the race
+/// site for the full condition and its log lines.
+fn whisper_ladder_guard_trip_race_terms(
+    inc_frontier: Option<f32>,
+    cand_frontier: Option<f32>,
+    inc_repeat: Option<((String, String), usize)>,
+    cand_repeat: Option<((String, String), usize)>,
+    inc_evidence_secs: Option<f32>,
+    cand_evidence_secs: Option<f32>,
+    inc_trip_ngram_len: Option<usize>,
+    audio_duration_seconds: f32,
+) -> WhisperLadderGuardTripRace {
+    let frontier_covers = inc_frontier
+        .zip(cand_frontier)
+        .is_some_and(|(inc_frontier, cand_frontier)| cand_frontier >= inc_frontier);
+    // Both sides must repeat the SAME modal phrase for the copy counts to be
+    // comparable: the denial protects a stub whose loop the challenger
+    // under-transcribes, not a stub whose loop the challenger never attempted
+    // (a music-loop stub against non-repeating filler disagrees about the
+    // audio itself -- the span race decides that case, and a one-sided repeat
+    // count would defend hallucinations).
+    let same_phrase = inc_repeat
+        .as_ref()
+        .zip(cand_repeat.as_ref())
+        .is_some_and(|(inc_repeat, cand_repeat)| inc_repeat.0 == cand_repeat.0);
+    let copies_not_lower = cand_repeat.map(|repeat| repeat.1).unwrap_or(0)
+        >= inc_repeat.map(|repeat| repeat.1).unwrap_or(0);
+    // Whether the challenger clearly covers more audio than the stub (past
+    // the progress margin, on measured spans both sides). A tied or
+    // unmeasurable span pair carries no coverage verdict at all -- in
+    // particular the length tie-break hands windows to long zero-span
+    // filler, which must never take a guard-stub's window on text length.
+    let exceeds = cand_evidence_secs
+        .zip(inc_evidence_secs)
+        .is_some_and(|(cand_span, inc_span)| {
+            cand_span > inc_span + WHISPER_LADDER_EVIDENCE_PROGRESS_MIN_SECONDS
+        });
+    // Whether the stub's placed words reach the window end (within the
+    // tail-shortfall band): the stub claims the whole window, so a span tie
+    // is about who renders it. A stub that abandons its tail has no standing
+    // to keep the window on a tie. Reuses the tail-coverage band, no new
+    // constant.
+    let stub_stands = inc_frontier.is_some_and(|frontier| {
+        frontier + WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS >= audio_duration_seconds.max(0.0)
+    });
+    // Whether the stub tripped on a phrase-scale cycle (see
+    // [`WHISPER_LADDER_GUARD_TRIP_MIN_PHRASE_NGRAM_LEN`]): stutter-scale
+    // loops defer to the raw race on a span tie.
+    let stub_phrase_scale =
+        inc_trip_ngram_len.is_some_and(|len| len >= WHISPER_LADDER_GUARD_TRIP_MIN_PHRASE_NGRAM_LEN);
+    let trifecta = same_phrase && frontier_covers && copies_not_lower;
+    // A challenger that clearly covers more audio with different content wins
+    // on the span race's own terms: content disagreement is not this gate's
+    // business.
+    let content_disagreement = exceeds && !same_phrase;
+    let deny =
+        !content_disagreement && !trifecta && (exceeds || (stub_stands && stub_phrase_scale));
+    WhisperLadderGuardTripRace {
+        frontier_covers,
+        same_phrase,
+        copies_not_lower,
+        exceeds,
+        content_disagreement,
+        stub_stands,
+        stub_phrase_scale,
+        deny,
+    }
+}
+
+/// The verdict of [`whisper_ladder_guard_trip_race_terms`] for one guard-trip
+/// race, with every term kept for the race log lines. Pure so the gate is
+/// unit-testable without a decoder.
+struct WhisperLadderGuardTripRace {
+    frontier_covers: bool,
+    same_phrase: bool,
+    copies_not_lower: bool,
+    exceeds: bool,
+    content_disagreement: bool,
+    stub_stands: bool,
+    stub_phrase_scale: bool,
+    deny: bool,
+}
+
 /// Minimum consecutive-token block that may be collapsed by the tail-repeat
 /// pass. Below this, a repeated tail is treated as genuine backchannel /
 /// stutter ("hoo-ah hoo-ah", "um um um") and left untouched; the no-speech
@@ -7049,12 +7137,22 @@ fn whisper_ladder_evidence_span_seconds(
     candidate: &WhisperDecodeCandidate,
     audio_duration_seconds: f32,
 ) -> Option<f32> {
+    whisper_ladder_evidence_span_over(&candidate.token_alignments, audio_duration_seconds)
+}
+
+/// The span math over an explicit alignment slice: the ladder's guard-trip
+/// race re-measures a guard-cut incumbent over its pre-trip prefix (the trip
+/// drops a token tail the per-step alignment rows outlive), so the peak
+/// extraction lives here rather than on the whole candidate.
+fn whisper_ladder_evidence_span_over(
+    token_alignments: &[WhisperGeneratedTokenAlignment],
+    audio_duration_seconds: f32,
+) -> Option<f32> {
     const ENCODER_FRAME_RESOLUTION: usize = 1500;
     if audio_duration_seconds <= 0.0 {
         return None;
     }
-    let mut peaks: Vec<usize> = candidate
-        .token_alignments
+    let mut peaks: Vec<usize> = token_alignments
         .iter()
         .filter_map(|alignment| {
             alignment
@@ -7073,6 +7171,105 @@ fn whisper_ladder_evidence_span_seconds(
     let hi = peaks[(peaks.len() * 90 / 100).min(peaks.len() - 1)];
     Some(hi.saturating_sub(lo) as f32 / ENCODER_FRAME_RESOLUTION as f32 * audio_duration_seconds)
 }
+
+/// The end of the round's last placed word, in slice-relative seconds: where
+/// its transcription of the window actually stops. `None` when the round
+/// placed no words at all.
+fn whisper_ladder_placed_frontier_seconds(
+    tokenizer: &WhisperTokenizer,
+    candidate: &WhisperDecodeCandidate,
+    result: &WhisperGreedyDecodeResult,
+    audio_duration_seconds: f32,
+    word_audio_rms_frames: Option<&[f32]>,
+) -> Option<f32> {
+    whisper_ladder_placed_frontier_and_repeat(
+        tokenizer,
+        candidate,
+        result,
+        audio_duration_seconds,
+        word_audio_rms_frames,
+    )
+    .0
+}
+
+/// The placed-word frontier of a ladder round beside its modal normalized
+/// word bigram and how often it occurs: the short phrase the round is
+/// repeating, and the number of times it actually lands in placed words. The
+/// word pass reads the full pre-trip alignment rows, so for a guard-cut stub
+/// this is what reaches the final transcript, not the trip-trimmed generated
+/// stream the guard's own counters describe. The repeat is `None` when no
+/// bigram occurs twice (a round that is not looping has no phrase to defend).
+fn whisper_ladder_placed_frontier_and_repeat(
+    tokenizer: &WhisperTokenizer,
+    candidate: &WhisperDecodeCandidate,
+    result: &WhisperGreedyDecodeResult,
+    audio_duration_seconds: f32,
+    word_audio_rms_frames: Option<&[f32]>,
+) -> (Option<f32>, Option<((String, String), usize)>) {
+    let words = match whisper_cross_attention_word_timestamps(
+        tokenizer,
+        &candidate.token_alignments,
+        &result.generated_probabilities,
+        audio_duration_seconds,
+        word_audio_rms_frames,
+    ) {
+        Ok((words, _)) => words,
+        Err(_) => return (None, None),
+    };
+    let frontier = words.last().map(|word| word.end);
+    (frontier, modal_normalized_word_bigram(&words))
+}
+
+/// The most frequent normalized word bigram over placed words and its count,
+/// or `None` when no bigram occurs twice. Normalization is ASCII-alphanumeric
+/// lowercase (so "Coming." and "coming" are the same copy); a bigram needs
+/// two adjacent content-bearing words, so a round that never repeats has no
+/// modal phrase. Pure so the guard-trip race's same-phrase gate is
+/// unit-testable without a decoder.
+fn modal_normalized_word_bigram(
+    words: &[crate::api::backend::WordTimestamp],
+) -> Option<((String, String), usize)> {
+    let normalized: Vec<String> = words
+        .iter()
+        .map(|word| {
+            word.word
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    normalized
+        .windows(2)
+        .fold(
+            std::collections::BTreeMap::new(),
+            |mut counts: std::collections::BTreeMap<(String, String), usize>, bigram| {
+                *counts
+                    .entry((bigram[0].clone(), bigram[1].clone()))
+                    .or_default() += 1;
+                counts
+            },
+        )
+        .into_iter()
+        // NOTE: the map is a BTreeMap, so this tie-break is deterministic:
+        // `max_by_key` keeps the last maximum, i.e. the lexicographically
+        // greatest bigram. A HashMap here would pick among tied modal phrases
+        // per-process-randomly and make the same-phrase gate flaky (a hook
+        // loop ties N copies across all its internal links on every stub).
+        .max_by_key(|(_, count)| *count)
+        .filter(|(_, count)| *count >= 2)
+}
+
+/// Minimum guard-trip cycle length (tokens) for the span race to treat a
+/// tied stub as a phrase-scale loop worth defending. A stub that tripped on a
+/// 6+ token cycle rendered a full short clause repeatedly (the coming hook is
+/// exactly 6 tokens per occurrence, claire's end card 10); a shorter cycle is
+/// stutter-scale ("Music Music", "Howdy Howdy") and defers to the raw race on
+/// a span tie, where keeping it has no coverage evidence behind it. Only the
+/// tie branch of the guard-trip gate reads this; a challenger that clearly
+/// out-covers the stub is judged on phrase equality alone.
+const WHISPER_LADDER_GUARD_TRIP_MIN_PHRASE_NGRAM_LEN: usize = 6;
 
 /// How much less audio (cross-attention span) the ladder's carry-less round
 /// may cover before it is refused. The adoption is a content-preservation
@@ -7876,7 +8073,117 @@ fn run_whisper_decode_loop(
                 continue;
             }
             let cand_evidence = whisper_ladder_evidence_span_seconds(&cand, audio_duration_seconds);
-            if whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence) {
+            let span_race_wins =
+                whisper_decode_candidate_better(&cand, &best.0, cand_evidence, best_evidence);
+            // Guard-trip race (C1): the incumbent's evidence span is
+            // loop-inflated by construction -- its trip cycles attend to every
+            // repeated instance at once -- so what the race should actually
+            // read is what the placed words carry. The word pass builds words
+            // from the full pre-trip alignment rows, so a guard-cut stub's
+            // placed frontier and modal repeat are the copies the transcript
+            // keeps if the stub keeps the window. The context below is
+            // computed whenever the incumbent is guard-tripped and either the
+            // debug log wants it or the raw race would hand the window away
+            // (the only case the gate can act on); the denial verdict itself
+            // is unconditional.
+            let guard_trip_incumbent =
+                best.1.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard;
+            let guard_trip_race = (guard_trip_incumbent
+                && (whisper_ladder_debug_enabled() || span_race_wins))
+                .then(|| {
+                    let rows = &best.0.token_alignments;
+                    let pre_trip_cycle = rows
+                        .len()
+                        .saturating_sub(best.1.guard_trip_ngram_len.unwrap_or(0));
+                    let pre_trip_kept = rows.len().min(best.1.generated_tokens.len());
+                    (
+                        whisper_ladder_evidence_span_over(
+                            &rows[..pre_trip_cycle],
+                            audio_duration_seconds,
+                        ),
+                        whisper_ladder_evidence_span_over(
+                            &rows[..pre_trip_kept],
+                            audio_duration_seconds,
+                        ),
+                        whisper_ladder_placed_frontier_and_repeat(
+                            tokenizer,
+                            &best.0,
+                            &best.1,
+                            audio_duration_seconds,
+                            word_audio_rms_frames,
+                        ),
+                        whisper_ladder_placed_frontier_and_repeat(
+                            tokenizer,
+                            &cand,
+                            &result,
+                            audio_duration_seconds,
+                            word_audio_rms_frames,
+                        ),
+                    )
+                });
+            let round3 = |secs: f32| (secs * 1000.0).round() / 1000.0;
+            let mut effective_wins = span_race_wins;
+            if let Some((
+                inc_pre_trip_cycle,
+                inc_pre_trip_kept,
+                (inc_frontier, inc_copies),
+                (cand_frontier, cand_copies),
+            )) = &guard_trip_race
+            {
+                let terms = whisper_ladder_guard_trip_race_terms(
+                    inc_frontier.as_ref().copied(),
+                    cand_frontier.as_ref().copied(),
+                    inc_copies.clone(),
+                    cand_copies.clone(),
+                    best_evidence,
+                    cand_evidence,
+                    best.1.guard_trip_ngram_len,
+                    audio_duration_seconds,
+                );
+                if whisper_ladder_debug_enabled() {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=temperature_ladder event=guard_trip_race round={} temperature={} trip_ngram_len={:?} incumbent_evidence_secs={:?} incumbent_pre_trip_cycle_secs={:?} incumbent_pre_trip_kept_secs={:?} incumbent_frontier_secs={:?} incumbent_word_repeat={:?} challenger_evidence_secs={:?} challenger_frontier_secs={:?} challenger_word_repeat={:?} span_race_challenger_wins={}",
+                        i + 2,
+                        temperature,
+                        best.1.guard_trip_ngram_len,
+                        best_evidence.map(round3),
+                        inc_pre_trip_cycle.as_ref().copied().map(round3),
+                        inc_pre_trip_kept.as_ref().copied().map(round3),
+                        inc_frontier.as_ref().copied().map(round3),
+                        inc_copies,
+                        cand_evidence.map(round3),
+                        cand_frontier.as_ref().copied().map(round3),
+                        cand_copies,
+                        span_race_wins,
+                    );
+                }
+                if span_race_wins && terms.deny {
+                    // The challenger under-transcribes the stub's loop (or
+                    // ties it on span without a standing phrase-scale stub):
+                    // the hand would trade placed loop copies for fewer --
+                    // which reads as a TempErr win while dropping recall.
+                    // Fail closed: the stub keeps the window with its
+                    // placements intact.
+                    effective_wins = false;
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=temperature_ladder event=guard_trip_race_denied round={} temperature={} frontier_covers={} same_phrase={} copies_not_lower={} exceeds={} content_disagreement={} stub_stands={} stub_phrase_scale={} incumbent_frontier_secs={:?} challenger_frontier_secs={:?} incumbent_word_repeat={:?} challenger_word_repeat={:?}",
+                        i + 2,
+                        temperature,
+                        terms.frontier_covers,
+                        terms.same_phrase,
+                        terms.copies_not_lower,
+                        terms.exceeds,
+                        terms.content_disagreement,
+                        terms.stub_stands,
+                        terms.stub_phrase_scale,
+                        inc_frontier.as_ref().copied().map(round3),
+                        cand_frontier.as_ref().copied().map(round3),
+                        inc_copies,
+                        cand_copies,
+                    );
+                }
+            }
+            if effective_wins {
                 // A clean round being replaced is still a challenger for the
                 // audible-tail coverage re-race below; it must not vanish just
                 // because it lost the span race. (A guard-tripped incumbent has
@@ -8141,15 +8448,13 @@ fn run_whisper_decode_loop(
             let placed_frontier = |cand: &WhisperDecodeCandidate,
                                    result: &WhisperGreedyDecodeResult|
              -> Option<f32> {
-                whisper_cross_attention_word_timestamps(
+                whisper_ladder_placed_frontier_seconds(
                     tokenizer,
-                    &cand.token_alignments,
-                    &result.generated_probabilities,
+                    cand,
+                    result,
                     audio_duration_seconds,
                     word_audio_rms_frames,
                 )
-                .ok()
-                .and_then(|(words, _)| words.last().map(|word| word.end))
             };
             let window_end = audio_duration_seconds.max(0.0);
             let winner_frontier = placed_frontier(&best.0, &best.1);

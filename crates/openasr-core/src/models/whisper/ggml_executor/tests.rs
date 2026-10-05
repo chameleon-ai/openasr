@@ -3656,3 +3656,146 @@ fn carry_head_skip_graft_swaps_only_degenerate_covered_heads() {
         Some(WhisperCarryHeadSkipGraft::Splice { .. })
     ));
 }
+
+#[test]
+fn modal_word_bigram_counts_the_hook_phrase_case_insensitively() {
+    // The coming hook, placed 3x with mixed case/punctuation: the modal phrase
+    // is the ("dont","stop") bigram at 3 occurrences, which is what the
+    // guard-trip race compares against the stub's modal phrase (same-phrase
+    // gate -- a challenger looping a different phrase must not inherit the
+    // stub's copy-count defense).
+    let words = [
+        "and", "they", "don't", "stop", "coming", "and", "they", "Don't", "stop", "coming", "and",
+        "they", "don't", "Stop", "coming",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, word)| head_skip_word(word, i as f32, i as f32 + 0.5))
+    .collect::<Vec<_>>();
+    let modal = modal_normalized_word_bigram(&words).expect("the hook repeats");
+    assert_eq!(modal.1, 3);
+    assert!(
+        modal.0 == ("dont".to_string(), "stop".to_string())
+            || modal.0 == ("stop".to_string(), "coming".to_string())
+            || modal.0 == ("and".to_string(), "they".to_string())
+            || modal.0 == ("they".to_string(), "dont".to_string()),
+        "modal bigram is one of the hook's own links, got {:?}",
+        modal.0
+    );
+    // A non-repeating confabulation (the tequila slice shape: diverse filler
+    // around one true word) has no modal phrase, so the race passes it
+    // through to the raw span verdict instead of defending the stub.
+    let filler = [
+        "heat", "can", "be", "ear", "high", "Tequila", "Fe", "kitchen",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, word)| head_skip_word(word, i as f32, i as f32 + 0.5))
+    .collect::<Vec<_>>();
+    assert_eq!(modal_normalized_word_bigram(&filler), None);
+    // A single content word is not a loop either.
+    assert_eq!(
+        modal_normalized_word_bigram(&[head_skip_word("Music.", 0.0, 1.0)]),
+        None
+    );
+    // Ties break deterministically (lexicographically greatest): a hook loop
+    // ties its internal links at the same count on every stub, so the gate
+    // must not pick among them per-process-randomly.
+    let tied = ["a", "b", "a", "b", "b", "a"]
+        .iter()
+        .enumerate()
+        .map(|(i, word)| head_skip_word(word, i as f32, i as f32 + 0.5))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        modal_normalized_word_bigram(&tied),
+        Some((("b".to_string(), "a".to_string()), 2))
+    );
+    assert_eq!(
+        modal_normalized_word_bigram(&tied),
+        modal_normalized_word_bigram(&tied),
+        "modal phrase is stable across calls"
+    );
+}
+
+fn guard_trip_repeat(first: &str, second: &str, count: usize) -> Option<((String, String), usize)> {
+    Some(((first.to_string(), second.to_string()), count))
+}
+
+#[test]
+fn guard_trip_race_denies_a_same_loop_under_transcription() {
+    // coming slice 1 (measured): the 12-copy hook stub against the clean
+    // T=1.0 round's 3 copies. Same phrase, shorter frontier, fewer copies --
+    // the hand would trade placed loop copies for fewer.
+    let terms = whisper_ladder_guard_trip_race_terms(
+        Some(26.75),
+        Some(17.912),
+        guard_trip_repeat("they", "dont", 12),
+        guard_trip_repeat("they", "dont", 3),
+        Some(22.078),
+        Some(23.183),
+        Some(6),
+        26.75,
+    );
+    assert!(terms.deny, "coming slice 1 must keep its stub");
+}
+
+#[test]
+fn guard_trip_race_passes_content_disagreement_through() {
+    // tequila music slice (measured): the 5-copy "music" stub against
+    // non-repeating filler on a zero-span tie. Different content, no coverage
+    // verdict -- the raw span race stays the arbiter.
+    let terms = whisper_ladder_guard_trip_race_terms(
+        Some(27.719),
+        Some(24.52),
+        guard_trip_repeat("music", "music", 5),
+        None,
+        Some(0.0),
+        Some(0.0),
+        Some(2),
+        30.0,
+    );
+    assert!(!terms.deny, "tequila must defer to the raw race");
+}
+
+#[test]
+fn guard_trip_race_passes_a_tail_abandoning_stutter_stub_through() {
+    // oregon slice 2 (measured): the 11-copy "howdy" stub pins only 4.3 s of
+    // a 6.3 s window and tripped on a 3-token stutter cycle. No standing, no
+    // phrase scale -- keeping it once cascaded into a pool-race hallucination.
+    let terms = whisper_ladder_guard_trip_race_terms(
+        Some(4.332),
+        Some(4.332),
+        guard_trip_repeat("howdy", "howdy", 11),
+        None,
+        Some(0.0),
+        Some(0.0),
+        Some(3),
+        6.33,
+    );
+    assert!(
+        !terms.stub_phrase_scale,
+        "a 3-token trip cycle is stutter scale, not phrase scale"
+    );
+    assert!(!terms.deny, "oregon must defer to the raw race");
+}
+
+#[test]
+fn guard_trip_race_denies_zero_span_filler_off_a_standing_end_card() {
+    // claire end-card slice (measured): the 12-copy end-card stub claims the
+    // whole window against a non-repeating zero-span confabulation. The
+    // length tie-break must never take a standing phrase-scale stub's window
+    // on text length.
+    let terms = whisper_ladder_guard_trip_race_terms(
+        Some(28.05),
+        Some(28.05),
+        guard_trip_repeat("well", "be", 12),
+        None,
+        Some(0.0),
+        Some(0.0),
+        Some(10),
+        28.05,
+    );
+    assert!(terms.stub_stands, "end-card stub claims its window");
+    assert!(terms.stub_phrase_scale, "10-token cycle is phrase scale");
+    assert!(terms.deny, "claire must keep its stub");
+}
