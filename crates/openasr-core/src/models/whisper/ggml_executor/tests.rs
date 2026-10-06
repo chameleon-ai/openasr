@@ -3725,36 +3725,51 @@ fn guard_trip_repeat(first: &str, second: &str, count: usize) -> Option<((String
 fn guard_trip_race_denies_a_same_loop_under_transcription() {
     // coming slice 1 (measured): the 12-copy hook stub against the clean
     // T=1.0 round's 3 copies. Same phrase, shorter frontier, fewer copies --
-    // the hand would trade placed loop copies for fewer.
-    let terms = whisper_ladder_guard_trip_race_terms(
-        Some(26.75),
-        Some(17.912),
-        guard_trip_repeat("they", "dont", 12),
-        guard_trip_repeat("they", "dont", 3),
-        Some(22.078),
-        Some(23.183),
-        Some(6),
-        26.75,
-    );
-    assert!(terms.deny, "coming slice 1 must keep its stub");
+    // the hand would trade placed loop copies for fewer. The standing-stub
+    // gate does not change the verdict: the stub stands and even without the
+    // escape the under-transcribed same-phrase round is denied on `exceeds`.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(26.75),
+            Some(17.912),
+            guard_trip_repeat("they", "dont", 12),
+            guard_trip_repeat("they", "dont", 3),
+            Some(22.078),
+            Some(23.183),
+            Some(6),
+            26.75,
+            standing_stub_gate,
+        );
+        assert!(
+            terms.deny,
+            "coming slice 1 must keep its stub (gate={standing_stub_gate})"
+        );
+    }
 }
 
 #[test]
 fn guard_trip_race_passes_content_disagreement_through() {
     // tequila music slice (measured): the 5-copy "music" stub against
     // non-repeating filler on a zero-span tie. Different content, no coverage
-    // verdict -- the raw span race stays the arbiter.
-    let terms = whisper_ladder_guard_trip_race_terms(
-        Some(27.719),
-        Some(24.52),
-        guard_trip_repeat("music", "music", 5),
-        None,
-        Some(0.0),
-        Some(0.0),
-        Some(2),
-        30.0,
-    );
-    assert!(!terms.deny, "tequila must defer to the raw race");
+    // verdict -- the raw span race stays the arbiter. No `exceeds`, so the
+    // standing-stub gate has nothing to act on either way.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(27.719),
+            Some(24.52),
+            guard_trip_repeat("music", "music", 5),
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(2),
+            30.0,
+            standing_stub_gate,
+        );
+        assert!(
+            !terms.deny,
+            "tequila must defer to the raw race (gate={standing_stub_gate})"
+        );
+    }
 }
 
 #[test]
@@ -3762,21 +3777,29 @@ fn guard_trip_race_passes_a_tail_abandoning_stutter_stub_through() {
     // oregon slice 2 (measured): the 11-copy "howdy" stub pins only 4.3 s of
     // a 6.3 s window and tripped on a 3-token stutter cycle. No standing, no
     // phrase scale -- keeping it once cascaded into a pool-race hallucination.
-    let terms = whisper_ladder_guard_trip_race_terms(
-        Some(4.332),
-        Some(4.332),
-        guard_trip_repeat("howdy", "howdy", 11),
-        None,
-        Some(0.0),
-        Some(0.0),
-        Some(3),
-        6.33,
-    );
-    assert!(
-        !terms.stub_phrase_scale,
-        "a 3-token trip cycle is stutter scale, not phrase scale"
-    );
-    assert!(!terms.deny, "oregon must defer to the raw race");
+    // The standing-stub gate cannot fire (the stub abandons its tail), so the
+    // verdict holds in both modes.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(4.332),
+            Some(4.332),
+            guard_trip_repeat("howdy", "howdy", 11),
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(3),
+            6.33,
+            standing_stub_gate,
+        );
+        assert!(
+            !terms.stub_phrase_scale,
+            "a 3-token trip cycle is stutter scale, not phrase scale"
+        );
+        assert!(
+            !terms.deny,
+            "oregon must defer to the raw race (gate={standing_stub_gate})"
+        );
+    }
 }
 
 #[test]
@@ -3784,18 +3807,225 @@ fn guard_trip_race_denies_zero_span_filler_off_a_standing_end_card() {
     // claire end-card slice (measured): the 12-copy end-card stub claims the
     // whole window against a non-repeating zero-span confabulation. The
     // length tie-break must never take a standing phrase-scale stub's window
-    // on text length.
-    let terms = whisper_ladder_guard_trip_race_terms(
-        Some(28.05),
-        Some(28.05),
-        guard_trip_repeat("well", "be", 12),
+    // on text length. No `exceeds` on a zero-span pair, so the standing-stub
+    // gate leaves the tie-branch verdict untouched.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(28.05),
+            Some(28.05),
+            guard_trip_repeat("well", "be", 12),
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(10),
+            28.05,
+            standing_stub_gate,
+        );
+        assert!(terms.stub_stands, "end-card stub claims its window");
+        assert!(terms.stub_phrase_scale, "10-token cycle is phrase scale");
+        assert!(
+            terms.deny,
+            "claire must keep its stub (gate={standing_stub_gate})"
+        );
+    }
+}
+
+#[test]
+fn standing_stub_gate_denies_a_covering_challenger_over_a_standing_stub() {
+    // lobster-uvr slice 1 (measured): the guard-cut narration stub, whose
+    // loop-inflated span is 19.812 s and whose placed words reach the 26.87 s
+    // window end, against the T=0.7 round's 20.797 s span -- a 0.985 s excess
+    // measured against the inflated baseline. Old behavior let that round take
+    // the window on the content-disagreement escape (a later round then beat IT
+    // on the length tie-break and the narration survived no round); with the
+    // gate the standing stub yields only to its own loop extended.
+    let terms_gated = whisper_ladder_guard_trip_race_terms(
+        Some(26.87),
+        Some(16.178),
+        guard_trip_repeat("rock", "lobster", 12),
         None,
-        Some(0.0),
-        Some(0.0),
-        Some(10),
-        28.05,
+        Some(19.812),
+        Some(20.797),
+        Some(3),
+        26.87,
+        true,
     );
-    assert!(terms.stub_stands, "end-card stub claims its window");
-    assert!(terms.stub_phrase_scale, "10-token cycle is phrase scale");
-    assert!(terms.deny, "claire must keep its stub");
+    assert!(terms_gated.stub_stands, "narration stub claims its window");
+    assert!(
+        terms_gated.exceeds,
+        "the span excess is real relative to the inflated stub"
+    );
+    assert!(
+        !terms_gated.content_disagreement,
+        "the gate voids the escape"
+    );
+    assert!(terms_gated.deny, "the standing stub keeps the window");
+    // The same measured hand under the pre-gate rule is what let the tiling
+    // rounds through on this clip.
+    let terms_ungated = whisper_ladder_guard_trip_race_terms(
+        Some(26.87),
+        Some(16.178),
+        guard_trip_repeat("rock", "lobster", 12),
+        None,
+        Some(19.812),
+        Some(20.797),
+        Some(3),
+        26.87,
+        false,
+    );
+    assert!(
+        !terms_ungated.deny,
+        "the pre-gate rule passed this hand through"
+    );
+}
+
+#[test]
+fn standing_stub_gate_denies_a_different_loop_tiling_over_a_standing_stub() {
+    // lobster-uvr slice 1 (measured): the T=1.0 filler round -- "All good.
+    // ...five, five, five, five, ...qua lof." -- repeats its own 3-copy
+    // ("five","five") loop while tiling the window its cross-attention spread
+    // measures at 20.547 s. Its loop is not the stub's, so the old rule read
+    // it as content disagreement and let it win the ladder on span alone.
+    let terms_gated = whisper_ladder_guard_trip_race_terms(
+        Some(26.87),
+        Some(26.87),
+        guard_trip_repeat("rock", "lobster", 12),
+        guard_trip_repeat("five", "five", 3),
+        Some(19.812),
+        Some(20.547),
+        Some(3),
+        26.87,
+        true,
+    );
+    assert!(terms_gated.exceeds);
+    assert!(
+        !terms_gated.same_phrase,
+        "the filler round loops on its own phrase"
+    );
+    assert!(
+        terms_gated.deny,
+        "a standing stub is not taken by foreign tiling"
+    );
+    let terms_ungated = whisper_ladder_guard_trip_race_terms(
+        Some(26.87),
+        Some(26.87),
+        guard_trip_repeat("rock", "lobster", 12),
+        guard_trip_repeat("five", "five", 3),
+        Some(19.812),
+        Some(20.547),
+        Some(3),
+        26.87,
+        false,
+    );
+    assert!(
+        !terms_ungated.deny,
+        "the pre-gate rule let the foreign loop through"
+    );
+}
+
+#[test]
+fn standing_stub_gate_keeps_the_escape_for_a_tail_abandoning_stub() {
+    // lobster-uvr slice (measured): the "I'm ready. Rock" stub places its
+    // words to 12.73 s of a 30 s window -- it abandons the tail -- against a
+    // challenger whose real content reaches 12.051 s of span. The escape's
+    // job is exactly this case, and the gate must leave it alone.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(12.73),
+            Some(8.077),
+            guard_trip_repeat("rock", "rock", 4),
+            None,
+            Some(9.624),
+            Some(12.051),
+            Some(2),
+            30.0,
+            standing_stub_gate,
+        );
+        assert!(!terms.stub_stands, "the stub does not reach its window end");
+        assert!(terms.exceeds, "the challenger genuinely covers more audio");
+        assert!(
+            !terms.deny,
+            "the escape still passes the challenger (gate={standing_stub_gate})"
+        );
+    }
+}
+
+#[test]
+fn standing_stub_gate_passes_a_same_loop_extension() {
+    // The trifecta is the one hand a standing stub takes even under the gate:
+    // the same phrase, a covering frontier, and no fewer copies than the stub
+    // carries -- a true extension of its own loop rather than a re-tile of the
+    // window.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(26.87),
+            Some(26.87),
+            guard_trip_repeat("rock", "lobster", 12),
+            guard_trip_repeat("rock", "lobster", 13),
+            Some(19.812),
+            Some(20.493),
+            Some(3),
+            26.87,
+            standing_stub_gate,
+        );
+        assert!(
+            terms.same_phrase && terms.frontier_covers && terms.copies_not_lower,
+            "fixture is a same-loop extension"
+        );
+        assert!(
+            !terms.deny,
+            "a same-loop extension takes the window (gate={standing_stub_gate})"
+        );
+    }
+}
+
+#[test]
+fn standing_stub_gate_env_reads_default_on() {
+    use crate::test_process_env::with_test_process_env;
+
+    const KEY: &str = "OPENASR_WHISPER_LADDER_STANDING_STUB_GATE";
+    let unset = with_test_process_env([(KEY, None)], || {
+        super::whisper_ladder_standing_stub_gate_enabled()
+    });
+    assert!(unset, "the gate defaults on when the env var is unset");
+    for value in ["1", "on", "true", "yes"] {
+        let on = with_test_process_env([(KEY, Some(value.into()))], || {
+            super::whisper_ladder_standing_stub_gate_enabled()
+        });
+        assert!(on, "truthy value {value} keeps the gate on");
+    }
+    for value in ["0", "off", "false", "no", ""] {
+        let off = with_test_process_env([(KEY, Some(value.into()))], || {
+            super::whisper_ladder_standing_stub_gate_enabled()
+        });
+        assert!(
+            !off,
+            "falsy value {value:?} restores the pre-refinement gate"
+        );
+    }
+}
+
+#[test]
+fn standing_stub_gate_still_denies_a_lower_copy_same_loop() {
+    // lobster-uvr slice 1 (measured), the T=0.4 round: the correct narration
+    // plus 5 copies of the hook against the stub's 12 pre-trip copies. The
+    // copies defense is unchanged by the gate -- the extra loop copies sit
+    // over the window's unvoiced tail, so the stub's kept narration stands.
+    for standing_stub_gate in [false, true] {
+        let terms = whisper_ladder_guard_trip_race_terms(
+            Some(26.87),
+            Some(26.87),
+            guard_trip_repeat("rock", "lobster", 12),
+            guard_trip_repeat("rock", "lobster", 5),
+            Some(19.812),
+            Some(20.493),
+            Some(3),
+            26.87,
+            standing_stub_gate,
+        );
+        assert!(
+            terms.deny,
+            "fewer loop copies never take the stub (gate={standing_stub_gate})"
+        );
+    }
 }

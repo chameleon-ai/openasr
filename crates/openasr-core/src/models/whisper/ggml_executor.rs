@@ -6419,6 +6419,26 @@ fn whisper_ladder_debug_enabled() -> bool {
     std::env::var_os("OPENASR_WHISPER_DEBUG_LADDER").is_some()
 }
 
+/// Env opt-out (defaults on) for the guard-trip race's standing-stub
+/// refinement (see [`whisper_ladder_guard_trip_race_terms`]). Against a
+/// standing guard-cut stub -- one whose placed words reach the window end --
+/// the content-disagreement escape's span excess is measured against the
+/// stub's loop-inflated span, so it rewards a round whose cross-attention
+/// merely tiles the window the stub's loop already claims instead of
+/// recovering audio the stub abandoned. With the gate on, a standing stub
+/// yields only to a same-loop extension (the trifecta); a stub that abandons
+/// its tail keeps the escape. Set to `0`/`off`/`false`/`no` (or empty) to
+/// restore the pre-refinement gate.
+fn whisper_ladder_standing_stub_gate_enabled() -> bool {
+    std::env::var("OPENASR_WHISPER_LADDER_STANDING_STUB_GATE")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
+}
+
 /// Guard-trip-aware span race (C1): when the ladder incumbent is guard-cut,
 /// its evidence span is loop-inflated by construction, so a clean challenger
 /// takes the window only on placed-word merit -- the same repeated phrase at
@@ -6426,6 +6446,12 @@ fn whisper_ladder_debug_enabled() -> bool {
 /// extension), or clearly more audio with different content. Every other hand
 /// keeps the stub, which holds the transcript's placed copies. See the race
 /// site for the full condition and its log lines.
+///
+/// `standing_stub_gate` refines the content-disagreement hand: when the stub
+/// stands (its placed words reach the window end), the window is already
+/// claimed, so a span excess over the loop-inflated stub span is not evidence
+/// of recovered audio and only the same-loop extension may take the window.
+/// A non-standing stub abandons its tail, where the escape still applies.
 fn whisper_ladder_guard_trip_race_terms(
     inc_frontier: Option<f32>,
     cand_frontier: Option<f32>,
@@ -6435,6 +6461,7 @@ fn whisper_ladder_guard_trip_race_terms(
     cand_evidence_secs: Option<f32>,
     inc_trip_ngram_len: Option<usize>,
     audio_duration_seconds: f32,
+    standing_stub_gate: bool,
 ) -> WhisperLadderGuardTripRace {
     let frontier_covers = inc_frontier
         .zip(cand_frontier)
@@ -6477,8 +6504,14 @@ fn whisper_ladder_guard_trip_race_terms(
     let trifecta = same_phrase && frontier_covers && copies_not_lower;
     // A challenger that clearly covers more audio with different content wins
     // on the span race's own terms: content disagreement is not this gate's
-    // business.
-    let content_disagreement = exceeds && !same_phrase;
+    // business. The standing-stub gate voids that hand when the stub stands:
+    // the excess is then measured against the stub's loop-inflated span, and a
+    // challenger whose attention merely tiles the same window (its own span
+    // equally diffuse over the unvoiced tail) is not transcribing audio the
+    // stub abandoned -- the window is already claimed by the stub's placed
+    // words. A standing stub yields only to its own loop, extended; a stub
+    // that abandons its tail keeps the escape.
+    let content_disagreement = exceeds && !same_phrase && (!standing_stub_gate || !stub_stands);
     let deny =
         !content_disagreement && !trifecta && (exceeds || (stub_stands && stub_phrase_scale));
     WhisperLadderGuardTripRace {
@@ -8046,6 +8079,7 @@ fn run_whisper_decode_loop(
             );
         }
         let mut clean_rounds: Vec<WhisperLadderRound> = Vec::new();
+        let standing_stub_gate = whisper_ladder_standing_stub_gate_enabled();
         for (i, &temperature) in WHISPER_TEMPERATURE_LADDER.iter().enumerate() {
             let seed = WHISPER_TEMPERATURE_LADDER_BASE_SEED
                 .wrapping_add(i as u64)
@@ -8139,10 +8173,11 @@ fn run_whisper_decode_loop(
                     cand_evidence,
                     best.1.guard_trip_ngram_len,
                     audio_duration_seconds,
+                    standing_stub_gate,
                 );
                 if whisper_ladder_debug_enabled() {
                     eprintln!(
-                        "openasr_whisper_greedy_decode stage=temperature_ladder event=guard_trip_race round={} temperature={} trip_ngram_len={:?} incumbent_evidence_secs={:?} incumbent_pre_trip_cycle_secs={:?} incumbent_pre_trip_kept_secs={:?} incumbent_frontier_secs={:?} incumbent_word_repeat={:?} challenger_evidence_secs={:?} challenger_frontier_secs={:?} challenger_word_repeat={:?} span_race_challenger_wins={}",
+                        "openasr_whisper_greedy_decode stage=temperature_ladder event=guard_trip_race round={} temperature={} trip_ngram_len={:?} incumbent_evidence_secs={:?} incumbent_pre_trip_cycle_secs={:?} incumbent_pre_trip_kept_secs={:?} incumbent_frontier_secs={:?} incumbent_word_repeat={:?} challenger_evidence_secs={:?} challenger_frontier_secs={:?} challenger_word_repeat={:?} standing_stub_gate={} span_race_challenger_wins={}",
                         i + 2,
                         temperature,
                         best.1.guard_trip_ngram_len,
@@ -8154,6 +8189,7 @@ fn run_whisper_decode_loop(
                         cand_evidence.map(round3),
                         cand_frontier.as_ref().copied().map(round3),
                         cand_copies,
+                        standing_stub_gate,
                         span_race_wins,
                     );
                 }
