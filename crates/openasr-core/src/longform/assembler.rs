@@ -118,6 +118,11 @@ const SEAM_PHANTOM_HEAD_MIN_WIDTH_SECONDS: f32 = 0.9;
 /// full width of the slice that heard it.
 const SEAM_REREAD_HEAD_MAX_WIDTH_RATIO: f32 = 0.5;
 
+/// Confidence gap by which the A-side head must beat the committed
+/// fragment for the trust-flip to eat the fragment. A clear upgrade of
+/// the slot's reading owns the audio; a near-tie keeps both copies.
+const SEAM_TRUST_FLIP_HEAD_MARGIN: f32 = 0.3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -738,10 +743,13 @@ impl TranscriptAssembler {
     /// All signals must agree, or the word stays. The committed word ends
     /// at the cut (clamped, not run past it); the head starts before the
     /// cut and continues past it (it heard the straddling audio whole).
-    /// The committed word is uncertain and the head is certain -- the same
-    /// 0.85 floor the B-side rules use for "a certain reading owns its
-    /// audio", applied here with the ownership flipped. A cap-pinned head
-    /// is a stretched artifact, never the whole-word reading. Same-token
+    /// The committed word is uncertain and the head clearly the better
+    /// reading -- the same ownership premise the B-side rules use
+    /// ("a certain reading owns its audio"), applied here with the
+    /// ownership flipped: a committed fragment below the certainty floor
+    /// does not own its audio when the next slice read the same slot
+    /// clearly better. A cap-pinned head is refused only when it does
+    /// not fully cover the fragile fragment it shadows. Same-token
     /// heads stay with the stitch / re-read rules, and non-Latin heads
     /// with the unit rules. Runs after the B-side rules so existing
     /// behavior keeps first crack at the seam.
@@ -847,16 +855,31 @@ fn seam_a_side_trust_flip_should_drop(
     };
     // Trust-flip of the B-side premise: the certain reading owns the audio.
     // Here the head is certain and the committed word is not, so the head
-    // wins and the committed fragment goes.
-    if committed_confidence >= SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE
-        || head_confidence < SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE
+    // wins and the committed fragment goes. The head need not reach the
+    // 0.85 floor on its own -- when the committed fragment is deeply
+    // uncertain (lobster's `progen.` @0.347), a head that is clearly the
+    // better reading of the slot owns it. A near-tie keeps both copies
+    // (the `Lippers`/`flipping.` near-miss: 0.707 vs 0.59).
+    if committed_confidence >= SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE {
+        return false;
+    }
+    if head_confidence
+        < (committed_confidence + SEAM_TRUST_FLIP_HEAD_MARGIN)
+            .min(SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE)
     {
         return false;
     }
     // A cap-pinned head is a stretched placement artifact, not a
-    // whole-word reading.
+    // whole-word reading -- unless its stretched window fully covers the
+    // fragile committed fragment it shadows. In that shape the fragment
+    // has no audio coverage of its own left: the head already claims the
+    // whole slot, and keeping both duplicates one decoded word (lobster's
+    // `progen.`/`broken.` over "fruging"). A merely partial overlap stays
+    // untrusted: the cap-pinned head says nothing certain about the part
+    // of the fragment it does not cover.
     if let Some(limit) = max_word_span_original_seconds
         && head.end - head.start >= limit - 0.05
+        && (head.start > committed.start + 0.05 || head.end < committed.end - 0.05)
     {
         return false;
     }
@@ -5288,11 +5311,14 @@ mod tests {
     }
 
     #[test]
-    fn a_side_terms_keeps_lobster_progen_broken_both_out() {
-        // Recon row #2: progen. @0.347 vs broken. @0.818 (cap-pinned 1.6s).
-        // Both-out music confab already parked under C2: the head is neither
-        // certain nor a whole-word reading.
-        assert!(!a_side_terms(
+    fn a_side_terms_drops_lobster_progen_broken_cap_pinned_head() {
+        // Recon row #2: progen. @0.347, cut-clamped and deeply uncertain,
+        // vs broken. @0.818 (cap-pinned 1.6s) whose stretched window
+        // fully covers the fragment. The deeply uncertain fragment's audio
+        // is already claimed by the clearly better head, so the fragment
+        // is a duplicate slot decode and must go; keeping both is the
+        // overlapping-word seam error.
+        assert!(a_side_terms(
             ("progen.", 330.1515, 330.85, 0.347),
             ("broken.", 330.096, 331.696, 0.818),
             330.85
@@ -5468,9 +5494,11 @@ mod tests {
     }
 
     #[test]
-    fn assembler_keeps_a_side_tail_when_head_cap_pinned() {
+    fn assembler_drops_a_side_tail_when_head_cap_pinned_but_covering() {
         // Row #2 end-to-end: both-out confab whose head is a 1.6s stretched
-        // artifact under certainty. Neither copy may be eaten.
+        // artifact, but whose window fully covers the deeply uncertain cut
+        // fragment. The fragment is duplicate coverage of one decoded slot
+        // and must be eaten; the cap-pinned head keeps its read.
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
                 .with_max_word_span_original_seconds(Some(1.7));
@@ -5503,15 +5531,16 @@ mod tests {
             time_domain: SegmentTimeDomain::AbsoluteOriginal,
         });
         let (transcription, stats) = assembler.into_parts();
-        assert_eq!(stats.duplicate_merge_count, 0);
+        assert_eq!(stats.duplicate_merge_count, 1);
         assert!(
-            transcription.segments[0].text.contains("progen"),
-            "the both-out tail must stay, got {:?}",
+            !transcription.segments[0].text.contains("progen"),
+            "the duplicate slot fragment must go, got {:?}",
             transcription.segments[0].text
         );
+        assert_eq!(transcription.segments[0].text, "Everybody's");
         assert!(
             transcription.segments[1].text.starts_with("broken."),
-            "the both-out head must stay too, got {:?}",
+            "the covering head must stay, got {:?}",
             transcription.segments[1].text
         );
     }
