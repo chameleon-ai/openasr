@@ -991,6 +991,72 @@ fn whisper_dtw_offset_floor_margin_db() -> f64 {
         .unwrap_or(WHISPER_DTW_OFFSET_FLOOR_MARGIN_DB)
 }
 
+/// The offset tail lookahead in use, honoring the deployment env override so
+/// a tuning pass can sweep it without a rebuild (see
+/// [`WHISPER_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES`]). A bare environment falls
+/// back to the compiled default.
+fn whisper_dtw_offset_tail_lookahead_frames() -> usize {
+    std::env::var("OPENASR_WHISPER_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(WHISPER_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES)
+}
+
+/// A trailing fricative tail past a word's sustained-run offset: the index in
+/// `region` of the last above-`floor` frame within `lookahead_frames` past
+/// `anchor_end` that real silence follows, or `anchor_end` when there is none.
+///
+/// The sustain gate refuses a 1-2 frame sibilant blip as an anchor, so the
+/// offset pass would land before it and cut the word's own tail. The blip
+/// still counts when it sits just past the sustained run and silence follows
+/// it -- a decaying /s/ or final burst, not the next word. A blip running
+/// straight into the next onset (no trailing quiet) or sitting past the
+/// lookahead keeps the anchor: at a 0 lookahead the offset always stands as
+/// found. Only ever extends, never retreats, and never past `anchor_end +
+/// lookahead_frames`.
+fn whisper_dtw_offset_tail_end(
+    region: &[f32],
+    anchor_end: usize,
+    floor: f64,
+    min_quiet_frames: usize,
+    lookahead_frames: usize,
+) -> usize {
+    if lookahead_frames == 0 || region.is_empty() {
+        return anchor_end;
+    }
+    let last = region.len() - 1;
+    let scan_end = (anchor_end + lookahead_frames).min(last);
+    // The latest above-floor frame in reach: an earlier blip with a later one
+    // behind it extends through both, landing on the tail's true end.
+    let mut tail_end = anchor_end;
+    for (index, &sample) in region
+        .iter()
+        .enumerate()
+        .take(scan_end + 1)
+        .skip(anchor_end + 1)
+    {
+        if f64::from(sample) >= floor {
+            tail_end = index;
+        }
+    }
+    if tail_end == anchor_end {
+        return anchor_end;
+    }
+    // Real silence must follow the blip: a tail running into the next word's
+    // onset is that word's audio, not this one's.
+    let mut quiet = 0usize;
+    let mut probe = tail_end;
+    while probe + 1 < region.len() && f64::from(region[probe + 1]) < floor {
+        probe += 1;
+        quiet += 1;
+    }
+    if quiet >= min_quiet_frames {
+        tail_end
+    } else {
+        anchor_end
+    }
+}
+
 /// Minimum duration of the speech run above the floor that qualifies as the
 /// word's offset (expressed in envelope frames of 0.02 s).
 const WHISPER_DTW_OFFSET_SUSTAIN_FRAMES: usize = 5;
@@ -1019,6 +1085,15 @@ const WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB: f64 = 12.0;
 /// offset tail decays through coarticulatory micro-silences shorter than this;
 /// without the tolerance the run shreds and no qualifying offset is found.
 const WHISPER_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES: usize = 3;
+/// Frames past a word's sustained-run offset the trailing-tail scan may reach
+/// for a sub-sustain blip (a decaying fricative, a final burst) that is the
+/// word's own audio. The sustain gate refuses such a blip as an anchor, so
+/// without this the offset lands before it and cuts the tail: on jfk the
+/// "Americans" sibilant blip sits ~5 frames past the sustained run's end and
+/// the word ends at 2.00 s without its final ~0.1 s. 0 disables the scan and
+/// the offset stands as found. Honored with the same deployment env-override
+/// convention as the other DTW tunables.
+const WHISPER_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES: usize = 8;
 /// Consecutive frames above the silence ceiling before a hollow region stops
 /// reading as silence. A single bed-crackle frame is not a music floor (that
 /// would void a legitimate pull on bed-backed clips), while a sustained floor
@@ -1233,6 +1308,17 @@ fn whisper_refine_dtw_word_offsets(
         let Some(rel) = offset_rel else {
             continue;
         };
+        // A sub-sustain blip just past the sustained run's end (a decaying
+        // fricative, a final burst) is the word's own tail: extend the offset
+        // over it when silence follows. At a 0 lookahead the offset stands as
+        // found.
+        let rel = whisper_dtw_offset_tail_end(
+            region,
+            rel,
+            floor,
+            min_quiet_frames,
+            whisper_dtw_offset_tail_lookahead_frames(),
+        );
         // The run ends at `rel`; one frame past it is where the silence begins. An
         // offset before the word's own start would invert the window (its audio
         // sits entirely earlier than the window -- the onset pass's domain), so
@@ -1694,6 +1780,28 @@ fn whisper_word_offset_pad_seconds() -> f32 {
     )
 }
 
+/// Extra tail, in seconds, a word window may extend past its fold end toward
+/// the next word's core onset, capped at the gap between the two. The fold's
+/// offset refiner trims a window's end to its own sustained-speech offset,
+/// but the reference convention lets a word window carry ~0.2-0.3 s into the
+/// following gap; on jfk that shortfall ends `Americans,` at 2.00 s against
+/// a 2.315 s truth. A flat tail is affine-fit invariant for TempErr, and the
+/// cap stops the fold from bleeding into the next word's audio -- with no
+/// gap to fill, the window stays byte-identical. Sweep it via deployment env
+/// override; a bare environment falls back to the compiled default.
+const WHISPER_WORD_END_TAIL_SECONDS: f32 = 0.0;
+
+/// The end-side tail in use, honoring the deployment env override so a tuning
+/// pass can sweep it without a rebuild (see
+/// [`WHISPER_WORD_END_TAIL_SECONDS`]). A bare environment is byte-identical
+/// to the constant.
+fn whisper_word_end_tail_seconds() -> f32 {
+    parse_whisper_word_pad_override(
+        std::env::var("OPENASR_WHISPER_WORD_END_TAIL_SECONDS").ok(),
+        WHISPER_WORD_END_TAIL_SECONDS,
+    )
+}
+
 /// Parse one side's pad override: a set-and-parseable value wins, anything
 /// else (unset or unparsable) falls back to the compiled default. Pure so
 /// unit tests can pin the parsing without mutating process env (unsafe in
@@ -1705,7 +1813,9 @@ fn parse_whisper_word_pad_override(raw: Option<String>, fallback: f32) -> f32 {
 
 /// Widen each word window back over the true speech span: start earlier by
 /// [`WHISPER_WORD_ONSET_PAD_SECONDS`], end later by
-/// [`WHISPER_WORD_OFFSET_PAD_SECONDS`], clamped to `[0, duration]`.
+/// [`WHISPER_WORD_OFFSET_PAD_SECONDS`] plus the end-side tail
+/// ([`WHISPER_WORD_END_TAIL_SECONDS`]) capped at the next word's core onset,
+/// clamped to `[0, duration]`.
 ///
 /// The DTW center fold places adjacent words' windows back-to-back on shared
 /// seam boundaries, so a word's window can end up a tenth of a second inside
@@ -1730,9 +1840,27 @@ fn whisper_pad_dtw_word_windows(
     let duration = audio_duration_seconds.max(0.0);
     let onset_pad = whisper_word_onset_pad_seconds();
     let offset_pad = whisper_word_offset_pad_seconds();
-    for word in &mut words {
+    let end_tail = whisper_word_end_tail_seconds();
+    // The fold seam between two words is the second word's core start: the
+    // emitted pad only moves it, never redraws it. Read the pre-pad seam in
+    // one pass, so the tail below can𢓭-cap the tail at it.
+    let next_core_start: Vec<f32> = words
+        .iter()
+        .enumerate()
+        .map(|(index, _)| words.get(index + 1).map_or(duration, |next| next.start))
+        .collect();
+    for (index, word) in words.iter_mut().enumerate() {
         let new_start = (word.start - onset_pad).max(0.0).min(duration);
-        let new_end = (word.end + offset_pad).min(duration);
+        let mut new_end = (word.end + offset_pad).min(duration);
+        if end_tail > 0.0 {
+            // Extend the window into the trailing gap, but never past the
+            // fold's own seam to the next word: overlapping the next
+            // window's core would inflate the double-claimed audio region
+            // every gate tracks. An empty gap keeps the window exact.
+            let gap = (next_core_start[index] - word.end).max(0.0);
+            new_end = word.end + (offset_pad + end_tail).min(gap);
+            new_end = new_end.min(duration);
+        }
         word.start = new_start;
         word.end = new_end.max(new_start);
     }

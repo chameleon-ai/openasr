@@ -646,6 +646,107 @@ fn refine_dtw_offsets_leaves_a_word_whose_audio_runs_to_the_tail() {
     assert!((out[1].start - 11.5).abs() < 1e-4);
 }
 
+// ---------------------------------------------------------------------------
+// whisper_dtw_offset_tail_end
+// ---------------------------------------------------------------------------
+
+/// The compiled tail lookahead is 8 frames (160 ms): a decaying fricative a
+/// few frames past the sustained run still counts, while audio farther out
+/// belongs to the pause or the next word. The runtime reads it through the
+/// env-override fn, so pin the constant here rather than mutating process
+/// env, which is unsafe in this edition and races under parallel nextest.
+#[test]
+fn offset_tail_lookahead_is_eight_frames() {
+    assert_eq!(WHISPER_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES, 8);
+}
+
+/// A 30-frame 0.25 run ending at frame 129 with silence after: the tail
+/// helper's anchor regime (floor 0.00178, the 5 dB margin over the 0.001
+/// median; blips at 0.25).
+fn offset_tail_fixture() -> Vec<f32> {
+    let mut region = vec![0.001f32; 200];
+    for s in region[100..130].iter_mut() {
+        *s = 0.25;
+    }
+    region
+}
+
+/// A 2-frame blip 4 frames past the anchor, silence after: the tail extends
+/// to the blip's end (the jfk sibilant shape).
+#[test]
+fn offset_tail_end_extends_over_a_blip_followed_by_silence() {
+    let mut region = offset_tail_fixture();
+    region[134] = 0.25;
+    region[135] = 0.25;
+    let end = whisper_dtw_offset_tail_end(&region, 129, 0.00178, 2, 8);
+    assert_eq!(end, 135);
+}
+
+/// A blip running straight into the next onset (no trailing quiet) is that
+/// word's audio, not this one's tail: the anchor stands.
+#[test]
+fn offset_tail_end_refuses_a_blip_running_into_the_next_onset() {
+    let mut region = offset_tail_fixture();
+    region[134] = 0.25;
+    region[135] = 0.25;
+    for s in region[136..160].iter_mut() {
+        *s = 0.25; // next onset immediately behind the blip
+    }
+    let end = whisper_dtw_offset_tail_end(&region, 129, 0.00178, 2, 8);
+    assert_eq!(end, 129);
+}
+
+/// A blip past the lookahead keeps the anchor: audio that far out belongs to
+/// the pause or the next word.
+#[test]
+fn offset_tail_end_refuses_a_blip_past_the_lookahead() {
+    let mut region = offset_tail_fixture();
+    region[140] = 0.25;
+    region[141] = 0.25;
+    let end = whisper_dtw_offset_tail_end(&region, 129, 0.00178, 2, 8);
+    assert_eq!(end, 129);
+}
+
+/// A 0 lookahead disables the scan: the anchor stands even with a blip and
+/// silence behind it (the pre-tail behavior).
+#[test]
+fn offset_tail_end_is_a_noop_at_zero_lookahead() {
+    let mut region = offset_tail_fixture();
+    region[134] = 0.25;
+    region[135] = 0.25;
+    let end = whisper_dtw_offset_tail_end(&region, 129, 0.00178, 2, 0);
+    assert_eq!(end, 129);
+}
+
+/// Two blips in reach land on the later one's end, extending through both.
+#[test]
+fn offset_tail_end_lands_on_the_later_of_two_blips() {
+    let mut region = offset_tail_fixture();
+    region[132] = 0.25;
+    region[136] = 0.25;
+    let end = whisper_dtw_offset_tail_end(&region, 129, 0.00178, 2, 8);
+    assert_eq!(end, 136);
+}
+
+/// End to end through the offset pass: a sustained run to 2.6 s, a 2-frame
+/// blip at 2.68-2.72 s, silence after -- the word's end lands on the blip
+/// (2.72 s), recovering the fricative tail the sustain gate would cut.
+#[test]
+fn refine_dtw_offsets_extends_over_a_trailing_fricative_blip() {
+    let mut env = offset_fixture_envelope();
+    for s in env[134..136].iter_mut() {
+        *s = 0.25; // blip 4 frames past the run's end, silence behind it
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.72).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
 /// No envelope (a run without cross-attention word timestamps) is a byte-exact
 /// no-op.
 #[test]
@@ -710,6 +811,15 @@ fn pad_dtw_word_windows_is_a_noop_when_empty_and_clamps_zero_duration() {
     let zero = whisper_pad_dtw_word_windows(vec![word_ts("a", 0.30, 0.90)], 0.0);
     assert_eq!(zero[0].start, 0.0);
     assert_eq!(zero[0].end, 0.0);
+}
+
+/// The end-side tail ships off by default (0.0): measured suite sweeps set
+/// the shipped value, and the tail can only extend into a gap, never move a
+/// center or retract a window. A bare environment is byte-identical to the
+/// constant.
+#[test]
+fn word_end_tail_defaults_to_zero() {
+    assert_eq!(WHISPER_WORD_END_TAIL_SECONDS, 0.0);
 }
 
 /// The compiled pad defaults are asymmetric: a 0.10 s onset pad with a zero
