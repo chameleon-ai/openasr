@@ -292,13 +292,16 @@ fn whisper_dtw_max_edge_word_span_seconds() -> f32 {
 
 /// How far a punctuation-only token piece may sit from its word's content mean
 /// and still count toward the word's center (see
-/// `punctuation_trust_radius_seconds`). A comma parked within this of its
-/// word is the DTW path's best statement of the word's offset -- arnold's
-/// comma 0.48 s past "Rick", dog's 1.48 s past "Okay" next to the following
-/// onset -- while the multi-second pause linger behind the width-cap cluster
-/// (gilbert 2.2 s, mikan 2.6 s, tenma 6.3 s) is excluded. Honored with the
-/// same deployment env-override convention as the other DTW tunables.
-const WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS: f32 = 1.75;
+/// `punctuation_trust_radius_seconds`). Swept suite-wide on the committed
+/// suite (timing-notes.md Appendix): a punctuation token lingering seconds
+/// into the following pause and dragging its word's center with it (jfk's
+/// "Americans," comma: 0.107 -> 0.074) is far more common and costly than a
+/// punctuation mark that legitimately restates its word's offset across a
+/// pause, so the vote is dropped (0). Cost where the latter did the work:
+/// dog 0.055 -> 0.069, flip +0.004, oregon +0.005, lobster InWin 98% -> 97%;
+/// MEAN-uvr 0.154 -> 0.141. Honored with the same deployment env-override
+/// convention as the other DTW tunables.
+const WHISPER_DTW_PUNCTUATION_TRUST_RADIUS_SECONDS: f32 = 0.0;
 
 /// The punctuation trust radius in use, honoring the deployment env override
 /// so a tuning pass can sweep it without a rebuild (see
@@ -1283,6 +1286,20 @@ const WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES: usize = 4;
 /// sustained onset bleeds into it: shorter than the word-speech runs because
 /// the next word's weak onset still counts.
 const WHISPER_DTW_REANCHOR_NEXT_RUN_SUSTAIN_FRAMES: usize = 3;
+/// Sub-sustain runs (a fricative tail, a click) between the token's center
+/// and the word's own offset do not veto the reanchor: the backward walk
+/// skips past them, deducting their frames from this budget, and keeps
+/// looking for a sustained run that still clears
+/// [`WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES`]. A 0 budget is the old
+/// walk -- a sub-sustain first run refuses the pull. The swept suite winner
+/// (timing-notes.md Appendix) is 8: at 4 the same ali decode broadly pins
+/// interior words to the 1.3 s half-span clamp (cap count 4 -> 22); 8
+/// restores the slice-seam assembly branch ali already favors (cap count
+/// back to baseline) and keeps dog's load-bearing comma flat, the case
+/// deleting it with a 0 punctuation trust radius regresses. The gap gate
+/// keeps bounding the total jump to the final anchor, so a far anchor still
+/// fails closed.
+const WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES: usize = 8;
 
 /// Deployment env override for the reanchor minimum gap
 /// ([`WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS`]); a bare environment falls back
@@ -1302,6 +1319,91 @@ fn whisper_dtw_reanchor_max_jump_seconds() -> f32 {
         .ok()
         .and_then(|raw| raw.parse::<f32>().ok())
         .unwrap_or(WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS)
+}
+
+/// Deployment env override for the reanchor skipped-blip budget
+/// ([`WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES`]); a bare environment
+/// falls back to the compiled default, staying byte-identical to it.
+fn whisper_dtw_reanchor_max_skipped_blip_frames() -> usize {
+    std::env::var("OPENASR_WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES)
+}
+
+/// The anchor the reanchor's backward pause walk settled on: the index of
+/// the last frame of the sustained speech run, and how many sub-sustain blip
+/// frames the walk skipped to reach it (0 without a skip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReanchorAnchor {
+    end_frame: usize,
+    skipped_blip_frames: usize,
+}
+
+/// The reanchor's backward search for the sustained speech run that may
+/// anchor a pull (see [`whisper_reanchor_dtw_token_centers`]): walk back from
+/// the token's center over the trusted-silence frames that separate it from
+/// the run. The walk stops at the frame-array edge (no preceding speech) or
+/// at a sustained above-ceiling stretch (a music bed, not a pause); a few
+/// crackle frames crossing the ceiling inside a deep pause do not stop it.
+///
+/// The first run of at least
+/// [`WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES`] frames above the floor is
+/// the anchor: a real word tail, not a noise blip. A shorter run is skipped
+/// instead of ending the search when the budget allows (its frames are
+/// deducted from it and the walk resumes at the frame before the blip,
+/// mirroring the ceiling-tolerance walk above for threshold-level blips): a
+/// fricative tail of the word's own offset is what the pull targets, and a
+/// click after it must not steal the anchor. A blip wider than the remaining
+/// budget, or one met after the budget is spent, returns `None` -- with a 0
+/// budget that is every sub-sustain run, the pre-skip walk's fail-closed
+/// behavior. The run found this way is still screened by the caller's gap
+/// gate, so a far anchor fails closed exactly as before.
+fn whisper_reanchor_find_anchor(
+    levels: &[f32],
+    entry_frame: usize,
+    threshold: f64,
+    silence_ceiling: f64,
+    max_skipped_blip_frames: usize,
+) -> Option<ReanchorAnchor> {
+    let mut scan = entry_frame;
+    let mut crossing_run = 0usize;
+    let mut blip_budget = max_skipped_blip_frames;
+    while scan > 0 {
+        let level = f64::from(levels[scan - 1]);
+        if level >= threshold {
+            let mut run_start = scan - 1;
+            while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
+                run_start -= 1;
+            }
+            let run_length = scan - run_start;
+            if run_length >= WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES {
+                return Some(ReanchorAnchor {
+                    end_frame: scan - 1,
+                    skipped_blip_frames: max_skipped_blip_frames - blip_budget,
+                });
+            }
+            if run_length > blip_budget {
+                return None;
+            }
+            blip_budget -= run_length;
+            // A blip is a speech event: ceiling crackle on either side of it
+            // is counted afresh, not across it.
+            crossing_run = 0;
+            scan = run_start;
+            continue;
+        }
+        if level > silence_ceiling {
+            crossing_run += 1;
+            if crossing_run > WHISPER_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES {
+                return None;
+            }
+        } else {
+            crossing_run = 0;
+        }
+        scan -= 1;
+    }
+    None
 }
 
 /// Pull a word-final punctuation token the DTW path parked in the pause after
@@ -1344,6 +1446,14 @@ fn whisper_dtw_reanchor_max_jump_seconds() -> f32 {
 /// threshold. On a clean clip there is no pause-long punctuation entry to
 /// pull, and on a music bed the ceiling tests fail the way the edge refiners'
 /// do, so the pass is a no-op there.
+///
+/// The backward anchor walk skips sub-sustain runs (a fricative tail, a
+/// click) sitting between the center and the word's own offset, up to the
+/// frame budget of
+/// [`WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES`] (a 0 budget fails closed
+/// on the first sub-sustain run it meets, the pre-skip walk). The anchor it
+/// settles on must clear the sustain gate, and the gap gate is measured to
+/// that final anchor, so a far anchor fails closed the way it always has.
 fn whisper_reanchor_dtw_token_centers(
     mut token_times: Vec<Seq2SeqTokenTime>,
     decode_text: &dyn Fn(&[u32]) -> Option<String>,
@@ -1358,6 +1468,7 @@ fn whisper_reanchor_dtw_token_centers(
         return token_times;
     }
     let spf = f64::from(seconds_per_frame);
+    let blip_budget = whisper_dtw_reanchor_max_skipped_blip_frames();
     let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
     ranked.sort_by(f64::total_cmp);
     let noise_floor = ranked[ranked.len() / 2];
@@ -1479,46 +1590,25 @@ fn whisper_reanchor_dtw_token_centers(
         if quiet_mean >= threshold || ceiling_sustained || quiet_above > 0.5 {
             continue;
         }
-        // The nearest preceding sustained speech run: walk back over the
-        // trusted-silence frames that separate the center from it. The walk
-        // stops at the frame-array edge (no preceding speech) or at a
-        // sustained above-ceiling stretch (a music bed, not a pause); a few
-        // crackle frames crossing the ceiling inside a deep pause do not
-        // stop it.
-        let mut scan = entry_frame;
-        let mut run_end: Option<usize> = None;
-        let mut crossing_run = 0usize;
-        while scan > 0 {
-            let level = f64::from(levels[scan - 1]);
-            if level >= threshold {
-                run_end = Some(scan - 1);
-                break;
-            }
-            if level > silence_ceiling {
-                crossing_run += 1;
-                if crossing_run > WHISPER_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES {
-                    break;
-                }
-            } else {
-                crossing_run = 0;
-            }
-            scan -= 1;
-        }
-        let Some(end) = run_end else {
+        // The anchor: the nearest preceding sustained speech run, with
+        // sub-sustain blips between the center and it skipped within the blip
+        // budget (the fricative tail of the word's own offset must not steal
+        // the anchor). At a 0 budget the walk fails closed on the first
+        // sub-sustain run it meets, the pre-skip behavior.
+        let Some(anchor) = whisper_reanchor_find_anchor(
+            levels,
+            entry_frame,
+            threshold,
+            silence_ceiling,
+            blip_budget,
+        ) else {
             continue;
         };
-        let mut run_start = end;
-        while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
-            run_start -= 1;
-        }
-        // The anchor must be real speech, not a noise blip: at least the
-        // anchor sustain length of frames above the floor.
-        if end - run_start + 1 < WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES {
-            continue;
-        }
+        let end = anchor.end_frame;
         // The silent gap between the run's end and the center must be a real
         // pause: clearly past the fold's calibration error, and short enough
-        // to be an intra-word linger rather than a larger drift.
+        // to be an intra-word linger rather than a larger drift. Measured to
+        // the final anchor, so a far anchor fails closed as before.
         let gap_secs = entry_secs - (end as f64 + 1.0) * spf;
         if !(min_gap..=max_jump).contains(&gap_secs) {
             continue;
@@ -1529,7 +1619,8 @@ fn whisper_reanchor_dtw_token_centers(
         let target_secs = (end as f64 + 1.0) * spf;
         if debug_reanchor {
             eprintln!(
-                "reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (preceding run ends at frame {end})",
+                "reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (skipped {} blip frame(s); preceding run ends at frame {end})",
+                anchor.skipped_blip_frames,
             );
         }
         token_time.center_seconds = target_secs as f32;

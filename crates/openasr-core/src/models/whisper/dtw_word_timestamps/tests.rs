@@ -1010,13 +1010,15 @@ fn reanchor_dtw_token_centers_refuses_word_initial_punctuation() {
     );
 }
 
-/// A frame of bed level (above the thin-floor silence ceiling, below the
-/// speech threshold) in the gap between the run and the center is an untrusted
-/// frame: the walk finds no anchored run and the center stays.
+/// A single above-threshold frame in the gap between the run and the center
+/// is a 1-frame blip, not an untrusted gap: the swept default budget skips
+/// past it, the walk anchors on the sustained run behind it, and the pull
+/// lands one frame past that run's end. (At a 0 budget this frame refuses the
+/// pull -- the pre-skip walk -- pinned at the helper level.)
 #[test]
-fn reanchor_dtw_token_centers_refuses_a_gap_with_an_untrusted_frame() {
+fn reanchor_dtw_token_centers_skips_a_single_blip_frame_in_the_gap() {
     let mut env = reanchor_fixture_envelope();
-    env[120] = 0.0305; // above the 0.03 ceiling, below the 0.0316 floor margin
+    env[120] = 0.0305; // a 1-frame blip above the speech threshold
     let decode = |ids: &[u32]| -> Option<String> {
         match ids {
             [100] => Some("it".to_string()),
@@ -1030,9 +1032,173 @@ fn reanchor_dtw_token_centers_refuses_a_gap_with_an_untrusted_frame() {
         Some(&env),
         0.02,
     );
+    assert!(
+        (out[1].center_seconds - 1.8).abs() < 1e-3,
+        "the blip is skipped and the pull lands past the run's end, got {}",
+        out[1].center_seconds
+    );
+}
+
+// ---------------------------------------------------------------------------
+// whisper_reanchor_find_anchor
+// ---------------------------------------------------------------------------
+
+/// The compiled skipped-blip budget is the swept suite winner (8: net-positive
+/// clip-by-clip with no regressions, dog's load-bearing comma kept flat, and
+/// the interior half-span clamp cluster kept at baseline where 4 pins it on
+/// ali). The env override is read by the caller, not by the walk, so pin the
+/// constant here rather than mutating process env, which is unsafe in this
+/// edition and races under parallel nextest.
+#[test]
+fn reanchor_max_skipped_blip_frames_is_the_swept_default() {
+    assert_eq!(WHISPER_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES, 8);
+}
+
+// The anchor walk's test regime: floor 0.01 < ceiling 0.04 < crackle 0.045
+// < threshold 0.10 <= speech 0.20, so every walk branch (trusting silence,
+// ceiling crackle, above-threshold run) is a distinct level.
+const REANCHOR_ANCHOR_THRESHOLD: f64 = 0.10;
+const REANCHOR_ANCHOR_CEILING: f64 = 0.04;
+
+/// 300 frames of 0.01 floor with a sustained 0.20 run over frames 50..89.
+fn reanchor_anchor_fixture() -> Vec<f32> {
+    let mut env = vec![0.01f32; 300];
+    for sample in env[50..90].iter_mut() {
+        *sample = 0.20;
+    }
+    env
+}
+
+/// A sustained run before the center anchors the pull at any blip budget,
+/// including 0 (which fails closed on the first sub-sustain run it would
+/// otherwise skip), and reports no skipped frames.
+#[test]
+fn reanchor_find_anchor_anchors_on_the_preceding_sustained_run() {
+    let env = reanchor_anchor_fixture();
+    for budget in [0usize, 4] {
+        let anchor = whisper_reanchor_find_anchor(
+            &env,
+            140,
+            REANCHOR_ANCHOR_THRESHOLD,
+            REANCHOR_ANCHOR_CEILING,
+            budget,
+        )
+        .expect("the sustained run anchors");
+        assert_eq!(
+            anchor,
+            ReanchorAnchor {
+                end_frame: 89,
+                skipped_blip_frames: 0,
+            },
+            "budget {budget}"
+        );
+    }
+}
+
+/// A sub-sustain blip between the center and the sustained run refuses the
+/// pull at a 0 budget: the pre-skip walk, fails closed on the blip.
+#[test]
+fn reanchor_find_anchor_refuses_a_sub_sustain_blip_without_budget() {
+    let mut env = reanchor_anchor_fixture();
+    env[105] = 0.20; // one-frame blip past the run
+    assert!(
+        whisper_reanchor_find_anchor(
+            &env,
+            140,
+            REANCHOR_ANCHOR_THRESHOLD,
+            REANCHOR_ANCHOR_CEILING,
+            0,
+        )
+        .is_none(),
+        "the 0-budget walk fails closed on a blip"
+    );
+}
+
+/// With budget the walk skips past a sub-sustain blip and anchors on the
+/// sustained run behind it: the pull lands one frame past that run's end,
+/// not on the blip (the jfk fricative-tail shape).
+#[test]
+fn reanchor_find_anchor_skips_a_sub_sustain_blip_within_budget() {
+    let mut env = reanchor_anchor_fixture();
+    env[105] = 0.20; // one-frame blip past the run
+    let anchor = whisper_reanchor_find_anchor(
+        &env,
+        140,
+        REANCHOR_ANCHOR_THRESHOLD,
+        REANCHOR_ANCHOR_CEILING,
+        4,
+    )
+    .expect("the blip is skipped and the run behind it anchors");
     assert_eq!(
-        out[1].center_seconds, 2.8,
-        "untrusted gap frame keeps the center"
+        anchor,
+        ReanchorAnchor {
+            end_frame: 89,
+            skipped_blip_frames: 1,
+        }
+    );
+}
+
+/// A blip wider than the whole budget still refuses the pull.
+#[test]
+fn reanchor_find_anchor_refuses_a_blip_wider_than_the_budget() {
+    let mut env = reanchor_anchor_fixture();
+    env[104] = 0.20;
+    env[105] = 0.20; // two-frame blip
+    assert!(
+        whisper_reanchor_find_anchor(
+            &env,
+            140,
+            REANCHOR_ANCHOR_THRESHOLD,
+            REANCHOR_ANCHOR_CEILING,
+            1,
+        )
+        .is_none(),
+        "a blip wider than the budget fails closed"
+    );
+}
+
+/// The budget is spent across skips: a second blip after the first consumed
+/// it refuses the pull even though each blip alone fits it.
+#[test]
+fn reanchor_find_anchor_refuses_a_second_blip_past_a_spent_budget() {
+    let mut env = reanchor_anchor_fixture();
+    env[95] = 0.20;
+    env[105] = 0.20; // two one-frame blips
+    assert!(
+        whisper_reanchor_find_anchor(
+            &env,
+            140,
+            REANCHOR_ANCHOR_THRESHOLD,
+            REANCHOR_ANCHOR_CEILING,
+            1,
+        )
+        .is_none(),
+        "the second blip meets a spent budget"
+    );
+}
+
+/// The ceiling veto still fires past a skipped blip: a sustained
+/// above-ceiling stretch between the blip and the run is a bed and refuses
+/// the pull; the blip does not inherit or extend the crackle count.
+#[test]
+fn reanchor_find_anchor_still_refuses_a_bed_after_a_skipped_blip() {
+    let mut env = reanchor_anchor_fixture();
+    for sample in env[100..105].iter_mut() {
+        // Five ceiling-crossing frames: more than the tolerance, whether or
+        // not the blip separates them.
+        *sample = 0.045;
+    }
+    env[105] = 0.20; // blip before the bed
+    assert!(
+        whisper_reanchor_find_anchor(
+            &env,
+            140,
+            REANCHOR_ANCHOR_THRESHOLD,
+            REANCHOR_ANCHOR_CEILING,
+            8,
+        )
+        .is_none(),
+        "the bed veto holds past a skipped blip"
     );
 }
 
