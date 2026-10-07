@@ -32,30 +32,69 @@ fn whisper_dtw_onset_head_margin_is_the_low_default() {
 fn whisper_dtw_lead_silence_advance_fires_only_on_a_leading_leak() {
     let spf = 0.02_f32; // 1500 frames over a 30s window.
     let min_gap = WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS; // 0.2s -> 10 frames.
+    let mid_run_gap = WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS; // 1.0s -> 50 frames.
+    let advance = |band_start, band_end, front, levels| {
+        whisper_dtw_lead_silence_advance_frame(
+            band_start,
+            band_end,
+            front,
+            spf,
+            min_gap,
+            mid_run_gap,
+            levels,
+        )
+    };
+    // A 1500-frame envelope at a flat 0.001 noise floor: everything reads as
+    // silence. A second one carries speech across [300, 355), so the same
+    // attention gap resolves the other way.
+    let quiet = vec![0.001_f32; 1500];
+    let mut carrying = quiet.clone();
+    for sample in carrying.iter_mut().take(355).skip(300) {
+        *sample = 0.2;
+    }
 
-    // A run at the window front whose content onset sits well past the bound
-    // (a leading silence leak) is advanced to that onset.
-    let advance = whisper_dtw_lead_silence_advance_frame(0, Some(55), spf, min_gap); // 1.1s gap.
-    assert_eq!(advance, Some(55));
+    // --- window front (no decoded `<|start|>` before the run) ---
+    //
+    // The historical shape: a leading silence leak, advanced on the gap alone.
+    // Onset 1.1s past the bound.
+    assert_eq!(advance(0, 1500, Some(55), None), Some(55));
+    // A gap just over the margin fires, one just under does not (sub-margin
+    // `<|start|>` jitter is not a leak). Values sit clearly off the 0.2s
+    // boundary, an arbitrary f32 knife-edge rather than a meaningful threshold.
+    assert_eq!(advance(0, 1500, Some(11), None), Some(11)); // 0.22s
+    assert_eq!(advance(0, 1500, Some(9), None), None); // 0.18s
+    // No envelope and no usable content peak: nothing to advance to.
+    assert_eq!(advance(0, 1500, None, Some(&quiet)), None);
+    // At the front the onset may sit past the band's own end: rye's opening
+    // `<|0.00|>` leak measures it there.
+    assert_eq!(advance(0, 400, Some(500), None), Some(500));
 
-    // The same onset but on a mid-run decoded `<|start|>` bound is NOT advanced:
-    // the band_start == 0 gate is what keeps a real timestamp (which can mark a
-    // large misalignment) from retargeting the lead word to an unrelated peak.
-    let mid_run = whisper_dtw_lead_silence_advance_frame(300, Some(355), spf, min_gap); // 1.1s gap.
-    assert_eq!(mid_run, None);
-
-    // A window-front onset just over the minimum gap fires; a gap just under it
-    // is normal `<|start|>` jitter, not a leak, so the sub-margin gate keeps it
-    // untouched. (Values are kept clearly off the margin since the exact 0.2s
-    // boundary is an arbitrary f32 knife-edge, not a meaningful threshold.)
-    let over = whisper_dtw_lead_silence_advance_frame(0, Some(11), spf, min_gap); // 0.22s gap.
-    assert_eq!(over, Some(11));
-    let under = whisper_dtw_lead_silence_advance_frame(0, Some(9), spf, min_gap); // 0.18s gap.
-    assert_eq!(under, None);
-
-    // No usable content peak: nothing to advance to.
-    let no_front = whisper_dtw_lead_silence_advance_frame(0, None, spf, min_gap);
-    assert_eq!(no_front, None);
+    // --- mid-run decoded `<|start|>` ---
+    //
+    // A seconds-scale gap whose skipped region reads quiet is the block
+    // displacement (mikan's `Oh,`): advanced.
+    assert_eq!(advance(300, 1500, Some(400), Some(&quiet)), Some(400));
+    // A sub-second gap is ordinary bound jitter the fold already calibrates
+    // around, so it is left alone even when the region reads quiet.
+    assert_eq!(advance(300, 1500, Some(320), Some(&quiet)), None);
+    // The same gap over a region that still carries speech is not a leak: the
+    // bound cut into the run's own lead word there, or the peak belongs to a
+    // repeated word elsewhere in the window.
+    assert_eq!(advance(300, 1500, Some(400), Some(&carrying)), None);
+    // No envelope means no acoustic confirmation, so a real timestamp is never
+    // moved (the non-cross-attention decode paths keep their behavior exactly).
+    assert_eq!(advance(300, 1500, Some(400), None), None);
+    // An onset past the band's end is refused: on a repeated vocalization every
+    // copy's tokens peak on the same later audio (lobster-uvr's trailing
+    // `Wah! Wah!`), and advancing to it would invert the band, fold the run onto
+    // a single instant, and hand a zero-width run to the degenerate-tail gate.
+    assert_eq!(advance(300, 400, Some(500), Some(&quiet)), None);
+    // A content onset behind the bound is never advanced onto: that peak can
+    // belong to an earlier copy of the same word, and walking the bound back to
+    // it would relocate the run onto the wrong audio (oregon decoding `How`
+    // `dy` with both rows peaking eight seconds earlier).
+    assert_eq!(advance(355, 1500, Some(300), Some(&quiet)), None);
+    assert_eq!(advance(355, 1500, Some(300), Some(&carrying)), None);
 }
 
 // ---------------------------------------------------------------------------

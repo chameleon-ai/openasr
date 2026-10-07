@@ -325,6 +325,18 @@ fn whisper_dtw_punctuation_trust_radius_seconds() -> f32 {
 /// the margin while normal `<|start|>` jitter sits at or inside it.
 const WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS: f32 = 0.2;
 
+/// The same threshold for a *mid-run* decoded `<|start|>` bound, which is held
+/// to the full block-displacement scale. A sub-second offset there is ordinary
+/// bound jitter that the fold's own boundary calibration absorbs: measured over
+/// the test corpus, the mid-run advances that help are the seconds-scale ones
+/// (mikan's `Oh,` 1.8 s and `That` 1.5 s, thriller's two ~3 s block moves,
+/// gilbert's 1.0-1.9 s moves), while every sub-second mid-run advance costs
+/// (sakuracon's 0.2-0.5 s moves push its lead words a tenth of a second past
+/// their truth onsets and drop an InWin overlap each; arnold's 0.24 s and 0.5 s
+/// moves do the same). The window-front bound keeps the margin above, where the
+/// leak it corrects is a slice's own leading silence.
+const WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS: f32 = 1.0;
+
 /// The leading-silence advance gap threshold, honoring a deployment env
 /// override so a tuning pass can sweep it without a rebuild (see
 /// [`WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS`]). A bare environment is
@@ -336,36 +348,96 @@ fn whisper_dtw_lead_silence_advance_min_gap_seconds() -> f32 {
         .unwrap_or(WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS)
 }
 
-/// Whether to advance a run's lead anchor past its decoded band start, and to
-/// which frame. Returns `Some(advance_to_frame)` only for a genuine leading-
-/// silence leak: the run must start at the window front (`band_start == 0`, i.e.
-/// no decoded `<|start|>` before it) AND its measured content onset (`band_front`)
-/// must sit at least `min_gap_seconds` ahead of the band start. Otherwise
-/// `None` and the decoded bound is kept.
+/// Deployment env override for the mid-run threshold
+/// ([`WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS`]); a bare environment
+/// falls back to the compiled default, staying byte-identical to it.
+fn whisper_dtw_mid_run_lead_advance_min_gap_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS)
+}
+
+/// Whether a run's lead anchor must move off its decoded band start, and to
+/// which frame.
 ///
-/// The `band_start == 0` gate is what keeps this from firing on a mid-run
-/// decoded `<|start|>` whose frame merely falls short of the run's own earliest
-/// attention peak: there the bound is a real timestamp that can mark a large
-/// misalignment (a repeated/leaked word elsewhere in the window), and retargeting
-/// the lead word to an unrelated peak would move it further off. The gap gate
-/// keeps a real-but-tight leading boundary (sub-margin `<|start|>` jitter)
-/// untouched, matching the historical "at-most-a-margin early" tolerance.
+/// Whisper's DTW backtracks to the band origin, so the lead token's entry frame
+/// is the band's first frame and the center fold anchors the run's first word
+/// there by construction. A decoded `<|start|>` that leaked into the silence
+/// ahead of the run's real speech therefore parks that word -- and, through the
+/// fold's lower center clamp, every following seam -- that far early, which is
+/// the intra-segment block displacement measured on the committed whisper
+/// suite (mikan's `Oh,` run measured 1.8 s of leaked silence ahead of its
+/// speech and `That` 1.5 s, both inside one slice).
+///
+/// The advance is admitted only where the run's measured content onset
+/// (`band_front`, the earliest per-token attention peak in the run) sits at
+/// least `min_gap_seconds` ahead of the bound -- so ordinary sub-margin
+/// `<|start|>` jitter stays untouched -- and, on a mid-run bound, where two
+/// further conditions hold:
+///
+/// * the onset is inside the band's own extent. On a repeated vocalization
+///   every copy's tokens peak on the same later audio (lobster-uvr's trailing
+///   `Wah! Wah!`, both rows peaking 2.5 s beyond the band's end), so advancing
+///   to it would invert the band, fold the run onto a single instant, and hand
+///   a zero-width run to the degenerate-tail gate.
+/// * the skipped region reads quiet on the envelope (its mean is below the
+///   slice's own speech floor). A region that still carries speech is not a
+///   leak: the bound cut into the run's own lead word there, or `band_front`
+///   is a repeated-word / leaked-token peak elsewhere in the window, and the
+///   decoded bound is kept.
+///
+/// The mirror case, walking a bound *back* toward a later-than-expected content
+/// onset, is deliberately not handled: an early peak on another copy of the
+/// same word (oregon decoding `How` `dy` with both rows peaking eight seconds
+/// earlier) reads as speech and would relocate the run onto the wrong audio.
+///
+/// At the window front (`band_start == 0`, no decoded `<|start|>` before the
+/// run) the gap alone decides, the historical behavior in full -- including
+/// advancing to an onset past `band_end`, which is exactly the shape rye's
+/// opening `<|0.00|>` leak has. A mid-run bound needs the envelope as well, so
+/// without one (the non-cross-attention decode paths) only the window-front
+/// shape fires, exactly as before.
 fn whisper_dtw_lead_silence_advance_frame(
     band_start: usize,
+    band_end: usize,
     band_front: Option<usize>,
     seconds_per_frame: f32,
     min_gap_seconds: f32,
+    mid_run_min_gap_seconds: f32,
+    audio_rms_frames: Option<&[f32]>,
 ) -> Option<usize> {
-    if band_start != 0 {
+    let front = band_front?;
+    if front <= band_start {
         return None;
     }
-    let front = band_front?;
-    let gap_seconds = (front.saturating_sub(band_start) as f32) * seconds_per_frame;
-    if gap_seconds >= min_gap_seconds {
-        Some(front)
-    } else {
-        None
+    if band_start == 0 {
+        let gap_seconds = (front - band_start) as f32 * seconds_per_frame;
+        return (gap_seconds >= min_gap_seconds).then_some(front);
     }
+    // Mid-run decoded bound: only the block-displacement scale qualifies, the
+    // onset must stay inside the band, and the skipped region must read as
+    // silence.
+    let gap_seconds = (front - band_start) as f32 * seconds_per_frame;
+    if gap_seconds < mid_run_min_gap_seconds || front >= band_end {
+        return None;
+    }
+    let levels = audio_rms_frames?;
+    if levels.len() < 4 {
+        return None;
+    }
+    let mut ranked: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    ranked.sort_by(f64::total_cmp);
+    let noise_floor = ranked[ranked.len() / 2];
+    if !(noise_floor > 0.0 && noise_floor.is_finite()) {
+        return None;
+    }
+    let threshold = noise_floor * 10.0_f64.powf(whisper_dtw_onset_floor_margin_db() / 20.0);
+    let first = band_start.min(levels.len() - 1);
+    let last = front.min(levels.len()).max(first + 1);
+    let region = &levels[first..last];
+    let mean = region.iter().map(|sample| f64::from(*sample)).sum::<f64>() / region.len() as f64;
+    if mean < threshold { Some(front) } else { None }
 }
 
 /// Limit how long a single DTW word may run.
@@ -1993,16 +2065,29 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                 let band_front =
                     speech_band_from_rows(&full_window[*lo..=*hi], &run_is_content, None)
                         .map(|(onset, _)| onset);
-                // Advance the first word's start to the measured content onset when
-                // the run's bound is a leading silence leak (see the decision in
-                // `whisper_dtw_lead_silence_advance_frame`). A mid-run decoded
-                // `<|start|>` or a sub-margin jitter falls through to the decoded
-                // bound, leaving those segments byte-identical to baseline.
+                if std::env::var_os("OPENASR_WHISPER_DEBUG_DTW_SPANS").is_some() {
+                    eprintln!(
+                        "  band_bound={:.2}s front={:?} end={:.2}s",
+                        (band_start as f32) * seconds_per_frame,
+                        band_front.map(|f| (f as f32) * seconds_per_frame),
+                        (band_end as f32) * seconds_per_frame,
+                    );
+                }
+                // Move the run's lead anchor to the measured content onset when
+                // the decoded bound leaked into the silence ahead of the run's
+                // own speech (see the decision in
+                // `whisper_dtw_lead_silence_advance_frame`). A sub-margin
+                // jitter, or a skipped region that still carries speech, falls
+                // through to the decoded bound, keeping those segments
+                // byte-identical to baseline.
                 let band_start_secs = match whisper_dtw_lead_silence_advance_frame(
                     band_start,
+                    band_end,
                     band_front,
                     seconds_per_frame,
                     whisper_dtw_lead_silence_advance_min_gap_seconds(),
+                    whisper_dtw_mid_run_lead_advance_min_gap_seconds(),
+                    audio_rms_frames,
                 ) {
                     Some(front) => {
                         if std::env::var_os("OPENASR_WHISPER_DEBUG_CROSS").is_some() {
@@ -2047,6 +2132,22 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 }
+                if std::env::var_os("OPENASR_WHISPER_DEBUG_DTW_SPANS").is_some() {
+                    eprintln!(
+                        "dtw_spans: band=[{:.2}s..{:.2}s] tokens={}",
+                        band_start_secs,
+                        band_end_secs,
+                        token_times.len()
+                    );
+                    for token_time in &token_times {
+                        let text = decode_piece_text(&[token_time.token_id])
+                            .unwrap_or_else(|| "<?>".to_string());
+                        eprintln!(
+                            "  tok id={} {:?} entry={:.2}s",
+                            token_time.token_id, text, token_time.center_seconds
+                        );
+                    }
+                }
                 // A word-final punctuation token carries no audio of its own
                 // and its center can sit in the pause after its word; pull it
                 // back to the word's own offset before the fold turns these
@@ -2072,6 +2173,11 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     whisper_dtw_max_interior_half_span_seconds(),
                 ) {
                     block_words = whisper_cap_dtw_word_spans(block_words, seconds_per_frame);
+                    if std::env::var_os("OPENASR_WHISPER_DEBUG_DTW_SPANS").is_some() {
+                        for word in &block_words {
+                            eprintln!("  word {:?} {:.2}..{:.2}", word.word, word.start, word.end);
+                        }
+                    }
                     words.extend(block_words);
                 }
                 run_word_ranges.push((run_word_start, words.len()));
