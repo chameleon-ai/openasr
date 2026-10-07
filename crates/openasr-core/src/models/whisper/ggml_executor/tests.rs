@@ -1684,7 +1684,9 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
     // Seed and generated use ids below the first timestamp id so they are
     // treated as plain words, isolating the tail-trim from the timestamp
     // strip. The generated tail alternates so it is not loop-dominant (a
-    // flat run would be refused by the carry loop-dominance gate).
+    // flat run would be refused by the carry loop-dominance gate) -- it does
+    // still read as a repeated cycle, which the carry strip then collapses, so
+    // this row pins the tail limit against a stripped source.
     assert!(2 < first_timestamp);
     let generated = vec![2, 3, 2, 3, 2, 3, 2, 3, 2, 3];
     let carry_prompt_token_ids =
@@ -1696,9 +1698,11 @@ fn build_whisper_carry_prompt_token_ids_keeps_last_longform_tail() {
         carry_prompt_token_ids.len(),
         WHISPER_LONGFORM_PROMPT_TOKEN_TAIL_LIMIT
     );
-    // tail = last 32 of seed[1;40] ++ generated = 22 ones then the run.
-    let mut expected = vec![1; 22];
-    expected.extend_from_slice(&generated);
+    // The trailing-cycle strip runs on the joined seed ++ generated stream
+    // before the tail limit is applied, so the five `[2, 3]` copies collapse to
+    // one and the 32-token tail is 30 ones plus that single cycle.
+    let mut expected = vec![1; 30];
+    expected.extend_from_slice(&[2, 3]);
     assert_eq!(carry_prompt_token_ids.as_slice(), &expected);
 }
 
@@ -3298,10 +3302,7 @@ fn carry_trailing_repeat_cycle_strip_shapes() {
     );
     // No repeated tail: input unchanged.
     let no_rep = vec![1u32, 2, 3, 4, 5];
-    assert_eq!(
-        strip_trailing_repeated_cycle_tokens(&no_rep),
-        no_rep
-    );
+    assert_eq!(strip_trailing_repeated_cycle_tokens(&no_rep), no_rep);
     // A repeated pair at the tail of mid-sentence content: one pair kept.
     assert_eq!(
         strip_trailing_repeated_cycle_tokens(&[5, 6, 7, 8, 7, 8]),

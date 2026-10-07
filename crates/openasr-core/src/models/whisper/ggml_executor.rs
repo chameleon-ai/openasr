@@ -8262,7 +8262,7 @@ fn run_whisper_decode_loop(
                 // audible-tail coverage re-race below; it must not vanish just
                 // because it lost the span race. (A guard-tripped incumbent has
                 // no salvageable audio left, so it is kept out of the pool.)
-                if !best.1.stop_reason.is_truncated() && best.0.text_trimmed.len() > 0 {
+                if !best.1.stop_reason.is_truncated() && !best.0.text_trimmed.is_empty() {
                     let prev = std::mem::replace(&mut best, (cand, result));
                     clean_rounds.push(WhisperLadderRound {
                         round: best_round,

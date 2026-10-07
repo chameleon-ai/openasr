@@ -769,14 +769,12 @@ impl TranscriptAssembler {
         // to the cut region: the first word ending clearly before the cut
         // stops it.
         let mut dropped = 0;
-        loop {
-            let (committed, previous_end, word_count) = match self.segments.last() {
-                Some(previous) => match previous.words.last() {
-                    Some(committed) => (committed.clone(), previous.end, previous.words.len()),
-                    None => break,
-                },
-                None => break,
+        while let Some(previous) = self.segments.last() {
+            let Some(committed) = previous.words.last().cloned() else {
+                break;
             };
+            let previous_end = previous.end;
+            let word_count = previous.words.len();
             if word_count <= 1 {
                 break;
             }
