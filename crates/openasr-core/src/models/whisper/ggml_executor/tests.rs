@@ -3278,6 +3278,38 @@ fn carry_loop_dominance_shapes() {
 }
 
 #[test]
+fn carry_trailing_repeat_cycle_strip_shapes() {
+    // The ploomet shape: a hook phrase ("relax." = [5789, 13]) closing the
+    // slice, doubled in the decode by a sub-threshold loop -- the carry
+    // drops the second copy, keeping one occurrence of the unit.
+    assert_eq!(
+        strip_trailing_repeated_cycle_tokens(&[100, 5789, 13, 5789, 13]),
+        vec![100, 5789, 13]
+    );
+    // Three copies collapse to one.
+    assert_eq!(
+        strip_trailing_repeated_cycle_tokens(&[7, 5789, 13, 5789, 13, 5789, 13]),
+        vec![7, 5789, 13]
+    );
+    // Single-token stutter at the tail: one remains.
+    assert_eq!(
+        strip_trailing_repeated_cycle_tokens(&[1, 2, 9, 9, 9]),
+        vec![1, 2, 9]
+    );
+    // No repeated tail: input unchanged.
+    let no_rep = vec![1u32, 2, 3, 4, 5];
+    assert_eq!(
+        strip_trailing_repeated_cycle_tokens(&no_rep),
+        no_rep
+    );
+    // A repeated pair at the tail of mid-sentence content: one pair kept.
+    assert_eq!(
+        strip_trailing_repeated_cycle_tokens(&[5, 6, 7, 8, 7, 8]),
+        vec![5, 6, 7, 8]
+    );
+}
+
+#[test]
 fn slice_head_is_audible_when_head_matches_speech_level() {
     // 100 x 20 ms frames = 2 s of flat, speech-level envelope.
     let rms = vec![0.5_f32; 100];

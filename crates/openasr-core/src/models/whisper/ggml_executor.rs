@@ -4511,6 +4511,16 @@ fn build_whisper_carry_prompt_token_ids(
     // strip removes: re-prime the habit across slices and they accumulate,
     // so the carried context drops them while the transcript keeps them.
     let cleaned_source = strip_whisper_ellipsis_tokens(tokenizer, &cleaned_source)?;
+    // A hook-phrase tail -- the same short token unit repeated 2+ times at
+    // the end of the stream -- is the signature of a sub-threshold loop the
+    // decode survived (never tripped the degenerate-repeat guard, so the
+    // guard-trip cut above did not fire). Carried verbatim, a doubled tail
+    // primes the next slice's decode onto the same cycle. Keeping one
+    // occurrence preserves the speech context; the repeat itself is filler
+    // for conditioning purposes. Genuine back-to-back repetition (a sung
+    // hook) is unaffected in the transcript -- only the carried prompt tail
+    // is deduped.
+    let cleaned_source = strip_trailing_repeated_cycle_tokens(&cleaned_source);
     if cleaned_source.is_empty() {
         // The stream held only stripped side-commentary (a near-silence slice
         // the model "commented" on or "paused" through): carry nothing, and
@@ -4645,6 +4655,34 @@ pub(super) fn strip_whisper_ellipsis_tokens(
         }
     }
     Ok(kept)
+}
+
+/// Strip a trailing maximal run of a repeated token unit from `tokens`,
+/// keeping a single occurrence of that unit. The unit is any `n` in
+/// `1..=8` consecutive tokens appearing at least twice back-to-back at the
+/// stream's tail; the smallest matching `n` wins (finer units subdivide a
+/// coarser one, e.g. "Relax. Relax." tokens [t, p, t, p] strips to one
+/// [t, p] rather than one "Relax. Relax." pair). Returns the input
+/// unchanged when the tail holds no repeated unit.
+pub(super) fn strip_trailing_repeated_cycle_tokens(tokens: &[u32]) -> Vec<u32> {
+    let len = tokens.len();
+    let max_n = len / 2;
+    let mut n_hit = None;
+    for n in 1..=max_n.min(8) {
+        let ngram = &tokens[len - n..];
+        let mut reps = 1usize;
+        while (reps + 1) * n <= len && &tokens[len - (reps + 1) * n..len - reps * n] == ngram {
+            reps += 1;
+        }
+        if reps >= 2 {
+            n_hit = Some((n, reps));
+            break;
+        }
+    }
+    match n_hit {
+        Some((n, reps)) => tokens[..len - (reps - 1) * n].to_vec(),
+        None => tokens.to_vec(),
+    }
 }
 
 fn build_whisper_carry_prompt_seed_token_ids(

@@ -937,6 +937,8 @@ fn finish_whisper_serve_batch_output(
             .map_err(|error| WhisperServeBatchError::DecodeFailed {
                 reason: error.to_string(),
             })?;
+    let carry_generated_tokens =
+        super::ggml_executor::strip_trailing_repeated_cycle_tokens(&carry_generated_tokens);
     let carry_prompt_token_ids = if carry_generated_tokens.is_empty() {
         // The stream held only pruned filler (a slice the model "paused"
         // through): it holds no words to condition the next slice, so carry
