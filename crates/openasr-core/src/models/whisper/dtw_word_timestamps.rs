@@ -436,6 +436,17 @@ fn whisper_dtw_onset_floor_margin_db() -> f64 {
 // `pub(crate)`: the decode-side silence checks reuse the same sustained-speech
 // run length.
 pub(crate) const WHISPER_DTW_ONSET_SUSTAIN_FRAMES: usize = 5;
+/// Shorter runs that may still qualify as an onset when they follow a
+/// genuine pause. A word with a weak, fragmented onset (a quiet /iz/, a
+/// fricative blip) can clear the speech floor for only a frame or two
+/// before dipping again; the strict 5-frame test skips it and the fold
+/// parks the start inside the preceding pause. Accepting a short run is
+/// only trusted right after a real pause -- a blip a few frames after
+/// the previous word's decay is still weak evidence.
+const WHISPER_DTW_ONSET_SHORT_SUSTAIN_FRAMES: usize = 2;
+/// How much continuous below-floor quiet must precede a short onset run
+/// for it to be trusted (a real inter-word pause, not a glottal dip).
+const WHISPER_DTW_ONSET_SHORT_MIN_QUIET_S: f32 = 0.4;
 /// Minimum run of silence between the run before a word and its onset, in
 /// seconds, so a run that merely touches a brief inter-word glottal gap is not
 /// treated as a real pause.
@@ -801,14 +812,20 @@ fn whisper_refine_dtw_word_onsets(
                 while run_end + 1 < region_len && region_above(run_end + 1) {
                     run_end += 1;
                 }
-                if run_end - index + 1 >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+                if run_end - index + 1 >= WHISPER_DTW_ONSET_SHORT_SUSTAIN_FRAMES {
                     let mut quiet = 0usize;
                     let mut probe = index;
                     while probe > 0 && !region_above(probe - 1) {
                         probe -= 1;
                         quiet += 1;
                     }
-                    if quiet >= min_quiet_frames {
+                    let full_run = run_end - index + 1 >= WHISPER_DTW_ONSET_SUSTAIN_FRAMES;
+                    let short_run_after_pause = run_end - index + 1
+                        < WHISPER_DTW_ONSET_SUSTAIN_FRAMES
+                        && quiet
+                            >= ((WHISPER_DTW_ONSET_SHORT_MIN_QUIET_S as f64) / seconds_per_frame)
+                                .ceil() as usize;
+                    if (full_run && quiet >= min_quiet_frames) || short_run_after_pause {
                         onset_rel = Some(index);
                     }
                 }
@@ -1254,6 +1271,18 @@ const WHISPER_DTW_REANCHOR_MAX_JUMP_SECONDS: f32 = 3.5;
 /// the center is treated as sitting in a pause (see
 /// [`whisper_reanchor_dtw_token_centers`]).
 const WHISPER_DTW_REANCHOR_ENTRY_QUIET_FRAMES: usize = 4;
+/// Consecutive frames over the ceiling inside the backward pause walk before
+/// the walk refuses: more than this is a bed, not a pause crackle.
+const WHISPER_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES: usize = 4;
+/// Sustain length of the preceding speech run that may anchor a reanchor
+/// pull. One frame shorter than the full onset sustain: a real word's tail
+/// frequently decays under the floor by its last 20 ms, and the trusted-gap
+/// and max-jump checks already reject noise blips.
+const WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES: usize = 4;
+/// Sustain length of the run that may truncate the entry quiet window when a
+/// sustained onset bleeds into it: shorter than the word-speech runs because
+/// the next word's weak onset still counts.
+const WHISPER_DTW_REANCHOR_NEXT_RUN_SUSTAIN_FRAMES: usize = 3;
 
 /// Deployment env override for the reanchor minimum gap
 /// ([`WHISPER_DTW_REANCHOR_MIN_GAP_SECONDS`]); a bare environment falls back
@@ -1305,9 +1334,14 @@ fn whisper_dtw_reanchor_max_jump_seconds() -> f32 {
 ///
 /// The trusted-silence requirement is the edge refiners' own (same floor,
 /// same thin-floor ceiling): the center region's mean below the floor, no
-/// frame above the silence ceiling, fewer than half its frames above the
-/// floor, and every frame between the run's end and the center at or below
-/// the ceiling. On a clean clip there is no pause-long punctuation entry to
+/// sustained run above the silence ceiling, fewer than half its frames above
+/// the floor, and every frame between the run's end and the center below
+/// the ceiling except for a few crackle frames (a deeper silence reads a
+/// single loud crackle that a hard `max` ceiling would veto; a sustained
+/// crossing still fails, the way a music bed reads to the edge refiners).
+/// An entry whose short trusted window is truncated by the onset of the next
+/// sustained speech run is still judged on the sliver that remains below
+/// threshold. On a clean clip there is no pause-long punctuation entry to
 /// pull, and on a music bed the ceiling tests fail the way the edge refiners'
 /// do, so the pass is a no-op there.
 fn whisper_reanchor_dtw_token_centers(
@@ -1396,29 +1430,64 @@ fn whisper_reanchor_dtw_token_centers(
         let entry_frame = ((entry_secs / spf) as usize).min(last_frame);
         // Trusted pause at the center: the same mean / ceiling /
         // active-fraction tests the edge refiners apply to a word half, over a
-        // short run of frames from the center.
-        let quiet_end = (entry_frame + WHISPER_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        // short run of frames from the center. When a sustained speech run
+        // begins inside that short window -- the entry sits in the quieter
+        // last sliver before the next word's onset -- the window is truncated
+        // at that run and re-tested over the remaining sliver. Otherwise the
+        // next onset's rising edge bleeding into the window would veto a
+        // pull that the sliver alone supports.
+        let mut quiet_end = (entry_frame + WHISPER_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        if f64::from(levels[entry_frame]) < threshold {
+            let mut probe = entry_frame + 1;
+            while probe <= quiet_end {
+                if f64::from(levels[probe]) >= threshold {
+                    let mut run_end = probe;
+                    while run_end < last_frame && f64::from(levels[run_end + 1]) >= threshold {
+                        run_end += 1;
+                    }
+                    if run_end - probe + 1 >= WHISPER_DTW_REANCHOR_NEXT_RUN_SUSTAIN_FRAMES {
+                        quiet_end = probe - 1;
+                        break;
+                    }
+                }
+                probe += 1;
+            }
+        }
         let quiet = &levels[entry_frame..=quiet_end];
         let quiet_mean =
             quiet.iter().map(|sample| f64::from(*sample)).sum::<f64>() / quiet.len() as f64;
-        let quiet_max = quiet
-            .iter()
-            .map(|sample| f64::from(*sample))
-            .fold(0.0_f64, f64::max);
         let quiet_above = quiet
             .iter()
             .filter(|sample| f64::from(**sample) >= threshold)
             .count() as f64
             / quiet.len() as f64;
-        if quiet_mean >= threshold || quiet_max > silence_ceiling || quiet_above > 0.5 {
+        // A sustained run above the ceiling means a bed or breath; an
+        // isolated crackle frame must not veto an otherwise trusted sliver.
+        let mut crossing_run = 0usize;
+        let mut ceiling_sustained = false;
+        for &sample in quiet {
+            crossing_run = if f64::from(sample) > silence_ceiling {
+                crossing_run + 1
+            } else {
+                0
+            };
+            if crossing_run >= WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
+        if quiet_mean >= threshold || ceiling_sustained || quiet_above > 0.5 {
             continue;
         }
         // The nearest preceding sustained speech run: walk back over the
         // trusted-silence frames that separate the center from it. The walk
-        // stops at the frame-array edge (no preceding speech) or at a frame
-        // above the silence ceiling (a music bed, not a pause).
+        // stops at the frame-array edge (no preceding speech) or at a
+        // sustained above-ceiling stretch (a music bed, not a pause); a few
+        // crackle frames crossing the ceiling inside a deep pause do not
+        // stop it.
         let mut scan = entry_frame;
         let mut run_end: Option<usize> = None;
+        let mut crossing_run = 0usize;
         while scan > 0 {
             let level = f64::from(levels[scan - 1]);
             if level >= threshold {
@@ -1426,7 +1495,12 @@ fn whisper_reanchor_dtw_token_centers(
                 break;
             }
             if level > silence_ceiling {
-                break;
+                crossing_run += 1;
+                if crossing_run > WHISPER_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES {
+                    break;
+                }
+            } else {
+                crossing_run = 0;
             }
             scan -= 1;
         }
@@ -1437,9 +1511,9 @@ fn whisper_reanchor_dtw_token_centers(
         while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
             run_start -= 1;
         }
-        // The anchor must be real speech, not a noise blip: at least the onset
-        // sustain length of frames above the floor.
-        if end - run_start + 1 < WHISPER_DTW_ONSET_SUSTAIN_FRAMES {
+        // The anchor must be real speech, not a noise blip: at least the
+        // anchor sustain length of frames above the floor.
+        if end - run_start + 1 < WHISPER_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES {
             continue;
         }
         // The silent gap between the run's end and the center must be a real

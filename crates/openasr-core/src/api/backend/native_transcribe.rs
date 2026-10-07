@@ -4057,12 +4057,18 @@ const DEGENERATE_RUN_TAIL_ABSORB_WORDS: usize = 2;
 /// Maximal collapsed runs in a word list, as half-open index ranges: a run
 /// starts at a word whose window is at or below
 /// [`DEGENERATE_RUN_MAX_WINDOW_SECONDS`] and extends over the following words
-/// that stay within that window and within
-/// [`DEGENERATE_RUN_MAX_SPREAD_SECONDS`] of the run's first start; runs
-/// shorter than [`DEGENERATE_RUN_MIN_WORDS`] are not runs. A qualifying run
-/// whose tail sits within [`DEGENERATE_RUN_TAIL_ABSORB_WORDS`] words of the
-/// segment end is extended to the end (see that constant), and overlapping or
-/// adjacent extensions are merged.
+/// that stay within that window, within
+/// [`DEGENERATE_RUN_MAX_SPREAD_SECONDS`] of the run's first start, and --
+/// the decisive shape -- stack onto one common instant (every run's word
+/// window overlaps every other at at least one point, i.e. the latest
+/// window start does not exceed the earliest window end). That separates the
+/// degenerate DTW floor (all slots on one instant) from a fluent triad like
+/// "You think I", whose three windows can be equally short but advance: the
+/// first word already ends before the last one starts. Runs shorter than
+/// [`DEGENERATE_RUN_MIN_WORDS`] are not runs. A qualifying run whose tail
+/// sits within [`DEGENERATE_RUN_TAIL_ABSORB_WORDS`] words of the segment end
+/// is extended to the end (see that constant), and overlapping or adjacent
+/// extensions are merged.
 fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
@@ -4072,10 +4078,13 @@ fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
             continue;
         }
         let mut j = i + 1;
+        let mut min_end = words[i].end;
         while j < words.len()
             && words[j].end - words[j].start <= DEGENERATE_RUN_MAX_WINDOW_SECONDS
             && words[j].start - words[i].start <= DEGENERATE_RUN_MAX_SPREAD_SECONDS
+            && words[j].start <= min_end
         {
+            min_end = min_end.min(words[j].end);
             j += 1;
         }
         if j - i >= DEGENERATE_RUN_MIN_WORDS {
