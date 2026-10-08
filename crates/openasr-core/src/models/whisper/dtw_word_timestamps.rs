@@ -337,6 +337,33 @@ const WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS: f32 = 0.2;
 /// leak it corrects is a slice's own leading silence.
 const WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS: f32 = 1.0;
 
+/// How far behind the run's measured content onset (`band_front`) the skipped
+/// region's last above-floor energy may have stopped and still be the tail of
+/// that run's lead word: the advance then anchors on that tail's onset rather
+/// than on the late onset. On FX-heavy audio (mikan's voice-modulated
+/// interjections) the lead token's cross-attention peak trails the envelope
+/// onset by a few hundred ms, and anchoring on the peak parks the word in the
+/// pause after its own brief, envelope-visible audio. A region whose energy
+/// stopped well before the onset does not anchor on that energy: it is a
+/// separate earlier event (a breath, an FX blip, a neighbour's decay) and the
+/// onset is the run's real speech (mikan's `That` block, thriller's `You`).
+/// Swept over the test corpus: the refined tails ended 0.00-0.40 s before the
+/// measured onset, while every non-refined mid-run advance carried either a
+/// one-frame floor-noise blip or energy that ended >= 1.66 s behind it, so
+/// 0.5 s separates the two shapes.
+const WHISPER_DTW_MID_RUN_LEAD_ADVANCE_ONSET_TAIL_GAP_MAX_SECONDS: f32 = 0.5;
+
+/// Deployment env override for the mid-run envelope-onset tail gap
+/// ([`WHISPER_DTW_MID_RUN_LEAD_ADVANCE_ONSET_TAIL_GAP_MAX_SECONDS`]); a bare
+/// environment falls back to the compiled default, staying byte-identical to
+/// it.
+fn whisper_dtw_mid_run_lead_advance_onset_tail_gap_max_seconds() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_MID_RUN_LEAD_ADVANCE_ONSET_TAIL_GAP_MAX_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_MID_RUN_LEAD_ADVANCE_ONSET_TAIL_GAP_MAX_SECONDS)
+}
+
 /// The leading-silence advance gap threshold, honoring a deployment env
 /// override so a tuning pass can sweep it without a rebuild (see
 /// [`WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS`]). A bare environment is
@@ -386,6 +413,24 @@ fn whisper_dtw_mid_run_lead_advance_min_gap_seconds() -> f32 {
 ///   leak: the bound cut into the run's own lead word there, or `band_front`
 ///   is a repeated-word / leaked-token peak elsewhere in the window, and the
 ///   decoded bound is kept.
+///
+/// A quiet region may still refine *where* the advance lands. `band_front` is
+/// the run's own earliest cross-attention peak, and on FX-heavy audio (a
+/// voice-modulator) that peak can trail the word's own envelope onset by a
+/// few hundred ms: anchoring on the peak then parks the lead word in the
+/// pause after its own brief, envelope-visible audio (mikan's `Oh!` and
+/// `Oh,`, both full misses 0.1-0.2 s past their ground-truth windows). When
+/// the region's last above-floor run ended no more than
+/// [`whisper_dtw_mid_run_lead_advance_onset_tail_gap_max_seconds`] before the
+/// onset, that run is the tail of the same speech event the onset peaks on,
+/// and the advance anchors on its onset instead. The run must start at least
+/// two frames off the bound (a run abutting the bound is the previous word's
+/// decay across the decoded edge, not this run's speech) and meet
+/// [`WHISPER_DTW_ONSET_SHORT_SUSTAIN_FRAMES`] (a one-frame blip is floor
+/// noise, not a speech tail). A region whose energy stopped well before the
+/// onset, or with no above-floor run at all, anchors on the onset as before:
+/// that energy belongs to an earlier, separate event and moving the anchor
+/// onto it would relocate the run onto the wrong audio.
 ///
 /// The mirror case, walking a bound *back* toward a later-than-expected content
 /// onset, is deliberately not handled: an early peak on another copy of the
@@ -437,7 +482,39 @@ fn whisper_dtw_lead_silence_advance_frame(
     let last = front.min(levels.len()).max(first + 1);
     let region = &levels[first..last];
     let mean = region.iter().map(|sample| f64::from(*sample)).sum::<f64>() / region.len() as f64;
-    if mean < threshold { Some(front) } else { None }
+    if mean >= threshold {
+        return None;
+    }
+    // The quiet gate passed: the skipped region is silence apart from its own
+    // brief above-floor tails. When the last such tail ends close to the onset,
+    // it is the lead word's own audio that the onset peaks late on, and the
+    // anchor lands on that tail's onset instead (see the doc above).
+    let mut last_run: Option<(usize, usize)> = None;
+    let mut index = first;
+    while index < last {
+        if f64::from(levels[index]) >= threshold {
+            let mut run_end = index;
+            while run_end + 1 < last && f64::from(levels[run_end + 1]) >= threshold {
+                run_end += 1;
+            }
+            last_run = Some((index, run_end));
+            index = run_end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    let Some((run_start, run_end)) = last_run else {
+        return Some(front);
+    };
+    let tail_gap_seconds = (last - (run_end + 1)) as f32 * seconds_per_frame;
+    let anchors_on_envelope_onset = run_start - first >= 2
+        && run_end - run_start + 1 >= WHISPER_DTW_ONSET_SHORT_SUSTAIN_FRAMES
+        && tail_gap_seconds <= whisper_dtw_mid_run_lead_advance_onset_tail_gap_max_seconds();
+    Some(if anchors_on_envelope_onset {
+        run_start
+    } else {
+        front
+    })
 }
 
 /// Limit how long a single DTW word may run.

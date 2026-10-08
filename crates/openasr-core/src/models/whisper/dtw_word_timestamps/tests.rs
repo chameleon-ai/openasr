@@ -97,6 +97,77 @@ fn whisper_dtw_lead_silence_advance_fires_only_on_a_leading_leak() {
     assert_eq!(advance(355, 1500, Some(300), Some(&carrying)), None);
 }
 
+#[test]
+fn whisper_dtw_lead_silence_advance_mid_run_anchors_on_the_envelope_onset() {
+    let spf = 0.02_f32; // 1500 frames over a 30s window.
+    let min_gap = WHISPER_DTW_LEAD_SILENCE_ADVANCE_MIN_GAP_SECONDS;
+    let mid_run_gap = WHISPER_DTW_MID_RUN_LEAD_ADVANCE_MIN_GAP_SECONDS;
+    let advance = |band_start, band_end, front, levels| {
+        whisper_dtw_lead_silence_advance_frame(
+            band_start,
+            band_end,
+            front,
+            spf,
+            min_gap,
+            mid_run_gap,
+            levels,
+        )
+    };
+    // A flat 0.001 noise floor with a single 5-frame (0.1s) lead-word tail
+    // above the speech floor (3x the floor, just over the 5 dB line): the
+    // mid-run bound at 14.0s, the measured content onset at 15.24s.
+    let slice = vec![0.001_f32; 1500];
+    let with_tail = |first_frame: usize, last_frame: usize| {
+        let mut levels = slice.clone();
+        for sample in levels.iter_mut().take(last_frame).skip(first_frame) {
+            *sample = 0.003;
+        }
+        levels
+    };
+
+    // The tail ends 0.10s before the onset: the onset is the late peak of the
+    // same speech event, so the anchor lands on the tail's onset, not the peak
+    // (mikan's `Oh!` / ` Oh,`: peak 0.1-0.4s past the word's own envelope).
+    let tail_near_onset = with_tail(752, 757);
+    assert_eq!(
+        advance(700, 900, Some(762), Some(&tail_near_onset)),
+        Some(752)
+    );
+    // A tail that still ends at the onset reads as the word's own audio
+    // straddling the peak: anchored on its onset too.
+    let tail_at_onset = with_tail(757, 762);
+    assert_eq!(
+        advance(700, 900, Some(762), Some(&tail_at_onset)),
+        Some(757)
+    );
+    // The same tail 0.56s away from the onset is a separate, earlier event
+    // (a breath, an FX blip, a neighbour's decay), not the lead word: the
+    // anchor keeps the measured onset (mikan's `That` block, thriller's `You`).
+    let tail_far_from_onset = with_tail(705, 710);
+    assert_eq!(
+        advance(700, 900, Some(762), Some(&tail_far_from_onset)),
+        Some(762)
+    );
+    // A one-frame blip at the onset is floor noise, not a speech tail: the
+    // anchor keeps the measured onset.
+    let blip_at_onset = with_tail(760, 761);
+    assert_eq!(
+        advance(700, 900, Some(762), Some(&blip_at_onset)),
+        Some(762)
+    );
+    // A quiet region with no above-floor run at all keeps the onset (the
+    // window-front variant of this geometry: see the leading-leak test above).
+    assert_eq!(advance(700, 900, Some(762), Some(&slice)), Some(762));
+    // The window-front bound stays gap-only in full: the same tail near its
+    // onset never drags the anchor back (the leading-silence advance is
+    // deliberate about the window-front shape).
+    let tail_front_bound = with_tail(752, 757);
+    assert_eq!(
+        advance(0, 900, Some(762), Some(&tail_front_bound)),
+        Some(762)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // whisper_refine_dtw_word_onsets
 // ---------------------------------------------------------------------------
