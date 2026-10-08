@@ -973,6 +973,20 @@ fn apply_suffix_prefix_stitch(
                 if regap_seconds > max_seam_regap_seconds {
                     return false;
                 }
+                // The current copy must restart where the previous reading
+                // left off, within the seam-scale budget (onset jitter plus
+                // the slice overlap re-hear). A copy restarting well after it
+                // sits behind different audio -- the phrase ended, a pause,
+                // then the phrase AGAIN -- and stitching would consume real
+                // words from the current segment. The regap guard above only
+                // bounds gross displacement; a fast genuine repeat (a
+                // back-to-back "I need to go") restarts ~1 s after the
+                // previous reading while staying under it. Single-unit seams
+                // never reach this bound: their clamp and past-end checks
+                // already hold the restart under ~0.25 s.
+                if regap_seconds > SEGMENT_STITCH_REHOME_MAX_RESTART_GAP_SECONDS {
+                    return false;
+                }
                 // A committed word pinned at the family span cap is a
                 // stretched placement artifact (band-final edge grant
                 // inherited the band tail, then the cap clamped it), not a
@@ -1371,7 +1385,10 @@ fn split_words_at_char(
 /// ASCII keeps the historical fold (`don't` → `dont`, `twenty-one` →
 /// `twentyone`, `café` → `caf`). CJK has no ASCII letters, so it falls
 /// through to one unit per non-punctuation character.
-fn normalize_words(text: &str) -> Vec<String> {
+///
+/// Shared with the longform driver's collapsed-run head-echo match, which
+/// must fold echo text exactly the way the seam stitch does.
+pub(crate) fn normalize_words(text: &str) -> Vec<String> {
     text.split_whitespace()
         .flat_map(|word| {
             let ascii: String = word
@@ -2539,6 +2556,144 @@ mod tests {
         assert_eq!(transcription.segments[1].words.len(), 3);
         assert_eq!(transcription.text, "hear the dead ne? dead ne? again");
         assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_refuses_long_stitch_restarting_past_the_reading() {
+        // Warriors 100.90 s seam shape: slice 1 ends "...I need to go. I
+        // need to go." (last word ends 2.0 s) but its segment runs to 3.0 s
+        // (a dead tail the decode left wordless). Slice 2 opens with two
+        // more genuine "I need to go." copies starting at 3.0 s. The texts
+        // match over 8 units with a regap (1.0 s) the outer guard allows,
+        // but the copy restarts a full second after the previous reading
+        // left off -- a later utterance, not a re-read -- so the stitch must
+        // refuse and both copies survive.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 48_000),
+            text: "But it is actually a war cry. I need to go. I need to go.".to_string(),
+            segments: vec![absolute_segment(
+                "But it is actually a war cry. I need to go. I need to go.",
+                0.5,
+                3.0,
+                vec![
+                    word("But", 0.5, 0.6),
+                    word("it", 0.6, 0.7),
+                    word("is", 0.7, 0.8),
+                    word("actually", 0.8, 0.9),
+                    word("a", 0.9, 1.0),
+                    word("war", 1.0, 1.1),
+                    word("cry.", 1.1, 1.2),
+                    word("I", 1.2, 1.3),
+                    word("need", 1.3, 1.4),
+                    word("to", 1.4, 1.5),
+                    word("go.", 1.5, 1.6),
+                    word("I", 1.6, 1.7),
+                    word("need", 1.7, 1.8),
+                    word("to", 1.8, 1.9),
+                    word("go.", 1.9, 2.0),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(32_000, 80_000),
+            text: "I need to go. I need to go. I am kind of.".to_string(),
+            segments: vec![absolute_segment(
+                "I need to go. I need to go. I am kind of.",
+                3.0,
+                5.0,
+                vec![
+                    word("I", 3.0, 3.2),
+                    word("need", 3.25, 3.45),
+                    word("to", 3.5, 3.7),
+                    word("go.", 3.75, 4.0),
+                    word("I", 4.1, 4.3),
+                    word("need", 4.35, 4.5),
+                    word("to", 4.55, 4.7),
+                    word("go.", 4.75, 4.9),
+                    word("I", 4.95, 5.0),
+                    word("am", 5.0, 5.05),
+                    word("kind", 5.05, 5.1),
+                    word("of.", 5.1, 5.15),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(
+            transcription.segments[0].text,
+            "But it is actually a war cry. I need to go. I need to go."
+        );
+        assert_eq!(
+            transcription.segments[1].text,
+            "I need to go. I need to go. I am kind of."
+        );
+        assert_eq!(transcription.segments[1].words.len(), 12);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_still_stitches_long_reread_restarting_at_the_reading() {
+        // Positive control for the restart bound above: the same 8-unit
+        // overlap, but the current copy restarts where the previous reading
+        // left off (a true slice-boundary re-read inside the inter-slice
+        // overlap). The stitch consumes the re-read copy.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 48_000),
+            text: "I need to go. I need to go.".to_string(),
+            segments: vec![absolute_segment(
+                "I need to go. I need to go.",
+                0.5,
+                3.0,
+                vec![
+                    word("I", 0.5, 0.7),
+                    word("need", 0.75, 0.95),
+                    word("to", 1.0, 1.15),
+                    word("go.", 1.2, 1.4),
+                    word("I", 1.45, 1.6),
+                    word("need", 1.65, 1.8),
+                    word("to", 1.85, 1.95),
+                    word("go.", 2.0, 2.2),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(32_000, 80_000),
+            text: "I need to go. I need to go. I am kind of.".to_string(),
+            segments: vec![absolute_segment(
+                "I need to go. I need to go. I am kind of.",
+                2.0,
+                5.0,
+                vec![
+                    word("I", 2.1, 2.3),
+                    word("need", 2.35, 2.5),
+                    word("to", 2.55, 2.7),
+                    word("go.", 2.75, 2.9),
+                    word("I", 2.95, 3.1),
+                    word("need", 3.15, 3.3),
+                    word("to", 3.35, 3.5),
+                    word("go.", 3.55, 3.7),
+                    word("I", 3.9, 4.0),
+                    word("am", 4.0, 4.1),
+                    word("kind", 4.1, 4.2),
+                    word("of.", 4.2, 4.3),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(
+            transcription.segments[1].text, "I am kind of.",
+            "the re-read copies are consumed, the continuation survives"
+        );
+        assert_eq!(stats.duplicate_merge_count, 1);
     }
 
     #[test]

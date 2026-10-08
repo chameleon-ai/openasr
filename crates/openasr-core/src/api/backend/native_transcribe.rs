@@ -928,6 +928,11 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
     // GPU-fallback provenance match byte-for-byte.
     let mut slice_index = 0usize;
     let mut first_error: Option<BackendError> = None;
+    // Normalized tail of the previously integrated slice, for the
+    // collapsed-run head-echo match. Silent/gated slices carry no words, so
+    // the tail stays at the last slice that actually produced words -- the
+    // same audio the next decode was conditioned on.
+    let mut prev_slice_tail_words: Vec<String> = Vec::new();
     for (position, item) in plan_items.into_iter().enumerate() {
         if item.silent {
             *suppressed_slice_count += 1;
@@ -952,8 +957,14 @@ fn run_concurrent_slice_pipeline(pipeline: ConcurrentSlicePipeline) -> Result<()
         match results[position].take() {
             Some(Ok(mut decoded)) => {
                 slice_index += 1;
-                let (dropped_words, dropped_spans) =
-                    drop_collapsed_word_runs(&mut decoded.text, &mut decoded.segments);
+                let (dropped_words, dropped_spans) = drop_collapsed_word_runs(
+                    &mut decoded.text,
+                    &mut decoded.segments,
+                    &prev_slice_tail_words,
+                );
+                if carry_text_has_meaningful_word(&decoded.text) {
+                    prev_slice_tail_words = tail_normalized_words(&decoded.segments);
+                }
                 if dropped_words > 0 {
                     log_collapsed_run_drop(
                         slice_index,
@@ -3026,6 +3037,12 @@ fn run_native_transcription_impl(
                     );
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
             let mut rolling_prompt_token_ids: Vec<u32> = Vec::new();
+            // Normalized tail of the previously decoded slice, for the
+            // collapsed-run head-echo match. Recovery tails are transparent
+            // to the carry chain (they must not re-route what follows), so
+            // like the carry itself the tail advances only on planned
+            // slices that actually produced words.
+            let mut prev_slice_tail_words: Vec<String> = Vec::new();
             let carry_prompt_mode =
                 longform_prompt_carry_mode(&longform_options, selected_family.model_architecture);
             let mut ran_any_slice = false;
@@ -3354,6 +3371,7 @@ fn run_native_transcription_impl(
                     let (dropped_words, dropped_spans) = drop_collapsed_word_runs(
                         &mut transcription.text,
                         &mut transcription.segments,
+                        &prev_slice_tail_words,
                     );
                     if dropped_words > 0 {
                         log_collapsed_run_drop(
@@ -3463,6 +3481,13 @@ fn run_native_transcription_impl(
                                 rolling_prompt_token_ids = prompt_token_ids;
                             }
                         }
+                    }
+                    // Advance the head-echo tail alongside the carry chain:
+                    // recovery tails must not re-route what follows, and a
+                    // slice without a meaningful word leaves the tail where
+                    // the last word-producing slice put it.
+                    if !is_recovery_tail && carry_text_has_meaningful_word(&transcription.text) {
+                        prev_slice_tail_words = tail_normalized_words(&transcription.segments);
                     }
                     let mut transcript_slice = slice;
                     // A slice whose words stop mid-window -- a guard cut or a
@@ -4047,6 +4072,41 @@ fn midspan_refill_abandoned_end(
 const DEGENERATE_RUN_MAX_WINDOW_SECONDS: f32 = 0.25;
 const DEGENERATE_RUN_MAX_SPREAD_SECONDS: f32 = 0.25;
 const DEGENERATE_RUN_MIN_WORDS: usize = 3;
+/// A run shorter than this many words is only a degenerate echo when its
+/// words share a substantial common instant (at least
+/// [`DEGENERATE_RUN_MIN_COMMON_SHORT_SECONDS`] of overlap across the whole
+/// run). Three fast words ("Okay you know", "want to know", "I need to")
+/// each fit the window and spread caps and touch at one point, but their
+/// starts advance ~0.1 s per word, so the shared instant is ~0.01 s wide;
+/// the degenerate floor piles every slot onto one instant, whose shared
+/// width is the window itself (~0.1-0.2 s). Runs of at least this many words
+/// inside one 0.25 s spread keep the historical any-touch rule: that density
+/// (≈16+ words/s) is past any fluent pace, pile or not.
+const DEGENERATE_RUN_LONG_MIN_WORDS: usize = 5;
+const DEGENERATE_RUN_MIN_COMMON_SHORT_SECONDS: f32 = 0.15;
+/// A short collapsed pile is still a degenerate echo when the model decoded
+/// it weakly: the median token confidence across the pile sits under this
+/// value. Hallucinated piles over silence or breath ("heat can Suggest",
+/// "heat can be") carry near-zero scores, and collapsed stutter re-reads
+/// ("you're here now" behind an already-decoded "Are you here now?") sit
+/// well under it, while genuinely spoken fast triads ("Okay you know" at
+/// 0.95, "I need to" at 0.98+) score at the top of the range. Words without
+/// a score abstain (the pile keeps unless another signal fires), so a
+/// missing alignment never deletes words on its own. Fluent echoes of the
+/// carried prompt can score high ("awe!" at 1.0), which is what the
+/// head-echo match below is for.
+const DEGENERATE_RUN_MIN_MEDIAN_CONFIDENCE: f32 = 0.85;
+/// How many normalized tail units of the previously decoded slice the
+/// head-echo match below looks at. A slice-head echo re-reads the immediate
+/// tail of the previous output ("I'm in awe!" behind "...I'm in awe!",
+/// "Rock. Rock. Rock." behind "...Rock. Rock."), so four units cover a short
+/// run's prefix with room for the wider tail the match anchors against.
+const DEGENERATE_RUN_PREV_TAIL_UNITS: usize = 4;
+/// Shortest run-prefix match against the previous slice's tail suffix that
+/// counts as a head echo. Two shared units separate a re-read head from a
+/// coincidental function-word start; the full run matching is the stronger
+/// sub-case of the same rule.
+const DEGENERATE_RUN_ECHO_MIN_MATCH_UNITS: usize = 2;
 /// When a dropped run ends this close to the segment end, the drop extends to
 /// the segment end: a collapsed echo of a carried phrase leaves its closing
 /// token (the spread-out final punctuation word) outside the collapsed run,
@@ -4054,22 +4114,31 @@ const DEGENERATE_RUN_MIN_WORDS: usize = 3;
 /// eating more than a couple of words past its own tail.
 const DEGENERATE_RUN_TAIL_ABSORB_WORDS: usize = 2;
 
-/// Maximal collapsed runs in a word list, as half-open index ranges: a run
-/// starts at a word whose window is at or below
-/// [`DEGENERATE_RUN_MAX_WINDOW_SECONDS`] and extends over the following words
-/// that stay within that window, within
-/// [`DEGENERATE_RUN_MAX_SPREAD_SECONDS`] of the run's first start, and --
-/// the decisive shape -- stack onto one common instant (every run's word
-/// window overlaps every other at at least one point, i.e. the latest
-/// window start does not exceed the earliest window end). That separates the
-/// degenerate DTW floor (all slots on one instant) from a fluent triad like
-/// "You think I", whose three windows can be equally short but advance: the
-/// first word already ends before the last one starts. Runs shorter than
-/// [`DEGENERATE_RUN_MIN_WORDS`] are not runs. A qualifying run whose tail
-/// sits within [`DEGENERATE_RUN_TAIL_ABSORB_WORDS`] words of the segment end
-/// is extended to the end (see that constant), and overlapping or adjacent
-/// extensions are merged.
-fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
+/// A geometric candidate is dropped only on a second signal. Runs of at
+/// least [`DEGENERATE_RUN_LONG_MIN_WORDS`] words keep the historical
+/// any-touch rule (that density is past any fluent pace). A short run needs
+/// one of: a substantial shared instant (at least
+/// [`DEGENERATE_RUN_MIN_COMMON_SHORT_SECONDS`], the true floor pile sharing
+/// most of the window while fast triads only touch at a point); a
+/// head-echo match (the segment opens by re-reading the previous slice's
+/// tail, which no timing can excuse); or weak model confidence (median
+/// under [`DEGENERATE_RUN_MIN_MEDIAN_CONFIDENCE`], the hallucinated and
+/// stutter piles). Genuinely spoken fast piles survive all three and are
+/// kept. A qualifying run whose tail sits within
+/// [`DEGENERATE_RUN_TAIL_ABSORB_WORDS`] words of the segment end is extended
+/// to the end (see that constant), and overlapping or adjacent extensions
+/// are merged.
+///
+/// `prev_tail_units` carries the normalized tail of the previously decoded
+/// slice (see [`DEGENERATE_RUN_PREV_TAIL_UNITS`]); pass an empty slice when
+/// there is none (first slice, wordless families' single pass).
+/// `slice_head` marks the slice's first segment: only a segment head can
+/// open with a cross-slice echo, so the head-echo match runs nowhere else.
+fn find_collapsed_word_runs(
+    words: &[WordTimestamp],
+    prev_tail_units: &[String],
+    slice_head: bool,
+) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < words.len() {
@@ -4079,15 +4148,19 @@ fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
         }
         let mut j = i + 1;
         let mut min_end = words[i].end;
+        let mut max_start = words[i].start;
         while j < words.len()
             && words[j].end - words[j].start <= DEGENERATE_RUN_MAX_WINDOW_SECONDS
             && words[j].start - words[i].start <= DEGENERATE_RUN_MAX_SPREAD_SECONDS
             && words[j].start <= min_end
         {
             min_end = min_end.min(words[j].end);
+            max_start = max_start.max(words[j].start);
             j += 1;
         }
-        if j - i >= DEGENERATE_RUN_MIN_WORDS {
+        if j - i >= DEGENERATE_RUN_MIN_WORDS
+            && is_degenerate_run(&words[i..j], slice_head && i == 0, prev_tail_units)
+        {
             let end = if words.len() - j <= DEGENERATE_RUN_TAIL_ABSORB_WORDS {
                 words.len()
             } else {
@@ -4109,6 +4182,100 @@ fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
     merged
 }
 
+/// Second-signal verdict for one geometric pile candidate (`core` holds the
+/// run's words, already known to satisfy the window/spread/common-instant
+/// caps and the minimum length). `at_slice_head` is true only for a run
+/// opening the slice's first segment. See [`find_collapsed_word_runs`].
+fn is_degenerate_run(
+    core: &[WordTimestamp],
+    at_slice_head: bool,
+    prev_tail_units: &[String],
+) -> bool {
+    if core.len() >= DEGENERATE_RUN_LONG_MIN_WORDS {
+        return true;
+    }
+    let mut min_end = f32::INFINITY;
+    let mut max_start = f32::NEG_INFINITY;
+    for word in core {
+        min_end = min_end.min(word.end);
+        max_start = max_start.max(word.start);
+    }
+    if min_end - max_start >= DEGENERATE_RUN_MIN_COMMON_SHORT_SECONDS {
+        return true;
+    }
+    if at_slice_head
+        && head_echo_match_len(core, prev_tail_units) >= DEGENERATE_RUN_ECHO_MIN_MATCH_UNITS
+    {
+        return true;
+    }
+    if median_run_confidence(core)
+        .is_some_and(|median| median < DEGENERATE_RUN_MIN_MEDIAN_CONFIDENCE)
+    {
+        return true;
+    }
+    false
+}
+
+/// Median token confidence across a pile candidate, or `None` when any word
+/// lacks a score: the confidence signal abstains rather than guessing, so a
+/// missing alignment never deletes words on its own.
+fn median_run_confidence(core: &[WordTimestamp]) -> Option<f32> {
+    let mut scores: Vec<f32> = Vec::with_capacity(core.len());
+    for word in core {
+        scores.push(word.confidence?);
+    }
+    scores.sort_by(f32::total_cmp);
+    let mid = scores.len() / 2;
+    Some(if scores.len() % 2 == 1 {
+        scores[mid]
+    } else {
+        0.5 * (scores[mid - 1] + scores[mid])
+    })
+}
+
+/// Longest prefix of the pile's normalized units matching a suffix of the
+/// previous slice's normalized tail, in units. A slice-head pile re-reading
+/// the carried tail matches for its full length ("I'm in awe!" behind
+/// "...I'm in awe!") or at least its first words ("Rock. Rock. Rock."
+/// behind "...Rock. Rock."); a genuinely new head phrase matches nothing.
+/// Normalization is the assembler's word fold, so the match speaks the same
+/// language as the seam stitch.
+fn head_echo_match_len(core: &[WordTimestamp], prev_tail_units: &[String]) -> usize {
+    if prev_tail_units.len() < DEGENERATE_RUN_ECHO_MIN_MATCH_UNITS {
+        return 0;
+    }
+    let run_units: Vec<String> = core
+        .iter()
+        .flat_map(|word| crate::longform::normalize_words(&word.word))
+        .collect();
+    let max_match = run_units
+        .len()
+        .min(prev_tail_units.len())
+        .min(DEGENERATE_RUN_PREV_TAIL_UNITS);
+    for len in (DEGENERATE_RUN_ECHO_MIN_MATCH_UNITS..=max_match).rev() {
+        if run_units[..len] == prev_tail_units[prev_tail_units.len() - len..] {
+            return len;
+        }
+    }
+    0
+}
+
+/// Normalized tail units of a slice's decoded words, retained for the next
+/// slice's head-echo match. Only the tail matters (see
+/// [`DEGENERATE_RUN_PREV_TAIL_UNITS`]); an echo re-reads what immediately
+/// precedes it.
+fn tail_normalized_words(segments: &[Segment]) -> Vec<String> {
+    let mut units: Vec<String> = segments
+        .iter()
+        .flat_map(|segment| segment.words.iter())
+        .flat_map(|word| crate::longform::normalize_words(&word.word))
+        .collect();
+    if units.len() > DEGENERATE_RUN_PREV_TAIL_UNITS {
+        units.drain(..units.len() - DEGENERATE_RUN_PREV_TAIL_UNITS);
+    }
+    units
+}
+
 /// Drop collapsed word runs from a slice's decoded segments, re-deriving each
 /// touched segment's text (and the top-level text) from the surviving words.
 /// The word strings carry the decode's tokens verbatim -- punctuation and
@@ -4119,9 +4286,14 @@ fn find_collapsed_word_runs(words: &[WordTimestamp]) -> Vec<(usize, usize)> {
 /// content beyond its word list keeps its text untouched and contributes only
 /// the dropped words. Returns the dropped word count and the slice-relative
 /// `(start, end)` span of each dropped run.
+///
+/// `prev_tail_units` carries the previous slice's normalized tail for the
+/// head-echo match (see [`find_collapsed_word_runs`]); the caller owns
+/// advancing it from each slice's surviving words.
 fn drop_collapsed_word_runs(
     text: &mut String,
     segments: &mut [Segment],
+    prev_tail_units: &[String],
 ) -> (usize, Vec<(f32, f32)>) {
     let pre_drop_join = crate::transcript_text::join_segment_texts(
         segments
@@ -4130,8 +4302,8 @@ fn drop_collapsed_word_runs(
     );
     let mut dropped_words = 0usize;
     let mut dropped_spans: Vec<(f32, f32)> = Vec::new();
-    for segment in segments.iter_mut() {
-        let runs = find_collapsed_word_runs(&segment.words);
+    for (segment_index, segment) in segments.iter_mut().enumerate() {
+        let runs = find_collapsed_word_runs(&segment.words, prev_tail_units, segment_index == 0);
         if runs.is_empty() {
             continue;
         }
@@ -12257,6 +12429,19 @@ mod tests {
         }
     }
 
+    fn word_at_conf(word: &str, start: f32, end: f32, confidence: f32) -> WordTimestamp {
+        WordTimestamp {
+            word: word.to_string(),
+            start,
+            end,
+            confidence: Some(confidence),
+        }
+    }
+
+    fn tail_units(text: &str) -> Vec<String> {
+        crate::longform::normalize_words(text)
+    }
+
     fn segment_with_words(words: Vec<WordTimestamp>) -> (String, Segment) {
         let text =
             crate::transcript_text::join_segment_texts(words.iter().map(|word| word.word.trim()));
@@ -12292,11 +12477,11 @@ mod tests {
             word_at("dead", 2.82, 3.17),
             word_at("ne?\"", 2.97, 4.67),
         ];
-        let runs = find_collapsed_word_runs(&words);
+        let runs = find_collapsed_word_runs(&words, &[], false);
         assert_eq!(runs, vec![(1, 10)]);
         let (mut text, segment) = segment_with_words(words);
         let mut segments = vec![segment];
-        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
         assert_eq!(dropped, 9);
         assert_eq!(spans, vec![(2.82, 4.67)]);
         assert_eq!(
@@ -12326,7 +12511,7 @@ mod tests {
         ];
         let (mut text, segment) = segment_with_words(words);
         let mut segments = vec![segment];
-        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
         assert_eq!(dropped, 9);
         assert_eq!(spans, vec![(10.42, 10.62)]);
         assert!(segments[0].words.is_empty());
@@ -12350,12 +12535,227 @@ mod tests {
         let original = text.clone();
         let segment = segment_with_words(words.clone()).1;
         let mut segments = vec![segment];
-        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
         assert_eq!(dropped, 0);
         assert!(spans.is_empty());
         assert_eq!(text, original);
         assert_eq!(segments[0].words, words);
         assert_eq!(segments[0].text, original);
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_advancing_fast_triads() {
+        // Warriors shapes: three fast function words fit the window and
+        // spread caps and touch at one instant, but their starts advance
+        // ~0.1 s per word, so the shared instant is ~0.01 s wide -- fluent
+        // speech, not the degenerate floor. Each triad must survive intact.
+        for triad in [
+            [
+                ("Okay,", 3.50, 3.71),
+                ("you", 3.61, 3.81),
+                ("know", 3.71, 3.89),
+            ],
+            [
+                ("want", 6.48, 6.72),
+                ("to", 6.62, 6.81),
+                ("know", 6.71, 6.96),
+            ],
+            [
+                ("I", 25.18, 25.41),
+                ("need", 25.31, 25.50),
+                ("to", 25.40, 25.65),
+            ],
+        ] {
+            let words: Vec<WordTimestamp> = triad
+                .into_iter()
+                .map(|(word, start, end)| word_at(word, start, end))
+                .collect();
+            assert!(
+                find_collapsed_word_runs(&words, &[], false).is_empty(),
+                "advancing triad {} {} {} must not form a run",
+                words[0].word,
+                words[1].word,
+                words[2].word
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_short_pile_with_narrow_common_instant() {
+        // Warriors 154 s shape: three words share one DTW instant, but the
+        // shared width (0.10 s) is well under the floor-pile bar -- the
+        // phrase is real speech ("I need to go"), only mistimed onto one
+        // instant. A three-word pile needs a substantial shared instant to
+        // count as a degenerate echo.
+        let words = vec![
+            word_at("I", 1.34, 1.44),
+            word_at("need", 1.34, 1.44),
+            word_at("to", 1.34, 1.44),
+            word_at("go.", 1.34, 1.61),
+            word_at("Please", 1.51, 1.91),
+        ];
+        assert!(find_collapsed_word_runs(&words, &[], false).is_empty());
+    }
+
+    #[test]
+    fn collapsed_run_drop_still_drops_long_drifting_pile() {
+        // Warriors 52 s shape: ten words inside one 0.25 s spread whose
+        // starts creep 0.66 -> 0.73 while the shared instant is only 0.03 s
+        // wide. Nine are hallucination ("All right ... sing love rồi.") and
+        // one ("I") is real, but no word geometry separates them -- the mass
+        // keeps the historical any-touch rule and the whole pile is dropped.
+        // Recovering the "I" would mean keeping the hallucination with it.
+        let words = vec![
+            word_at("All", 0.66, 0.76),
+            word_at("right,", 0.66, 0.76),
+            word_at("all", 0.66, 0.76),
+            word_at("right.", 0.66, 0.79),
+            word_at("Okay,", 0.69, 0.83),
+            word_at("so", 0.73, 0.83),
+            word_at("sing", 0.73, 0.83),
+            word_at("love", 0.73, 0.83),
+            word_at("rồi.", 0.73, 0.83),
+            word_at("I", 0.73, 0.87),
+            word_at("need", 0.77, 1.03),
+            word_at("to", 0.93, 1.23),
+            word_at("go.", 1.13, 1.93),
+        ];
+        assert_eq!(find_collapsed_word_runs(&words, &[], false), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_confident_short_pile() {
+        // Warriors 154 s shape with measured confidences: three words share
+        // one DTW instant (common 0.10 s, under the strong-pile bar), but
+        // the median confidence is 0.983 -- genuinely spoken, only mistimed.
+        // The "want" triad is the same shape with one uncertain token
+        // (0.318): the median still clears the bar, so a single weak token
+        // cannot sink a spoken phrase.
+        for (triad, confidences) in [
+            (
+                [("I", 1.34, 1.44), ("need", 1.34, 1.44), ("to", 1.34, 1.44)],
+                [0.564, 0.983, 0.998],
+            ),
+            (
+                [
+                    ("want", 6.48, 6.72),
+                    ("to", 6.62, 6.81),
+                    ("know", 6.71, 6.96),
+                ],
+                [0.32, 0.972, 0.980],
+            ),
+        ] {
+            let words: Vec<WordTimestamp> = triad
+                .into_iter()
+                .zip(confidences)
+                .map(|((word, start, end), confidence)| word_at_conf(word, start, end, confidence))
+                .collect();
+            assert!(
+                find_collapsed_word_runs(&words, &[], true).is_empty(),
+                "confident pile {} {} {} must survive",
+                words[0].word,
+                words[1].word,
+                words[2].word
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_run_drop_drops_weak_short_pile() {
+        // Hallucinated piles over silence ("heat can Suggest" at
+        // 0.0/0.001/0.38) and collapsed stutter re-reads ("you're here now"
+        // at 0.514/0.803/0.782, median 0.782) share the weak-pile geometry
+        // of the kept phrase above but decode weakly: the median falls under
+        // the bar, so both are dropped.
+        for (triad, confidences) in [
+            (
+                [
+                    ("heat", 5.28, 5.38),
+                    ("can", 5.28, 5.38),
+                    ("Suggest", 5.28, 5.38),
+                ],
+                [0.0, 0.001, 0.38],
+            ),
+            (
+                [
+                    ("you're", 29.75, 29.85),
+                    ("here", 29.75, 29.85),
+                    ("now.", 29.75, 29.94),
+                ],
+                [0.514, 0.803, 0.782],
+            ),
+        ] {
+            let words: Vec<WordTimestamp> = triad
+                .into_iter()
+                .zip(confidences)
+                .map(|((word, start, end), confidence)| word_at_conf(word, start, end, confidence))
+                .collect();
+            assert_eq!(
+                find_collapsed_word_runs(&words, &[], true),
+                vec![(0, 3)],
+                "weak pile {} {} {} must drop",
+                words[0].word,
+                words[1].word,
+                words[2].word
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_run_drop_drops_head_echo_of_previous_tail() {
+        // Fluent echoes can score high ("awe!" at 1.0), past any confidence
+        // bar: what marks them is position plus text. A segment opening by
+        // re-reading the previous slice's tail is dropped on the match
+        // alone -- full-length ("I'm in awe!" behind "...I'm in awe!") or a
+        // two-unit prefix ("Rock. Rock. Rock." behind "...Rock. Rock.").
+        let echo = vec![
+            word_at_conf("I'm", 0.0, 0.1, 0.95),
+            word_at_conf("in", 0.0, 0.1, 0.95),
+            word_at_conf("awe!", 0.0, 0.25, 0.95),
+        ];
+        assert_eq!(
+            find_collapsed_word_runs(&echo, &tail_units("Look at me I'm in awe!"), true),
+            vec![(0, 3)]
+        );
+        let rocks = vec![
+            word_at_conf("Rock.", 0.0, 0.1, 0.9),
+            word_at_conf("Rock.", 0.0, 0.1, 0.9),
+            word_at_conf("Rock.", 0.0, 0.18, 0.9),
+        ];
+        assert_eq!(
+            find_collapsed_word_runs(
+                &rocks,
+                &tail_units("It was a rock lobster. Rock. Rock."),
+                true
+            ),
+            vec![(0, 3)]
+        );
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_new_head_phrase() {
+        // The same confident head pile is kept when the previous tail holds
+        // different audio ("I need to" behind "Let me go."): position plus
+        // text must agree before a head pile counts as an echo.
+        let words = vec![
+            word_at_conf("I", 1.34, 1.44, 0.94),
+            word_at_conf("need", 1.34, 1.44, 0.95),
+            word_at_conf("to", 1.34, 1.44, 0.96),
+            word_at_conf("go.", 1.34, 1.61, 0.99),
+        ];
+        assert!(find_collapsed_word_runs(&words, &tail_units("Let me go."), true).is_empty());
+    }
+
+    #[test]
+    fn collapsed_run_drop_confidence_abstains_on_missing_scores() {
+        // A weak-pile triad with one unscored word keeps: without a full
+        // score set the confidence signal abstains rather than guessing.
+        let words = vec![
+            word_at_conf("is", 2.75, 2.94, 0.1),
+            word_at("what", 2.84, 2.99),
+            word_at_conf("I'll", 2.89, 3.13, 0.1),
+        ];
+        assert!(find_collapsed_word_runs(&words, &[], true).is_empty());
     }
 
     #[test]
@@ -12366,7 +12766,7 @@ mod tests {
             word_at("really", 1.0, 1.3),
             word_at("?", 2.0, 2.2),
         ];
-        assert!(find_collapsed_word_runs(&words).is_empty());
+        assert!(find_collapsed_word_runs(&words, &[], false).is_empty());
     }
 
     #[test]
@@ -12381,7 +12781,7 @@ mod tests {
         ];
         let (mut text, segment) = segment_with_words(words);
         let mut segments = vec![segment];
-        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments);
+        let (dropped, spans) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
         // Three surviving words sit past the tail-absorb reach, so the drop
         // stops exactly at the run.
         assert_eq!(dropped, 3);
@@ -12412,7 +12812,7 @@ mod tests {
         let mut segment = segment_with_words(words).1;
         segment.text = text;
         let mut segments = vec![segment];
-        let (dropped, _) = drop_collapsed_word_runs(&mut original_text, &mut segments);
+        let (dropped, _) = drop_collapsed_word_runs(&mut original_text, &mut segments, &[]);
         assert_eq!(dropped, 3);
         assert_eq!(segments[0].words.len(), 3);
         // The text cannot be re-derived from the words, so it is untouched.

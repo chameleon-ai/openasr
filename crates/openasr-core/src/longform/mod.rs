@@ -6,6 +6,7 @@ mod slicing;
 mod timeline;
 mod vad;
 
+pub(crate) use assembler::normalize_words;
 pub use assembler::{
     LongFormAssembleStats, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
     TranscriptAssembler,
