@@ -142,6 +142,64 @@ const SEAM_REREAD_HEAD_MAX_WIDTH_RATIO: f32 = 0.5;
 /// the slot's reading owns the audio; a near-tie keeps both copies.
 const SEAM_TRUST_FLIP_HEAD_MARGIN: f32 = 0.3;
 
+/// Minimum normalized-unit length for cross-token similarity (below): short
+/// function words collide constantly by edit distance ("a"/"I", "to"/"too",
+/// "an"/"and"), so only content-length units participate. The acoustic vet
+/// still has to place both copies on the same audio.
+const SEAM_SIMILAR_MIN_UNIT_CHARS: usize = 3;
+
+/// True when two normalized overlap units are close enough to be alternative
+/// readings of the same audio (`hope`/`hose`, `miss`/`missed`,
+/// `relax`/`relaxing`): edit distance <= 1, <= 2 for units of length >= 4,
+/// or either a prefix of the other. Same-token pairs return false -- they
+/// belong to the stitch/reread/phantom rules, and similarity is the
+/// cross-token path only. Pure-numeric units never match (line numbers and
+/// counts collide digit-wise), nor do units below
+/// [`SEAM_SIMILAR_MIN_UNIT_CHARS`].
+fn units_text_similar(left: &str, right: &str) -> bool {
+    if left == right {
+        return false;
+    }
+    let (lc, rc) = (left.chars().count(), right.chars().count());
+    if lc < SEAM_SIMILAR_MIN_UNIT_CHARS || rc < SEAM_SIMILAR_MIN_UNIT_CHARS {
+        return false;
+    }
+    if left.bytes().all(|b| b.is_ascii_digit()) && right.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+    let dist = edit_distance(
+        &left.chars().collect::<Vec<_>>(),
+        &right.chars().collect::<Vec<_>>(),
+    );
+    dist <= 1 || (dist <= 2 && lc.min(rc) >= 4)
+}
+
+/// Levenshtein distance over char slices (units here are a few chars; the
+/// quadratic table is smaller than the words' own timestamp structs).
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            curr[j + 1] = (prev[j] + usize::from(ca != cb))
+                .min(prev[j + 1] + 1)
+                .min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongFormAssembleStats {
     pub skipped_silent_chunks: usize,
@@ -282,6 +340,17 @@ impl TranscriptAssembler {
                 self.speaker_scope_by_segment.push(speaker_scope);
                 cross_slice_seam = false;
                 continue;
+            }
+            // Cross-token similar seam pair: same audio read under different
+            // tokens with a clear confidence gap (see
+            // `try_merge_similar_seam_pair`). Runs between the exact stitch
+            // (which found no shared text) and the midpoint trim (which would
+            // drop or keep the head before it is compared).
+            if cross_slice_seam && self.try_merge_similar_seam_pair(&mut mapped) {
+                self.stats.duplicate_merge_count += 1;
+                if mapped.text.trim().is_empty() {
+                    continue;
+                }
             }
             // Time-domain overlap trim: drop any leading words / whole segments
             // whose audio lies in the region a prior slice already committed.
@@ -758,6 +827,137 @@ impl TranscriptAssembler {
         true
     }
 
+    /// Merge a cross-token similar seam pair: the committed tail word and a
+    /// head-region word of the new slice that read the same audio under
+    /// different tokens (`hope?`/`hose`, `miss`/`missed`). The suffix-prefix
+    /// stitch cannot see the pair (no shared text), the midpoint trim keeps
+    /// or drops heads without comparing them to the tail, and the B-side
+    /// rules refuse it (same-token-only reread; phantom needs a wide weak
+    /// head; trust-flip needs an uncertain committed word plus a head that
+    /// continues past the cut). This rule covers what those leave: a similar
+    /// pair on seam audio with a CLEAR confidence gap, dropping the weaker
+    /// reading whichever side it stands on. A near-tie keeps both copies
+    /// (status quo ante).
+    ///
+    /// All signals must agree, or both words stay. The committed copy is the
+    /// word the cut landed on (clamped at the previous end within jitter,
+    /// not a cap-pinned artifact); the head copy starts inside the seam and
+    /// reaches back over the committed word's audio (a similar pair on
+    /// disjoint audio is two genuine neighbors, never a re-read). Only the
+    /// first similar head-region word is considered, single normalized units
+    /// each side (phrase-level similarity is a different project), and a
+    /// similar pair that continues as a run is genuine repetition, not a seam
+    /// echo (mirrors the re-read rule's run guard).
+    ///
+    /// Runs between the suffix-prefix stitch (exact matches belong there)
+    /// and the midpoint trim (which would otherwise drop or keep the head
+    /// before it is compared). Returns `true` when a copy was dropped (the
+    /// caller counts the merge; an emptied current segment is dropped by the
+    /// caller, as with the phantom rule).
+    fn try_merge_similar_seam_pair(&mut self, current: &mut Segment) -> bool {
+        if self.approximate_word_timestamps {
+            return false;
+        }
+        let Some(previous) = self.segments.last() else {
+            return false;
+        };
+        let Some(committed) = previous.words.last().cloned() else {
+            return false;
+        };
+        let previous_end = previous.end;
+        let committed_units = normalize_words(&committed.word);
+        if committed_units.len() != 1 {
+            return false;
+        }
+        if previous_end - committed.end > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
+            || committed.end - previous_end > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS
+        {
+            return false;
+        }
+        if let Some(limit) = self.max_word_span_original_seconds
+            && committed.end - committed.start >= limit - 0.05
+        {
+            return false;
+        }
+        let head_idx = current.words.iter().position(|word| {
+            word.start < previous_end + SEGMENT_STITCH_REREAD_MAX_PAST_PREV_END_SECONDS
+                && word.start < committed.end
+                && normalize_words(&word.word).len() == 1
+                && units_text_similar(&committed_units[0], &normalize_words(&word.word)[0])
+        });
+        let Some(head_idx) = head_idx else {
+            return false;
+        };
+        let head = current.words[head_idx].clone();
+        let head_units = normalize_words(&head.word);
+        if current.words.get(head_idx + 1).is_some_and(|next| {
+            normalize_words(&next.word)
+                .iter()
+                .any(|unit| units_text_similar(unit, &head_units[0]))
+        }) {
+            return false;
+        }
+        let (Some(committed_confidence), Some(head_confidence)) =
+            (committed.confidence, head.confidence)
+        else {
+            return false;
+        };
+        if head_confidence >= committed_confidence + SEAM_TRUST_FLIP_HEAD_MARGIN {
+            let Some(previous) = self.segments.last_mut() else {
+                return false;
+            };
+            if previous.words.len() <= 1 {
+                return false;
+            }
+            let keep = previous.words.len() - 1;
+            let chars: Vec<char> = previous.text.chars().collect();
+            let new_text = match leading_word_char_offset(&chars, &previous.words, keep) {
+                Some(offset) => chars[..offset]
+                    .iter()
+                    .collect::<String>()
+                    .trim()
+                    .to_string(),
+                None => crate::transcript_text::join_segment_texts(
+                    previous.words[..keep].iter().map(|word| word.word.as_str()),
+                ),
+            };
+            if new_text.trim().is_empty() {
+                return false;
+            }
+            previous.words.pop();
+            previous.text = new_text;
+            return true;
+        }
+        if committed_confidence >= head_confidence + SEAM_TRUST_FLIP_HEAD_MARGIN {
+            let chars: Vec<char> = current.text.chars().collect();
+            let start_off = match leading_word_char_offset(&chars, &current.words, head_idx) {
+                Some(offset) => offset,
+                None => return false,
+            };
+            let end_off = if head_idx + 1 < current.words.len() {
+                match leading_word_char_offset(&chars, &current.words, head_idx + 1) {
+                    Some(offset) => offset,
+                    None => return false,
+                }
+            } else {
+                chars.len()
+            };
+            let new_text: String = chars[..start_off]
+                .iter()
+                .chain(chars[end_off..].iter())
+                .collect::<String>()
+                .trim()
+                .to_string();
+            current.words.drain(head_idx..head_idx + 1);
+            if let Some(first) = current.words.first() {
+                current.start = first.start;
+            }
+            current.text = new_text;
+            return true;
+        }
+        false
+    }
+
     /// Drop the previous segment's tail word when it is an A-side seam
     /// mis-decode: the cut landed mid-word, the previous slice emitted a
     /// cut-clamped fragment of it, and the next slice heard the straddling
@@ -783,6 +983,11 @@ impl TranscriptAssembler {
     ///
     /// Returns `true` when the previous tail word was dropped (the caller
     /// counts the merge; the current segment is untouched).
+    ///
+    /// Cross-token similar pairs (`hope?`/`hose`) are handled by
+    /// `try_merge_similar_seam_pair` instead: it runs earlier (right after
+    /// the suffix-prefix stitch), measures similarity rather than requiring
+    /// a token match, and drops whichever copy loses on confidence gap.
     fn drop_seam_misdecoded_tail(&mut self, current: &Segment) -> bool {
         if self.approximate_word_timestamps {
             return false;
@@ -2620,6 +2825,47 @@ mod tests {
     }
 
     #[test]
+    fn units_text_similar_matches_readings_of_same_audio() {
+        // True: near-identical mistranscriptions and stem variants.
+        for (left, right) in [
+            ("hope", "hose"),
+            ("miss", "missed"),
+            ("relax", "relaxing"),
+            ("plane", "crane"),
+        ] {
+            assert!(
+                units_text_similar(left, right),
+                "{left:?} vs {right:?} should read as similar"
+            );
+            assert!(
+                units_text_similar(right, left),
+                "similarity must be symmetric: {right:?} vs {left:?}"
+            );
+        }
+        // False: identical (same-token rules own it), short function words,
+        // numerics, and genuinely different words.
+        for (left, right) in [
+            ("hose", "hose"),
+            ("to", "too"),
+            ("a", "i"),
+            ("an", "and"),
+            ("2012", "2013"),
+            ("claire", "yeah"),
+            ("my", "again"),
+            ("straddle", "world"),
+        ] {
+            assert!(
+                !units_text_similar(left, right),
+                "{left:?} vs {right:?} must not read as similar"
+            );
+            assert!(
+                !units_text_similar(right, left),
+                "similarity must be symmetric: {right:?} vs {left:?}"
+            );
+        }
+    }
+
+    #[test]
     fn assembler_keeps_genuine_new_head_word_collapsed_onto_seam() {
         // The rye "My" shape at production confidence (0.956): the new
         // slice's first word sits behind the committed boundary only because
@@ -2655,6 +2901,149 @@ mod tests {
         assert_eq!(transcription.segments[1].text, "My tan");
         assert_eq!(transcription.segments[1].words.len(), 2);
         assert_eq!(transcription.segments[1].words[0].word, "My");
+    }
+
+    #[test]
+    fn assembler_keeps_similar_pair_on_confidence_tie() {
+        // Production `hope?`/`hose` numbers: similar units on seam audio
+        // (reach-back, cut-clamped committed copy, restart inside the seam)
+        // but a 0.027 confidence gap -- far below the direction margin. The
+        // merger declines and both copies survive (status quo ante); this
+        // pins the tie behavior the dataset measures.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(1_992_000, 2_010_400),
+            text: "Is there a hope?".to_string(),
+            segments: vec![absolute_segment(
+                "Is there a hope?",
+                124.60,
+                125.65,
+                vec![
+                    word_conf("Is", 124.60, 124.90, 0.90),
+                    word_conf("there", 124.90, 125.20, 0.90),
+                    word_conf("a", 125.17, 125.43, 0.757),
+                    word_conf("hope?", 125.33, 125.65, 0.546),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(1_994_400, 2_350_400),
+            text: "His air hose broke.".to_string(),
+            segments: vec![absolute_segment(
+                "His air hose broke.",
+                124.65,
+                130.00,
+                vec![
+                    word_conf("His", 124.85, 125.08, 0.90),
+                    word_conf("air", 124.98, 125.25, 0.90),
+                    word_conf("hose", 125.27, 125.72, 0.519),
+                    word_conf("broke.", 125.72, 126.30, 0.923),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        let text: String = transcription
+            .segments
+            .iter()
+            .map(|segment| segment.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("hope?") && text.contains("hose"),
+            "near-tie similar pair must keep both copies, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn assembler_merges_similar_pair_toward_certain_head() {
+        // Same seam shape with a clear gap: the committed copy is weak, the
+        // head certain -- the previous tail word goes, the head stays.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 176_000),
+            text: "a red plane".to_string(),
+            segments: vec![absolute_segment(
+                "a red plane",
+                9.00,
+                10.90,
+                vec![
+                    word_conf("a", 9.00, 9.30, 0.95),
+                    word_conf("red", 9.40, 9.90, 0.95),
+                    word_conf("plane", 10.00, 10.90, 0.30),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(171_200, 200_000),
+            text: "crane to fly".to_string(),
+            segments: vec![absolute_segment(
+                "crane to fly",
+                10.70,
+                12.50,
+                vec![
+                    word_conf("crane", 10.70, 11.50, 0.90),
+                    word_conf("to", 11.60, 12.00, 0.90),
+                    word_conf("fly", 12.10, 12.50, 0.90),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[0].text, "a red");
+        assert_eq!(transcription.segments[1].words[0].word, "crane");
+    }
+
+    #[test]
+    fn assembler_merges_similar_pair_toward_certain_committed() {
+        // Mirror image: the committed copy is certain, the head weak -- the
+        // head word goes, the committed tail stands.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 176_000),
+            text: "a red plane".to_string(),
+            segments: vec![absolute_segment(
+                "a red plane",
+                9.00,
+                10.90,
+                vec![
+                    word_conf("a", 9.00, 9.30, 0.95),
+                    word_conf("red", 9.40, 9.90, 0.95),
+                    word_conf("plane", 10.00, 10.90, 0.95),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(171_200, 200_000),
+            text: "crane to fly".to_string(),
+            segments: vec![absolute_segment(
+                "crane to fly",
+                10.70,
+                12.50,
+                vec![
+                    word_conf("crane", 10.70, 11.50, 0.30),
+                    word_conf("to", 11.60, 12.00, 0.90),
+                    word_conf("fly", 12.10, 12.50, 0.90),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "to fly");
+        assert_eq!(transcription.segments[1].words[0].word, "to");
+        assert!(
+            transcription.segments[0].text.contains("plane"),
+            "certain committed copy must stand, got {:?}",
+            transcription.segments[0].text
+        );
     }
 
     #[test]
