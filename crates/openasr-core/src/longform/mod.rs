@@ -9,7 +9,7 @@ mod vad;
 pub(crate) use assembler::normalize_words;
 pub use assembler::{
     LongFormAssembleStats, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
-    TranscriptAssembler,
+    TimelineAudioLevels, TranscriptAssembler,
 };
 pub(crate) use duration::{ExecutorWindowLimitError, executor_window_limit_samples};
 pub use options::{LongFormMode, LongFormOptions, LongFormOptionsError, LongFormVadOptions};

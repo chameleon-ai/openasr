@@ -34,6 +34,119 @@ impl Default for SegmentMergePolicy {
     }
 }
 
+/// Coarse level probe over a whole recording, for seam rules that must
+/// verify an emitted word corresponds to an audible event (see
+/// `drop_unverified_hook_echo`).
+///
+/// Built once per request on the original timeline: overlapping 100 ms RMS
+/// windows at a 50 ms hop, in dBFS against full-scale f32 samples, with
+/// digital silence clamped so every query returns a finite level. The bed
+/// query reports the 25th percentile of the windows inside a band, which
+/// tracks the low floor of steady music or room tone rather than a peak; a
+/// word window that sits no more than a few dB above that floor carries no
+/// voiced event.
+#[derive(Debug, Clone)]
+pub struct TimelineAudioLevels {
+    window_db: Vec<f32>,
+    hop_seconds: f32,
+    window_seconds: f32,
+    duration_seconds: f32,
+}
+
+impl TimelineAudioLevels {
+    const WINDOW_SECONDS: f32 = 0.1;
+    const HOP_SECONDS: f32 = 0.05;
+    /// Digital-silence level so every query returns a finite dB value.
+    const SILENCE_DB: f32 = -96.0;
+
+    pub fn from_samples(samples: &[f32], sample_rate_hz: u32) -> Option<Self> {
+        if samples.is_empty() || sample_rate_hz == 0 {
+            return None;
+        }
+        let rate = sample_rate_hz as f32;
+        let window = super::slicing::seconds_to_samples(Self::WINDOW_SECONDS, sample_rate_hz);
+        let hop = super::slicing::seconds_to_samples(Self::HOP_SECONDS, sample_rate_hz);
+        if window == 0 || hop == 0 {
+            return None;
+        }
+        let mut window_db = Vec::with_capacity(
+            samples
+                .len()
+                .saturating_sub(window)
+                .saturating_div(hop)
+                .saturating_add(2),
+        );
+        let mut index = 0usize;
+        while index < samples.len() {
+            let end = (index + window).min(samples.len());
+            let rms = super::slicing::rms(&samples[index..end]);
+            // dBFS against full-scale f32 (samples are normalized to [-1, 1]).
+            window_db.push(if rms > 0.0 {
+                (20.0_f64 * f64::from(rms).log10()) as f32
+            } else {
+                Self::SILENCE_DB
+            });
+            index = index.saturating_add(hop);
+        }
+        Some(Self {
+            hop_seconds: Self::HOP_SECONDS,
+            window_seconds: Self::WINDOW_SECONDS,
+            duration_seconds: samples.len() as f32 / rate,
+            window_db,
+        })
+    }
+
+    /// Strongest window overlapping `[start, end]`; `None` when less than
+    /// half the range sits inside the recording or no window overlaps it.
+    pub fn max_window_db(&self, start: f32, end: f32) -> Option<f32> {
+        self.overlap_fraction(start, end)?;
+        self.windows_overlapping(start, end)
+            .into_iter()
+            .max_by(|a, b| a.total_cmp(b))
+    }
+
+    /// 25th percentile of the windows overlapping `[start, end]`; `None`
+    /// when the band holds fewer than `HOOK_ECHO_MIN_BED_WINDOWS` windows.
+    pub fn bed_db(&self, start: f32, end: f32) -> Option<f32> {
+        self.overlap_fraction(start, end)?;
+        let mut levels = self.windows_overlapping(start, end);
+        if levels.len() < HOOK_ECHO_MIN_BED_WINDOWS {
+            return None;
+        }
+        levels.sort_by(|a, b| a.total_cmp(b));
+        let index = ((levels.len() - 1) * 25) / 100;
+        Some(levels[index])
+    }
+
+    fn windows_overlapping(&self, start: f32, end: f32) -> Vec<f32> {
+        self.window_db
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let t = *index as f32 * self.hop_seconds;
+                t < end - 1.0e-3 && t + self.window_seconds > start + 1.0e-3
+            })
+            .map(|(_, db)| *db)
+            .collect()
+    }
+
+    /// Fraction of `[start, end]` that lies inside the recorded timeline;
+    /// `None` when none of it does or the range is degenerate.
+    fn overlap_fraction(&self, start: f32, end: f32) -> Option<f32> {
+        let span = end - start;
+        if !span.is_finite() || span <= 0.0 {
+            return None;
+        }
+        let lo = start.max(0.0);
+        let hi = end.min(self.duration_seconds);
+        if hi <= lo {
+            return None;
+        }
+        let fraction = (hi - lo) / span;
+        (fraction >= 0.5).then_some(fraction)
+    }
+}
+
 /// Largest gap (seconds) between the last matched word in the previous segment
 /// and the first matched word in the current that the seam-stitch will accept
 /// when both segments carry **acoustic** (not interpolated) word timestamps. A
@@ -230,6 +343,10 @@ pub struct TranscriptAssembler {
     /// so the assembler re-clamps mapped words to this bound. `None` leaves
     /// word widths unclamped.
     max_word_span_original_seconds: Option<f32>,
+    /// Whole-recording level probe for the seam-hook veto (see
+    /// `drop_unverified_hook_echo`). `None` stands the rule down: families
+    /// or drivers without it assemble exactly as before.
+    audio_levels: Option<TimelineAudioLevels>,
 }
 
 impl TranscriptAssembler {
@@ -243,6 +360,7 @@ impl TranscriptAssembler {
             committed_end_original: None,
             approximate_word_timestamps: false,
             max_word_span_original_seconds: None,
+            audio_levels: None,
         }
     }
 
@@ -255,6 +373,12 @@ impl TranscriptAssembler {
 
     pub(crate) fn with_max_word_span_original_seconds(mut self, max_span: Option<f32>) -> Self {
         self.max_word_span_original_seconds = max_span;
+        self
+    }
+
+    /// Level probe for the seam-hook veto; see `TimelineAudioLevels`.
+    pub fn with_audio_levels(mut self, levels: Option<TimelineAudioLevels>) -> Self {
+        self.audio_levels = levels;
         self
     }
 
@@ -390,6 +514,17 @@ impl TranscriptAssembler {
             // the phantom rule: the trim may expose the re-read as the
             // surviving head.
             if cross_slice_seam && self.drop_seam_reread_head(trim_boundary, &mut mapped) {
+                self.stats.duplicate_merge_count += 1;
+                if mapped.text.trim().is_empty() {
+                    continue;
+                }
+            }
+            // Seam-hook veto: the committed tail's repeated unit was
+            // cap-pinned (still running across the cut) and this head
+            // re-echoes the unit, but the echo's window reads unvoiced
+            // (primed decode over a gap). Runs after the re-read rule, same
+            // post-trim placement.
+            if cross_slice_seam && self.drop_unverified_hook_echo(&mut mapped) {
                 self.stats.duplicate_merge_count += 1;
                 if mapped.text.trim().is_empty() {
                     continue;
@@ -824,6 +959,148 @@ impl TranscriptAssembler {
         // A re-read head was dropped. The remainder (if any) is genuine
         // continuation that still runs the redundancy check before it is
         // pushed.
+        true
+    }
+}
+
+/// How far inside the new slice a hook-equal head word may sit and still
+/// count as the seam echo of the committed tail's repeated unit (the
+/// cap-pinned hook rule below). Hook runs repeat a few copies per slice, so
+/// a genuine continuation copy lands well inside the slice, but the rule
+/// inspects the head region only: anything deeper is intra-slice decode
+/// territory, which the seam rules do not touch.
+const HOOK_ECHO_HEAD_LIMIT_SECONDS: f32 = 15.0;
+/// Band around the head word whose windows estimate the local bed (steady
+/// music / room tone) the word would sit on if unvoiced.
+const HOOK_ECHO_BED_BAND_SECONDS: f32 = 2.0;
+/// Fewer windows in the bed band than this and the bed estimate is
+/// unreliable, so the rule stands down.
+const HOOK_ECHO_MIN_BED_WINDOWS: usize = 8;
+/// The head word's strongest window vs the local bed, in dBFS: a head copy
+/// whose window sits no more than this above the bed carries no voiced event,
+/// whatever the primed decode claimed. A genuinely-sung copy sits far above
+/// the bed in every observed hook clip, and a quiet-but-real copy still
+/// clears this line.
+const HOOK_ECHO_UNVOICED_MARGIN_DB: f32 = 6.0;
+
+impl TranscriptAssembler {
+    /// Deployment override for the seam-hook veto below: default on;
+    /// `OPENASR_HOOK_ECHO_VETO=0` (or the `_DISABLE` variant) turns it off
+    /// without a rebuild, for A/B.
+    fn hook_echo_veto_enabled() -> bool {
+        crate::ggml_runtime::env_toggle_with_raw(
+            std::env::var("OPENASR_HOOK_ECHO_VETO_DISABLE")
+                .ok()
+                .as_deref(),
+            std::env::var("OPENASR_HOOK_ECHO_VETO").ok().as_deref(),
+            true,
+        )
+    }
+
+    /// Drop the new slice's head word when it is a seam echo of a repeated
+    /// unit the committed tail carried cap-pinned, and its own window reads
+    /// unvoiced.
+    ///
+    /// A cap-pinned tail word is a copy the placement could not seat: the
+    /// repeated unit was still running when the slice ended, so the next
+    /// slice's window starts inside (or just past) the live run, and a
+    /// hook-primed carry lets the decode emit the unit again at the slice
+    /// head. That head copy is real only if its stamped window still holds
+    /// an audible event; a primed decode that lands in a gap stamps its
+    /// echo on the music bed, with no voiced content behind it. The
+    /// window-vs-bed level call is the discriminator none of the earlier
+    /// seam rules have: the committed tail ended well before the current
+    /// head (the re-read rule's gap bound refuses it), the tokens match
+    /// (the phantom rule is same-token-blind), and the head sits past the
+    /// cap-discounted trim boundary (the midpoint trim keeps it).
+    ///
+    /// A voiced head window always stays, whatever else the shape looks
+    /// like: a genuine copy the previous slice under-emitted is exactly the
+    /// case where the window does carry an event, and it is the shape the
+    /// geometric gates alone would eat. Interpolated tiles carry no usable
+    /// level signal, so the rule stands down (with the rest of the seam
+    /// rules) for `approximate_word_timestamps`, and likewise without an
+    /// audio-level probe or a known family word-span cap.
+    ///
+    /// Runs after the midpoint overlap trim, the B-side phantom rule, and
+    /// the B-side re-read rule, the same post-trim placement the re-read
+    /// rule uses: the trim may first expose the echo as the surviving head.
+    /// Returns `true` when the head word was dropped (the caller counts the
+    /// merge and drops an emptied segment, as with the phantom rule).
+    fn drop_unverified_hook_echo(&self, current: &mut Segment) -> bool {
+        self.drop_unverified_hook_echo_impl(current, Self::hook_echo_veto_enabled())
+    }
+
+    fn drop_unverified_hook_echo_impl(&self, current: &mut Segment, enabled: bool) -> bool {
+        if !enabled || self.approximate_word_timestamps {
+            return false;
+        }
+        let Some(levels) = self.audio_levels.as_ref() else {
+            return false;
+        };
+        let Some(max_span) = self.max_word_span_original_seconds else {
+            return false;
+        };
+        let Some(previous) = self.segments.last() else {
+            return false;
+        };
+        let (Some(committed), Some(head)) = (previous.words.last(), current.words.first()) else {
+            return false;
+        };
+        if normalize_words(&committed.word) != normalize_words(&head.word)
+            || !head.word.chars().any(|ch| ch.is_ascii_alphabetic())
+        {
+            return false;
+        }
+        // The committed tail is a cap-pinned placement: its window reached
+        // the family max, i.e. the copy could not be seated and the unit is
+        // still running across the cut. (Same width test as the
+        // cap-discounted trim boundary above.)
+        if committed.end - committed.start < max_span - 0.05 {
+            return false;
+        }
+        if head.start > current.start + HOOK_ECHO_HEAD_LIMIT_SECONDS {
+            return false;
+        }
+        let (Some(window_db), Some(bed_db)) = (
+            levels.max_window_db(head.start, head.end),
+            levels.bed_db(
+                head.start - HOOK_ECHO_BED_BAND_SECONDS,
+                head.end + HOOK_ECHO_BED_BAND_SECONDS,
+            ),
+        ) else {
+            return false;
+        };
+        if window_db > bed_db + HOOK_ECHO_UNVOICED_MARGIN_DB {
+            // The window still carries an audible event above the local
+            // bed: a voiced copy, whatever else the shape is. Keep it.
+            return false;
+        }
+        crate::stage_timing::log_detail_event(
+            "longform_assembler",
+            format_args!(
+                "stage=longform_hook_echo_veto word={:?} window=[{:.2}..{:.2}]s window_db={:.1} bed_db={:.1} committed=[{:.2}..{:.2}]s",
+                head.word, head.start, head.end, window_db, bed_db, committed.start, committed.end,
+            ),
+        );
+        let chars: Vec<char> = current.text.chars().collect();
+        let new_text = match leading_word_char_offset(&chars, &current.words, 1) {
+            Some(offset) => chars[offset..]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+            // Words did not align to the text (unexpected): rebuild from the
+            // kept tokens rather than mis-slice the string.
+            None => crate::transcript_text::join_segment_texts(
+                current.words[1..].iter().map(|word| word.word.as_str()),
+            ),
+        };
+        current.words.drain(0..1);
+        if let Some(first) = current.words.first() {
+            current.start = first.start;
+        }
+        current.text = new_text;
         true
     }
 
@@ -2673,6 +2950,218 @@ mod tests {
         assert_eq!(transcription.segments[1].text, "mad indeed");
         assert_eq!(transcription.text, "hello world mad indeed");
         assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    /// Constant bed at `bed_db` (16 kHz, alternating +/- amplitude so the
+    /// windowed RMS is exact), with voiced `spikes` (start, end, db) carved
+    /// into it.
+    fn bed_samples_with(
+        bed_db: f32,
+        spikes: &[(f32, f32, f32)],
+        duration_seconds: u32,
+    ) -> Vec<f32> {
+        let rate = 16_000.0_f32;
+        let n = (duration_seconds as usize) * (rate as usize);
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / rate;
+            let level = spikes
+                .iter()
+                .find(|(start, end, _)| *start <= t && t < *end)
+                .map_or(bed_db, |(_, _, level)| *level);
+            let amp = 10_f32.powf(level / 20.0);
+            samples.push(if i % 2 == 0 { amp } else { -amp });
+        }
+        samples
+    }
+
+    /// Assembler in the seam-hook veto shape: whisper-family 1.5s word-span
+    /// cap plus a 26s recording whose voiced content is given by `spikes`.
+    fn hook_echo_assembler(spikes: &[(f32, f32, f32)]) -> TranscriptAssembler {
+        let samples = bed_samples_with(-57.0, spikes, 26);
+        let levels = TimelineAudioLevels::from_samples(&samples, 16_000).unwrap();
+        TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+            .with_max_word_span_original_seconds(Some(1.5))
+            .with_audio_levels(Some(levels))
+    }
+
+    /// Push slice 2 of the seam shape: it opens with a head word (usually a
+    /// 'Relax.' echo of the committed tail at 12.70-13.30s, 9.2s behind the
+    /// committed tail, so past the re-read rule's gap bound) and continues
+    /// with new words.
+    fn push_hook_slice2(assembler: &mut TranscriptAssembler, head_word: &str) {
+        let text = format!("{head_word} glad you are here");
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(128_000, 400_000),
+            text: text.clone(),
+            segments: vec![absolute_segment(
+                &text,
+                13.20,
+                20.0,
+                vec![
+                    word(head_word, 12.70, 13.30),
+                    word("glad", 14.5, 14.8),
+                    word("you", 14.9, 15.2),
+                    word("are", 15.3, 15.5),
+                    word("here", 15.7, 16.1),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+    }
+
+    /// Push the seam pair the veto inspects: slice 1 ends on a cap-pinned
+    /// 'relax.' (a 1.6s window over a 0.3s real burst at 9.3-9.8s), then
+    /// slice 2 in the shape above.
+    fn push_hook_seam_pair(assembler: &mut TranscriptAssembler) {
+        push_hook_slice1_cap_pinned(assembler);
+        push_hook_slice2(assembler, "Relax.");
+    }
+
+    /// Slice 1 of the seam shape with a cap-pinned tail 'relax.'.
+    fn push_hook_slice1_cap_pinned(assembler: &mut TranscriptAssembler) {
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 160_000),
+            text: "please relax.".to_string(),
+            segments: vec![absolute_segment(
+                "please relax.",
+                8.0,
+                10.86,
+                vec![word("please", 9.0, 9.2), word("relax.", 9.26, 10.86)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+    }
+
+    #[test]
+    fn hook_echo_veto_drops_unvoiced_seam_echo() {
+        // The echo's window sits at the bed (no spike in 12.7-13.3): the
+        // primed decode placed the unit in a gap, so the copy is dropped and
+        // the continuation keeps its head.
+        let mut assembler = hook_echo_assembler(&[(9.3, 9.8, -30.0)]);
+        push_hook_seam_pair(&mut assembler);
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[0].text, "please relax.");
+        assert_eq!(transcription.segments[1].text, "glad you are here");
+        assert_eq!(transcription.segments[1].words.len(), 4);
+        assert_eq!(transcription.segments[1].start, 14.5);
+        assert_eq!(stats.duplicate_merge_count, 1);
+    }
+
+    #[test]
+    fn hook_echo_veto_keeps_voiced_seam_echo() {
+        // A sung copy: the echo's window carries an event 27dB above the
+        // bed. Whatever the geometric shape, the level call keeps it.
+        let mut assembler = hook_echo_assembler(&[(9.3, 9.8, -30.0), (12.7, 13.3, -30.0)]);
+        push_hook_seam_pair(&mut assembler);
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "Relax. glad you are here");
+        assert_eq!(transcription.segments[1].words.len(), 5);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    /// Slice 1 of the seam shape with a normally-seated tail 'relax.'
+    /// (0.8s window): the cap-pin premise is absent.
+    fn push_hook_slice1_plain(assembler: &mut TranscriptAssembler) {
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 160_000),
+            text: "please relax.".to_string(),
+            segments: vec![absolute_segment(
+                "please relax.",
+                8.0,
+                10.86,
+                vec![word("please", 9.0, 9.2), word("relax.", 9.26, 10.06)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+    }
+
+    #[test]
+    fn hook_echo_veto_stands_down_without_cap_pinned_tail() {
+        // The committed tail is a normally-seated word (0.8s window): the
+        // "run still active across the cut" premise is absent, and the echo
+        // is a genuine back-to-back copy.
+        let mut assembler = hook_echo_assembler(&[(9.3, 9.8, -30.0)]);
+        push_hook_slice1_plain(&mut assembler);
+        push_hook_slice2(&mut assembler, "Relax.");
+        let (transcription, stats) = assembler.into_parts();
+        let echo: Vec<_> = transcription
+            .segments
+            .iter()
+            .filter(|segment| segment.text == "Relax. glad you are here")
+            .collect();
+        assert_eq!(echo.len(), 1);
+        assert_eq!(echo[0].words.len(), 5);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn hook_echo_veto_stands_down_on_different_text() {
+        // No shared unit between committed tail and head: nothing to echo.
+        let mut assembler = hook_echo_assembler(&[(9.3, 9.8, -30.0)]);
+        push_hook_slice1_cap_pinned(&mut assembler);
+        push_hook_slice2(&mut assembler, "Rock.");
+        let (transcription, stats) = assembler.into_parts();
+        let echo: Vec<_> = transcription
+            .segments
+            .iter()
+            .filter(|segment| segment.text == "Rock. glad you are here")
+            .collect();
+        assert_eq!(echo.len(), 1);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn hook_echo_veto_impl_gates_on_enable_flag() {
+        // Same seam, driven through the impl directly so the enable gate
+        // itself is what flips the behavior, independent of the test
+        // environment.
+        let mut assembler = hook_echo_assembler(&[(9.3, 9.8, -30.0)]);
+        push_hook_slice1_cap_pinned(&mut assembler);
+        let words = || {
+            vec![
+                word("Relax.", 12.70, 13.30),
+                word("glad", 14.5, 14.8),
+                word("you", 14.9, 15.2),
+                word("are", 15.3, 15.5),
+                word("here", 15.7, 16.1),
+            ]
+        };
+        let mut current = absolute_segment("Relax. glad you are here", 13.20, 20.0, words());
+        let off_dropped = assembler.drop_unverified_hook_echo_impl(&mut current, false);
+        assert!(!off_dropped);
+        assert_eq!(current.words.len(), 5);
+        let mut current = absolute_segment("Relax. glad you are here", 13.20, 20.0, words());
+        let on_dropped = assembler.drop_unverified_hook_echo_impl(&mut current, true);
+        assert!(on_dropped);
+        assert_eq!(current.words.len(), 4);
+        assert_eq!(current.text, "glad you are here");
+        assert_eq!(current.start, 14.5);
+    }
+
+    #[test]
+    fn timeline_audio_levels_reports_window_and_bed() {
+        let samples = bed_samples_with(-57.0, &[(10.0, 10.3, -30.0)], 26);
+        let levels = TimelineAudioLevels::from_samples(&samples, 16_000).unwrap();
+        // The strongest window over the spike region lands on the spike.
+        let window = levels.max_window_db(9.9, 10.4).unwrap();
+        assert!((window - (-30.0)).abs() < 1.0, "window {window}");
+        // A region of pure bed reads at the bed.
+        let bed_window = levels.max_window_db(3.0, 3.5).unwrap();
+        assert!(
+            (bed_window - (-57.0)).abs() < 1.0,
+            "bed window {bed_window}"
+        );
+        // The bed percentile sits at the bed even with a spike in the band.
+        let bed = levels.bed_db(9.5, 11.0).unwrap();
+        assert!((bed - (-57.0)).abs() < 1.0, "bed {bed}");
+        // Ranges that mostly miss the recording and bands too small to
+        // estimate a bed both answer None.
+        assert!(levels.max_window_db(50.0, 51.0).is_none());
+        assert!(levels.bed_db(0.0, 0.15).is_none());
+        assert!(TimelineAudioLevels::from_samples(&[], 16_000).is_none());
     }
 
     #[test]

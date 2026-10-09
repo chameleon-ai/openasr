@@ -28,7 +28,7 @@ use crate::longform::plan_longform_slices;
 use crate::longform::{
     AudioSlice, AudioSliceKind, LongFormMode, LongFormSliceError, LongFormSlicePlanningError,
     LongFormVadProvider, LongFormVadSlice, SegmentMergePolicy, SegmentTimeDomain, SliceTranscript,
-    TranscriptAssembler, VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES,
+    TimelineAudioLevels, TranscriptAssembler, VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES,
     plan_longform_slices_with_materialization_gate, vad_speech_spans_overlap_samples,
 };
 use crate::models::decode_policy_component_registry::{
@@ -3015,6 +3015,21 @@ fn run_native_transcription_impl(
             });
         }
         if has_processed_audio || !whole_file_single_slice {
+            // Silence packing necessarily creates different samples; move
+            // that Vec into one new immutable backing. Identity plans clone
+            // only the original backing handle. Every slice below is a range
+            // view into whichever one applies.
+            let plan_audio = plan
+                .processed_audio
+                .take()
+                .map(PcmBuffer::from_vec)
+                .unwrap_or_else(|| prepared_audio.clone());
+            // Whole-recording level probe for the assembler's seam-hook
+            // veto (see `TranscriptAssembler::with_audio_levels`): built
+            // once here, O(recording / 50ms) in the one place that owns the
+            // timeline samples.
+            let audio_levels =
+                TimelineAudioLevels::from_samples(plan_audio.as_slice(), plan.sample_rate_hz);
             // Re-deriving word spans at a stitched seam is only meaningful for
             // families that *generate* their spans by uniform token tiling
             // (DecodeInvariant worded-stitch families: qwen, moonshine, the
@@ -3034,7 +3049,8 @@ fn run_native_transcription_impl(
                         crate::arch::max_word_span_original_seconds_for_model_architecture(
                             selected_family.model_architecture,
                         ),
-                    );
+                    )
+                    .with_audio_levels(audio_levels);
             let mut rolling_prompt = request_options.prompt.clone().unwrap_or_default();
             let mut rolling_prompt_token_ids: Vec<u32> = Vec::new();
             // Normalized tail of the previously decoded slice, for the
@@ -3047,15 +3063,6 @@ fn run_native_transcription_impl(
                 longform_prompt_carry_mode(&longform_options, selected_family.model_architecture);
             let mut ran_any_slice = false;
             let mut suppressed_slice_count = 0usize;
-            // Silence packing necessarily creates different samples; move
-            // that Vec into one new immutable backing. Identity plans clone
-            // only the original backing handle. Every slice below is a range
-            // view into whichever one applies.
-            let plan_audio = plan
-                .processed_audio
-                .take()
-                .map(PcmBuffer::from_vec)
-                .unwrap_or_else(|| prepared_audio.clone());
             // Publish per-slice decode progress for the UI, weighted by each
             // slice's audio samples so the bar tracks decode time rather than slice
             // number. The forced-align refine (if any) continues the same monotonic
