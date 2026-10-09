@@ -86,6 +86,25 @@ const SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS: f32 = 0.1;
 /// it in every observed seam.
 const SEGMENT_STITCH_REHOME_MAX_RESTART_GAP_SECONDS: f32 = 0.5;
 
+/// How far back before the trim boundary the committed-overlap trim looks
+/// for the previous segment's words a dropped head word could echo
+/// (`trim_committed_overlap`, below). The lookback covers the widest
+/// inter-slice overlap (the 2 s forced ceiling) plus stamp jitter; anything
+/// older cannot be a re-read of audio this seam re-heard.
+const TRIM_TAIL_MATCH_LOOKBACK_SECONDS: f32 = 2.5;
+
+/// Minimum confidence for a behind-boundary head word with no committed-tail
+/// match to survive the overlap trim (below). A genuinely-new head word
+/// collapsed onto the seam by slice-head timestamping can still carry the
+/// certainty of the slice that heard it whole (rye "My" at 0.956); a
+/// mistranscribed straddle or hallucinated head is decoded weakly (committed
+/// fragments at <=0.455, the "If," family by definition). Mirrors the B-side
+/// phantom rule's weak/strong split. Strong hallucinations (an "Audi!" at
+/// 0.99) still pass this gate -- that leak rate is measured in suite A/Bs
+/// via overlaps/MISMATCH, not modeled here. Confidence-less words keep the
+/// old positional behavior.
+const SEAM_TRIM_HEAD_MIN_CONFIDENCE: f32 = 0.5;
+
 /// Confidence ceiling of the new slice's head word for the B-side seam
 /// phantom rule (below). A re-read of audio the previous slice already
 /// committed is a second, weaker decode of that same audio, so the artifact
@@ -268,8 +287,16 @@ impl TranscriptAssembler {
             // whose audio lies in the region a prior slice already committed.
             // Skip when stitch already consumed the re-read; interpolated
             // seq2seq words would otherwise delete the matching prefix.
+            // The per-word drop is content-gated on the committed tail (see
+            // `trim_committed_overlap`): a genuinely-new head word the slice
+            // stamped onto the seam survives.
             if let Some(boundary) = trim_boundary
-                && trim_committed_overlap(&mut mapped, boundary)
+                && let Some(previous) = self.segments.last()
+                && trim_committed_overlap(
+                    &mut mapped,
+                    boundary,
+                    &prev_tail_match_units(previous, boundary),
+                )
             {
                 self.stats.duplicate_merge_count += 1;
                 continue;
@@ -1284,7 +1311,23 @@ fn crop_processed_window_to_elision_flank(
 /// Leading committed words are dropped and the segment text is reconstructed
 /// from the surviving word span (exact substring of the original text, so CJK
 /// and glued punctuation stay intact); a segment left empty is dropped.
-fn trim_committed_overlap(segment: &mut Segment, boundary: f32) -> bool {
+/// Normalized tail units of the committed previous segment that a trimmed
+/// head word could echo: words reaching into [`TRIM_TAIL_MATCH_LOOKBACK_SECONDS`]
+/// before the trim boundary. See `trim_committed_overlap`.
+fn prev_tail_match_units(previous: &Segment, boundary: f32) -> Vec<String> {
+    previous
+        .words
+        .iter()
+        .filter(|word| word.end >= boundary - TRIM_TAIL_MATCH_LOOKBACK_SECONDS)
+        .flat_map(|word| normalize_words(&word.word))
+        .collect()
+}
+
+fn trim_committed_overlap(
+    segment: &mut Segment,
+    boundary: f32,
+    prev_tail_units: &[String],
+) -> bool {
     // Whole segment already behind the committed frontier: drop it outright.
     // (This is the standalone-orphan shape, e.g. a hallucinated 1-word cue.)
     if segment.end <= boundary {
@@ -1297,10 +1340,37 @@ fn trim_committed_overlap(segment: &mut Segment, boundary: f32) -> bool {
         // the segment as a unit.
         return false;
     }
-    let first_keep = segment
-        .words
-        .iter()
-        .position(|word| 0.5 * (word.start + word.end) >= boundary);
+    // Leading words whose majority sits behind the boundary are re-reads of
+    // committed audio -- but only when they are wholly behind it or their
+    // content matches the committed tail. A word reaching past the boundary
+    // owns uncommitted audio too, so with no tail match it goes only when
+    // weak: a genuinely-new head word collapsed onto the seam by slice-head
+    // timestamping can still carry the certainty of the slice that heard it
+    // whole (see SEAM_TRIM_HEAD_MIN_CONFIDENCE), while a mistranscribed
+    // straddle or hallucinated head is decoded weakly. Punctuation-only and
+    // confidence-less heads keep the old behavior. The suffix-prefix stitch,
+    // phantom, and re-read rules downstream still handle what these gates
+    // let through.
+    let first_keep = segment.words.iter().position(|word| {
+        if 0.5 * (word.start + word.end) >= boundary {
+            return true;
+        }
+        if word.end <= boundary {
+            return false;
+        }
+        let units = normalize_words(&word.word);
+        if units.is_empty()
+            || units
+                .iter()
+                .any(|unit| prev_tail_units.iter().any(|tail| tail == unit))
+        {
+            return false;
+        }
+        matches!(
+            word.confidence,
+            Some(confidence) if confidence >= SEAM_TRIM_HEAD_MIN_CONFIDENCE
+        )
+    });
     let Some(first_keep) = first_keep else {
         // Every word's majority sits in the committed region.
         return true;
@@ -2438,6 +2508,8 @@ mod tests {
     fn assembler_trims_straddling_word_with_majority_before_boundary() {
         // Same cut, but the leading word's midpoint (0.925s) is before the
         // boundary, so the word belongs to the prior slice and is trimmed.
+        // Confidence-less words keep this positional behavior under the
+        // content-gated trim (see SEAM_TRIM_HEAD_MIN_CONFIDENCE).
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
         assembler.push_slice_result(SliceTranscript {
@@ -2467,6 +2539,236 @@ mod tests {
         assert_eq!(transcription.segments[1].text, "tail");
         assert_eq!(transcription.segments[1].words.len(), 1);
         assert_eq!(transcription.segments[1].words[0].word, "tail");
+    }
+
+    #[test]
+    fn assembler_keeps_certain_mismatched_straddling_head() {
+        // Same geometry, but the straddling head carries certainty: it is a
+        // genuine reading that owns audio past the cut, so it survives. The
+        // double-claim cost (both slices own [0.75, 0.9] under different
+        // tokens) is measured in suite A/Bs via overlaps/MISMATCH, not here.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "straddle tail".to_string(),
+            segments: vec![absolute_segment(
+                "straddle tail",
+                0.75,
+                1.60,
+                vec![
+                    word_conf("straddle", 0.75, 1.10, 0.92),
+                    word("tail", 1.30, 1.60),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "straddle tail");
+        assert_eq!(transcription.segments[1].words.len(), 2);
+        assert_eq!(transcription.segments[1].words[0].word, "straddle");
+    }
+
+    #[test]
+    fn assembler_drops_weak_mismatched_straddling_head() {
+        // Same geometry with a weak head: a mistranscribed straddle or
+        // hallucinated head is decoded weakly and goes with the re-reads.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "hello world".to_string(),
+            segments: vec![absolute_segment(
+                "hello world",
+                0.1,
+                0.9,
+                vec![word("hello", 0.1, 0.4), word("world", 0.5, 0.9)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(12_000, 32_000),
+            text: "straddle tail".to_string(),
+            segments: vec![absolute_segment(
+                "straddle tail",
+                0.75,
+                1.60,
+                vec![
+                    word_conf("straddle", 0.75, 1.10, 0.30),
+                    word("tail", 1.30, 1.60),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "tail");
+        assert_eq!(transcription.segments[1].words.len(), 1);
+        assert_eq!(transcription.segments[1].words[0].word, "tail");
+    }
+
+    #[test]
+    fn assembler_keeps_genuine_new_head_word_collapsed_onto_seam() {
+        // The rye "My" shape at production confidence (0.956): the new
+        // slice's first word sits behind the committed boundary only because
+        // slice-head timestamping stamped it at window open. Certain, reaching
+        // past the boundary, and sharing no content with the committed tail,
+        // so the trim must keep it (the old positional rule ate it).
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "green again!".to_string(),
+            segments: vec![absolute_segment(
+                "green again!",
+                0.5,
+                0.97,
+                vec![word("green", 0.5, 0.8), word("again!", 0.85, 0.97)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(14_000, 30_000),
+            text: "My tan".to_string(),
+            segments: vec![absolute_segment(
+                "My tan",
+                0.875,
+                1.40,
+                vec![word_conf("My", 0.875, 1.10, 0.956), word("tan", 1.15, 1.40)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "My tan");
+        assert_eq!(transcription.segments[1].words.len(), 2);
+        assert_eq!(transcription.segments[1].words[0].word, "My");
+    }
+
+    #[test]
+    fn assembler_drops_weak_new_head_word_collapsed_onto_seam() {
+        // Same seam with a weak head: without certainty the collapsed word is
+        // indistinguishable from a hallucinated head, so it goes with the
+        // re-reads. Recovery through this gate is partial by construction.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "green again!".to_string(),
+            segments: vec![absolute_segment(
+                "green again!",
+                0.5,
+                0.97,
+                vec![word("green", 0.5, 0.8), word("again!", 0.85, 0.97)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(14_000, 30_000),
+            text: "My tan".to_string(),
+            segments: vec![absolute_segment(
+                "My tan",
+                0.875,
+                1.40,
+                vec![word_conf("My", 0.875, 1.10, 0.30), word("tan", 1.15, 1.40)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "tan");
+        assert_eq!(transcription.segments[1].words.len(), 1);
+        assert_eq!(transcription.segments[1].words[0].word, "tan");
+    }
+
+    #[test]
+    fn assembler_still_trims_exact_reread_prefix_on_tail_match() {
+        // Same geometry as the "My" test, but the head word re-emits the
+        // committed tail verbatim: the tail-content match fires and the
+        // re-read prefix is still trimmed.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "green again!".to_string(),
+            segments: vec![absolute_segment(
+                "green again!",
+                0.5,
+                0.97,
+                vec![word("green", 0.5, 0.8), word("again!", 0.85, 0.97)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(14_000, 30_000),
+            text: "again! My tan".to_string(),
+            segments: vec![absolute_segment(
+                "again! My tan",
+                0.875,
+                1.40,
+                vec![
+                    word("again!", 0.875, 1.02),
+                    word("My", 1.03, 1.20),
+                    word("tan", 1.21, 1.40),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "My tan");
+        assert_eq!(transcription.segments[1].words.len(), 2);
+        assert_eq!(transcription.segments[1].words[0].word, "My");
+    }
+
+    #[test]
+    fn assembler_still_trims_punctuation_only_head() {
+        // A punctuation-only head carries no content to match: keeps the old
+        // drop behavior rather than littering seams with filler.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000),
+            text: "green again!".to_string(),
+            segments: vec![absolute_segment(
+                "green again!",
+                0.5,
+                0.97,
+                vec![word("green", 0.5, 0.8), word("again!", 0.85, 0.97)],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(14_000, 30_000),
+            text: "... My tan".to_string(),
+            segments: vec![absolute_segment(
+                "... My tan",
+                0.875,
+                1.40,
+                vec![
+                    word("...", 0.875, 0.95),
+                    word("My", 1.03, 1.20),
+                    word("tan", 1.21, 1.40),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+        let transcription = assembler.into_transcription();
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[1].text, "My tan");
+        assert_eq!(transcription.segments[1].words.len(), 2);
     }
 
     #[test]
