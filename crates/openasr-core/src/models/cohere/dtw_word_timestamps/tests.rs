@@ -1578,3 +1578,159 @@ fn cohere_reanchor_dtw_token_centers_noop_without_envelope() {
     );
     assert_eq!(out[1].center_seconds, 2.8);
 }
+
+// ---------------------------------------------------------------------------
+// reanchor: sub-sustain blip skipping in the backward walk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cohere_reanchor_dtw_token_centers_skips_a_sub_sustain_blip_to_the_word_tail() {
+    let decode = |ids: &[u32]| -> Result<String, ()> {
+        match ids {
+            [100] => Ok("it".to_string()),
+            [100, 101] => Ok("it?".to_string()),
+            _ => Err(()),
+        }
+    };
+    // Thin floor 0.01 (contrast 20x against the 0.20 run). The word's own run
+    // is [40,70) (0.20), a 2-frame blip at [90,92) sits between it and the
+    // punctuation entry (frame 100, 2.0 s). The pre-skip walk would stop on the
+    // blip (shorter than the onset sustain) and refuse; the skip budget carries
+    // the walk past it to the word's tail, anchoring at frame 69 -> 1.4 s.
+    let mut envelope = vec![0.01f32; 750];
+    for level in envelope[40..70].iter_mut() {
+        *level = 0.20;
+    }
+    for level in envelope[90..92].iter_mut() {
+        *level = 0.20;
+    }
+    let out = cohere_reanchor_dtw_token_centers(
+        vec![reanchor_token(100, 0.85), reanchor_token(101, 2.0)],
+        &decode,
+        Some(&envelope),
+    );
+    assert!(
+        (out[1].center_seconds - 1.4).abs() < 1e-3,
+        "a sub-sustain blip must not steal the anchor; center={}",
+        out[1].center_seconds
+    );
+}
+
+// ---------------------------------------------------------------------------
+// onset refiner: head hunt (Rule 2 window-start veto)
+// ---------------------------------------------------------------------------
+
+/// 15 s, 0.02 s envelope (750 frames) at a 0.001 noise floor, a single 0.5 peak
+/// at 8 s (frame 400) sets the clip peak (thin floor). A word window at
+/// [2.0, 4.0) (frames 100..200): a near-floor head (0.0016, above the 1.19x head
+/// line, below the 1.78x speech line) at the window start, and a loud core
+/// (0.002) straddling the window end (frames 195..215).
+fn onset_head_fixture(head_span: std::ops::Range<usize>) -> Vec<f32> {
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[head_span.start.min(200)..head_span.end.min(200)].iter_mut() {
+        *level = 0.0016;
+    }
+    for level in envelope[195..215].iter_mut() {
+        *level = 0.002;
+    }
+    envelope
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_when_the_window_opens_on_a_quiet_head() {
+    // A dense (10-frame) near-floor cluster spanning the window's own start is a
+    // real onset head at 0.8x the core's peak: the fold already placed the word
+    // on its head, so the push to the loud core is refused outright.
+    let envelope = onset_head_fixture(100..110);
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!(
+        (out[1].start - 2.0).abs() < 1e-4,
+        "a dense window-start head must veto the push; start={}",
+        out[1].start
+    );
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_pushes_when_the_window_head_is_too_short_to_be_a_head() {
+    // Only 6 dense frames at the window start: below the 10-frame span floor that
+    // proves a real head, so the patch is treated as breath and the push proceeds
+    // to the loud core (first above-threshold run at frame 195 = 3.9 s).
+    let envelope = onset_head_fixture(100..106);
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!(
+        (out[1].start - 3.9).abs() < 0.05,
+        "a short window-start patch is not a head; push proceeds to the core; start={}",
+        out[1].start
+    );
+}
+
+// ---------------------------------------------------------------------------
+// offset refiner: trailing-tail lookahead
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cohere_dtw_offset_tail_lookahead_is_eight_frames() {
+    assert_eq!(
+        cohere_dtw_offset_tail_lookahead_frames(),
+        COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES
+    );
+    assert_eq!(COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES, 8);
+}
+
+/// A 200-frame region at a 0.0001 floor, a 0.25 sustained run over [100,130)
+/// (anchors at frame 129) and a 0.05 two-frame decaying blip just past it.
+fn offset_tail_fixture() -> Vec<f32> {
+    let mut region = vec![0.0001f32; 200];
+    for level in region[100..130].iter_mut() {
+        *level = 0.25;
+    }
+    region[130] = 0.05;
+    region[131] = 0.05;
+    region
+}
+
+#[test]
+fn cohere_dtw_offset_tail_end_extends_over_a_silenced_blip() {
+    // A 2-frame blip a couple of frames past the anchor, followed by silence: the
+    // decaying tail, the offset extends over it (frame 129 -> 131).
+    let region = offset_tail_fixture();
+    let end = cohere_dtw_offset_tail_end(&region, 129, 0.0005, 2, 8);
+    assert_eq!(end, 131, "a silenced blip extends the offset over the tail");
+}
+
+#[test]
+fn cohere_dtw_offset_tail_end_refuses_a_blip_running_into_the_next_onset() {
+    // The blip runs straight into the next word (no trailing quiet): that is the
+    // next word's audio, not this word's tail -- the anchor stands.
+    let mut region = offset_tail_fixture();
+    for level in region[132..160].iter_mut() {
+        *level = 0.25;
+    }
+    let end = cohere_dtw_offset_tail_end(&region, 129, 0.0005, 2, 8);
+    assert_eq!(end, 129, "a blip with no trailing silence keeps the anchor");
+}
+
+#[test]
+fn cohere_dtw_offset_tail_end_is_a_noop_at_zero_lookahead() {
+    // A 0 lookahead disables the scan: the offset stands as found even with a
+    // silenced blip behind the anchor.
+    let region = offset_tail_fixture();
+    let end = cohere_dtw_offset_tail_end(&region, 129, 0.0005, 2, 0);
+    assert_eq!(end, 129, "a 0 lookahead disables the tail scan");
+}
+
+#[test]
+fn cohere_dtw_offset_tail_end_refuses_a_blip_past_the_lookahead() {
+    // A silenced blip sits one frame past the 3-frame lookahead: out of reach,
+    // the anchor stands.
+    let mut region = vec![0.0001f32; 200];
+    for level in region[100..130].iter_mut() {
+        *level = 0.25;
+    }
+    region[133] = 0.05; // 4 frames past the anchor (129) -- past a 3 lookahead
+    let end = cohere_dtw_offset_tail_end(&region, 129, 0.0005, 2, 3);
+    assert_eq!(end, 129, "a blip past the lookahead keeps the anchor");
+}

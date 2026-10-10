@@ -156,6 +156,22 @@ fn cohere_dtw_thin_floor_peak_of_median() -> f64 {
 /// dB above the chunk's own noise floor (the median envelope level) that counts
 /// as real speech, for the onset pass.
 const COHERE_DTW_ONSET_FLOOR_MARGIN_DB: f64 = 5.0;
+/// dB above the chunk's own noise floor (the median envelope level) that counts
+/// as real speech, for the offset pass; the trailing-silence counterpart of
+/// [`COHERE_DTW_ONSET_FLOOR_MARGIN_DB`].
+const COHERE_DTW_OFFSET_FLOOR_MARGIN_DB: f64 = 5.0;
+
+/// The offset floor margin in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`COHERE_DTW_OFFSET_FLOOR_MARGIN_DB`]). A bare environment is
+/// byte-identical to the constant.
+fn cohere_dtw_offset_floor_margin_db() -> f64 {
+    std::env::var("OPENASR_COHERE_DTW_OFFSET_FLOOR_MARGIN_DB")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(COHERE_DTW_OFFSET_FLOOR_MARGIN_DB)
+}
+
 /// dB below the search region's own peak that still counts as that word's audio
 /// for the offset pass, so a quiet word over a music bed is judged against its
 /// own level rather than the chunk-wide floor.
@@ -165,6 +181,18 @@ const COHERE_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB: f64 = 12.0;
 /// word's onset / offset, in envelope frames of 0.02 s (0.1 s of speech).
 const COHERE_DTW_ONSET_SUSTAIN_FRAMES: usize = 5;
 const COHERE_DTW_OFFSET_SUSTAIN_FRAMES: usize = 5;
+
+/// Shorter onset runs that may still qualify when they follow a genuine pause.
+/// A word with a weak, fragmented onset (a quiet /iz/, a fricative blip) can
+/// clear the speech floor for only a frame or two before dipping again; the
+/// strict sustain test skips it and the fold parks the start inside the
+/// preceding pause. Accepting a short run is only trusted right after a real
+/// inter-word pause -- a blip a few frames after the previous word's decay is
+/// still weak evidence.
+const COHERE_DTW_ONSET_SHORT_SUSTAIN_FRAMES: usize = 2;
+/// How much continuous below-floor quiet must precede a short onset run for it
+/// to be trusted (a real inter-word pause, not a glottal dip).
+const COHERE_DTW_ONSET_SHORT_MIN_QUIET_S: f32 = 0.4;
 
 /// Minimum run of silence between two speech runs, in seconds, so a run that
 /// merely touches a brief inter-word glottal gap is not treated as a real pause.
@@ -209,10 +237,79 @@ fn cohere_dtw_onset_edge_lead_s() -> f32 {
         .unwrap_or(COHERE_DTW_ONSET_EDGE_LEAD_S)
 }
 
+/// Minimum level, relative to the word's own loud core, for a detected head
+/// cluster to count as the word's onset head. Both head rules gate on it: an
+/// onset head is speech of the same utterance as the core, while a dense patch
+/// of pause noise or breath reads far weaker. Raising it makes the head hunt
+/// stricter -- fewer words re-targeted, and fewer parked words lose a good core
+/// push to a noise "head".
+const COHERE_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO: f64 = 0.7;
+
+/// dB above the chunk's own noise floor (the median envelope level) that a
+/// word's quiet onset head may sit at and still be recognized as speech. A
+/// fricative or aspirate head reads at a small multiple of the floor -- far
+/// below the [`COHERE_DTW_ONSET_FLOOR_MARGIN_DB`] line the sustained-run search
+/// uses -- so the head hunt is judged against this lower line. Kept
+/// deliberately close to the floor: higher, and scattered breath or room tone
+/// chains into false heads; lower, and real heads on dense chunks read as
+/// silence.
+const COHERE_DTW_ONSET_HEAD_MARGIN_DB: f64 = 1.5;
+
+/// The head margin in use, honoring the deployment env override so a tuning
+/// pass can sweep it without a rebuild. A bare environment falls back to the
+/// compiled default, staying byte-identical to it.
+fn cohere_dtw_onset_head_margin_db() -> f64 {
+    std::env::var("OPENASR_COHERE_DTW_ONSET_HEAD_MARGIN_DB")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(COHERE_DTW_ONSET_HEAD_MARGIN_DB)
+}
+
+/// Minimum frames above the head line in a head cluster. Shorter than the
+/// sustained-run requirement: an onset head rises and dips through frication,
+/// so a real head shreds under the core's five-consecutive test.
+const COHERE_DTW_ONSET_HEAD_SUSTAIN_FRAMES: usize = 4;
+
+/// Below-line frames tolerated inside a head cluster before it splits. Mirrors
+/// the offset pass's run gap tolerance: a word's onset head rises through
+/// fricative micro-silences shorter than this.
+const COHERE_DTW_ONSET_HEAD_GAP_TOLERANCE_FRAMES: usize = 3;
+
+/// Share of frames within a head cluster's span that must sit above the head
+/// line. A real head is dense; scattered breath or room tone hovers at the
+/// floor without forming a dense cluster.
+const COHERE_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION: f64 = 0.55;
+
+/// Minimum span, in envelope frames (0.2 s), of a dense cluster at the
+/// window's own start before it proves the fold placed the word on its onset
+/// head and the push to the loud core is refused. A shorter burst at the edge
+/// is breath or bleed-through, not a head -- parked words whose pauses carry
+/// scattered noise must still fire.
+const COHERE_DTW_ONSET_HEAD_WINDOW_START_SPAN_FRAMES: usize = 10;
+
 /// Below-floor frames tolerated inside a speech run before it splits. A word's
 /// offset tail decays through coarticulatory micro-silences shorter than this;
 /// without the tolerance the run shreds and no qualifying offset is found.
 const COHERE_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES: usize = 3;
+
+/// Frames past a word's sustained-run offset the trailing-tail scan may reach
+/// for a sub-sustain blip (a decaying fricative, a final burst) that is the
+/// word's own audio. The sustain gate refuses such a blip as an anchor, so
+/// without this the offset lands before it and cuts the tail. 0 disables the
+/// scan and the offset stands as found. Honored with the deployment
+/// env-override convention as the other DTW tunables.
+const COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES: usize = 8;
+
+/// The offset tail lookahead in use, honoring the deployment env override so a
+/// tuning pass can sweep it without a rebuild (see
+/// [`COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES`]). A bare environment falls back
+/// to the compiled default.
+fn cohere_dtw_offset_tail_lookahead_frames() -> usize {
+    std::env::var("OPENASR_COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(COHERE_DTW_OFFSET_TAIL_LOOKAHEAD_FRAMES)
+}
 
 /// Consecutive frames above the silence ceiling before a hollow region stops
 /// reading as silence. A single bed-crackle frame is not a music floor (that
@@ -234,6 +331,36 @@ const COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS: f32 = 3.5;
 /// Envelope frames read forward from the token's center before the center is
 /// treated as sitting in a pause.
 const COHERE_DTW_REANCHOR_ENTRY_QUIET_FRAMES: usize = 4;
+/// Consecutive frames over the ceiling inside the backward pause walk before
+/// the walk refuses: more than this is a bed, not a pause crackle.
+const COHERE_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES: usize = 4;
+/// Sustain length of the preceding speech run that may anchor a reanchor pull.
+/// One frame shorter than the full onset sustain: a real word's tail frequently
+/// decays under the floor by its last 20 ms, and the trusted-gap and max-jump
+/// checks already reject noise blips.
+const COHERE_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES: usize = 4;
+/// Sustain length of the run that may truncate the entry quiet window when a
+/// sustained onset bleeds into it: shorter than the word-speech runs because
+/// the next word's weak onset still counts.
+const COHERE_DTW_REANCHOR_NEXT_RUN_SUSTAIN_FRAMES: usize = 3;
+/// Sub-sustain runs (a fricative tail, a click) between the token's center and
+/// the word's own offset do not veto the reanchor: the backward walk skips past
+/// them, deducting their frames from this budget, and keeps looking for a
+/// sustained run that still clears
+/// [`COHERE_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES`]. A 0 budget is the old walk --
+/// a sub-sustain first run refuses the pull. The kept bounding of the total
+/// jump to the final anchor means a far anchor still fails closed.
+const COHERE_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES: usize = 8;
+
+/// Deployment env override for the reanchor skipped-blip budget
+/// ([`COHERE_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES`]). A bare environment falls
+/// back to the compiled default, staying byte-identical to it.
+fn cohere_dtw_reanchor_max_skipped_blip_frames() -> usize {
+    std::env::var("OPENASR_COHERE_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(COHERE_DTW_REANCHOR_MAX_SKIPPED_BLIP_FRAMES)
+}
 
 /// Deployment env override for the reanchor minimum gap
 /// ([`COHERE_DTW_REANCHOR_MIN_GAP_SECONDS`]).
@@ -251,6 +378,80 @@ fn cohere_dtw_reanchor_max_jump_seconds() -> f32 {
         .ok()
         .and_then(|raw| raw.parse::<f32>().ok())
         .unwrap_or(COHERE_DTW_REANCHOR_MAX_JUMP_SECONDS)
+}
+
+/// The anchor the reanchor's backward pause walk settled on: the index of the
+/// last frame of the sustained speech run, and how many sub-sustain blip frames
+/// the walk skipped to reach it (0 without a skip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReanchorAnchor {
+    end_frame: usize,
+    skipped_blip_frames: usize,
+}
+
+/// The reanchor's backward search for the sustained speech run that may anchor
+/// a pull (see [`cohere_reanchor_dtw_token_centers`]): walk back from the
+/// token's center over the trusted-silence frames that separate it from the run.
+/// The walk stops at the frame-array edge (no preceding speech) or at a
+/// sustained above-ceiling stretch (a music bed, not a pause); a few crackle
+/// frames crossing the ceiling inside a deep pause do not stop it.
+///
+/// The first run of at least
+/// [`COHERE_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES`] frames above the floor is the
+/// anchor: a real word tail, not a noise blip. A shorter run is skipped instead
+/// of ending the search when the budget allows (its frames are deducted from it
+/// and the walk resumes at the frame before the blip): a fricative tail of the
+/// word's own offset is what the pull targets, and a click after it must not
+/// steal the anchor. A blip wider than the remaining budget, or one met after
+/// the budget is spent, returns `None` -- with a 0 budget that is every
+/// sub-sustain run, the pre-skip walk's fail-closed behavior. The run found this
+/// way is still screened by the caller's gap gate, so a far anchor fails closed
+/// exactly as before.
+fn cohere_reanchor_find_anchor(
+    levels: &[f32],
+    entry_frame: usize,
+    threshold: f64,
+    silence_ceiling: f64,
+    max_skipped_blip_frames: usize,
+) -> Option<ReanchorAnchor> {
+    let mut scan = entry_frame;
+    let mut crossing_run = 0usize;
+    let mut blip_budget = max_skipped_blip_frames;
+    while scan > 0 {
+        let level = f64::from(levels[scan - 1]);
+        if level >= threshold {
+            let mut run_start = scan - 1;
+            while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
+                run_start -= 1;
+            }
+            let run_length = scan - run_start;
+            if run_length >= COHERE_DTW_REANCHOR_ANCHOR_SUSTAIN_FRAMES {
+                return Some(ReanchorAnchor {
+                    end_frame: scan - 1,
+                    skipped_blip_frames: max_skipped_blip_frames - blip_budget,
+                });
+            }
+            if run_length > blip_budget {
+                return None;
+            }
+            blip_budget -= run_length;
+            // A blip is a speech event: ceiling crackle on either side of it is
+            // counted afresh, not across it.
+            crossing_run = 0;
+            scan = run_start;
+            continue;
+        }
+        if level > silence_ceiling {
+            crossing_run += 1;
+            if crossing_run > COHERE_DTW_REANCHOR_CEILING_GAP_TOLERANCE_FRAMES {
+                return None;
+            }
+        } else {
+            crossing_run = 0;
+        }
+        scan -= 1;
+    }
+    None
 }
 
 /// The level a region may reach before it stops reading as trusted silence.
@@ -436,6 +637,8 @@ fn cohere_reanchor_dtw_token_centers<E>(
     let last_frame = levels.len() - 1;
     let min_gap = f64::from(cohere_dtw_reanchor_min_gap_seconds());
     let max_jump = f64::from(cohere_dtw_reanchor_max_jump_seconds());
+    let blip_budget = cohere_dtw_reanchor_max_skipped_blip_frames();
+    let debug_reanchor = std::env::var_os("OPENASR_COHERE_DEBUG_REANCHOR").is_some();
 
     // Pass 1 (mirrors the fold's): the incremental prefix decode gives every
     // token the text piece the fold will attribute to it -- the all-punctuation
@@ -493,55 +696,74 @@ fn cohere_reanchor_dtw_token_centers<E>(
         let entry_frame = ((entry_secs / envelope_spf) as usize).min(last_frame);
         // Trusted pause at the center: the same mean / ceiling / active-fraction
         // tests the edge refiners apply to a word half, over a short run of
-        // frames from the center.
-        let quiet_end = (entry_frame + COHERE_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        // frames from the center. When a sustained speech run begins inside that
+        // short window -- the entry sits in the quieter last sliver before the
+        // next word's onset -- the window is truncated at that run and re-tested
+        // over the remaining sliver. Otherwise the next onset's rising edge
+        // bleeding into the window would veto a pull that the sliver alone
+        // supports.
+        let mut quiet_end = (entry_frame + COHERE_DTW_REANCHOR_ENTRY_QUIET_FRAMES).min(last_frame);
+        if f64::from(levels[entry_frame]) < threshold {
+            let mut probe = entry_frame + 1;
+            while probe <= quiet_end {
+                if f64::from(levels[probe]) >= threshold {
+                    let mut run_end = probe;
+                    while run_end < last_frame && f64::from(levels[run_end + 1]) >= threshold {
+                        run_end += 1;
+                    }
+                    if run_end - probe + 1 >= COHERE_DTW_REANCHOR_NEXT_RUN_SUSTAIN_FRAMES {
+                        quiet_end = probe - 1;
+                        break;
+                    }
+                }
+                probe += 1;
+            }
+        }
         let quiet = &levels[entry_frame..=quiet_end];
         let quiet_mean =
             quiet.iter().map(|sample| f64::from(*sample)).sum::<f64>() / quiet.len() as f64;
-        let quiet_max = quiet
-            .iter()
-            .map(|sample| f64::from(*sample))
-            .fold(0.0_f64, f64::max);
         let quiet_above = quiet
             .iter()
             .filter(|sample| f64::from(**sample) >= threshold)
             .count() as f64
             / quiet.len() as f64;
-        if quiet_mean >= threshold || quiet_max > silence_ceiling || quiet_above > 0.5 {
+        // A sustained run above the ceiling means a bed or breath; an isolated
+        // crackle frame must not veto an otherwise trusted sliver.
+        let mut crossing_run = 0usize;
+        let mut ceiling_sustained = false;
+        for &sample in quiet {
+            crossing_run = if f64::from(sample) > silence_ceiling {
+                crossing_run + 1
+            } else {
+                0
+            };
+            if crossing_run >= COHERE_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES {
+                ceiling_sustained = true;
+                break;
+            }
+        }
+        if quiet_mean >= threshold || ceiling_sustained || quiet_above > 0.5 {
             continue;
         }
-        // The nearest preceding sustained speech run: walk back over the
-        // trusted-silence frames that separate the center from it. The walk
-        // stops at the frame-array edge (no preceding speech) or at a frame above
-        // the silence ceiling (a music bed, not a pause).
-        let mut scan = entry_frame;
-        let mut run_end: Option<usize> = None;
-        while scan > 0 {
-            let level = f64::from(levels[scan - 1]);
-            if level >= threshold {
-                run_end = Some(scan - 1);
-                break;
-            }
-            if level > silence_ceiling {
-                break;
-            }
-            scan -= 1;
-        }
-        let Some(end) = run_end else {
+        // The anchor: the nearest preceding sustained speech run, with
+        // sub-sustain blips between the center and it skipped within the blip
+        // budget (the fricative tail of the word's own offset must not steal
+        // the anchor). At a 0 budget the walk fails closed on the first
+        // sub-sustain run it meets, the pre-skip behavior.
+        let Some(anchor) = cohere_reanchor_find_anchor(
+            levels,
+            entry_frame,
+            threshold,
+            silence_ceiling,
+            blip_budget,
+        ) else {
             continue;
         };
-        let mut run_start = end;
-        while run_start > 0 && f64::from(levels[run_start - 1]) >= threshold {
-            run_start -= 1;
-        }
-        // The anchor must be real speech, not a noise blip: at least the onset
-        // sustain length of frames above the floor.
-        if end - run_start + 1 < COHERE_DTW_ONSET_SUSTAIN_FRAMES {
-            continue;
-        }
+        let end = anchor.end_frame;
         // The silent gap between the run's end and the center must be a real
-        // pause: clearly past the fold's calibration error, and short enough to be
-        // an intra-word linger rather than a larger drift.
+        // pause: clearly past the fold's calibration error, and short enough to
+        // be an intra-word linger rather than a larger drift. Measured to the
+        // final anchor, so a far anchor fails closed as before.
         let gap_secs = entry_secs - (end as f64 + 1.0) * envelope_spf;
         if !(min_gap..=max_jump).contains(&gap_secs) {
             continue;
@@ -550,9 +772,10 @@ fn cohere_reanchor_dtw_token_centers<E>(
         // fold clamps centers non-decreasing, so the pulled center can never run
         // ahead of the previous word's.
         let target_secs = (end as f64 + 1.0) * envelope_spf;
-        if std::env::var_os("OPENASR_COHERE_DEBUG_REANCHOR").is_some() {
+        if debug_reanchor {
             eprintln!(
-                "cohere reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (preceding run ends at frame {end})"
+                "cohere reanchor: piece={piece:?} entry={entry_secs:.2}s -> pulled to {target_secs:.2}s (skipped {} blip frame(s); preceding run ends at frame {end})",
+                anchor.skipped_blip_frames,
             );
         }
         token_time.center_seconds = target_secs as f32;
@@ -728,6 +951,8 @@ fn cohere_refine_dtw_word_onsets(
         let region = &levels[frame_start..region_frame_end + 1];
         let region_len = region.len();
         let region_above = |index: usize| f64::from(region[index]) >= threshold;
+        let short_min_quiet_frames =
+            ((COHERE_DTW_ONSET_SHORT_MIN_QUIET_S as f64) / envelope_spf).ceil() as usize;
         let mut onset_rel: Option<usize> = None;
         let mut index = 0usize;
         while index < region_len && onset_rel.is_none() {
@@ -736,14 +961,18 @@ fn cohere_refine_dtw_word_onsets(
                 while run_end + 1 < region_len && region_above(run_end + 1) {
                     run_end += 1;
                 }
-                if run_end - index + 1 >= COHERE_DTW_ONSET_SUSTAIN_FRAMES {
+                if run_end - index + 1 >= COHERE_DTW_ONSET_SHORT_SUSTAIN_FRAMES {
                     let mut quiet = 0usize;
                     let mut probe = index;
                     while probe > 0 && !region_above(probe - 1) {
                         probe -= 1;
                         quiet += 1;
                     }
-                    if quiet >= min_quiet_frames {
+                    let full_run = run_end - index + 1 >= COHERE_DTW_ONSET_SUSTAIN_FRAMES;
+                    let short_run_after_pause = run_end - index + 1
+                        < COHERE_DTW_ONSET_SUSTAIN_FRAMES
+                        && quiet >= short_min_quiet_frames;
+                    if (full_run && quiet >= min_quiet_frames) || short_run_after_pause {
                         onset_rel = Some(index);
                     }
                 }
@@ -755,7 +984,118 @@ fn cohere_refine_dtw_word_onsets(
         let Some(rel) = onset_rel else {
             continue;
         };
-        let onset_s = ((frame_start + rel) as f64 * envelope_spf) as f32;
+        // A word that begins with a quiet or fragmented onset head (a fricative
+        // or aspirate that dips in and out of the speech floor) defeats the
+        // strict sustained-run test: the first qualifying run is the word's loud
+        // core, and landing the start there parks it mid-word. Two head-hunt
+        // rules guard the core landing, both using gap-tolerant clusters
+        // (coarticulatory dips do not split them, mirroring the offset pass's run
+        // tolerance). A cluster is (above-line frame count, span from its first
+        // above-line frame):
+        let head_cluster = |line: f64, first: usize| -> (usize, usize) {
+            let mut above = 0usize;
+            let mut last_above = first;
+            let mut below_gap = 0usize;
+            let mut probe = first;
+            while probe < rel {
+                if f64::from(region[probe]) >= line {
+                    above += 1;
+                    last_above = probe;
+                    below_gap = 0;
+                } else {
+                    below_gap += 1;
+                    if below_gap > COHERE_DTW_ONSET_HEAD_GAP_TOLERANCE_FRAMES {
+                        break;
+                    }
+                }
+                probe += 1;
+            }
+            (above, last_above - first + 1)
+        };
+        // The core's own strict run (its first frames can still be the vowel's
+        // ramp): long enough to reach its level, short enough to exclude the
+        // next word's audio. Both head rules compare their cluster's peak
+        // against it -- a real onset head is speech of the same utterance as the
+        // core, a noise patch is not.
+        let mut core_end = rel;
+        while core_end + 1 < region.len() && region_above(core_end + 1) {
+            core_end += 1;
+        }
+        let core_peak = region[rel..=core_end]
+            .iter()
+            .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)));
+        let cluster_peak = |first: usize, span: usize| -> f64 {
+            region[first..first + span]
+                .iter()
+                .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)))
+        };
+        // A head landing is legal only if it clears the push bounds and does not
+        // invert the window -- the same test the core landing must pass. A
+        // cluster that cannot produce a legal push is not the word's onset at
+        // all (a patch of pause noise sitting a few hundredths in), and is
+        // treated as no head rather than as one.
+        let legal_landing = |landing: usize| -> bool {
+            let landing_s = ((frame_start + landing) as f64 * envelope_spf) as f32;
+            let push = landing_s - raw_start as f32;
+            f64::from(landing_s) < raw_end
+                && (COHERE_DTW_ONSET_MIN_PUSH_S..=COHERE_DTW_ONSET_MAX_PUSH_S).contains(&push)
+        };
+        // Rule 1 -- a head inside the skipped region: a dense cluster at the full
+        // speech floor is the word's real onset; land on it instead of the core.
+        // Clusters are maximal by construction, so one starting at or past
+        // `min_quiet_frames` always has a real below-floor run ahead of it -- the
+        // previous word's decaying tail can never qualify. The peak gate keeps a
+        // dense *noise* patch in a parked word's front from reading as the word's
+        // head, and the legality test keeps an unusable candidate from both
+        // re-targeting the push and (below) suppressing the window-start veto.
+        let mut head_rel: Option<usize> = None;
+        let mut index = min_quiet_frames;
+        while index < rel && head_rel.is_none() {
+            if f64::from(region[index]) >= threshold {
+                let (above, span) = head_cluster(threshold, index);
+                if above >= COHERE_DTW_ONSET_HEAD_SUSTAIN_FRAMES
+                    && above as f64 / span as f64 >= COHERE_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION
+                    && cluster_peak(index, span)
+                        >= core_peak * COHERE_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
+                    && legal_landing(index)
+                {
+                    head_rel = Some(index);
+                }
+                index += span;
+            } else {
+                index += 1;
+            }
+        }
+        let core_s = ((frame_start + rel) as f64 * envelope_spf) as f32;
+        let onset_s = head_rel.map_or(core_s, |head| {
+            ((frame_start + head) as f64 * envelope_spf) as f32
+        });
+        // Rule 2 -- the window already opens on the head: a dense cluster of
+        // near-floor audio spanning the window's own start proves the fold
+        // placed the word on its onset head, so the loud run ahead is the word's
+        // core and the push is refused. Only consulted when no legal mid-region
+        // head qualified: a window-start cluster coexisting with a real onset
+        // deeper in the region is pre-onset noise, not the word. The span floor
+        // keeps a short breath burst at the edge from vetoing a genuine
+        // parked-word push, and the peak ratio keeps pause noise (far weaker than
+        // the core) from masquerading as a head even when it chains into a long
+        // cluster.
+        if head_rel.is_none() {
+            let head_line = noise_floor * 10.0_f64.powf(cohere_dtw_onset_head_margin_db() / 20.0);
+            if let Some(first) =
+                (0..min_quiet_frames.min(rel)).find(|&i| f64::from(region[i]) >= head_line)
+            {
+                let (above, span) = head_cluster(head_line, first);
+                if above >= COHERE_DTW_ONSET_HEAD_SUSTAIN_FRAMES
+                    && span >= COHERE_DTW_ONSET_HEAD_WINDOW_START_SPAN_FRAMES
+                    && above as f64 / span as f64 >= COHERE_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION
+                    && cluster_peak(first, span)
+                        >= core_peak * COHERE_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
+                {
+                    continue;
+                }
+            }
+        }
         // A run that lies entirely past the window end would land the start at
         // or beyond the word's own end, inverting the window; the word's end
         // would have to move too -- a rehouse, not an edge correction. Refuse it
@@ -773,6 +1113,60 @@ fn cohere_refine_dtw_word_onsets(
         word.start = onset_s;
     }
     words
+}
+
+/// A trailing fricative tail past a word's sustained-run offset: the index in
+/// `region` of the last above-`floor` frame within `lookahead_frames` past
+/// `anchor_end` that real silence follows, or `anchor_end` when there is none.
+///
+/// The sustain gate refuses a 1-2 frame sibilant blip as an anchor, so the
+/// offset pass would land before it and cut the word's own tail. The blip still
+/// counts when it sits just past the sustained run and silence follows it -- a
+/// decaying /s/ or final burst, not the next word. A blip running straight into
+/// the next onset (no trailing quiet) or sitting past the lookahead keeps the
+/// anchor: at a 0 lookahead the offset always stands as found. Only ever
+/// extends, never retreats, and never past `anchor_end + lookahead_frames`.
+fn cohere_dtw_offset_tail_end(
+    region: &[f32],
+    anchor_end: usize,
+    floor: f64,
+    min_quiet_frames: usize,
+    lookahead_frames: usize,
+) -> usize {
+    if lookahead_frames == 0 || region.is_empty() {
+        return anchor_end;
+    }
+    let last = region.len() - 1;
+    let scan_end = (anchor_end + lookahead_frames).min(last);
+    // The latest above-floor frame in reach: an earlier blip with a later one
+    // behind it extends through both, landing on the tail's true end.
+    let mut tail_end = anchor_end;
+    for (index, &sample) in region
+        .iter()
+        .enumerate()
+        .take(scan_end + 1)
+        .skip(anchor_end + 1)
+    {
+        if f64::from(sample) >= floor {
+            tail_end = index;
+        }
+    }
+    if tail_end == anchor_end {
+        return anchor_end;
+    }
+    // Real silence must follow the blip: a tail running into the next word's
+    // onset is that word's audio, not this one's.
+    let mut quiet = 0usize;
+    let mut probe = tail_end;
+    while probe + 1 < region.len() && f64::from(region[probe + 1]) < floor {
+        probe += 1;
+        quiet += 1;
+    }
+    if quiet >= min_quiet_frames {
+        tail_end
+    } else {
+        anchor_end
+    }
 }
 
 /// Pull a word the center fold let run past its speech into the trailing silence
@@ -821,7 +1215,7 @@ fn cohere_refine_dtw_word_offsets(
     let Some((noise_floor, clip_peak)) = cohere_dtw_envelope_floor_and_peak(levels) else {
         return words;
     };
-    let threshold = noise_floor * 10.0_f64.powf(COHERE_DTW_ONSET_FLOOR_MARGIN_DB / 20.0);
+    let threshold = noise_floor * 10.0_f64.powf(cohere_dtw_offset_floor_margin_db() / 20.0);
     let silence_ceiling = cohere_dtw_edge_silence_ceiling(noise_floor, clip_peak);
     let envelope_spf = cohere_dtw_envelope_seconds_per_frame();
     let min_quiet_frames = (COHERE_DTW_OFFSET_MIN_SILENCE_S as f64 / envelope_spf).ceil() as usize;
@@ -943,6 +1337,17 @@ fn cohere_refine_dtw_word_offsets(
         let Some(rel) = offset_rel else {
             continue;
         };
+        // A sub-sustain blip just past the sustained run's end (a decaying
+        // fricative, a final burst) is the word's own tail: extend the offset
+        // over it when silence follows. At a 0 lookahead the offset stands as
+        // found.
+        let rel = cohere_dtw_offset_tail_end(
+            region,
+            rel,
+            floor,
+            min_quiet_frames,
+            cohere_dtw_offset_tail_lookahead_frames(),
+        );
         // The run ends at `rel`; one frame past it is where the silence begins. An
         // offset before the word's own start would invert the window (its audio
         // sits entirely earlier than the window -- the onset pass's domain), so
