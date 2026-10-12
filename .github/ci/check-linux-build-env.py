@@ -7,7 +7,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / ".github/ci/linux-build-env.lock"
 IMAGE_PATTERN = re.compile(
-    r"ghcr\.io/quintinshaw/openasr-ci-linux@sha256:[0-9a-f]{64}"
+    r"ghcr\.io/chameleon-ai/openasr-ci-linux@sha256:[0-9a-f]{64}"
 )
 CONSUMERS = {
     ".github/workflows/ci.yml": 2,
@@ -30,14 +30,14 @@ GPU_LOCKS = (
         "x86_64-unknown-linux-gnu-cuda",
         ROOT / ".github/ci/linux-cuda.lock",
         re.compile(
-            r"ghcr\.io/quintinshaw/openasr-ci-linux-cuda@sha256:[0-9a-f]{64}"
+            r"ghcr\.io/chameleon-ai/openasr-ci-linux-cuda@sha256:[0-9a-f]{64}"
         ),
     ),
     (
         "x86_64-unknown-linux-gnu-rocm",
         ROOT / ".github/ci/linux-rocm.lock",
         re.compile(
-            r"ghcr\.io/quintinshaw/openasr-ci-linux-rocm@sha256:[0-9a-f]{64}"
+            r"ghcr\.io/chameleon-ai/openasr-ci-linux-rocm@sha256:[0-9a-f]{64}"
         ),
     ),
 )

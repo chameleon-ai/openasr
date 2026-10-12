@@ -5,7 +5,7 @@
     "asset": "linux-x86_64",
     "binary_name": "openasr",
     "archive_ext": "tar.gz",
-    "container": "ghcr.io/quintinshaw/openasr-ci-linux@sha256:8ddcfdea6a758bab0c14a9108de9b3876d23f44bcf815db109593b370f8b1c29"
+    "container": "ghcr.io/chameleon-ai/openasr-ci-linux@sha256:0ad0dcc8814c5eb10a951f1a718f1339f8e96e1936430df35d8db15a450b49db"
   },
   {
     "os": "ubuntu-22.04-arm",
@@ -367,7 +367,7 @@
     "archive_ext": "tar.gz",
     "features": "cuda",
     "timeout": 120,
-    "container": "ghcr.io/quintinshaw/openasr-ci-linux-cuda@sha256:7d3a80aae720b6e726c71f2da726857039abf52e9f32d0f8ae1f68b8a7de3a77"
+    "container": "ghcr.io/chameleon-ai/openasr-ci-linux-cuda@sha256:4fe6e1ed567f74cea78233cde0b58608f683e8f4960ce58d7fc248150e26b955"
   },
   {
     "os": "ubuntu-22.04",
@@ -377,6 +377,6 @@
     "archive_ext": "tar.gz",
     "features": "hip",
     "timeout": 240,
-    "container": "ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:98ed26463af7dfd6bb4a3235145a914531fcd2c2a7c3ea8422cc8c9ad30b5917"
+    "container": "ghcr.io/chameleon-ai/openasr-ci-linux-rocm@sha256:ddc8528d496368420f80104eac2fd0f315b563a08483330902fe86d54eeb1998"
   }
 ]

@@ -71,15 +71,15 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         rows = {row["target"]: row for row in load_matrix()}
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu"]["container"],
-            "ghcr.io/quintinshaw/openasr-ci-linux@sha256:8ddcfdea6a758bab0c14a9108de9b3876d23f44bcf815db109593b370f8b1c29",
+            "ghcr.io/chameleon-ai/openasr-ci-linux@sha256:0ad0dcc8814c5eb10a951f1a718f1339f8e96e1936430df35d8db15a450b49db",
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-cuda"]["container"],
-            "ghcr.io/quintinshaw/openasr-ci-linux-cuda@sha256:7d3a80aae720b6e726c71f2da726857039abf52e9f32d0f8ae1f68b8a7de3a77",
+            "ghcr.io/chameleon-ai/openasr-ci-linux-cuda@sha256:4fe6e1ed567f74cea78233cde0b58608f683e8f4960ce58d7fc248150e26b955",
         )
         self.assertEqual(
             rows["x86_64-unknown-linux-gnu-rocm"]["container"],
-            "ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:98ed26463af7dfd6bb4a3235145a914531fcd2c2a7c3ea8422cc8c9ad30b5917",
+            "ghcr.io/chameleon-ai/openasr-ci-linux-rocm@sha256:ddc8528d496368420f80104eac2fd0f315b563a08483330902fe86d54eeb1998",
         )
         self.assertNotIn("container", rows["x86_64-unknown-linux-gnu-vulkan"])
         self.assertNotIn("container", rows["aarch64-unknown-linux-gnu"])

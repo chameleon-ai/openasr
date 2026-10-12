@@ -8,7 +8,7 @@ pins three Linux environments and leaves Windows on the hosted VS image.
 
 ### CPU (`openasr-ci-linux`)
 
-- Image: `ghcr.io/quintinshaw/openasr-ci-linux`, digest in
+- Image: `ghcr.io/chameleon-ai/openasr-ci-linux`, digest in
   `.github/ci/linux-build-env.lock`.
 - Source: `.github/ci/linux-build-env/`.
 - Publish: `.github/workflows/ci-linux-build-env.yml`, only when that tree
@@ -28,7 +28,7 @@ change.
 ### CUDA 13.2.0
 
 - Consumer pin: `.github/ci/linux-cuda.lock`
-  (`ghcr.io/quintinshaw/openasr-ci-linux-cuda@sha256:7d3a80aa…`).
+  (`ghcr.io/chameleon-ai/openasr-ci-linux-cuda@sha256:4fe6e1ed…`).
 - Wrapper source: `.github/ci/linux-cuda/`, published by
   `.github/workflows/ci-linux-cuda-env.yml` on its own path changes only.
 - Base: official
@@ -39,7 +39,7 @@ change.
 ### ROCm 7.2.1
 
 - Consumer pin: `.github/ci/linux-rocm.lock`
-  (`ghcr.io/quintinshaw/openasr-ci-linux-rocm@sha256:98ed2646…`).
+  (`ghcr.io/chameleon-ai/openasr-ci-linux-rocm@sha256:ddc8528d…`).
 - Wrapper source: `.github/ci/linux-rocm/`, published by
   `.github/workflows/ci-linux-rocm-env.yml` on its own path changes only.
 - Base: official
@@ -85,7 +85,7 @@ A failed rust-cache step is not a rollback trigger. Re-run the job.
 ## Forks and `packages:write`
 
 Image publish workflows need `packages: write` to push to
-`ghcr.io/quintinshaw/...`. Forks do not receive that permission on the
+`ghcr.io/chameleon-ai/...`. Forks do not receive that permission on the
 canonical package namespace, so a fork PR that only touches
 `.github/ci/linux-*` will fail the publish job. That is expected. Routine
 The CPU build-image consumers (`ci.yml`, `family-regression.yml`,
