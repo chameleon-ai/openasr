@@ -39,13 +39,13 @@ jobs:
           context: .github/ci/linux-cuda
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/quintinshaw/openasr-ci-linux-cuda:${{ github.sha }}
+          tags: ghcr.io/chameleon-ai/openasr-ci-linux-cuda:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Verify published image contract
         env:
-          IMAGE: ghcr.io/quintinshaw/openasr-ci-linux-cuda@${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/chameleon-ai/openasr-ci-linux-cuda@${{ steps.build.outputs.digest }}
         run: docker run --rm "$IMAGE" openasr-ci-verify
 
       - name: Record immutable consumer reference
@@ -56,6 +56,6 @@ jobs:
             echo "### Linux CUDA CI build environment"
             echo
             echo '```text'
-            echo "ghcr.io/quintinshaw/openasr-ci-linux-cuda@${DIGEST}"
+            echo "ghcr.io/chameleon-ai/openasr-ci-linux-cuda@${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
