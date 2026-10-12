@@ -47,7 +47,7 @@ def modelscope_resolve_url(hf_url: str) -> str | None:
     if rest is None:
         return None
     parts = rest.split("/")
-    # OpenASR/<repo>/resolve/<rev>/<file>
+    # chameleon-ai/<repo>/resolve/<rev>/<file>
     if len(parts) < 5 or parts[2] != "resolve":
         return None
     repo, rev, filename = parts[1], parts[3], "/".join(parts[4:])
@@ -73,7 +73,7 @@ def iter_packs(catalog: dict) -> list[dict]:
         if model.get("public") is not True:
             continue
         hf_repo = str(model.get("hf_repo") or "")
-        if not hf_repo.lower().startswith("openasr/"):
+        if not hf_repo.lower().startswith("chameleon-ai/"):
             continue
         repo = hf_repo.split("/", 1)[1]
         for quant in model.get("quants") or []:

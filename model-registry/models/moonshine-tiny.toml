@@ -4,7 +4,7 @@ display_name = "Moonshine Tiny (OpenASR pack)"
 languages = ["en"]
 size = "tiny"
 license = "MIT"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/moonshine-tiny"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/moonshine-tiny"
 
 [variant]
 quantization = "q8_0"

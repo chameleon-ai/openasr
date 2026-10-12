@@ -1,4 +1,4 @@
-# Per-model card prose for OpenASR/whisper-large-v3. Paraphrased from the
+# Per-model card prose for chameleon-ai/whisper-large-v3. Paraphrased from the
 # upstream openai/whisper-large-v3 card and OpenAI Whisper project docs.
 
 tagline = "OpenAI's most accurate Whisper, the v3 large checkpoint"

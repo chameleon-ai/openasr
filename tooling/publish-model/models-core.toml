@@ -5,7 +5,7 @@
 
 ["qwen3-asr-1.7b"]
 family = "qwen"
-hf_repo = "OpenASR/qwen3-asr-1.7b"
+hf_repo = "chameleon-ai/qwen3-asr-1.7b"
 release_public = true
 size = "1.7b"
 registry_id = "qwen3-asr-1.7b"
@@ -39,7 +39,7 @@ upstream_release_date = "2026-01-28"
 
 ["qwen3-asr-0.6b"]
 family = "qwen"
-hf_repo = "OpenASR/qwen3-asr-0.6b"
+hf_repo = "chameleon-ai/qwen3-asr-0.6b"
 release_public = true
 size = "0.6b"
 registry_id = "qwen3-asr-0.6b"
@@ -66,7 +66,7 @@ upstream_release_date = "2026-01-28"
 
 ["moonshine-tiny"]
 family = "moonshine"
-hf_repo = "OpenASR/moonshine-tiny"
+hf_repo = "chameleon-ai/moonshine-tiny"
 release_public = true
 aliases = ["moonshine"]
 pull_alias = "moonshine"
@@ -82,7 +82,7 @@ upstream_release_date = "2024-10-30"
 
 ["cohere-transcribe-03-2026"]
 family = "cohere"
-hf_repo = "OpenASR/cohere-transcribe-03-2026"
+hf_repo = "chameleon-ai/cohere-transcribe-03-2026"
 release_public = true
 aliases = ["cohere-transcribe", "cohere"]
 pull_alias = "cohere-transcribe"
@@ -98,7 +98,7 @@ upstream_release_date = "2026-03-24"
 
 ["whisper-large-v3-turbo"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-large-v3-turbo"
+hf_repo = "chameleon-ai/whisper-large-v3-turbo"
 release_public = true
 aliases = ["whisper-turbo", "whisper-large-turbo"]
 pull_alias = "whisper-turbo"
@@ -114,7 +114,7 @@ upstream_release_date = "2024-10-01"
 
 ["whisper-small"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-small"
+hf_repo = "chameleon-ai/whisper-small"
 release_public = true
 aliases = []
 pull_alias = "whisper-small"
@@ -130,7 +130,7 @@ upstream_release_date = "2022-09-21"
 
 ["xasr-zh-en"]
 family = "xasr-zipformer"
-hf_repo = "OpenASR/xasr-zh-en"
+hf_repo = "chameleon-ai/xasr-zh-en"
 release_public = true
 size = "0.16b"
 registry_id = "xasr-zh-en"
@@ -150,7 +150,7 @@ upstream_release_date = "2026-05-18"
 # post-dialect-collapse; see _catalog.py).
 ["parakeet-tdt-0.6b-v3"]
 family = "parakeet-tdt"
-hf_repo = "OpenASR/parakeet-tdt-0.6b-v3"
+hf_repo = "chameleon-ai/parakeet-tdt-0.6b-v3"
 release_public = true
 aliases = []
 pull_alias = "parakeet-tdt-0.6b-v3"
@@ -171,7 +171,7 @@ min_core_version = "0.1.9"
 min_cli_version = "0.1.9"
 
 # Dolphin cn-dialect small (WeNet E-Branchformer, CTC + attention rescoring).
-# Published PUBLIC to OpenASR/dolphin-cn-dialect-small: `release_public = true`
+# Published PUBLIC to chameleon-ai/dolphin-cn-dialect-small: `release_public = true`
 # routes the publish lane to a public HF repo and lets --public run the
 # fail-closed public-listing gate and write the signed catalog.json entry,
 # pinned to the immutable HF revision + per-pack sha256. Dolphin is
@@ -181,7 +181,7 @@ min_cli_version = "0.1.9"
 # dialect codes (zh-sichuan, ...) as selectable source languages (see _catalog.py).
 ["dolphin-cn-dialect-small"]
 family = "dolphin"
-hf_repo = "OpenASR/dolphin-cn-dialect-small"
+hf_repo = "chameleon-ai/dolphin-cn-dialect-small"
 release_public = true
 # Bare `dolphin-cn` now resolves here (Chinese-only dialect tier); bare
 # `dolphin` resolves to the multilingual `dolphin-small` instead (see
@@ -230,7 +230,7 @@ min_cli_version = "0.1.3"
 # dolphin-cn-dialect-small's own launch.
 ["dolphin-cn-dialect-base"]
 family = "dolphin"
-hf_repo = "OpenASR/dolphin-cn-dialect-base"
+hf_repo = "chameleon-ai/dolphin-cn-dialect-base"
 release_public = true
 size = "base"
 registry_id = "dolphin-cn-dialect-base"
@@ -270,7 +270,7 @@ min_cli_version = "0.1.8"
 # min_core_version = 0.1.9 core release).
 ["dolphin-small"]
 family = "dolphin"
-hf_repo = "OpenASR/dolphin-small"
+hf_repo = "chameleon-ai/dolphin-small"
 release_public = true
 # Bare `dolphin` resolves here (multilingual small tier) -- see
 # dolphin-cn-dialect-small's note on the 2026-07 alias swap.
@@ -305,7 +305,7 @@ min_cli_version = "0.1.9"
 # Flipped public 2026-07-08 alongside dolphin-small, same 0.1.9 batch.
 ["dolphin-base"]
 family = "dolphin"
-hf_repo = "OpenASR/dolphin-base"
+hf_repo = "chameleon-ai/dolphin-base"
 release_public = true
 size = "base"
 registry_id = "dolphin-base"
@@ -335,12 +335,12 @@ min_cli_version = "0.1.9"
 
 # SenseVoiceSmall (FunASR SAN-M/DFSMN encoder + CTC head): multilingual
 # zh/yue/en/ja/ko with model-side language id. Published PUBLIC to
-# OpenASR/sensevoice-small: `release_public = true`. License is the FunASR
+# chameleon-ai/sensevoice-small: `release_public = true`. License is the FunASR
 # Model License v1.1 -- a custom license permitting commercial use; never
 # mislabel it Apache-2.0.
 ["sensevoice-small"]
 family = "sensevoice"
-hf_repo = "OpenASR/sensevoice-small"
+hf_repo = "chameleon-ai/sensevoice-small"
 release_public = true
 aliases = ["sensevoice", "sensevoice-small"]
 pull_alias = "sensevoice"
@@ -367,7 +367,7 @@ min_cli_version = "0.1.5"
 ["redimnet2-b6-cn"]
 kind = "capability-pack"
 family = "redimnet2"
-hf_repo = "OpenASR/redimnet2-b6-cn"
+hf_repo = "chameleon-ai/redimnet2-b6-cn"
 release_public = true
 size = "embedder"
 registry_id = "redimnet2-b6-cn"
@@ -485,7 +485,7 @@ role = "speaker-embedder"
 ["pyannote-segmentation-3.0"]
 kind = "capability-pack"
 family = "pyannote-segmentation"
-hf_repo = "OpenASR/pyannote-segmentation-3.0"
+hf_repo = "chameleon-ai/pyannote-segmentation-3.0"
 release_public = true
 size = "segmenter"
 registry_id = "pyannote-segmentation-3.0"
@@ -510,7 +510,7 @@ role = "speaker-segmenter"
 ["diarizen-large-s80-v2"]
 kind = "capability-pack"
 family = "diarizen-segmentation"
-hf_repo = "OpenASR/diarizen-large-s80-v2"
+hf_repo = "chameleon-ai/diarizen-large-s80-v2"
 release_public = true
 size = "segmenter"
 registry_id = "diarizen-large-s80-v2"
@@ -530,7 +530,7 @@ role = "speaker-segmenter"
 
 ["whisper-tiny"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-tiny"
+hf_repo = "chameleon-ai/whisper-tiny"
 release_public = true
 aliases = []
 pull_alias = "whisper-tiny"
@@ -546,7 +546,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-base"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-base"
+hf_repo = "chameleon-ai/whisper-base"
 release_public = true
 aliases = []
 pull_alias = "whisper-base"
@@ -562,7 +562,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-medium"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-medium"
+hf_repo = "chameleon-ai/whisper-medium"
 release_public = true
 aliases = []
 pull_alias = "whisper-medium"
@@ -578,7 +578,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-large-v3"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-large-v3"
+hf_repo = "chameleon-ai/whisper-large-v3"
 release_public = true
 aliases = []
 pull_alias = "whisper-large-v3"
@@ -594,7 +594,7 @@ upstream_release_date = "2023-11-06"
 
 ["whisper-tiny.en"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-tiny.en"
+hf_repo = "chameleon-ai/whisper-tiny.en"
 release_public = true
 aliases = []
 pull_alias = "whisper-tiny.en"
@@ -611,7 +611,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-base.en"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-base.en"
+hf_repo = "chameleon-ai/whisper-base.en"
 release_public = true
 aliases = []
 pull_alias = "whisper-base.en"
@@ -628,7 +628,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-small.en"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-small.en"
+hf_repo = "chameleon-ai/whisper-small.en"
 release_public = true
 aliases = []
 pull_alias = "whisper-small.en"
@@ -645,7 +645,7 @@ upstream_release_date = "2022-09-21"
 
 ["whisper-medium.en"]
 family = "whisper"
-hf_repo = "OpenASR/whisper-medium.en"
+hf_repo = "chameleon-ai/whisper-medium.en"
 release_public = true
 aliases = []
 pull_alias = "whisper-medium.en"
@@ -674,7 +674,7 @@ upstream_release_date = "2022-09-21"
 # public:false -> public:true).
 ["firered-aed-l-v2"]
 family = "firered-aed"
-hf_repo = "OpenASR/firered-aed-l-v2"
+hf_repo = "chameleon-ai/firered-aed-l-v2"
 release_public = true
 aliases = ["firered-aed", "firered", "firered-aed-v2"]
 pull_alias = "firered-aed-l-v2"
@@ -720,7 +720,7 @@ min_cli_version = "0.1.9"
 # pinned to the 0.1.17 release that first ships the runtime.
 ["firered2-llm"]
 family = "firered2-llm"
-hf_repo = "OpenASR/firered2-llm"
+hf_repo = "chameleon-ai/firered2-llm"
 release_public = true
 aliases = ["firered-llm", "firered2"]
 pull_alias = "firered2-llm"
@@ -754,7 +754,7 @@ min_cli_version = "0.1.17"
 # min_cli_version pinned to the 0.1.17 release that first ships the runtime.
 ["mimo-v2.5-asr"]
 family = "mimo-asr"
-hf_repo = "OpenASR/mimo-v2.5-asr"
+hf_repo = "chameleon-ai/mimo-v2.5-asr"
 release_public = true
 aliases = ["mimo", "mimo-v2.5"]
 pull_alias = "mimo-v2.5-asr"
@@ -789,7 +789,7 @@ min_cli_version = "0.1.17"
 ["qwen3-forced-aligner-0.6b"]
 kind = "capability-pack"
 family = "qwen3-forced-aligner"
-hf_repo = "OpenASR/qwen3-forced-aligner-0.6b"
+hf_repo = "chameleon-ai/qwen3-forced-aligner-0.6b"
 release_public = true
 size = "0.6b"
 registry_id = "qwen3-forced-aligner-0.6b"
@@ -832,7 +832,7 @@ role = "forced-aligner"
 ["firered-punc"]
 kind = "capability-pack"
 family = "firered-punc"
-hf_repo = "OpenASR/firered-punc"
+hf_repo = "chameleon-ai/firered-punc"
 release_public = true
 size = "base"
 registry_id = "firered-punc"
@@ -873,7 +873,7 @@ role = "punctuation-restorer"
 # records current state and never grants a later publish action by itself.
 ["moss-transcribe-diarize"]
 family = "moss-transcribe-diarize"
-hf_repo = "OpenASR/moss-transcribe-diarize"
+hf_repo = "chameleon-ai/moss-transcribe-diarize"
 release_public = true
 size = "0.9b"
 registry_id = "moss-transcribe-diarize"
@@ -910,13 +910,13 @@ min_cli_version = "0.1.24"
 # token); emits_punctuation unclaimed (None). Pack import is the Rust
 # funasr_nano::package_import importer (`openasr model-pack import
 # funasr-nano`) over the funasr_nano_pt_to_safetensors.py staged source.
-# Public catalog entry; HF packs live at OpenASR/funasr-nano. languages is
+# Public catalog entry; HF packs live at chameleon-ai/funasr-nano. languages is
 # an explicit override, lockstep with
 # FixedMultilingual { languages: &["zh","en"] } in arch/mod.rs (upstream card
 # also mentions Japanese; the runtime arch only ships the zh+en fixed set).
 ["funasr-nano"]
 family = "funasr-nano"
-hf_repo = "OpenASR/funasr-nano"
+hf_repo = "chameleon-ai/funasr-nano"
 release_public = true
 size = "0.8b"
 registry_id = "funasr-nano"
@@ -943,11 +943,11 @@ min_cli_version = "0.1.27"
 # (detect_implicit) -- free-text instruction-following, no language token;
 # emits_punctuation Some(true) (observed on goldens). Pack import is
 # CoreConvert `convert_local_granite_speech_source_to_runtime_pack`. Public
-# catalog entry; HF packs live at OpenASR/granite-speech-4.1-2b. languages is
+# catalog entry; HF packs live at chameleon-ai/granite-speech-4.1-2b. languages is
 # an explicit override from the upstream trained-language list.
 ["granite-speech-4.1-2b"]
 family = "granite-speech"
-hf_repo = "OpenASR/granite-speech-4.1-2b"
+hf_repo = "chameleon-ai/granite-speech-4.1-2b"
 release_public = true
 size = "2b"
 registry_id = "granite-speech-4.1-2b"

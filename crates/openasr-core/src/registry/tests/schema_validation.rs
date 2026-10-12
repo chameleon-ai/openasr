@@ -35,7 +35,16 @@ fn bundled_catalog_signature_verifies_committed_catalog_and_epoch() {
     .unwrap();
 
     assert_eq!(verified.catalog_epoch, expected_epoch);
-    assert_eq!(verified.key_id, crate::CATALOG_SIGNATURE_KEY_ID);
+    // The committed catalog is signed under whichever production key is
+    // current (v2 since the 2026-10 rotation); pin membership in the trust
+    // roots rather than one key id so the next rotation does not break this.
+    assert!(
+        crate::OPENASR_CATALOG_TRUST_ROOTS
+            .iter()
+            .any(|root| root.key_id == verified.key_id),
+        "committed catalog must verify under a production trust root, got key '{}'",
+        verified.key_id
+    );
 }
 
 #[test]
@@ -58,7 +67,13 @@ fn public_catalog_projection_signature_verifies_and_excludes_private_entries() {
     )
     .unwrap();
     assert_eq!(verified.catalog_epoch, expected_epoch);
-    assert_eq!(verified.key_id, crate::CATALOG_SIGNATURE_KEY_ID);
+    assert!(
+        crate::OPENASR_CATALOG_TRUST_ROOTS
+            .iter()
+            .any(|root| root.key_id == verified.key_id),
+        "public projection must verify under a production trust root, got key '{}'",
+        verified.key_id
+    );
 
     let public = parse_model_catalog(&public_contents, "public-projection").unwrap();
     // No staged/private entries may ship in the public artifact.

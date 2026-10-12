@@ -4438,7 +4438,7 @@ fn is_source_fallback_error(error: &PullError) -> bool {
         // 5xx: this source's own infra failed -- try the next one. 403/404:
         // this source does not have (or will not serve) the requested object,
         // which is a per-source availability gap, not a global failure -- e.g.
-        // weights.openasr.org only proxies the `OpenASR/*` org and 404s for
+        // weights.openasr.org only proxies the `chameleon-ai/*` org and 404s for
         // anything outside it, so the chain must be able to fall through to
         // hf-mirror/hf instead of hard-failing the whole pull. 400/401 are
         // deliberately NOT included: 400 is a malformed request that would

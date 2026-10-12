@@ -13,6 +13,7 @@ is written.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import date, datetime, timezone
@@ -33,7 +34,7 @@ from _catalog import (
 )
 from _file_loaders import atomic_write_json, load_required_json, load_toml
 from _pathlib_helpers import repo_root
-from audit_form import AuditFormError, validate_family_audit_form
+from audit_form import AuditFormError, default_audit_dir, validate_family_audit_form
 from public_gate import DEFAULT_PUBLIC_NAMESPACE, PublicGateError, validate_public_model
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -325,6 +326,25 @@ def ensure_release_public_allowed(model: str, entry: dict, public: bool) -> None
         )
 
 
+def _family_already_public_in_catalog(family: str, catalog_path: Path | None) -> bool:
+    """True iff the committed catalog lists at least one `public: true` entry
+    for `family` (any kind). Distinguishes a family's first public flip from a
+    re-emission of an already-public family. A missing/unreadable catalog is
+    reported as "not public" so the gate stays fail-closed."""
+    path = catalog_path if catalog_path is not None else REPO_ROOT / "model-registry" / "catalog.json"
+    try:
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("family") == family and item.get("public") is True
+        for item in models
+    )
+
+
 def ensure_release_audit_form(
     model: str,
     entry: dict,
@@ -336,13 +356,49 @@ def ensure_release_audit_form(
 ) -> None:
     """`--public` entries require a completed release audit form for the
     model's family (docs/model-audits/<family>.md; see audit_form.py for the
-    fail-closed checks and the pre-policy grandfather set).
+    fail-closed checks).
+
+    The requirement gates a family's FIRST public entry ("When to fill",
+    docs/model-audits/README.md). A family already listed publicly in the
+    committed catalog has by definition already passed (or predates) its first
+    flip, so its re-emissions -- metadata or download-URL changes -- are never
+    blocked here: the gate would otherwise hold unrelated catalog work hostage
+    to the pre-audit backfill (pre_audit_families.txt) and to forms that fell
+    behind as backend cells got stricter. If a form is missing or out of date
+    for such a family, the owed backfill is logged for visibility. A family
+    with NO public catalog entry still fails closed on a missing or incomplete
+    form.
     """
     if not public:
         return
+    family = entry.get("family")
+    if isinstance(family, str) and family.strip() and _family_already_public_in_catalog(family, catalog_path):
+        form_path = (audit_dir if audit_dir is not None else default_audit_dir()) / f"{family}.md"
+        if form_path.exists():
+            try:
+                validate_family_audit_form(
+                    family,
+                    audit_dir=audit_dir,
+                    inventory_path=inventory_path,
+                    catalog_path=catalog_path,
+                )
+                return  # current form: nothing owed
+            except AuditFormError as error:
+                message = (
+                    f"family '{family}' release audit form is out of date; re-emission allowed, "
+                    f"backfill owed: {error}"
+                )
+        else:
+            message = (
+                f"family '{family}' is already public in the committed catalog and has no release "
+                f"audit form; re-emission allowed (form still owed at "
+                f"docs/model-audits/{family}.md, tracked in pre_audit_families.txt)"
+            )
+        print(f"{model}: {message}", file=sys.stderr)
+        return
     try:
         validate_family_audit_form(
-            entry.get("family"),
+            family,
             audit_dir=audit_dir,
             inventory_path=inventory_path,
             catalog_path=catalog_path,
@@ -419,7 +475,9 @@ def main(argv: list[str]) -> int:
     if args.model not in catalog_entries:
         raise SystemExit(f"unknown model '{args.model}'")
     ensure_release_public_allowed(args.model, catalog_entries[args.model], args.public)
-    ensure_release_audit_form(args.model, catalog_entries[args.model], args.public)
+    ensure_release_audit_form(
+        args.model, catalog_entries[args.model], args.public, catalog_path=args.catalog
+    )
     model_entry = build_catalog_model(args.model, catalog_entries[args.model], args)
     if args.public:
         try:

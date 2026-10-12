@@ -210,6 +210,34 @@ routes weight downloads only. Deploys push the same two JSON files to Cloudflare
 and, when `esa-cli` is logged in, to ESA; ESA never origin-fetches Cloudflare.
 Signing stays local (the seed never enters CI).
 
+### Signing-key rotation
+
+Production trust roots live in `OPENASR_CATALOG_TRUST_ROOTS`
+(`crates/openasr-core/src/catalog_security.rs`): verification looks the
+manifest's `key_id` up in that list, so rotation adds a root rather than
+replacing one. History:
+
+- `openasr-catalog-v1` (original key; seed lost in the 2026-10 maintainer
+  transition, not compromised). Stays trusted so previously issued
+  signatures -- incident fixtures, deployed caches, qualification manifests
+  -- keep verifying; the epoch floor still rejects downgrade replays on
+  machines that already advanced past a newer epoch.
+- `openasr-catalog-v2` (2026-10 rotation key, current maintainer's seed).
+  All new signatures are issued under v2.
+
+Rotation procedure (order matters -- clients must carry the new root before
+the first manifest signed under it is served):
+
+1. Land the new trust root and cut a client release (old catalog is still
+   v1-signed, so it verifies everywhere -- safe).
+2. Re-sign the catalog with the new seed (`publish_catalog.sh` signs
+   production manifests under v2 by default) at a strictly greater epoch,
+   then push; `deploy-catalog` serves the v2-signed projection. Clients
+   without the v2 root degrade to their cache/embedded snapshot via the
+   fallback chain below instead of bricking.
+3. Retiring v1 is a separate, unhurried future release (only justified by
+   compromise, not loss).
+
 ## Cache And Rollback Boundary
 
 The catalog cache is a signed fetch-on-error fallback. On a successful HTTPS

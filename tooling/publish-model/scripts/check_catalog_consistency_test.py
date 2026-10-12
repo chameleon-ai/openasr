@@ -21,7 +21,9 @@ from check_catalog_consistency import (  # noqa: E402
     LOCAL_DEV_KEY_ID,
     LOCAL_DEV_PUBLIC_KEY_HEX,
     PRODUCTION_KEY_ID,
+    PRODUCTION_KEY_ID_V2,
     PRODUCTION_PUBLIC_KEY_HEX,
+    PRODUCTION_PUBLIC_KEY_HEX_V2,
     GateFailure,
     catalog_signing_payload,
     check_public_projection,
@@ -222,6 +224,32 @@ class CommittedRegistryGateTest(unittest.TestCase):
             shutil.rmtree(registry)
 
 
+    def test_v2_key_id_is_signature_checked_not_trusted_blindly(self) -> None:
+        # The rotated production key must go through real ed25519
+        # verification like v1: a manifest that records the right hash but is
+        # signed with a throwaway seed under the v2 key id must not verify.
+        # (The positive path -- real v2 signatures verifying -- is covered by
+        # test_committed_registry_passes once the registry is re-signed.)
+        registry = copy_registry()
+        try:
+            catalog_bytes = (registry / "catalog.json").read_bytes()
+            epoch = int((registry / "catalog.epoch").read_text().strip())
+            forged = sign_manifest(
+                seed=bytes.fromhex("c" * 64),
+                key_id=PRODUCTION_KEY_ID_V2,
+                catalog_bytes=catalog_bytes,
+                epoch=epoch,
+            )
+            (registry / "catalog.signature.json").write_text(
+                json.dumps(forged, indent=2) + "\n", encoding="utf-8"
+            )
+            failures = run_gate(registry_dir=registry, allow_dev_key=True)
+            self.assertTrue(
+                any("does not verify" in failure for failure in failures), failures
+            )
+        finally:
+            shutil.rmtree(registry)
+
     def test_projection_entry_without_id_fails_closed(self) -> None:
         # A projected model that lost its id must surface a named gate
         # failure, not a KeyError traceback.
@@ -307,6 +335,13 @@ class TrustRootDriftTest(unittest.TestCase):
         self.assertEqual(
             rust_const("const OPENASR_CATALOG_V1_PUBLIC_KEY_HEX"),
             PRODUCTION_PUBLIC_KEY_HEX,
+        )
+        self.assertEqual(
+            rust_const("const CATALOG_SIGNATURE_KEY_ID_V2"), PRODUCTION_KEY_ID_V2
+        )
+        self.assertEqual(
+            rust_const("const OPENASR_CATALOG_V2_PUBLIC_KEY_HEX"),
+            PRODUCTION_PUBLIC_KEY_HEX_V2,
         )
         self.assertEqual(
             rust_const("pub const CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID"),

@@ -43,12 +43,12 @@ class ModelscopeMappingTest(unittest.TestCase):
                     {
                         "id": "moonshine-tiny",
                         "public": True,
-                        "hf_repo": "OpenASR/moonshine-tiny",
+                        "hf_repo": "chameleon-ai/moonshine-tiny",
                         "hf_revision": "abc",
                         "quants": [
                             {
                                 "filename": "moonshine-tiny-q8_0.oasr",
-                                "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/abc/moonshine-tiny-q8_0.oasr",
+                                "url": "https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/abc/moonshine-tiny-q8_0.oasr",
                                 "sha256": "a" * 64,
                                 "size_bytes": 10,
                             }

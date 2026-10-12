@@ -4,7 +4,7 @@ display_name = "Fun-ASR-Nano (OpenASR pack)"
 languages = ["en", "zh"]
 size = "0.8b"
 license = "Apache-2.0"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/funasr-nano"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/funasr-nano"
 
 [variant]
 quantization = "q8_0"

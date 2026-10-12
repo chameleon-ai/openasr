@@ -1,6 +1,6 @@
 # OpenASR weights resolve proxy (Cloudflare Worker)
 
-**Proxies** the Hugging Face `resolve` endpoint for the `OpenASR/*` org, so a
+**Proxies** the Hugging Face `resolve` endpoint for the `chameleon-ai/*` org, so a
 client whose direct route to `huggingface.co` is blocked can still resolve and
 download model weights. It is the server side of `weights.openasr.org`, an
 alternative to pointing straight at `huggingface.co` (some networks block the
@@ -30,11 +30,11 @@ This is **not** a general Hugging Face proxy. It rejects everything except:
 
 | Method | Path | Action |
 | --- | --- | --- |
-| `GET`/`HEAD` | `/OpenASR/<repo>/resolve/<rev>/<file...>` | forward to `huggingface.co`, pass the response through |
+| `GET`/`HEAD` | `/chameleon-ai/<repo>/resolve/<rev>/<file...>` | forward to `huggingface.co`, pass the response through |
 | `GET`/`HEAD` | `/` or `/_version` | build-commit / health JSON |
 | anything else | any | `404`/`405` |
 
-- Only the `OpenASR` org, only the `resolve` action (no `blob`, `tree`, `api`,
+- Only the `chameleon-ai` org, only the `resolve` action (no `blob`, `tree`, `api`,
   other orgs, etc.) -- checked with a strict path regex before any outbound
   fetch, so unrelated/abusive traffic never reaches Hugging Face through this
   Worker's quota.
@@ -69,7 +69,7 @@ done by a maintainer with account access -- see that workflow's comments.
 
 ```sh
 curl -sSD - -o /dev/null \
-  "https://weights.openasr.org/OpenASR/<repo>/resolve/<rev>/<file>.oasr"
+  "https://weights.openasr.org/chameleon-ai/<repo>/resolve/<rev>/<file>.oasr"
 # Expect: HTTP/2 302 with a Location header pointing at a Hugging Face CDN/Xet
 # blob host, not a 200 body.
 

@@ -11,13 +11,13 @@ from public_gate import HeadResult, PublicGateError, PublicProbe, validate_publi
 
 REVISION = "b" * 40
 SHA256 = "a" * 64
-URL = f"https://huggingface.co/OpenASR/moonshine-tiny/resolve/{REVISION}/moonshine-tiny-q8_0.oasr"
+URL = f"https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/{REVISION}/moonshine-tiny-q8_0.oasr"
 
 
 def valid_model() -> dict:
     return {
         "id": "moonshine-tiny",
-        "hf_repo": "OpenASR/moonshine-tiny",
+        "hf_repo": "chameleon-ai/moonshine-tiny",
         "hf_revision": REVISION,
         "public": True,
         "min_cli_version": "0.1.0",
@@ -47,7 +47,7 @@ class FakeProbe:
         head: HeadResult | None = None,
         download: tuple[str, int] | None = None,
     ) -> None:
-        self.info = info if info is not None else {"id": "OpenASR/moonshine-tiny", "private": False}
+        self.info = info if info is not None else {"id": "chameleon-ai/moonshine-tiny", "private": False}
         self.head_result = head or HeadResult(
             status=200,
             headers={"content-length": "3", "x-repo-commit": REVISION},
@@ -143,7 +143,7 @@ class PublicGateTest(unittest.TestCase):
 
         validate_public_model(valid_model(), probe=probe)
 
-        self.assertEqual(probe.model_info_calls, ["OpenASR/moonshine-tiny"])
+        self.assertEqual(probe.model_info_calls, ["chameleon-ai/moonshine-tiny"])
         self.assertEqual(probe.head_calls, [URL])
         self.assertEqual(probe.sha256_calls, [URL])
 
@@ -231,13 +231,13 @@ class PublicGateTest(unittest.TestCase):
                     status=200,
                     headers={},
                     url=URL,
-                    body=b'{"id": "OpenASR/moonshine-tiny", "private": false}',
+                    body=b'{"id": "chameleon-ai/moonshine-tiny", "private": false}',
                 ),
             ],
             attempts=2,
         )
 
-        info = probe.model_info("OpenASR/moonshine-tiny")
+        info = probe.model_info("chameleon-ai/moonshine-tiny")
 
         self.assertEqual(info["private"], False)
         self.assertEqual(len(probe.urls), 2)
@@ -251,13 +251,13 @@ class PublicGateTest(unittest.TestCase):
                     status=200,
                     headers={},
                     url=URL,
-                    body=b'{"id": "OpenASR/moonshine-tiny", "private": false}',
+                    body=b'{"id": "chameleon-ai/moonshine-tiny", "private": false}',
                 ),
             ],
             attempts=2,
         )
 
-        info = probe.model_info("OpenASR/moonshine-tiny")
+        info = probe.model_info("chameleon-ai/moonshine-tiny")
 
         self.assertEqual(info["private"], False)
         self.assertEqual(len(probe.urls), 2)
@@ -267,7 +267,7 @@ class PublicGateTest(unittest.TestCase):
         probe = ModelInfoProbe([http_error(404)], attempts=3)
 
         with self.assertRaisesRegex(PublicGateError, "HTTP 404"):
-            probe.model_info("OpenASR/moonshine-tiny")
+            probe.model_info("chameleon-ai/moonshine-tiny")
 
         self.assertEqual(len(probe.urls), 1)
         self.assertEqual(probe.sleep_calls, [])

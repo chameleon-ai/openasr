@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -181,7 +183,9 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
                     catalog_path=catalog,
                 )
 
-    def test_public_generation_blocks_untested_advertised_gpu_lanes(self) -> None:
+    def test_public_generation_reports_stale_cells_of_an_already_public_family(self) -> None:
+        # Re-emission is never blocked by stale cells (the audit gates the
+        # family's first public flip), but the owed backfill must be reported.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             audit_dir = root / "audits"
@@ -198,7 +202,8 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
             )
             (audit_dir / "gpu-family.md").write_text(text)
             inventory, catalog = self.advertised_gpu_sources(root)
-            with self.assertRaises(SystemExit) as error:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
                 _manifest.ensure_release_audit_form(
                     "gpu",
                     {"registry_id": "gpu", "family": "gpu-family"},
@@ -206,10 +211,9 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
                     audit_dir=audit_dir,
                     inventory_path=inventory,
                     catalog_path=catalog,
-                )
-            message = str(error.exception)
-            self.assertIn("release-audit gate failed", message)
-            self.assertRegex(message, "unproven or stale status|cuda backend cell|vulkan|hip")
+                )  # must not raise
+            self.assertIn("backfill owed", stderr.getvalue())
+            self.assertRegex(stderr.getvalue(), "unproven or stale status|cuda backend cell|vulkan|hip")
 
     def test_explicit_nonactivation_is_not_an_approval(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -275,6 +279,93 @@ class ValidateFamilyAuditFormTest(unittest.TestCase):
                 {"registry_id": "new-model", "family": "new-family"},
                 False,
                 audit_dir=Path(temp),
+            )
+
+    def _catalog_with_family(self, root: Path, family: str, public: bool) -> Path:
+        catalog = root / "catalog.json"
+        catalog.write_text(
+            json.dumps(
+                {"models": [{"id": "m", "family": family, "kind": "asr-model", "public": public}]}
+            )
+        )
+        return catalog
+
+    def test_first_public_flip_without_form_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # Another family being public must not exempt this one: 'new-family'
+            # has no public entry, so its first flip still needs the form.
+            catalog = self._catalog_with_family(root, "other-family", True)
+            with self.assertRaises(SystemExit) as error:
+                _manifest.ensure_release_audit_form(
+                    "new-model",
+                    {"registry_id": "new-model", "family": "new-family"},
+                    True,
+                    audit_dir=root / "audits",
+                    catalog_path=catalog,
+                )
+        self.assertIn("release-audit gate failed", str(error.exception))
+
+    def test_reemit_of_already_public_family_without_form_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = self._catalog_with_family(root, "whisper", True)
+            _manifest.ensure_release_audit_form(
+                "whisper-small",
+                {"registry_id": "whisper-small", "family": "whisper"},
+                True,
+                audit_dir=root / "audits",  # no form on disk yet
+                catalog_path=catalog,
+            )  # must not raise
+
+    def test_reemit_exception_needs_a_public_entry_not_just_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            catalog = self._catalog_with_family(root, "whisper", public=False)
+            with self.assertRaises(SystemExit):
+                _manifest.ensure_release_audit_form(
+                    "whisper-small",
+                    {"registry_id": "whisper-small", "family": "whisper"},
+                    True,
+                    audit_dir=root / "audits",
+                    catalog_path=catalog,
+                )
+
+    def test_reemit_with_existing_stale_form_is_allowed_and_reported(self) -> None:
+        # A half-filled form on disk is mid-migration state: the re-emition is
+        # allowed, and the concrete validation failure is reported as owed
+        # backfill instead of blocking the write.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit_dir = root / "audits"
+            audit_dir.mkdir()
+            (audit_dir / "whisper.md").write_text(TEMPLATE_PATH.read_text())
+            catalog = self._catalog_with_family(root, "whisper", True)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                _manifest.ensure_release_audit_form(
+                    "whisper-small",
+                    {"registry_id": "whisper-small", "family": "whisper"},
+                    True,
+                    audit_dir=audit_dir,
+                    catalog_path=catalog,
+                )  # must not raise
+            self.assertIn("backfill owed", stderr.getvalue())
+            self.assertIn("marker", stderr.getvalue())
+
+    def test_reemit_of_public_family_with_completed_form_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit_dir = root / "audits"
+            audit_dir.mkdir()
+            (audit_dir / "other-family.md").write_text(completed_form_text())
+            catalog = self._catalog_with_family(root, "other-family", True)
+            _manifest.ensure_release_audit_form(
+                "other-model",
+                {"registry_id": "other-model", "family": "other-family"},
+                True,
+                audit_dir=audit_dir,
+                catalog_path=catalog,
             )
 
 

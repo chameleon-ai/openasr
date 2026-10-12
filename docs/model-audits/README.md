@@ -27,8 +27,15 @@ release quality, not paperwork: filling one should take an afternoon.
 - **Ships with the release:** the completed form is part of the release; keep
   it updated when a dimension's status changes (e.g. a Deferred item lands).
 - **Existing families:** `PRE_AUDIT_FAMILIES` is retained only as a migration
-  ledger for source-tree reporting. It is not a release exemption: a missing
-  form fails closed. For every public family/provider lane that the architecture
+  ledger for source-tree reporting. The form is required whenever a family's
+  public set would grow (its first public entry), and a missing form fails
+  closed there. Re-emitting entries of a family that is ALREADY public in the
+  committed catalog (metadata or download-URL changes) is never blocked by the
+  gate -- an unfinished form must not hold unrelated catalog work hostage to
+  the backfill. The gate instead validates the form when one exists and logs
+  the result as owed backfill (form missing, or the exact validation failure),
+  so the debt stays visible on every re-emission. For every public
+  family/provider lane that the architecture
   inventory marks Auto-eligible or explicitly selectable, the structured backend
   table must contain current positive Supported, Golden-verified, and utilization
   answers (CPU may use `N/A` for utilization). `Untested`, `Deferred`, `No`,

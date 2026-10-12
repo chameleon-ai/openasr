@@ -205,7 +205,7 @@ fn split_tag_filename(rest: &str) -> Option<(&str, &str)> {
 
 /// Map a signed Hugging Face pack URL onto ModelScope's resolve path.
 ///
-/// `https://huggingface.co/OpenASR/<repo>/resolve/<rev>/<file>`
+/// `https://huggingface.co/chameleon-ai/<repo>/resolve/<rev>/<file>`
 /// → `https://www.modelscope.cn/models/openasr/<repo>/resolve/master/<file>`
 ///
 /// The Hugging Face revision is parsed so we only map real `/resolve/` pack

@@ -4,7 +4,7 @@ display_name = "Whisper Small (English) (OpenASR pack)"
 languages = ["en"]
 size = "small.en"
 license = "Apache-2.0"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/whisper-small.en"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/whisper-small.en"
 
 [variant]
 quantization = "q8_0"

@@ -4,7 +4,7 @@ display_name = "Granite Speech 4.1 2B (OpenASR pack)"
 languages = ["de", "en", "es", "fr", "ja", "pt"]
 size = "2b"
 license = "Apache-2.0"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/granite-speech-4.1-2b"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/granite-speech-4.1-2b"
 
 [variant]
 quantization = "q8_0"

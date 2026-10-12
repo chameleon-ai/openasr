@@ -66,7 +66,7 @@ class OnboardingReadinessTest(unittest.TestCase):
             write_json(packs / f"{model}.{quant}.result.json", sidecar(model, quant, pack))
             metrics["quants"][quant] = metric()
         write_json(model_root / "metrics.json", metrics)
-        (model_root / "hf_repo.txt").write_text(f"OpenASR/{model}\n")
+        (model_root / "hf_repo.txt").write_text(f"chameleon-ai/{model}\n")
         (model_root / "hf_revision.txt").write_text("b" * 40 + "\n")
 
     def write_catalog(self, models: list[dict]) -> None:
@@ -83,7 +83,7 @@ class OnboardingReadinessTest(unittest.TestCase):
     def catalog_model(self, model: str, public: bool) -> dict:
         return {
             "id": model,
-            "hf_repo": f"OpenASR/{model}",
+            "hf_repo": f"chameleon-ai/{model}",
             "hf_revision": "c" * 40,
             "public": public,
             "quants": [

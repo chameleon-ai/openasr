@@ -4,7 +4,7 @@ display_name = "SenseVoice Small (OpenASR pack)"
 languages = ["en", "ja", "ko", "yue", "zh"]
 size = "small"
 license = "FunASR Model License v1.1"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/sensevoice-small"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/sensevoice-small"
 
 [variant]
 quantization = "fp16"

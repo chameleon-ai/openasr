@@ -30,7 +30,7 @@ done
 CLI="$(hf_cli)"
 [[ "$CLI" == "ERR_NO_HF_CLI" ]] && die "no hf CLI and no uvx available"
 CLI_PY="$(hf_py)"
-CATALOG_REPO="$(cat_field "$MODEL" hf_repo)"   # e.g. openasr/qwen3-asr-1.7b
+CATALOG_REPO="$(cat_field "$MODEL" hf_repo)"   # e.g. chameleon-ai/qwen3-asr-1.7b
 REPO="$(repo_dir "$MODEL")"
 mkdir -p "$REPO"
 

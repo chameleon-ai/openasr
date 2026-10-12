@@ -4,7 +4,7 @@ display_name = "ReDimNet2-B6 Speaker Embedder (OpenASR pack)"
 languages = ["en", "zh"]
 size = "embedder"
 license = "MIT"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/redimnet2-b6-cn"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/redimnet2-b6-cn"
 
 [variant]
 quantization = "fp16"

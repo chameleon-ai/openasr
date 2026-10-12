@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Cloudflare Worker that PROXIES huggingface.co resolve requests for OpenASR/* model weights, so clients that cannot reach the resolve hop directly still get redirected to the reachable CDN blob host. Not a trust anchor: clients verify sha256 + the signed catalog independently.",
+  "description": "Cloudflare Worker that PROXIES huggingface.co resolve requests for chameleon-ai/* model weights, so clients that cannot reach the resolve hop directly still get redirected to the reachable CDN blob host. Not a trust anchor: clients verify sha256 + the signed catalog independently.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

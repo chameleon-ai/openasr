@@ -4,7 +4,7 @@ display_name = "FireRedPunc (OpenASR pack)"
 languages = ["zh"]
 size = "base"
 license = "Apache-2.0"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/firered-punc"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/firered-punc"
 
 [variant]
 quantization = "fp16"

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-09-11T08:44:02+00:00",
+  "generated_at": "2026-10-12T16:23:21+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -71,8 +71,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/qwen3-asr-1.7b",
-      "hf_revision": "e34cec2cd54e2b389d3833b5f4258a9ad0cc41ce",
+      "hf_repo": "chameleon-ai/qwen3-asr-1.7b",
+      "hf_revision": "420011c0b3425028b3b9145b98c95fe1d0240ccb",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -95,7 +95,7 @@
           "suffix": "fp16",
           "pull": "qwen3-asr-1.7b:fp16",
           "filename": "qwen3-asr-1.7b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/e34cec2cd54e2b389d3833b5f4258a9ad0cc41ce/qwen3-asr-1.7b-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-1.7b/resolve/420011c0b3425028b3b9145b98c95fe1d0240ccb/qwen3-asr-1.7b-fp16.oasr",
           "sha256": "297ffa4dc497c5a67dee2697f186ede5373ddef4dce5236d23af016c447dee92",
           "size_bytes": 4704801920,
           "recommended": false,
@@ -111,7 +111,7 @@
           "suffix": "q8",
           "pull": "qwen3-asr-1.7b:q8",
           "filename": "qwen3-asr-1.7b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/e34cec2cd54e2b389d3833b5f4258a9ad0cc41ce/qwen3-asr-1.7b-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-1.7b/resolve/420011c0b3425028b3b9145b98c95fe1d0240ccb/qwen3-asr-1.7b-q8_0.oasr",
           "sha256": "a26d2629ba9e68fe765f9a6585f4d1df0e839d3584acef39292aa6edab01ecea",
           "size_bytes": 2506724480,
           "recommended": true,
@@ -127,7 +127,7 @@
           "suffix": "q4",
           "pull": "qwen3-asr-1.7b:q4",
           "filename": "qwen3-asr-1.7b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-1.7b/resolve/e34cec2cd54e2b389d3833b5f4258a9ad0cc41ce/qwen3-asr-1.7b-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-1.7b/resolve/420011c0b3425028b3b9145b98c95fe1d0240ccb/qwen3-asr-1.7b-q4_k.oasr",
           "sha256": "cc882c5a02327d1e353ab781e8f3943c42b87098fbc15240f28ecd547b9d0782",
           "size_bytes": 1490916416,
           "recommended": false,
@@ -141,6 +141,8 @@
       ],
       "language_mode": "detect_implicit",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "sort_weight": 920,
       "recommended": true,
       "prose_locales": {
@@ -154,9 +156,7 @@
           ]
         }
       },
-      "upstream_release_date": "2026-01-28",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2026-01-28"
     },
     {
       "id": "parakeet-tdt-0.6b-v3",
@@ -197,8 +197,8 @@
       "license": "CC-BY-4.0",
       "license_url": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/parakeet-tdt-0.6b-v3",
-      "hf_revision": "4036ec58b98577388703e3d20ce08f70d1546cd4",
+      "hf_repo": "chameleon-ai/parakeet-tdt-0.6b-v3",
+      "hf_revision": "5594c7c8c35062f03bd38ffb0272233dbe1c4e99",
       "public": true,
       "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
@@ -221,7 +221,7 @@
           "suffix": "fp16",
           "pull": "parakeet-tdt-0.6b-v3:fp16",
           "filename": "parakeet-tdt-0.6b-v3-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4036ec58b98577388703e3d20ce08f70d1546cd4/parakeet-tdt-0.6b-v3-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/parakeet-tdt-0.6b-v3/resolve/5594c7c8c35062f03bd38ffb0272233dbe1c4e99/parakeet-tdt-0.6b-v3-fp16.oasr",
           "sha256": "fde514b45dbeabd17b24bd3cdcba8b65b4bbc1be4b04efe085cb43d7eebe32a9",
           "size_bytes": 1415202560,
           "recommended": false,
@@ -237,7 +237,7 @@
           "suffix": "q8",
           "pull": "parakeet-tdt-0.6b-v3:q8",
           "filename": "parakeet-tdt-0.6b-v3-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4036ec58b98577388703e3d20ce08f70d1546cd4/parakeet-tdt-0.6b-v3-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/parakeet-tdt-0.6b-v3/resolve/5594c7c8c35062f03bd38ffb0272233dbe1c4e99/parakeet-tdt-0.6b-v3-q8_0.oasr",
           "sha256": "4416134e5f4d42690ecfe6b2be8c30fcb3186eb5491434195355a1597f497454",
           "size_bytes": 919136000,
           "recommended": true,
@@ -253,7 +253,7 @@
           "suffix": "q4",
           "pull": "parakeet-tdt-0.6b-v3:q4",
           "filename": "parakeet-tdt-0.6b-v3-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/parakeet-tdt-0.6b-v3/resolve/4036ec58b98577388703e3d20ce08f70d1546cd4/parakeet-tdt-0.6b-v3-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/parakeet-tdt-0.6b-v3/resolve/5594c7c8c35062f03bd38ffb0272233dbe1c4e99/parakeet-tdt-0.6b-v3-q4_k.oasr",
           "sha256": "0218e1a1338b31d0ef7150c2afc99c167e7965f056fcd26635a5d7ec220ad7c9",
           "size_bytes": 919136000,
           "recommended": false,
@@ -267,6 +267,8 @@
       ],
       "language_mode": "fixed_multilingual",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "sort_weight": 915,
       "recommended": true,
       "prose_locales": {
@@ -281,9 +283,7 @@
         }
       },
       "upstream_release_date": "2025-08-14",
-      "min_core_version": "0.1.9",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "firered-aed-l-v2",
@@ -326,8 +326,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/FireRedTeam/FireRedASR2-AED/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/firered-aed-l-v2",
-      "hf_revision": "878a7be29104370c25938af686f80602c3db73d2",
+      "hf_repo": "chameleon-ai/firered-aed-l-v2",
+      "hf_revision": "3fa2e5cb094f39a3a6d8faa1c38bfa20ab81924e",
       "public": true,
       "min_cli_version": "0.1.9",
       "recommended_quant": "q4_k",
@@ -351,7 +351,7 @@
           "suffix": "fp16",
           "pull": "firered-aed-l-v2:fp16",
           "filename": "firered-aed-l-v2-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/878a7be29104370c25938af686f80602c3db73d2/firered-aed-l-v2-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/firered-aed-l-v2/resolve/3fa2e5cb094f39a3a6d8faa1c38bfa20ab81924e/firered-aed-l-v2-fp16.oasr",
           "sha256": "da280b2280c52c4f5034a91f7e21c93731e4a26d060d04d6bc7421f396787306",
           "size_bytes": 2345595360,
           "recommended": false,
@@ -367,7 +367,7 @@
           "suffix": "q8",
           "pull": "firered-aed-l-v2:q8",
           "filename": "firered-aed-l-v2-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/878a7be29104370c25938af686f80602c3db73d2/firered-aed-l-v2-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/firered-aed-l-v2/resolve/3fa2e5cb094f39a3a6d8faa1c38bfa20ab81924e/firered-aed-l-v2-q8_0.oasr",
           "sha256": "aab62beffd6e64ce7d1d946e1c0275abc67f200d3476393af8ba8fa9d9c1f9a7",
           "size_bytes": 1277697376,
           "recommended": false,
@@ -383,7 +383,7 @@
           "suffix": "q4",
           "pull": "firered-aed-l-v2:q4",
           "filename": "firered-aed-l-v2-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/firered-aed-l-v2/resolve/878a7be29104370c25938af686f80602c3db73d2/firered-aed-l-v2-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/firered-aed-l-v2/resolve/3fa2e5cb094f39a3a6d8faa1c38bfa20ab81924e/firered-aed-l-v2-q4_k.oasr",
           "sha256": "b24853f159ed85192b527601190bf31b904e3f62957b8a26418a78c07a5b5688",
           "size_bytes": 1062435296,
           "recommended": true,
@@ -397,6 +397,8 @@
       ],
       "language_mode": "fixed_multilingual",
       "emits_punctuation": false,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "sort_weight": 912,
       "recommended": true,
       "prose_locales": {
@@ -412,9 +414,7 @@
         }
       },
       "upstream_release_date": "2026-02-12",
-      "min_core_version": "0.1.9",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "xasr-zh-en",
@@ -435,8 +435,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/GilgameshWind/X-ASR-zh-en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/xasr-zh-en",
-      "hf_revision": "68aab6ccc9ae09add233449c22b34284277911b1",
+      "hf_repo": "chameleon-ai/xasr-zh-en",
+      "hf_revision": "b2227295e9c04d77d5f77e890a59334d181d7ef9",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -459,7 +459,7 @@
           "suffix": "fp16",
           "pull": "xasr-zh-en:fp16",
           "filename": "xasr-zh-en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/68aab6ccc9ae09add233449c22b34284277911b1/xasr-zh-en-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/xasr-zh-en/resolve/b2227295e9c04d77d5f77e890a59334d181d7ef9/xasr-zh-en-fp16.oasr",
           "sha256": "89316b6e912aa474121fa6b8b7738514b64c9ba144f26702cbb36313b69a2e95",
           "size_bytes": 314918720,
           "recommended": false,
@@ -475,7 +475,7 @@
           "suffix": "q8",
           "pull": "xasr-zh-en:q8",
           "filename": "xasr-zh-en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/xasr-zh-en/resolve/68aab6ccc9ae09add233449c22b34284277911b1/xasr-zh-en-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/xasr-zh-en/resolve/b2227295e9c04d77d5f77e890a59334d181d7ef9/xasr-zh-en-q8_0.oasr",
           "sha256": "a0201070212ceff3a37d8dafd21455209ea48721d1b53b31e8eff328fc573fdb",
           "size_bytes": 175711040,
           "recommended": true,
@@ -489,6 +489,8 @@
       ],
       "language_mode": "fixed_multilingual",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "sort_weight": 910,
       "recommended": true,
       "prose_locales": {
@@ -502,9 +504,7 @@
           ]
         }
       },
-      "upstream_release_date": "2026-05-18",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2026-05-18"
     },
     {
       "id": "dolphin-cn-dialect-small",
@@ -537,8 +537,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/DataoceanAI1/dolphi-cn-dialect-small/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/dolphin-cn-dialect-small",
-      "hf_revision": "5b72c03f91a38e9ae4bf696b420bb4d7e35b0b75",
+      "hf_repo": "chameleon-ai/dolphin-cn-dialect-small",
+      "hf_revision": "969b661f54998e453eed24803c27b8b4501ff0af",
       "public": true,
       "min_cli_version": "0.1.3",
       "recommended_quant": "fp16",
@@ -562,7 +562,7 @@
           "suffix": "fp16",
           "pull": "dolphin-cn-dialect-small:fp16",
           "filename": "dolphin-cn-dialect-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/5b72c03f91a38e9ae4bf696b420bb4d7e35b0b75/dolphin-cn-dialect-small-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-small/resolve/969b661f54998e453eed24803c27b8b4501ff0af/dolphin-cn-dialect-small-fp16.oasr",
           "sha256": "008a812b0ded5420d6e9d864170ae63150155858a7f5a25c14db3b770894df0c",
           "size_bytes": 859973344,
           "recommended": true,
@@ -578,7 +578,7 @@
           "suffix": "q8",
           "pull": "dolphin-cn-dialect-small:q8",
           "filename": "dolphin-cn-dialect-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/5b72c03f91a38e9ae4bf696b420bb4d7e35b0b75/dolphin-cn-dialect-small-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-small/resolve/969b661f54998e453eed24803c27b8b4501ff0af/dolphin-cn-dialect-small-q8_0.oasr",
           "sha256": "55083d6b6167c375f3a0b6d685f11158fab4e0357f0dd22412295506b8846aa6",
           "size_bytes": 493553888,
           "recommended": false,
@@ -594,7 +594,7 @@
           "suffix": "q4",
           "pull": "dolphin-cn-dialect-small:q4",
           "filename": "dolphin-cn-dialect-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-small/resolve/5b72c03f91a38e9ae4bf696b420bb4d7e35b0b75/dolphin-cn-dialect-small-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-small/resolve/969b661f54998e453eed24803c27b8b4501ff0af/dolphin-cn-dialect-small-q4_k.oasr",
           "sha256": "5e3370764012e70b898eb45949586c8ff203b20b712290b2a58bdf6dc233ae02",
           "size_bytes": 406362912,
           "recommended": false,
@@ -609,6 +609,8 @@
       "language_mode": "specify_only",
       "language_default": "zh",
       "emits_punctuation": false,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "sort_weight": 905,
       "recommended": true,
       "prose_locales": {
@@ -624,9 +626,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.3",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.3"
     },
     {
       "id": "qwen3-asr-0.6b",
@@ -696,8 +696,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/qwen3-asr-0.6b",
-      "hf_revision": "3ed5dbd9ef0ddc4fa236e7a6ac87ab4c8af560d6",
+      "hf_repo": "chameleon-ai/qwen3-asr-0.6b",
+      "hf_revision": "58e78ca5f1b81b351485d004247066d6a32182ba",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -720,7 +720,7 @@
           "suffix": "fp16",
           "pull": "qwen3-asr-0.6b:fp16",
           "filename": "qwen3-asr-0.6b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/3ed5dbd9ef0ddc4fa236e7a6ac87ab4c8af560d6/qwen3-asr-0.6b-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-0.6b/resolve/58e78ca5f1b81b351485d004247066d6a32182ba/qwen3-asr-0.6b-fp16.oasr",
           "sha256": "8232fbfbbad29e86848cad63754e3c8cc9dc1132967f5d420c3e9e80017541ae",
           "size_bytes": 1882039200,
           "recommended": false,
@@ -736,7 +736,7 @@
           "suffix": "q8",
           "pull": "qwen3-asr-0.6b:q8",
           "filename": "qwen3-asr-0.6b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/3ed5dbd9ef0ddc4fa236e7a6ac87ab4c8af560d6/qwen3-asr-0.6b-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-0.6b/resolve/58e78ca5f1b81b351485d004247066d6a32182ba/qwen3-asr-0.6b-q8_0.oasr",
           "sha256": "3a3b6625e09aad6db6bdc2f919d5b3fd790b899ee4a59950f5b8fed0d4bf6924",
           "size_bytes": 1006811040,
           "recommended": true,
@@ -752,7 +752,7 @@
           "suffix": "q4",
           "pull": "qwen3-asr-0.6b:q4",
           "filename": "qwen3-asr-0.6b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-asr-0.6b/resolve/3ed5dbd9ef0ddc4fa236e7a6ac87ab4c8af560d6/qwen3-asr-0.6b-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-asr-0.6b/resolve/58e78ca5f1b81b351485d004247066d6a32182ba/qwen3-asr-0.6b-q4_k.oasr",
           "sha256": "f71b8c2a5a60b2ee0d598064b9ab2c0bc01b41ffddfc40b49fd7f195097da6f8",
           "size_bytes": 631027552,
           "recommended": false,
@@ -766,6 +766,8 @@
       ],
       "language_mode": "detect_implicit",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "sort_weight": 900,
       "recommended": true,
       "prose_locales": {
@@ -779,9 +781,7 @@
           ]
         }
       },
-      "upstream_release_date": "2026-01-28",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2026-01-28"
     },
     {
       "id": "sensevoice-small",
@@ -805,8 +805,8 @@
       "license": "FunASR Model License v1.1",
       "license_url": "https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/sensevoice-small",
-      "hf_revision": "52fa74567f213c8280fbea6e2d919709b7a7209f",
+      "hf_repo": "chameleon-ai/sensevoice-small",
+      "hf_revision": "0f8376de37118fbdcbfdc5207bbaf9060924d851",
       "public": true,
       "min_cli_version": "0.1.5",
       "recommended_quant": "fp16",
@@ -830,7 +830,7 @@
           "suffix": "fp16",
           "pull": "sensevoice-small:fp16",
           "filename": "sensevoice-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/sensevoice-small/resolve/52fa74567f213c8280fbea6e2d919709b7a7209f/sensevoice-small-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/sensevoice-small/resolve/0f8376de37118fbdcbfdc5207bbaf9060924d851/sensevoice-small-fp16.oasr",
           "sha256": "97a59d7cd080731a1972fc87fd089b3cccfd20ca77ce5bc3e90d54a8d0802ea7",
           "size_bytes": 470203584,
           "recommended": true,
@@ -846,7 +846,7 @@
           "suffix": "q8",
           "pull": "sensevoice-small:q8",
           "filename": "sensevoice-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/sensevoice-small/resolve/52fa74567f213c8280fbea6e2d919709b7a7209f/sensevoice-small-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/sensevoice-small/resolve/0f8376de37118fbdcbfdc5207bbaf9060924d851/sensevoice-small-q8_0.oasr",
           "sha256": "785a1d45ac22289a5c67927f16f2fc40fd5dae11a630c6c4484092f321517f82",
           "size_bytes": 252476064,
           "recommended": false,
@@ -860,6 +860,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "sort_weight": 900,
       "prose_locales": {
         "zh-CN": {
@@ -874,9 +876,7 @@
         }
       },
       "upstream_release_date": "2024-07-04",
-      "min_core_version": "0.1.5",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.5"
     },
     {
       "id": "firered2-llm",
@@ -897,8 +897,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/FireRedTeam/FireRedASR2-LLM",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/firered2-llm",
-      "hf_revision": "50df0b30058801f9c956a83a4b2136d0c17bf42a",
+      "hf_repo": "chameleon-ai/firered2-llm",
+      "hf_revision": "10f194f871ce76fe7e6952b0cb9b54e5c9e52267",
       "public": true,
       "min_cli_version": "0.1.17",
       "recommended_quant": "q4_k",
@@ -922,7 +922,7 @@
           "suffix": "q4",
           "pull": "firered2-llm:q4",
           "filename": "firered2-llm-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/firered2-llm/resolve/50df0b30058801f9c956a83a4b2136d0c17bf42a/firered2-llm-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/firered2-llm/resolve/10f194f871ce76fe7e6952b0cb9b54e5c9e52267/firered2-llm-q4_k.oasr",
           "sha256": "8f42a5895c778f58c9bc9d4a03c9f3776c763b7295690f7e272f39328f8e1e93",
           "size_bytes": 5097451168,
           "recommended": true,
@@ -935,6 +935,8 @@
         }
       ],
       "language_mode": "fixed_multilingual",
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "sort_weight": 890,
       "prose_locales": {
         "zh-CN": {
@@ -949,9 +951,7 @@
         }
       },
       "upstream_release_date": "2026-02-12",
-      "min_core_version": "0.1.17",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.17"
     },
     {
       "id": "mimo-v2.5-asr",
@@ -973,8 +973,8 @@
       "license": "MIT",
       "license_url": "https://huggingface.co/XiaomiMiMo/MiMo-V2.5-ASR/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/mimo-v2.5-asr",
-      "hf_revision": "d555242ba962b3cda675789e0a4a0e9e87d7c947",
+      "hf_repo": "chameleon-ai/mimo-v2.5-asr",
+      "hf_revision": "9914cecbbf93472ffa7791049a4fe96fa279ebf7",
       "public": true,
       "min_cli_version": "0.1.17",
       "recommended_quant": "q4_k",
@@ -999,7 +999,7 @@
           "suffix": "q4",
           "pull": "mimo-v2.5-asr:q4",
           "filename": "mimo-v2.5-asr-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/mimo-v2.5-asr/resolve/d555242ba962b3cda675789e0a4a0e9e87d7c947/mimo-v2.5-asr-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/mimo-v2.5-asr/resolve/9914cecbbf93472ffa7791049a4fe96fa279ebf7/mimo-v2.5-asr-q4_k.oasr",
           "sha256": "06c080a4fe040f18b374e740627911877b38af123c0085b912a9d2a941442b4c",
           "size_bytes": 5828003840,
           "recommended": true,
@@ -1012,6 +1012,8 @@
         }
       ],
       "language_mode": "fixed_multilingual",
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "sort_weight": 888,
       "prose_locales": {
         "zh-CN": {
@@ -1026,9 +1028,7 @@
           ]
         }
       },
-      "min_core_version": "0.1.17",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.17"
     },
     {
       "id": "moss-transcribe-diarize",
@@ -1062,8 +1062,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/moss-transcribe-diarize",
-      "hf_revision": "196b6d4939c334ff41559db2549f1432899f8822",
+      "hf_repo": "chameleon-ai/moss-transcribe-diarize",
+      "hf_revision": "42bd01e9e25f3d0e398fc1283e8af9c797e1fc60",
       "public": true,
       "min_cli_version": "0.1.24",
       "recommended_quant": "q8_0",
@@ -1087,7 +1087,7 @@
           "suffix": "fp16",
           "pull": "moss-transcribe-diarize:fp16",
           "filename": "moss-transcribe-diarize-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/196b6d4939c334ff41559db2549f1432899f8822/moss-transcribe-diarize-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/moss-transcribe-diarize/resolve/42bd01e9e25f3d0e398fc1283e8af9c797e1fc60/moss-transcribe-diarize-fp16.oasr",
           "sha256": "648fe154f4dc536d3b11b3561a0bd92fc54be5031da71150f32e451503ff8891",
           "size_bytes": 1823128992,
           "recommended": false,
@@ -1103,7 +1103,7 @@
           "suffix": "q8",
           "pull": "moss-transcribe-diarize:q8",
           "filename": "moss-transcribe-diarize-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/196b6d4939c334ff41559db2549f1432899f8822/moss-transcribe-diarize-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/moss-transcribe-diarize/resolve/42bd01e9e25f3d0e398fc1283e8af9c797e1fc60/moss-transcribe-diarize-q8_0.oasr",
           "sha256": "137f8283052fced1192af6aa80c3bf984b37d3b19c82803a63f57025b76626ee",
           "size_bytes": 1122221472,
           "recommended": true,
@@ -1119,7 +1119,7 @@
           "suffix": "q4",
           "pull": "moss-transcribe-diarize:q4",
           "filename": "moss-transcribe-diarize-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/moss-transcribe-diarize/resolve/196b6d4939c334ff41559db2549f1432899f8822/moss-transcribe-diarize-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/moss-transcribe-diarize/resolve/42bd01e9e25f3d0e398fc1283e8af9c797e1fc60/moss-transcribe-diarize-q4_k.oasr",
           "sha256": "0044546efb95d4d08e85f5574da2b042a5a4fb2490678c666b65404f1ac94c04",
           "size_bytes": 902020512,
           "recommended": false,
@@ -1133,6 +1133,7 @@
       ],
       "language_mode": "detect_implicit",
       "speaker_source": "native",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "0.9B \u53c2\u6570\uff0c\u4e00\u6b21\u89e3\u7801\u540c\u65f6\u5b8c\u6210\u8f6c\u5199\u548c\u5f55\u97f3\u5185\u8bf4\u8bdd\u4eba\u5206\u79bb",
@@ -1146,8 +1147,7 @@
         }
       },
       "upstream_release_date": "2026-07-09",
-      "min_core_version": "0.1.24",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.24"
     },
     {
       "id": "dolphin-base",
@@ -1203,8 +1203,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/DataoceanAI/dolphin-base/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/dolphin-base",
-      "hf_revision": "cedd9f67c535032fcfae07c5469dc49f9d957aab",
+      "hf_repo": "chameleon-ai/dolphin-base",
+      "hf_revision": "498992308eeac4a9cb3054e90dbc430ebf7d5af3",
       "public": true,
       "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
@@ -1228,7 +1228,7 @@
           "suffix": "fp16",
           "pull": "dolphin-base:fp16",
           "filename": "dolphin-base-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-base/resolve/498992308eeac4a9cb3054e90dbc430ebf7d5af3/dolphin-base-fp16.oasr",
           "sha256": "f8d83121160f08c5d166d0251403ec5d6e4719cccd8a18956e8f675a7d031ec3",
           "size_bytes": 286733696,
           "recommended": false,
@@ -1244,7 +1244,7 @@
           "suffix": "q8",
           "pull": "dolphin-base:q8",
           "filename": "dolphin-base-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-base/resolve/cedd9f67c535032fcfae07c5469dc49f9d957aab/dolphin-base-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-base/resolve/498992308eeac4a9cb3054e90dbc430ebf7d5af3/dolphin-base-q8_0.oasr",
           "sha256": "79ca61ddfcba1d83aec875fa5f7d482b8a7e92939f80345e152553a4f453add7",
           "size_bytes": 158106176,
           "recommended": true,
@@ -1259,6 +1259,8 @@
       "language_mode": "specify_only",
       "language_default": "zh",
       "emits_punctuation": false,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b\uff0c\u5165\u95e8\u6863 \u2014 \u4ec5 140M \u53c2\u6570\uff0c\u5c0f\u5de7\u7701\u8d44\u6e90",
@@ -1272,9 +1274,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.9",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "dolphin-cn-dialect-base",
@@ -1304,8 +1304,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/DataoceanAI/dolphin-cn-dialect-base/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/dolphin-cn-dialect-base",
-      "hf_revision": "e3ce5581fa51f8a6e687d0e8fe50346c08291a85",
+      "hf_repo": "chameleon-ai/dolphin-cn-dialect-base",
+      "hf_revision": "f649b540ab26744b4e8b0c23c328e9d1fbf55038",
       "public": true,
       "min_cli_version": "0.1.8",
       "recommended_quant": "fp16",
@@ -1329,7 +1329,7 @@
           "suffix": "fp16",
           "pull": "dolphin-cn-dialect-base:fp16",
           "filename": "dolphin-cn-dialect-base-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e3ce5581fa51f8a6e687d0e8fe50346c08291a85/dolphin-cn-dialect-base-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-base/resolve/f649b540ab26744b4e8b0c23c328e9d1fbf55038/dolphin-cn-dialect-base-fp16.oasr",
           "sha256": "7fa84334cdb81ec3d0ae09882e613424a79eef871a682d4028487ea72318e520",
           "size_bytes": 224297952,
           "recommended": true,
@@ -1345,7 +1345,7 @@
           "suffix": "q8",
           "pull": "dolphin-cn-dialect-base:q8",
           "filename": "dolphin-cn-dialect-base-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e3ce5581fa51f8a6e687d0e8fe50346c08291a85/dolphin-cn-dialect-base-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-base/resolve/f649b540ab26744b4e8b0c23c328e9d1fbf55038/dolphin-cn-dialect-base-q8_0.oasr",
           "sha256": "4cda4dbbb147c55af488c0d292acd6bd1bf406f44b3c97a23a2f0c79cbf17870",
           "size_bytes": 127104192,
           "recommended": false,
@@ -1361,7 +1361,7 @@
           "suffix": "q4",
           "pull": "dolphin-cn-dialect-base:q4",
           "filename": "dolphin-cn-dialect-base-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-cn-dialect-base/resolve/e3ce5581fa51f8a6e687d0e8fe50346c08291a85/dolphin-cn-dialect-base-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-cn-dialect-base/resolve/f649b540ab26744b4e8b0c23c328e9d1fbf55038/dolphin-cn-dialect-base-q4_k.oasr",
           "sha256": "7ec60acf9ec1974cea96cfa77b829375ed789bed71639f95a96e1bcc36dc6980",
           "size_bytes": 100564480,
           "recommended": false,
@@ -1376,6 +1376,8 @@
       "language_mode": "specify_only",
       "language_default": "zh",
       "emits_punctuation": false,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4e2d\u6587\u591a\u65b9\u8a00\u8bed\u97f3\u8bc6\u522b\uff0c\u5165\u95e8\u6863 \u2014 \u4ec5 140M \u53c2\u6570\uff0c\u8986\u76d6\u56db\u5ddd\u8bdd\u53ca 22 \u79cd\u5730\u65b9\u65b9\u8a00",
@@ -1389,9 +1391,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.8",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.8"
     },
     {
       "id": "dolphin-small",
@@ -1449,8 +1449,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/DataoceanAI/dolphin-small/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/dolphin-small",
-      "hf_revision": "7d78fea2153295e38909dbec0962179d9164acc1",
+      "hf_repo": "chameleon-ai/dolphin-small",
+      "hf_revision": "56ef23d78bc50707a79b105e402cb070af79c11d",
       "public": true,
       "min_cli_version": "0.1.9",
       "recommended_quant": "q8_0",
@@ -1474,7 +1474,7 @@
           "suffix": "fp16",
           "pull": "dolphin-small:fp16",
           "filename": "dolphin-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/7d78fea2153295e38909dbec0962179d9164acc1/dolphin-small-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-small/resolve/56ef23d78bc50707a79b105e402cb070af79c11d/dolphin-small-fp16.oasr",
           "sha256": "8e6dac3908f96871c3b887eb13880dbf516b35946aa7ae4e0a1f142ba8a2941e",
           "size_bytes": 754136512,
           "recommended": false,
@@ -1490,7 +1490,7 @@
           "suffix": "q8",
           "pull": "dolphin-small:q8",
           "filename": "dolphin-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/7d78fea2153295e38909dbec0962179d9164acc1/dolphin-small-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-small/resolve/56ef23d78bc50707a79b105e402cb070af79c11d/dolphin-small-q8_0.oasr",
           "sha256": "95554064292e0e63461b07839a254bd232030809bcb1b64b1dc34aee26767eec",
           "size_bytes": 411711712,
           "recommended": true,
@@ -1506,7 +1506,7 @@
           "suffix": "q4",
           "pull": "dolphin-small:q4",
           "filename": "dolphin-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/dolphin-small/resolve/7d78fea2153295e38909dbec0962179d9164acc1/dolphin-small-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/dolphin-small/resolve/56ef23d78bc50707a79b105e402cb070af79c11d/dolphin-small-q4_k.oasr",
           "sha256": "7e02ac54cdedcc1925538ff5f5ee6db9074aabb4e016c68f66d0575609950b26",
           "size_bytes": 309006304,
           "recommended": false,
@@ -1521,6 +1521,8 @@
       "language_mode": "specify_only",
       "language_default": "zh",
       "emits_punctuation": false,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u8986\u76d6 40 \u79cd\u8bed\u8a00\u7684\u591a\u8bed\u79cd\u8bed\u97f3\u8bc6\u522b \u2014 \u6db5\u76d6\u5357\u4e9a\u3001\u4e1c\u5357\u4e9a\u3001\u4e2d\u4e9a\u8bed\u8a00\u4e0e\u4e2d\u6587\u65b9\u8a00",
@@ -1534,9 +1536,7 @@
         }
       },
       "upstream_release_date": "2026-05-13",
-      "min_core_version": "0.1.9",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.9"
     },
     {
       "id": "cohere-transcribe-03-2026",
@@ -1569,8 +1569,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/cohere-transcribe-03-2026",
-      "hf_revision": "d68f62404ea48d4606ddea1a7c4eb19ffc352bb7",
+      "hf_repo": "chameleon-ai/cohere-transcribe-03-2026",
+      "hf_revision": "73e738e67149f1c76305171b69fe98c232f1c731",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -1593,7 +1593,7 @@
           "suffix": "fp16",
           "pull": "cohere-transcribe-03-2026:fp16",
           "filename": "cohere-transcribe-03-2026-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/cohere-transcribe-03-2026/resolve/73e738e67149f1c76305171b69fe98c232f1c731/cohere-transcribe-03-2026-fp16.oasr",
           "sha256": "0171306966445fe6a5a008c4d1fee6bbeca9f44530f7da86163e6a3064830823",
           "size_bytes": 4136505984,
           "recommended": false,
@@ -1609,7 +1609,7 @@
           "suffix": "q8",
           "pull": "cohere-transcribe-03-2026:q8",
           "filename": "cohere-transcribe-03-2026-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/cohere-transcribe-03-2026/resolve/d68f62404ea48d4606ddea1a7c4eb19ffc352bb7/cohere-transcribe-03-2026-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/cohere-transcribe-03-2026/resolve/73e738e67149f1c76305171b69fe98c232f1c731/cohere-transcribe-03-2026-q8_0.oasr",
           "sha256": "e2ec0cd9a9d50f398e5553ef58bda19a7d4d0075c897bf5474686d877876a05f",
           "size_bytes": 2423804544,
           "recommended": true,
@@ -1624,6 +1624,8 @@
       "language_mode": "specify_only",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u4e13\u4e3a\u8bed\u97f3\u8f6c\u6587\u5b57\u6253\u9020\u7684 2B \u53c2\u6570\u6a21\u578b\uff0c\u652f\u6301 14 \u79cd\u8bed\u8a00",
@@ -1635,9 +1637,7 @@
           ]
         }
       },
-      "upstream_release_date": "2026-03-24",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2026-03-24"
     },
     {
       "id": "redimnet2-b6-cn",
@@ -1659,8 +1659,8 @@
       "license": "MIT",
       "license_url": "https://github.com/PalabraAI/redimnet2/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/redimnet2-b6-cn",
-      "hf_revision": "4c8deac5d2f81fabe4a16a2dcd6184c3e47c02dd",
+      "hf_repo": "chameleon-ai/redimnet2-b6-cn",
+      "hf_revision": "cb3fdc9734bba15b11fb13b6db70fb7a508b8500",
       "public": true,
       "min_cli_version": "0.1.23",
       "recommended_quant": "fp16",
@@ -1684,7 +1684,7 @@
           "suffix": "fp16",
           "pull": "redimnet2-b6-cn:fp16",
           "filename": "redimnet2-b6-cn-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/redimnet2-b6-cn/resolve/4c8deac5d2f81fabe4a16a2dcd6184c3e47c02dd/redimnet2-b6-cn-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/redimnet2-b6-cn/resolve/cb3fdc9734bba15b11fb13b6db70fb7a508b8500/redimnet2-b6-cn-fp16.oasr",
           "sha256": "ef408d57e9f41d3e430e5c6aa9483bacaebf9531cc224217d395d0cfb37cf6d1",
           "size_bytes": 27775520,
           "recommended": true,
@@ -1730,8 +1730,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/FireRedTeam/FireRedPunc",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/firered-punc",
-      "hf_revision": "61306bcc8c84441794cad658a3f991fcf841bbdd",
+      "hf_repo": "chameleon-ai/firered-punc",
+      "hf_revision": "8642c768b9b16dcc585dc854eddd777d1f2d9030",
       "public": true,
       "min_cli_version": "0.1.11",
       "recommended_quant": "fp16",
@@ -1755,7 +1755,7 @@
           "suffix": "fp16",
           "pull": "firered-punc:fp16",
           "filename": "firered-punc-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/firered-punc/resolve/61306bcc8c84441794cad658a3f991fcf841bbdd/firered-punc-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/firered-punc/resolve/8642c768b9b16dcc585dc854eddd777d1f2d9030/firered-punc-fp16.oasr",
           "sha256": "95033ed3842e5399f6eec430c28950d34ecba0b41d0c0f7069ccbd8280f48234",
           "size_bytes": 203631008,
           "recommended": true,
@@ -1802,8 +1802,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B/blob/c7cbfc2048c462b0d63a45797104fc9db3ad62b7/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/qwen3-forced-aligner-0.6b",
-      "hf_revision": "3a82628cf7036c2ad0128f2d35bd1cced09b3100",
+      "hf_repo": "chameleon-ai/qwen3-forced-aligner-0.6b",
+      "hf_revision": "f40c05348fce737df5d7b650626865f8bba7e7aa",
       "public": true,
       "min_cli_version": "0.1.32",
       "recommended_quant": "q4_k",
@@ -1827,7 +1827,7 @@
           "suffix": "fp16",
           "pull": "qwen3-forced-aligner-0.6b:fp16",
           "filename": "qwen3-forced-aligner-0.6b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-forced-aligner-0.6b/resolve/f40c05348fce737df5d7b650626865f8bba7e7aa/qwen3-forced-aligner-0.6b-fp16.oasr",
           "sha256": "6a66901681415f360e1bc61cc62ae4702ac53795910e99aed6913172c36dbafe",
           "size_bytes": 1841709344,
           "recommended": false,
@@ -1843,7 +1843,7 @@
           "suffix": "q8",
           "pull": "qwen3-forced-aligner-0.6b:q8",
           "filename": "qwen3-forced-aligner-0.6b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-forced-aligner-0.6b/resolve/f40c05348fce737df5d7b650626865f8bba7e7aa/qwen3-forced-aligner-0.6b-q8_0.oasr",
           "sha256": "68af47f60b2809a942b1f6e7a43c6a5189e74bbf3f7ae15b4b3bdfe07e48c5c7",
           "size_bytes": 985596704,
           "recommended": false,
@@ -1859,7 +1859,7 @@
           "suffix": "q4",
           "pull": "qwen3-forced-aligner-0.6b:q4",
           "filename": "qwen3-forced-aligner-0.6b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/qwen3-forced-aligner-0.6b/resolve/3a82628cf7036c2ad0128f2d35bd1cced09b3100/qwen3-forced-aligner-0.6b-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/qwen3-forced-aligner-0.6b/resolve/f40c05348fce737df5d7b650626865f8bba7e7aa/qwen3-forced-aligner-0.6b-q4_k.oasr",
           "sha256": "5b36662d373cbee279f168c2f88700a59a93246584bf3a5ade9e800e41c7807b",
           "size_bytes": 765395744,
           "recommended": true,
@@ -1905,8 +1905,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/funasr-nano",
-      "hf_revision": "394981427adb65a1589743152b640ece0512ba3f",
+      "hf_repo": "chameleon-ai/funasr-nano",
+      "hf_revision": "96979123077ea2c7edb94c4dca50c03c7f54bd4e",
       "public": true,
       "min_cli_version": "0.1.27",
       "recommended_quant": "q8_0",
@@ -1929,7 +1929,7 @@
           "suffix": "fp16",
           "pull": "funasr-nano:fp16",
           "filename": "funasr-nano-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/funasr-nano/resolve/96979123077ea2c7edb94c4dca50c03c7f54bd4e/funasr-nano-fp16.oasr",
           "sha256": "080ccfb5f24ebbe5bea365e31fa6feefa224d0e7e720bebf1088a31585bc541b",
           "size_bytes": 1978044032,
           "recommended": false,
@@ -1945,7 +1945,7 @@
           "suffix": "q8",
           "pull": "funasr-nano:q8",
           "filename": "funasr-nano-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/funasr-nano/resolve/96979123077ea2c7edb94c4dca50c03c7f54bd4e/funasr-nano-q8_0.oasr",
           "sha256": "25ed4e852729d90003b81a7714abba195bbbfcaf874ff7ee25c7849d8f44e32e",
           "size_bytes": 1055952512,
           "recommended": true,
@@ -1961,7 +1961,7 @@
           "suffix": "q4",
           "pull": "funasr-nano:q4",
           "filename": "funasr-nano-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/funasr-nano/resolve/394981427adb65a1589743152b640ece0512ba3f/funasr-nano-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/funasr-nano/resolve/96979123077ea2c7edb94c4dca50c03c7f54bd4e/funasr-nano-q4_k.oasr",
           "sha256": "d26ab0cb0d26207041043c5c79a9a6c14f3d51a1634da8b51576c15130da14b3",
           "size_bytes": 680169088,
           "recommended": false,
@@ -1975,6 +1975,7 @@
       ],
       "language_mode": "fixed_multilingual",
       "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5c0f\u4f53\u79ef\u53cc\u8bed\u8bed\u97f3\u8bc6\u522b\u2014\u2014\u666e\u901a\u8bdd\u548c\u82f1\u6587\uff0c\u7ea6 0.8B \u7684 SAN-M + Qwen3 \u7ec4\u5408",
@@ -1987,8 +1988,7 @@
         }
       },
       "upstream_release_date": "2025-12-01",
-      "min_core_version": "0.1.27",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.27"
     },
     {
       "id": "granite-speech-4.1-2b",
@@ -2013,8 +2013,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/ibm-granite/granite-speech-4.1-2b/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/granite-speech-4.1-2b",
-      "hf_revision": "8f6743e1bec5819962d92588a18021f7c66b592c",
+      "hf_repo": "chameleon-ai/granite-speech-4.1-2b",
+      "hf_revision": "c3293ad3397c999e411a08814c3fbc63ca5250ad",
       "public": true,
       "min_cli_version": "0.1.27",
       "recommended_quant": "q8_0",
@@ -2037,7 +2037,7 @@
           "suffix": "fp16",
           "pull": "granite-speech-4.1-2b:fp16",
           "filename": "granite-speech-4.1-2b-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/granite-speech-4.1-2b/resolve/8f6743e1bec5819962d92588a18021f7c66b592c/granite-speech-4.1-2b-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/granite-speech-4.1-2b/resolve/c3293ad3397c999e411a08814c3fbc63ca5250ad/granite-speech-4.1-2b-fp16.oasr",
           "sha256": "56ff48fd309c7219c416492ef71ff56bbf6cc836a5c6e0176f0800b3062080e0",
           "size_bytes": 4631163712,
           "recommended": false,
@@ -2053,7 +2053,7 @@
           "suffix": "q8",
           "pull": "granite-speech-4.1-2b:q8",
           "filename": "granite-speech-4.1-2b-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/granite-speech-4.1-2b/resolve/8f6743e1bec5819962d92588a18021f7c66b592c/granite-speech-4.1-2b-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/granite-speech-4.1-2b/resolve/c3293ad3397c999e411a08814c3fbc63ca5250ad/granite-speech-4.1-2b-q8_0.oasr",
           "sha256": "7368242e65f8f907bae8002a609f966a25fcb32af6575b1baae6057c48e6566c",
           "size_bytes": 2466018112,
           "recommended": true,
@@ -2069,7 +2069,7 @@
           "suffix": "q4",
           "pull": "granite-speech-4.1-2b:q4",
           "filename": "granite-speech-4.1-2b-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/granite-speech-4.1-2b/resolve/8f6743e1bec5819962d92588a18021f7c66b592c/granite-speech-4.1-2b-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/granite-speech-4.1-2b/resolve/c3293ad3397c999e411a08814c3fbc63ca5250ad/granite-speech-4.1-2b-q4_k.oasr",
           "sha256": "8092fb3209781dfee9ebd4ee2c203ab10d75597470c33d728bf3802d26289758",
           "size_bytes": 1547463488,
           "recommended": false,
@@ -2083,6 +2083,8 @@
       ],
       "language_mode": "detect_implicit",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "forced_aligner",
       "prose_locales": {
         "zh-CN": {
           "tagline": "IBM Granite Speech 4.1\u2014\u20142B \u591a\u8bed\u8a00\u8bed\u97f3\u8bc6\u522b\uff0c\u82f1\u6587\u7cbe\u5ea6\u7a81\u51fa",
@@ -2095,9 +2097,7 @@
         }
       },
       "upstream_release_date": "2025-05-01",
-      "min_core_version": "0.1.27",
-      "speaker_source": "external",
-      "word_timestamp_source": "forced_aligner"
+      "min_core_version": "0.1.27"
     },
     {
       "id": "moonshine-tiny",
@@ -2116,8 +2116,8 @@
       "license": "MIT",
       "license_url": "https://huggingface.co/UsefulSensors/moonshine-tiny",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/moonshine-tiny",
-      "hf_revision": "765b763f3536cb8810ae1634b6aaa995abbb1bde",
+      "hf_repo": "chameleon-ai/moonshine-tiny",
+      "hf_revision": "b1281ca623287203404c3c17875e4fe678ff3124",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -2141,7 +2141,7 @@
           "suffix": "fp16",
           "pull": "moonshine-tiny:fp16",
           "filename": "moonshine-tiny-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/b1281ca623287203404c3c17875e4fe678ff3124/moonshine-tiny-fp16.oasr",
           "sha256": "2f024ab25f82fd06c6c213df0a2db6ec542e6463acd8bb5e799ed158468d6258",
           "size_bytes": 108863040,
           "recommended": false,
@@ -2157,7 +2157,7 @@
           "suffix": "q8",
           "pull": "moonshine-tiny:q8",
           "filename": "moonshine-tiny-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/moonshine-tiny/resolve/765b763f3536cb8810ae1634b6aaa995abbb1bde/moonshine-tiny-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/b1281ca623287203404c3c17875e4fe678ff3124/moonshine-tiny-q8_0.oasr",
           "sha256": "80ec6caed0a99abb27aa6775c9616c94a397417b6696466dfe59ae43c16f3e77",
           "size_bytes": 34360896,
           "recommended": true,
@@ -2172,6 +2172,8 @@
       "language_mode": "fixed_monolingual",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u8d85\u8f7b\u91cf 27M \u53c2\u6570\u82f1\u8bed\u8bed\u97f3\u8bc6\u522b\uff0c\u4e13\u4e3a\u5b9e\u65f6\u672c\u5730\u8f6c\u5199\u6253\u9020",
@@ -2184,9 +2186,7 @@
           ]
         }
       },
-      "upstream_release_date": "2024-10-30",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2024-10-30"
     },
     {
       "id": "whisper-large-v3-turbo",
@@ -2303,8 +2303,8 @@
       "license": "MIT",
       "license_url": "https://github.com/openai/whisper/blob/main/LICENSE",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-large-v3-turbo",
-      "hf_revision": "352b5f14883c38e3db2bbd58c816fd0d16921ae7",
+      "hf_repo": "chameleon-ai/whisper-large-v3-turbo",
+      "hf_revision": "c12d294f68f672c3918ef46dfaf301133f104c69",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -2327,7 +2327,7 @@
           "suffix": "fp16",
           "pull": "whisper-large-v3-turbo:fp16",
           "filename": "whisper-large-v3-turbo-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/352b5f14883c38e3db2bbd58c816fd0d16921ae7/whisper-large-v3-turbo-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3-turbo/resolve/c12d294f68f672c3918ef46dfaf301133f104c69/whisper-large-v3-turbo-fp16.oasr",
           "sha256": "c963b06ceb623f45d6661cbbe97c861764fb273a0cc0a2cbe5c44b536c42a3bf",
           "size_bytes": 1619471168,
           "recommended": false,
@@ -2343,7 +2343,7 @@
           "suffix": "q8",
           "pull": "whisper-large-v3-turbo:q8",
           "filename": "whisper-large-v3-turbo-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/352b5f14883c38e3db2bbd58c816fd0d16921ae7/whisper-large-v3-turbo-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3-turbo/resolve/c12d294f68f672c3918ef46dfaf301133f104c69/whisper-large-v3-turbo-q8_0.oasr",
           "sha256": "7aadbdd35ab260d127f50affaecae0a51f5793e700afe212cefb0e74a99f95da",
           "size_bytes": 931343168,
           "recommended": true,
@@ -2359,7 +2359,7 @@
           "suffix": "q4",
           "pull": "whisper-large-v3-turbo:q4",
           "filename": "whisper-large-v3-turbo-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3-turbo/resolve/352b5f14883c38e3db2bbd58c816fd0d16921ae7/whisper-large-v3-turbo-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3-turbo/resolve/c12d294f68f672c3918ef46dfaf301133f104c69/whisper-large-v3-turbo-q4_k.oasr",
           "sha256": "d67adbf377e75a10104b2f8ab31b30e83950f888a16a58c968b258c78c443967",
           "size_bytes": 878914304,
           "recommended": false,
@@ -2373,6 +2373,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "Whisper large-v3 \u7684\u63d0\u901f\u7cbe\u7b80\u7248\uff0c\u591a\u8bed\u8a00\u8bc6\u522b\u98de\u5feb",
@@ -2384,9 +2386,7 @@
           ]
         }
       },
-      "upstream_release_date": "2024-10-01",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2024-10-01"
     },
     {
       "id": "whisper-large-v3",
@@ -2500,8 +2500,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-large-v3/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-large-v3",
-      "hf_revision": "d8641881bbe2a28532cf21b78e9afe48751c50b9",
+      "hf_repo": "chameleon-ai/whisper-large-v3",
+      "hf_revision": "ffb859eb9cfa10a15e845ba8c2bcb4f41f705da1",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -2524,7 +2524,7 @@
           "suffix": "fp16",
           "pull": "whisper-large-v3:fp16",
           "filename": "whisper-large-v3-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/d8641881bbe2a28532cf21b78e9afe48751c50b9/whisper-large-v3-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3/resolve/ffb859eb9cfa10a15e845ba8c2bcb4f41f705da1/whisper-large-v3-fp16.oasr",
           "sha256": "8a0052daa836ecc10cd5e71f3dffce21af001b47a624501e5ef08d536a732598",
           "size_bytes": 3088750656,
           "recommended": false,
@@ -2540,7 +2540,7 @@
           "suffix": "q8",
           "pull": "whisper-large-v3:q8",
           "filename": "whisper-large-v3-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/d8641881bbe2a28532cf21b78e9afe48751c50b9/whisper-large-v3-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3/resolve/ffb859eb9cfa10a15e845ba8c2bcb4f41f705da1/whisper-large-v3-q8_0.oasr",
           "sha256": "2ea5a9cf974b0524ee570feb50c96d2b754b1108312a880f7778bf55caf49327",
           "size_bytes": 1712494656,
           "recommended": true,
@@ -2556,7 +2556,7 @@
           "suffix": "q4",
           "pull": "whisper-large-v3:q4",
           "filename": "whisper-large-v3-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-large-v3/resolve/d8641881bbe2a28532cf21b78e9afe48751c50b9/whisper-large-v3-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-large-v3/resolve/ffb859eb9cfa10a15e845ba8c2bcb4f41f705da1/whisper-large-v3-q4_k.oasr",
           "sha256": "95bd6d35f99bb237c91c8230cfb96fa33c7ccb355e12c1ad7bacc9857545b191",
           "size_bytes": 1293064192,
           "recommended": false,
@@ -2570,6 +2570,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "OpenAI \u51c6\u786e\u7387\u6700\u9ad8\u7684 Whisper\uff0cv3 \u5b8c\u6574\u7248",
@@ -2581,9 +2583,7 @@
           ]
         }
       },
-      "upstream_release_date": "2023-11-06",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2023-11-06"
     },
     {
       "id": "pyannote-segmentation-3.0",
@@ -2605,8 +2605,8 @@
       "license": "MIT",
       "license_url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/pyannote-segmentation-3.0",
-      "hf_revision": "aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a",
+      "hf_repo": "chameleon-ai/pyannote-segmentation-3.0",
+      "hf_revision": "8f20b41c8070ab09b90a2e2269f65009f87227d3",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "f32",
@@ -2630,7 +2630,7 @@
           "suffix": "f32",
           "pull": "pyannote-segmentation-3.0:f32",
           "filename": "pyannote-segmentation-3.0-f32.oasr",
-          "url": "https://huggingface.co/OpenASR/pyannote-segmentation-3.0/resolve/aaae2145d5b3ac34d493c1fe0edcd2cdd9184b6a/pyannote-segmentation-3.0-f32.oasr",
+          "url": "https://huggingface.co/chameleon-ai/pyannote-segmentation-3.0/resolve/8f20b41c8070ab09b90a2e2269f65009f87227d3/pyannote-segmentation-3.0-f32.oasr",
           "sha256": "48151e322a0a9bb318000994e33991bdeeedb14aec5c8ea4cdb0ad2f63cb60af",
           "size_bytes": 5975392,
           "recommended": true,
@@ -2768,8 +2768,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-base/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-base",
-      "hf_revision": "4d9835868de35cec46e934e12b1e0d6f4303cdc3",
+      "hf_repo": "chameleon-ai/whisper-base",
+      "hf_revision": "2b907b0b2e8425c120c6aaff3ee66a76f065e5d7",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -2792,7 +2792,7 @@
           "suffix": "fp16",
           "pull": "whisper-base:fp16",
           "filename": "whisper-base-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/4d9835868de35cec46e934e12b1e0d6f4303cdc3/whisper-base-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base/resolve/2b907b0b2e8425c120c6aaff3ee66a76f065e5d7/whisper-base-fp16.oasr",
           "sha256": "bf3e42a2e866182077deca694f3f3bc935b3f892a825ad2130b7a0c167014da7",
           "size_bytes": 149055136,
           "recommended": false,
@@ -2808,7 +2808,7 @@
           "suffix": "q8",
           "pull": "whisper-base:q8",
           "filename": "whisper-base-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/4d9835868de35cec46e934e12b1e0d6f4303cdc3/whisper-base-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base/resolve/2b907b0b2e8425c120c6aaff3ee66a76f065e5d7/whisper-base-q8_0.oasr",
           "sha256": "86a565a224ed9111e6477590b01632caea90502b1bca5350c50d80384f31f742",
           "size_bytes": 107767456,
           "recommended": true,
@@ -2824,7 +2824,7 @@
           "suffix": "q4",
           "pull": "whisper-base:q4",
           "filename": "whisper-base-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base/resolve/4d9835868de35cec46e934e12b1e0d6f4303cdc3/whisper-base-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base/resolve/2b907b0b2e8425c120c6aaff3ee66a76f065e5d7/whisper-base-q4_k.oasr",
           "sha256": "da4d29cb1341901facac6421b2f054563a0cec51dbcfa6a52f7728fb5202a53a",
           "size_bytes": 95184480,
           "recommended": false,
@@ -2838,6 +2838,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5c0f\u5de7\u7684\u591a\u8bed\u8a00 Whisper\uff0c\u6bd4 tiny \u66f4\u51c6\u4e00\u6863",
@@ -2849,9 +2851,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-base.en",
@@ -2868,8 +2868,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-base.en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-base.en",
-      "hf_revision": "d80b948ee82890c5b18d2e12efadd697529cc559",
+      "hf_repo": "chameleon-ai/whisper-base.en",
+      "hf_revision": "5e33a03901571292fd0e4f2aba2f651a4effccdc",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -2892,7 +2892,7 @@
           "suffix": "fp16",
           "pull": "whisper-base.en:fp16",
           "filename": "whisper-base.en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/d80b948ee82890c5b18d2e12efadd697529cc559/whisper-base.en-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base.en/resolve/5e33a03901571292fd0e4f2aba2f651a4effccdc/whisper-base.en-fp16.oasr",
           "sha256": "2f6b5f45412aa7e779781e3b1174632d96190e8af8ae3014f2ebcfbad196fe1f",
           "size_bytes": 148979040,
           "recommended": false,
@@ -2908,7 +2908,7 @@
           "suffix": "q8",
           "pull": "whisper-base.en:q8",
           "filename": "whisper-base.en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/d80b948ee82890c5b18d2e12efadd697529cc559/whisper-base.en-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base.en/resolve/5e33a03901571292fd0e4f2aba2f651a4effccdc/whisper-base.en-q8_0.oasr",
           "sha256": "e62c3ae3478dd36c2b4c74a8d798355b1d16d5533083acd24cc90088e6525d05",
           "size_bytes": 107691360,
           "recommended": true,
@@ -2924,7 +2924,7 @@
           "suffix": "q4",
           "pull": "whisper-base.en:q4",
           "filename": "whisper-base.en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-base.en/resolve/d80b948ee82890c5b18d2e12efadd697529cc559/whisper-base.en-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-base.en/resolve/5e33a03901571292fd0e4f2aba2f651a4effccdc/whisper-base.en-q4_k.oasr",
           "sha256": "f4d5e9c295fe6d025baa14eb58f68e66a49afe995d8500fca265fd8284fe5d47",
           "size_bytes": 95108352,
           "recommended": false,
@@ -2939,6 +2939,8 @@
       "language_mode": "fixed_monolingual",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5c0f\u5de7\u7684\u7eaf\u82f1\u8bed Whisper\uff0c\u8f6c\u5199\u82f1\u8bed\u53c8\u5feb\u53c8\u597d",
@@ -2950,9 +2952,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-medium",
@@ -3066,8 +3066,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-medium/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-medium",
-      "hf_revision": "d77e227b9e238851db9288badfeec1068423f348",
+      "hf_repo": "chameleon-ai/whisper-medium",
+      "hf_revision": "4923998e2ff597ebc4107e57d36076b7e956325a",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3090,7 +3090,7 @@
           "suffix": "fp16",
           "pull": "whisper-medium:fp16",
           "filename": "whisper-medium-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/d77e227b9e238851db9288badfeec1068423f348/whisper-medium-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium/resolve/4923998e2ff597ebc4107e57d36076b7e956325a/whisper-medium-fp16.oasr",
           "sha256": "08a80860d71f72728ad9676f3f3e7ef45d460c9d38a4eb11199607ed374da200",
           "size_bytes": 1534887520,
           "recommended": false,
@@ -3106,7 +3106,7 @@
           "suffix": "q8",
           "pull": "whisper-medium:q8",
           "filename": "whisper-medium-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/d77e227b9e238851db9288badfeec1068423f348/whisper-medium-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium/resolve/4923998e2ff597ebc4107e57d36076b7e956325a/whisper-medium-q8_0.oasr",
           "sha256": "5e663d322bcaa5743c3e4b3dac680f0b6c79f87edb9d7f1b9147a09329278c37",
           "size_bytes": 874284640,
           "recommended": true,
@@ -3122,7 +3122,7 @@
           "suffix": "q4",
           "pull": "whisper-medium:q4",
           "filename": "whisper-medium-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium/resolve/d77e227b9e238851db9288badfeec1068423f348/whisper-medium-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium/resolve/4923998e2ff597ebc4107e57d36076b7e956325a/whisper-medium-q4_k.oasr",
           "sha256": "58c9997472071e33fff30656ad492b5e60c8e03d23b57717c4893b4729bd0b05",
           "size_bytes": 672957984,
           "recommended": false,
@@ -3136,6 +3136,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u9ad8\u7cbe\u5ea6\u591a\u8bed\u8a00 Whisper\uff0c769M \u53c2\u6570\u517c\u987e\u51c6\u786e\u548c\u4f53\u79ef",
@@ -3147,9 +3149,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-medium.en",
@@ -3166,8 +3166,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-medium.en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-medium.en",
-      "hf_revision": "7d1816c40eb7e9ec052395a6a731aa3f831025c5",
+      "hf_repo": "chameleon-ai/whisper-medium.en",
+      "hf_revision": "b4cff2c5f3fe7fa7894a0208bc759412e3523630",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3190,7 +3190,7 @@
           "suffix": "fp16",
           "pull": "whisper-medium.en:fp16",
           "filename": "whisper-medium.en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7d1816c40eb7e9ec052395a6a731aa3f831025c5/whisper-medium.en-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium.en/resolve/b4cff2c5f3fe7fa7894a0208bc759412e3523630/whisper-medium.en-fp16.oasr",
           "sha256": "2245b9567d5bee5d31b5dc0154cf256cadd31fd78741118a833974d05c2da982",
           "size_bytes": 1534810368,
           "recommended": false,
@@ -3206,7 +3206,7 @@
           "suffix": "q8",
           "pull": "whisper-medium.en:q8",
           "filename": "whisper-medium.en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7d1816c40eb7e9ec052395a6a731aa3f831025c5/whisper-medium.en-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium.en/resolve/b4cff2c5f3fe7fa7894a0208bc759412e3523630/whisper-medium.en-q8_0.oasr",
           "sha256": "59c3bb72a039e596cc3c83fad9961f7348ebd1225cea132258b08c98dd7f7a54",
           "size_bytes": 874207488,
           "recommended": true,
@@ -3222,7 +3222,7 @@
           "suffix": "q4",
           "pull": "whisper-medium.en:q4",
           "filename": "whisper-medium.en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-medium.en/resolve/7d1816c40eb7e9ec052395a6a731aa3f831025c5/whisper-medium.en-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-medium.en/resolve/b4cff2c5f3fe7fa7894a0208bc759412e3523630/whisper-medium.en-q4_k.oasr",
           "sha256": "0dc12c940a8120532100071eb9266a1572fe6c13a39929ff2e44147d06263edf",
           "size_bytes": 672880832,
           "recommended": false,
@@ -3237,6 +3237,8 @@
       "language_mode": "fixed_monolingual",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u7eaf\u82f1\u8bed\u9ad8\u7cbe\u5ea6 Whisper\uff0c769M \u53c2\u6570\u6070\u5230\u597d\u5904",
@@ -3248,9 +3250,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-small",
@@ -3364,8 +3364,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-small/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-small",
-      "hf_revision": "a46dce8b9b710251985e113fb8189ac10fb59f31",
+      "hf_repo": "chameleon-ai/whisper-small",
+      "hf_revision": "cfa64105ff67e93c6313a71417e3526e0c68120b",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3388,7 +3388,7 @@
           "suffix": "fp16",
           "pull": "whisper-small:fp16",
           "filename": "whisper-small-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/a46dce8b9b710251985e113fb8189ac10fb59f31/whisper-small-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small/resolve/cfa64105ff67e93c6313a71417e3526e0c68120b/whisper-small-fp16.oasr",
           "sha256": "d345cd15361bd8e8d906cdc81a1a863c66d0d9a5770521fcac7a4c9a61923208",
           "size_bytes": 488712576,
           "recommended": false,
@@ -3404,7 +3404,7 @@
           "suffix": "q8",
           "pull": "whisper-small:q8",
           "filename": "whisper-small-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/a46dce8b9b710251985e113fb8189ac10fb59f31/whisper-small-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small/resolve/cfa64105ff67e93c6313a71417e3526e0c68120b/whisper-small-q8_0.oasr",
           "sha256": "9116ff1cb3a2a48850ba4f557901b75f9ab9f4c6c252534d77bd9ed23e7bc008",
           "size_bytes": 302918016,
           "recommended": true,
@@ -3420,7 +3420,7 @@
           "suffix": "q4",
           "pull": "whisper-small:q4",
           "filename": "whisper-small-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small/resolve/a46dce8b9b710251985e113fb8189ac10fb59f31/whisper-small-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small/resolve/cfa64105ff67e93c6313a71417e3526e0c68120b/whisper-small-q4_k.oasr",
           "sha256": "b0b1c54e6488bd5973d37a773fc004312a1ed4bd7fe3d69b78dc4ae87986f078",
           "size_bytes": 246294848,
           "recommended": false,
@@ -3434,6 +3434,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5c0f\u5de7\u591a\u8bed\u8a00 Whisper\uff0c\u672c\u5730\u8f6c\u5199\u7684\u5747\u8861\u4e4b\u9009",
@@ -3445,9 +3447,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-small.en",
@@ -3464,8 +3464,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-small.en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-small.en",
-      "hf_revision": "5cccb4c0766ab0d83abb6a16ec61947ae0f6a3f6",
+      "hf_repo": "chameleon-ai/whisper-small.en",
+      "hf_revision": "cb8909bff1ece01e13b937201f7d37954181c7eb",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3488,7 +3488,7 @@
           "suffix": "fp16",
           "pull": "whisper-small.en:fp16",
           "filename": "whisper-small.en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/5cccb4c0766ab0d83abb6a16ec61947ae0f6a3f6/whisper-small.en-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small.en/resolve/cb8909bff1ece01e13b937201f7d37954181c7eb/whisper-small.en-fp16.oasr",
           "sha256": "d4678873f9e1612d692cd0ebc8d907496d96509a31e35abbc0ca3dbb72237544",
           "size_bytes": 488635936,
           "recommended": false,
@@ -3504,7 +3504,7 @@
           "suffix": "q8",
           "pull": "whisper-small.en:q8",
           "filename": "whisper-small.en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/5cccb4c0766ab0d83abb6a16ec61947ae0f6a3f6/whisper-small.en-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small.en/resolve/cb8909bff1ece01e13b937201f7d37954181c7eb/whisper-small.en-q8_0.oasr",
           "sha256": "10653cc9293d6ba548dffb50b0fddb74ae437b0ed632e00c2cc3ac9d53daf416",
           "size_bytes": 302841376,
           "recommended": true,
@@ -3520,7 +3520,7 @@
           "suffix": "q4",
           "pull": "whisper-small.en:q4",
           "filename": "whisper-small.en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-small.en/resolve/5cccb4c0766ab0d83abb6a16ec61947ae0f6a3f6/whisper-small.en-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-small.en/resolve/cb8909bff1ece01e13b937201f7d37954181c7eb/whisper-small.en-q4_k.oasr",
           "sha256": "d5ab87ba43bfa1100f1fa97fd3c7ef1f071f1417702cb5ccb59e775cc11e836d",
           "size_bytes": 246218208,
           "recommended": false,
@@ -3535,6 +3535,8 @@
       "language_mode": "fixed_monolingual",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "\u5747\u8861\u597d\u7528\u7684\u7eaf\u82f1\u8bed Whisper\uff0c\u9002\u5408\u672c\u5730\u7cbe\u51c6\u8f6c\u5199",
@@ -3546,9 +3548,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-tiny",
@@ -3662,8 +3662,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-tiny/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-tiny",
-      "hf_revision": "75cd232dbd9b3b61a1d574b0b1ae2f2bab81c52e",
+      "hf_repo": "chameleon-ai/whisper-tiny",
+      "hf_revision": "3138f35cea92d7a919d72327e5ce2d98603e3dd7",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3686,7 +3686,7 @@
           "suffix": "fp16",
           "pull": "whisper-tiny:fp16",
           "filename": "whisper-tiny-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/75cd232dbd9b3b61a1d574b0b1ae2f2bab81c52e/whisper-tiny-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny/resolve/3138f35cea92d7a919d72327e5ce2d98603e3dd7/whisper-tiny-fp16.oasr",
           "sha256": "bc3f2c4c1f3e887d8e2e7f614febcdbd2bfe4acd325b104afe2d6c206f3ce60f",
           "size_bytes": 78793088,
           "recommended": false,
@@ -3702,7 +3702,7 @@
           "suffix": "q8",
           "pull": "whisper-tiny:q8",
           "filename": "whisper-tiny-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/75cd232dbd9b3b61a1d574b0b1ae2f2bab81c52e/whisper-tiny-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny/resolve/3138f35cea92d7a919d72327e5ce2d98603e3dd7/whisper-tiny-q8_0.oasr",
           "sha256": "13346d7bd47d349ae9e35be5cc8595997be0c2d2a5bbe41b4e3ef1c60a98ca17",
           "size_bytes": 63310208,
           "recommended": true,
@@ -3718,7 +3718,7 @@
           "suffix": "q4",
           "pull": "whisper-tiny:q4",
           "filename": "whisper-tiny-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny/resolve/75cd232dbd9b3b61a1d574b0b1ae2f2bab81c52e/whisper-tiny-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny/resolve/3138f35cea92d7a919d72327e5ce2d98603e3dd7/whisper-tiny-q4_k.oasr",
           "sha256": "2c9a7773d21c59038a22c78d5e2fc4fd0632e0270380db503fdbb02c41a870b3",
           "size_bytes": 62130496,
           "recommended": false,
@@ -3732,6 +3732,8 @@
       ],
       "language_mode": "detect_and_specify",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "Whisper \u7cfb\u5217\u6700\u5c0f\u7684\u591a\u8bed\u8a00\u7248\uff0c\u672c\u5730\u8f6c\u5199\u6700\u8f7b\u5feb",
@@ -3743,9 +3745,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "whisper-tiny.en",
@@ -3762,8 +3762,8 @@
       "license": "Apache-2.0",
       "license_url": "https://huggingface.co/openai/whisper-tiny.en/blob/main/README.md",
       "license_class": "permissive",
-      "hf_repo": "OpenASR/whisper-tiny.en",
-      "hf_revision": "ebc71f78feded9de8159beb9673bdde736f75055",
+      "hf_repo": "chameleon-ai/whisper-tiny.en",
+      "hf_revision": "fce9320c58f33032d18598a94fe2143ed3719d96",
       "public": true,
       "min_cli_version": "0.1.0",
       "recommended_quant": "q8_0",
@@ -3786,7 +3786,7 @@
           "suffix": "fp16",
           "pull": "whisper-tiny.en:fp16",
           "filename": "whisper-tiny.en-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/ebc71f78feded9de8159beb9673bdde736f75055/whisper-tiny.en-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny.en/resolve/fce9320c58f33032d18598a94fe2143ed3719d96/whisper-tiny.en-fp16.oasr",
           "sha256": "ec0f4bfd28a3edb142a763089bf02afa5292e145e4f3c675eda8662ee4e6b084",
           "size_bytes": 78717216,
           "recommended": false,
@@ -3802,7 +3802,7 @@
           "suffix": "q8",
           "pull": "whisper-tiny.en:q8",
           "filename": "whisper-tiny.en-q8_0.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/ebc71f78feded9de8159beb9673bdde736f75055/whisper-tiny.en-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny.en/resolve/fce9320c58f33032d18598a94fe2143ed3719d96/whisper-tiny.en-q8_0.oasr",
           "sha256": "8a95114cd2bc882aca971da6694c58d40b25f4530f81321044e4dac3aba80871",
           "size_bytes": 63234336,
           "recommended": true,
@@ -3818,7 +3818,7 @@
           "suffix": "q4",
           "pull": "whisper-tiny.en:q4",
           "filename": "whisper-tiny.en-q4_k.oasr",
-          "url": "https://huggingface.co/OpenASR/whisper-tiny.en/resolve/ebc71f78feded9de8159beb9673bdde736f75055/whisper-tiny.en-q4_k.oasr",
+          "url": "https://huggingface.co/chameleon-ai/whisper-tiny.en/resolve/fce9320c58f33032d18598a94fe2143ed3719d96/whisper-tiny.en-q4_k.oasr",
           "sha256": "669448e4af0c62e1079f46a2b092e8a3bd8a734775814075dc1b055c9ad7f863",
           "size_bytes": 62054624,
           "recommended": false,
@@ -3833,6 +3833,8 @@
       "language_mode": "fixed_monolingual",
       "language_default": "en",
       "emits_punctuation": true,
+      "speaker_source": "external",
+      "word_timestamp_source": "native",
       "prose_locales": {
         "zh-CN": {
           "tagline": "Whisper \u7cfb\u5217\u6700\u5c0f\u7684\u7eaf\u82f1\u8bed\u7248\uff0c\u82f1\u8bed\u8f6c\u5199\u98de\u5feb",
@@ -3844,9 +3846,7 @@
           ]
         }
       },
-      "upstream_release_date": "2022-09-21",
-      "speaker_source": "external",
-      "word_timestamp_source": "native"
+      "upstream_release_date": "2022-09-21"
     },
     {
       "id": "diarizen-large-s80-v2",
@@ -3868,8 +3868,8 @@
       "license": "CC BY-NC 4.0",
       "license_url": "https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2/blob/f27b9ffbedcf422856d104ecee9b94be37ea578e/README.md",
       "license_class": "noncommercial",
-      "hf_repo": "OpenASR/diarizen-large-s80-v2",
-      "hf_revision": "655b0132a5539f55d5ad3fffc88a2206ab0b7238",
+      "hf_repo": "chameleon-ai/diarizen-large-s80-v2",
+      "hf_revision": "2584d0adb3ee3524c6e4ec351db1ceec3317f8d4",
       "public": true,
       "min_cli_version": "0.1.28",
       "recommended_quant": "fp16",
@@ -3893,7 +3893,7 @@
           "suffix": "fp16",
           "pull": "diarizen-large-s80-v2:fp16",
           "filename": "diarizen-large-s80-v2-fp16.oasr",
-          "url": "https://huggingface.co/OpenASR/diarizen-large-s80-v2/resolve/655b0132a5539f55d5ad3fffc88a2206ab0b7238/diarizen-large-s80-v2-fp16.oasr",
+          "url": "https://huggingface.co/chameleon-ai/diarizen-large-s80-v2/resolve/2584d0adb3ee3524c6e4ec351db1ceec3317f8d4/diarizen-large-s80-v2-fp16.oasr",
           "sha256": "1d4b2c2e9fe3a3f6eebfc8f2280bca04dcbc6f9b14e4d9cbccb0fdca40e88311",
           "size_bytes": 139425120,
           "recommended": true,

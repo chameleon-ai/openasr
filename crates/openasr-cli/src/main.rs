@@ -12,13 +12,13 @@ use clap::Parser;
 use openasr_core::api::backend::transcribe_with_mock_backend;
 use openasr_core::{
     AudioInputInfo, AudioInputIssue, AudioPreparationOptions, BackendKind, BatchFailure,
-    BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CATALOG_SIGNATURE_KEY_ID,
-    CohereLocalSourceImportRequest, ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard,
-    MossTdImportRequest, NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeExecutionServices,
-    OpenAsrConfig, PreparedAudioInput, Qwen3AsrLocalSourceImportRequest,
-    Qwen3ForcedAlignerLocalSourceImportRequest, ResponseFormat, TranscriptionBackend,
-    TranscriptionRequest, WhisperLocalSourceImportRequest, atomic_write_text, config_path,
-    convert_local_cohere_source_to_runtime_pack,
+    BatchOutput, BatchSummary, BenchmarkFormat, BenchmarkResult, CohereLocalSourceImportRequest,
+    ConfigKey, DEFAULT_BACKEND_ID, DEFAULT_MODEL_ID, ModelCard, MossTdImportRequest,
+    NATIVE_RUNTIME_MODEL_ID_AUTO, NativeBackend, NativeExecutionServices,
+    OPENASR_CATALOG_TRUST_ROOTS, OpenAsrConfig, PreparedAudioInput,
+    Qwen3AsrLocalSourceImportRequest, Qwen3ForcedAlignerLocalSourceImportRequest, ResponseFormat,
+    TranscriptionBackend, TranscriptionRequest, WhisperLocalSourceImportRequest, atomic_write_text,
+    config_path, convert_local_cohere_source_to_runtime_pack,
     convert_local_moss_transcribe_diarize_source_to_runtime_pack,
     convert_local_qwen_forced_aligner_source_to_runtime_pack,
     convert_local_qwen_source_to_runtime_pack, convert_local_whisper_hf_source_to_runtime_pack,
@@ -857,13 +857,17 @@ fn sign_catalog_manifest_command(
         &signing_key_seed_hex,
     )
     .context("Could not render catalog signature manifest")?;
-    // The production trust root (`openasr-catalog-v1`) self-verifies against
-    // only the production public key; any other key id -- e.g. the public
-    // `openasr-catalog-local-dev-v1` dev key used to sign a local/preview
-    // catalog for `--catalog-url file://...` -- self-verifies against the
-    // wider local trust-root set instead, so this command stays usable for
-    // both the real release signing flow and local dev catalog previews.
-    let self_verify = if key_id == CATALOG_SIGNATURE_KEY_ID {
+    // A production key id (v1, or v2 after the 2026-10 rotation) self-verifies
+    // against only the production trust roots; any other key id -- e.g. the
+    // public `openasr-catalog-local-dev-v1` dev key used to sign a
+    // local/preview catalog for `--catalog-url file://...` -- self-verifies
+    // against the wider local trust-root set instead, so this command stays
+    // usable for both the real release signing flow and local dev catalog
+    // previews.
+    let self_verify = if OPENASR_CATALOG_TRUST_ROOTS
+        .iter()
+        .any(|root| root.key_id == key_id)
+    {
         verify_catalog_signature_manifest(&catalog_contents, &manifest, &resolved_catalog_url)
     } else {
         verify_local_catalog_signature_manifest(&catalog_contents, &manifest, &resolved_catalog_url)

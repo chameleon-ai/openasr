@@ -49,11 +49,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CATALOG_SIGNATURE_DOMAIN = "openasr.catalog_manifest.v1"
 CATALOG_SIGNATURE_ALGORITHM = "ed25519"
 PRODUCTION_KEY_ID = "openasr-catalog-v1"
+# Second production key, introduced in the 2026-10 rotation after the v1 seed
+# was lost in a maintainer transition. v1 stays trusted for previously issued
+# signatures (loss is not compromise); new signatures are issued under v2.
+PRODUCTION_KEY_ID_V2 = "openasr-catalog-v2"
+PRODUCTION_PUBLIC_KEY_HEX_V2 = "0afa1a711d871c51b5699c4f8c49f34a5c4a2915c2b5a02a08c243db3cbbd3cd"
 PRODUCTION_PUBLIC_KEY_HEX = "92331f1048a70b70fb00818f263b4f532ff536f21b7e86df2eb11c175105c2ad"
 LOCAL_DEV_KEY_ID = "openasr-catalog-local-dev-v1"
 LOCAL_DEV_PUBLIC_KEY_HEX = "bc1306d4cc4a1cbc817a862ee0223713ff79208c39bc8ce732da851db3c6b6a1"
 TRUST_ROOTS = {
     PRODUCTION_KEY_ID: PRODUCTION_PUBLIC_KEY_HEX,
+    PRODUCTION_KEY_ID_V2: PRODUCTION_PUBLIC_KEY_HEX_V2,
     LOCAL_DEV_KEY_ID: LOCAL_DEV_PUBLIC_KEY_HEX,
 }
 CANONICAL_CATALOG_URL = "https://catalog.openasr.org/v1/catalog.json"

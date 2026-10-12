@@ -71,7 +71,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                 self.assertEqual(catalog_model["hf_revision"], "b" * 40)
                 self.assertEqual(catalog_model["prose"]["tagline"], _manifest.read_prose(model)["tagline"])
                 self.assertEqual(catalog_model["pull_recommended"], "moonshine-tiny:q8")
-                self.assertTrue(all(q["url"].startswith("https://huggingface.co/OpenASR/moonshine-tiny/resolve/") for q in catalog_model["quants"]))
+                self.assertTrue(all(q["url"].startswith("https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/") for q in catalog_model["quants"]))
         finally:
             _manifest.REPO_ROOT = old_root
 
@@ -152,7 +152,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                 metrics = {"quants": {"q8_0": {"size_bytes": 10, "rtf_cpu": 0.1, "peak_rss_bytes": 1}}}
 
                 with self.assertRaisesRegex(SystemExit, "missing a valid pack sha256"):
-                    _manifest.quant_entry(model, model, "q8_0", "OpenASR/moonshine-tiny", "b" * 40, metrics)
+                    _manifest.quant_entry(model, model, "q8_0", "chameleon-ai/moonshine-tiny", "b" * 40, metrics)
         finally:
             _manifest.REPO_ROOT = old_root
 
@@ -182,7 +182,7 @@ class ManifestPublicGateTest(unittest.TestCase):
                 }
 
                 with self.assertRaisesRegex(SystemExit, "does not match result.json sha256"):
-                    _manifest.quant_entry(model, model, "q8_0", "OpenASR/moonshine-tiny", "b" * 40, metrics)
+                    _manifest.quant_entry(model, model, "q8_0", "chameleon-ai/moonshine-tiny", "b" * 40, metrics)
         finally:
             _manifest.REPO_ROOT = old_root
 

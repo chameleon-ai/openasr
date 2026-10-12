@@ -26,7 +26,7 @@ from typing import Any, Mapping
 
 from _pathlib_helpers import repo_root
 
-DEFAULT_PUBLIC_NAMESPACE = "OpenASR"
+DEFAULT_PUBLIC_NAMESPACE = "chameleon-ai"
 HF_BASE_URL = "https://huggingface.co"
 USER_AGENT = "openasr-public-gate/1"
 SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")

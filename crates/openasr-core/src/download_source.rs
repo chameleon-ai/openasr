@@ -13,7 +13,7 @@ pub enum DownloadSource {
     #[serde(rename = "hf-mirror")]
     HfMirror,
     /// The first-party `weights.openasr.org` Cloudflare Worker, which proxies the
-    /// `huggingface.co` `OpenASR/*` `/resolve/...` endpoint and transparently
+    /// `huggingface.co` `chameleon-ai/*` `/resolve/...` endpoint and transparently
     /// passes through the 302 into Hugging Face's Xet CDN (`us.aws.cdn.hf.co`).
     /// The start URL host is swapped to the worker; the Xet redirect is then
     /// followed VERBATIM, exactly like the direct `Hf` source (see

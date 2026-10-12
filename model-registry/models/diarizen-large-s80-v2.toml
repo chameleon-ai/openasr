@@ -4,7 +4,7 @@ display_name = "DiariZen Large-s80-md-v2 (OpenASR pack)"
 languages = ["en", "zh"]
 size = "segmenter"
 license = "CC BY-NC 4.0"
-source = "Published OpenASR packs: https://huggingface.co/OpenASR/diarizen-large-s80-v2"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/diarizen-large-s80-v2"
 
 [variant]
 quantization = "fp16"

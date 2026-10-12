@@ -34,31 +34,31 @@ describe("weights resolve proxy gating", () => {
   });
 
   it("rejects non-GET/HEAD methods with an Allow header", async () => {
-    const response = await call("POST", "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr");
+    const response = await call("POST", "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr");
     expect(response.status).toBe(405);
     expect(response.headers.get("Allow")).toBe("GET, HEAD");
   });
 
-  it("rejects paths outside the OpenASR org", async () => {
+  it("rejects paths outside the chameleon-ai org", async () => {
     const response = await call("GET", "/someone-else/model/resolve/main/model.oasr");
     expect(response.status).toBe(404);
   });
 
-  it("rejects OpenASR paths that are not a resolve request", async () => {
-    const response = await call("GET", "/OpenASR/qwen3-asr-1.7b/blob/main/model.oasr");
+  it("rejects chameleon-ai paths that are not a resolve request", async () => {
+    const response = await call("GET", "/chameleon-ai/qwen3-asr-1.7b/blob/main/model.oasr");
     expect(response.status).toBe(404);
   });
 
   it("rejects path traversal inside the file segment", async () => {
-    const response = await call("GET", "/OpenASR/qwen3-asr-1.7b/resolve/main/../../secrets");
+    const response = await call("GET", "/chameleon-ai/qwen3-asr-1.7b/resolve/main/../../secrets");
     expect(response.status).toBe(404);
   });
 
-  it("accepts only well-formed OpenASR resolve paths", () => {
-    expect(RESOLVE_PATH.test("/OpenASR/qwen3-asr-1.7b/resolve/main/qwen3-asr-1.7b-q4_k.oasr")).toBe(true);
-    expect(RESOLVE_PATH.test("/OpenASR/qwen3-asr-1.7b/blob/main/model.oasr")).toBe(false);
+  it("accepts only well-formed chameleon-ai resolve paths", () => {
+    expect(RESOLVE_PATH.test("/chameleon-ai/qwen3-asr-1.7b/resolve/main/qwen3-asr-1.7b-q4_k.oasr")).toBe(true);
+    expect(RESOLVE_PATH.test("/chameleon-ai/qwen3-asr-1.7b/blob/main/model.oasr")).toBe(false);
     expect(RESOLVE_PATH.test("/other-org/model/resolve/main/model.oasr")).toBe(false);
-    expect(RESOLVE_PATH.test("/OpenASR//resolve/main/model.oasr")).toBe(false);
+    expect(RESOLVE_PATH.test("/chameleon-ai//resolve/main/model.oasr")).toBe(false);
   });
 
   it("passes a legit resolve redirect through verbatim (does not follow the blob)", async () => {
@@ -66,12 +66,12 @@ describe("weights resolve proxy gating", () => {
     fetchMock
       .get("https://huggingface.co")
       .intercept({
-        path: "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr",
+        path: "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr",
         method: "GET",
       })
       .reply(302, "", { headers: { location: blobUrl } });
 
-    const response = await call("GET", "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr");
+    const response = await call("GET", "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr");
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toBe(blobUrl);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
@@ -84,12 +84,12 @@ describe("weights resolve proxy gating", () => {
     fetchMock
       .get("https://huggingface.co")
       .intercept({
-        path: "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr",
+        path: "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr",
         method: "GET",
       })
       .reply(503, "service unavailable");
 
-    const response = await call("GET", "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr");
+    const response = await call("GET", "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr");
     expect(response.status).toBe(503);
   });
 
@@ -97,12 +97,12 @@ describe("weights resolve proxy gating", () => {
     fetchMock
       .get("https://huggingface.co")
       .intercept({
-        path: "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr",
+        path: "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr",
         method: "GET",
       })
       .replyWithError(new Error("simulated network failure"));
 
-    const response = await call("GET", "/OpenASR/qwen3-asr-1.7b/resolve/main/model.oasr");
+    const response = await call("GET", "/chameleon-ai/qwen3-asr-1.7b/resolve/main/model.oasr");
     expect(response.status).toBe(502);
   });
 });

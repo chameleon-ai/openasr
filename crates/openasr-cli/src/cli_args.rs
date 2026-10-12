@@ -379,10 +379,12 @@ pub(crate) enum Command {
         /// Override catalog_url from the catalog JSON.
         #[arg(long)]
         catalog_url: Option<String>,
-        /// Signature key id: `openasr-catalog-v1` (production; needs the real
-        /// signing seed) or `openasr-catalog-local-dev-v1` (public dev key,
-        /// for local `--catalog-url file://...` previews only).
-        #[arg(long, default_value = "openasr-catalog-v1")]
+        /// Signature key id: `openasr-catalog-v2` (production since the 2026-10
+        /// rotation; needs the real signing seed), `openasr-catalog-v1` (prior
+        /// production key, seed lost -- verifies only), or
+        /// `openasr-catalog-local-dev-v1` (public dev key, for local
+        /// `--catalog-url file://...` previews only).
+        #[arg(long, default_value = "openasr-catalog-v2")]
         key_id: String,
         /// Print the derived public key for the env signing seed and exit.
         #[arg(long)]
@@ -408,7 +410,8 @@ pub(crate) enum Command {
         #[arg(long)]
         manifest_url: String,
         /// Production catalog key id. Qualification has no local-dev key.
-        #[arg(long, default_value = "openasr-catalog-v1")]
+        /// `openasr-catalog-v2` since the 2026-10 rotation (v1 verifies only).
+        #[arg(long, default_value = "openasr-catalog-v2")]
         key_id: String,
         /// Print the derived public key for the env signing seed and exit.
         #[arg(long)]

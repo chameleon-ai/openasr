@@ -1,6 +1,6 @@
 // OpenASR weights resolve proxy (Cloudflare Worker).
 //
-// PROXIES only the Hugging Face `resolve` endpoint for the `OpenASR/*` org, so a
+// PROXIES only the Hugging Face `resolve` endpoint for the `chameleon-ai/*` org, so a
 // client whose direct route to `huggingface.co` is blocked (the resolve hop, not
 // the CDN blob hop) can still reach it via `weights.openasr.org`. For normal
 // `.oasr` packs Hugging Face's resolve response is a 3xx redirect to a Xet/CDN
@@ -16,7 +16,7 @@
 //
 // Hard scope limits (deliberate, do not relax without re-reviewing abuse risk):
 //   - GET/HEAD only.
-//   - Path must match `/OpenASR/<repo>/resolve/<rev>/<file...>` exactly. This is
+//   - Path must match `/chameleon-ai/<repo>/resolve/<rev>/<file...>` exactly. This is
 //     NOT a general Hugging Face proxy: any other org, repo action (blob/tree/
 //     api/...), or path shape is rejected before any outbound fetch happens.
 //   - No caching (`Cache-Control: no-store` on every response).
@@ -25,13 +25,13 @@
 
 const ALLOWED_METHODS = "GET, HEAD";
 
-// /OpenASR/<repo>/resolve/<rev>/<file...>
+// /chameleon-ai/<repo>/resolve/<rev>/<file...>
 // - <repo> and <rev> are restricted to the character set Hugging Face itself
 //   uses for repo names and git refs (no "/", no "..").
 // - <file...> may contain "/" (nested paths inside a repo) but individual
 //   segments may not be "." or ".." (no traversal), and may not be empty.
 export const RESOLVE_PATH =
-  /^\/OpenASR\/([A-Za-z0-9][A-Za-z0-9._-]*)\/resolve\/([A-Za-z0-9][A-Za-z0-9._-]*)\/(.+)$/;
+  /^\/chameleon-ai\/([A-Za-z0-9][A-Za-z0-9._-]*)\/resolve\/([A-Za-z0-9][A-Za-z0-9._-]*)\/(.+)$/;
 
 const UPSTREAM_TIMEOUT_MS = 15_000;
 
@@ -85,7 +85,7 @@ export default {
     if (!match || hasPathTraversal(match[3])) {
       return denied(
         404,
-        "Not Found: only huggingface.co/OpenASR/*/resolve/*/* is proxied here",
+        "Not Found: only huggingface.co/chameleon-ai/*/resolve/*/* is proxied here",
       );
     }
 

@@ -184,14 +184,15 @@ pub use capability_approval::{
 };
 pub use catalog_security::{
     CATALOG_DEGRADED_MARKER_FILE_NAME, CATALOG_EPOCH_FILE_NAME, CATALOG_SIGNATURE_ALGORITHM,
-    CATALOG_SIGNATURE_FILE_NAME, CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
-    CATALOG_SIGNATURE_SCHEMA_VERSION, CatalogDegradedStatus, CatalogSecurityError,
-    CatalogSignature, CatalogSignatureManifest, LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX,
-    VerifiedCatalogSignature, catalog_signature_source, clear_catalog_degraded,
-    default_catalog_degraded_marker_path, default_catalog_epoch_path,
-    default_catalog_signature_cache_path, derive_catalog_public_key_hex,
-    read_catalog_degraded_status, record_catalog_degraded, render_catalog_signature_manifest,
-    verify_catalog_signature_manifest, verify_local_catalog_signature_manifest,
+    CATALOG_SIGNATURE_FILE_NAME, CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_KEY_ID_V2,
+    CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID, CATALOG_SIGNATURE_SCHEMA_VERSION, CatalogDegradedStatus,
+    CatalogSecurityError, CatalogSignature, CatalogSignatureManifest,
+    LOCAL_CATALOG_DEV_SIGNING_KEY_SEED_HEX, OPENASR_CATALOG_TRUST_ROOTS, VerifiedCatalogSignature,
+    catalog_signature_source, clear_catalog_degraded, default_catalog_degraded_marker_path,
+    default_catalog_epoch_path, default_catalog_signature_cache_path,
+    derive_catalog_public_key_hex, read_catalog_degraded_status, record_catalog_degraded,
+    render_catalog_signature_manifest, verify_catalog_signature_manifest,
+    verify_local_catalog_signature_manifest,
 };
 pub use ggml_runtime::{
     DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection, DiagnosticDecoderGraphMode,

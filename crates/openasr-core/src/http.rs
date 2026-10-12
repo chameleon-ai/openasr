@@ -56,7 +56,7 @@ pub(crate) fn error_message(error: &reqwest::Error) -> String {
 pub(crate) const HUGGING_FACE_HOST: &str = "https://huggingface.co/";
 pub(crate) const HF_MIRROR_ENDPOINT: &str = "https://hf-mirror.com";
 
-/// First-party Cloudflare Worker that proxies `huggingface.co`'s `OpenASR/*`
+/// First-party Cloudflare Worker that proxies `huggingface.co`'s `chameleon-ai/*`
 /// `/resolve/...` endpoint and transparently passes through the 302 into the Xet
 /// CDN. Used by [`DownloadSource::Weights`](crate::DownloadSource::Weights) as a
 /// China-chain fallback after ModelScope, and as an overseas fallback.

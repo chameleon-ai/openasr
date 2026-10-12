@@ -1174,7 +1174,7 @@ fn pull_does_not_fallback_after_runtime_validation_failure() {
 
 #[test]
 fn pull_falls_back_to_hf_mirror_after_weights_404() {
-    // weights.openasr.org only proxies the OpenASR/* org; a file outside that
+    // weights.openasr.org only proxies the chameleon-ai/* org; a file outside that
     // scope 404s there even though it exists on the other sources. The chain
     // must fall through to hf-mirror instead of hard-failing the whole pull.
     let bytes = tiny_pack_bytes();

@@ -31,7 +31,7 @@ env:
   CARGO_TERM_COLOR: always
   # Public moonshine-tiny q8_0 pack pinned to its immutable HF revision so the
   # download is reproducible.
-  MOONSHINE_PACK_URL: https://huggingface.co/OpenASR/moonshine-tiny/resolve/06c21bef0dbc2bd0474c4e32ef00bfeafd7002a6/moonshine-tiny-q8_0.oasr
+  MOONSHINE_PACK_URL: https://huggingface.co/chameleon-ai/moonshine-tiny/resolve/06c21bef0dbc2bd0474c4e32ef00bfeafd7002a6/moonshine-tiny-q8_0.oasr
   MOONSHINE_PACK_SHA256: 5df858db11aca1aca8d4bb8ba1230e9e683da8292a46137f0993981b89c655a3
 
 jobs:

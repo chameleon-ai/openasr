@@ -16,9 +16,25 @@ pub const CATALOG_EPOCH_FILE_NAME: &str = "catalog.epoch";
 pub const CATALOG_SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const CATALOG_SIGNATURE_KEY_ID: &str = "openasr-catalog-v1";
 
+/// Second production catalog signing key (`openasr-catalog-v2`), introduced
+/// when the v1 seed was lost in a maintainer transition (2026-10). The v1
+/// root stays trusted for previously issued signatures (see
+/// [`OPENASR_CATALOG_TRUST_ROOTS`]); new signatures are issued under v2.
+/// Anything except the local-dev key participates in the shared epoch floor
+/// (see [`participates_in_epoch_floor`]), so v2 needs no special-casing
+/// there -- only this constant, its public key, and the two trust-root
+/// lists below.
+pub const CATALOG_SIGNATURE_KEY_ID_V2: &str = "openasr-catalog-v2";
+
 const CATALOG_SIGNATURE_DOMAIN: &str = "openasr.catalog_manifest.v1";
 const OPENASR_CATALOG_V1_PUBLIC_KEY_HEX: &str =
     "92331f1048a70b70fb00818f263b4f532ff536f21b7e86df2eb11c175105c2ad";
+
+/// Public half of [`CATALOG_SIGNATURE_KEY_ID_V2`]. Derived from the v2 seed
+/// held by the current maintainer (never in-tree); pinned here so every
+/// client can verify v2-issued manifests without trusting a fetched key.
+const OPENASR_CATALOG_V2_PUBLIC_KEY_HEX: &str =
+    "0afa1a711d871c51b5699c4f8c49f34a5c4a2915c2b5a02a08c243db3cbbd3cd";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogTrustRoot {
@@ -26,10 +42,21 @@ pub struct CatalogTrustRoot {
     pub public_key_hex: &'static str,
 }
 
-pub const OPENASR_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[CatalogTrustRoot {
-    key_id: CATALOG_SIGNATURE_KEY_ID,
-    public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
-}];
+pub const OPENASR_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_KEY_ID,
+        public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
+    },
+    // The v1 seed is lost (not compromised), so v1-signed artifacts already
+    // in the wild -- incident fixtures, deployed caches, qualification
+    // manifests -- must keep verifying. Loss is not compromise: the epoch
+    // floor still rejects downgrade replays on machines that already
+    // advanced past a v2 epoch. Retiring v1 is a separate future release.
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_KEY_ID_V2,
+        public_key_hex: OPENASR_CATALOG_V2_PUBLIC_KEY_HEX,
+    },
+];
 
 /// Key id + public key for the **local-catalog development signing key**.
 ///
@@ -69,6 +96,10 @@ pub const OPENASR_LOCAL_CATALOG_TRUST_ROOTS: &[CatalogTrustRoot] = &[
     CatalogTrustRoot {
         key_id: CATALOG_SIGNATURE_KEY_ID,
         public_key_hex: OPENASR_CATALOG_V1_PUBLIC_KEY_HEX,
+    },
+    CatalogTrustRoot {
+        key_id: CATALOG_SIGNATURE_KEY_ID_V2,
+        public_key_hex: OPENASR_CATALOG_V2_PUBLIC_KEY_HEX,
     },
     CatalogTrustRoot {
         key_id: CATALOG_SIGNATURE_LOCAL_DEV_KEY_ID,
@@ -751,6 +782,72 @@ mod tests {
             key_id: TEST_KEY_ID,
             public_key_hex: TEST_PUBLIC_KEY_HEX,
         }]
+    }
+
+    #[test]
+    fn production_trust_roots_contain_v1_and_v2() {
+        // The 2026-10 rotation adds the v2 root alongside v1 (whose seed is
+        // lost but not compromised): old signatures keep verifying, new
+        // signatures are issued under v2.
+        let ids: Vec<&str> = OPENASR_CATALOG_TRUST_ROOTS
+            .iter()
+            .map(|root| root.key_id)
+            .collect();
+        assert_eq!(ids, [CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_KEY_ID_V2]);
+        assert_eq!(CATALOG_SIGNATURE_KEY_ID_V2, "openasr-catalog-v2");
+    }
+
+    #[test]
+    fn v2_public_key_is_a_valid_ed25519_point() {
+        // The pinned hex must decode to a real curve point, or every
+        // v2-issued manifest fails with InvalidPublicKey at runtime.
+        let bytes = decode_hex_exact::<32>(OPENASR_CATALOG_V2_PUBLIC_KEY_HEX, "public_key_hex")
+            .expect("v2 public key hex must decode");
+        VerifyingKey::from_bytes(&bytes).expect("v2 public key must be a valid point");
+    }
+
+    #[test]
+    fn v2_key_id_resolves_to_its_root_and_rejects_a_bad_signature() {
+        // A manifest claiming the v2 key id must resolve (not UnknownKey) and
+        // then fail signature verification (not pass blindly). The positive
+        // path -- a real v2 signature verifying -- is covered by the
+        // committed-registry gate once the catalog is re-signed under v2.
+        let catalog = r#"{"schema_version":1,"models":[]}"#;
+        let sha = sha256_hex(catalog.as_bytes());
+        let manifest = format!(
+            r#"{{"schema_version":1,"catalog_url":"{TEST_CATALOG_URL}","catalog_sha256":"{sha}","catalog_epoch":7,"signature":{{"algorithm":"ed25519","key_id":"{key}","value":"{sig}"}}}}"#,
+            key = CATALOG_SIGNATURE_KEY_ID_V2,
+            sig = "ab".repeat(64),
+        );
+        let error = verify_catalog_signature_manifest(catalog, &manifest, TEST_CATALOG_URL)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("signature verification failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_participates_in_the_epoch_floor_like_v1() {
+        // A v2-signed catalog at a lower epoch than the recorded floor must
+        // be rejected as a rollback, exactly like v1: only the public dev
+        // key is exempt.
+        assert!(participates_in_epoch_floor(CATALOG_SIGNATURE_KEY_ID_V2));
+    }
+
+    #[test]
+    fn local_catalog_trust_roots_include_both_production_keys() {
+        // A local copy of a v2-signed catalog must verify through the local
+        // roots exactly like a v1-signed one.
+        for key_id in [CATALOG_SIGNATURE_KEY_ID, CATALOG_SIGNATURE_KEY_ID_V2] {
+            assert!(
+                OPENASR_LOCAL_CATALOG_TRUST_ROOTS
+                    .iter()
+                    .any(|root| root.key_id == key_id),
+                "local roots missing {key_id}"
+            );
+        }
     }
 
     #[test]

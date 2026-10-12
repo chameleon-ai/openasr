@@ -1,4 +1,4 @@
-# Per-model card prose for OpenASR/pyannote-segmentation-3.0. Distilled
+# Per-model card prose for chameleon-ai/pyannote-segmentation-3.0. Distilled
 # (paraphrased, not copied) from the pyannote segmentation-3.0 model card.
 
 pipeline_tag = "voice-activity-detection"

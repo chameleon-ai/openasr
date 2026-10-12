@@ -1,4 +1,4 @@
-# Per-model card prose for OpenASR/whisper-small.en. Paraphrased from the
+# Per-model card prose for chameleon-ai/whisper-small.en. Paraphrased from the
 # upstream openai/whisper-small.en card and OpenAI Whisper project docs.
 
 tagline = "Balanced English-only Whisper for accurate local transcription"

@@ -1,4 +1,4 @@
-# Per-model card prose for OpenASR/cohere-transcribe-03-2026. Paraphrased from
+# Per-model card prose for chameleon-ai/cohere-transcribe-03-2026. Paraphrased from
 # the upstream CohereLabs/cohere-transcribe-03-2026 card.
 
 tagline = "Dedicated 2B ASR for 14-language transcription"
