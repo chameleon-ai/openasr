@@ -36,7 +36,7 @@ resolve_tag_commit() {
 version="${1#v}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be X.Y.Z or vX.Y.Z"
 tag="v${version}"
-repository="QuintinShaw/openasr"
+repository="chameleon-ai/openasr"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
@@ -49,7 +49,7 @@ if [ -z "${SSL_CERT_FILE:-}" ]; then
   fi
 fi
 
-repository="${GITHUB_REPOSITORY:-QuintinShaw/openasr}"
+repository="${GITHUB_REPOSITORY:-chameleon-ai/openasr}"
 is_draft="$(gh release view "$tag" --repo "$repository" --json isDraft --jq .isDraft 2>/dev/null)" \
   || fail "GitHub release ${tag} does not exist"
 [ "$is_draft" = "true" ] || fail "release ${tag} is already public or is not a draft"

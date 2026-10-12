@@ -38,9 +38,9 @@ HOST_ABI_SCHEMA_VERSION = 3
 HOST_ABI_MEMBER = "openasr-backend-host-abi-v1.json"
 BINARY_MEMBER = "openasr.exe"
 ATTESTATION_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
-ATTESTATION_REPOSITORY = "QuintinShaw/openasr"
+ATTESTATION_REPOSITORY = "chameleon-ai/openasr"
 ATTESTATION_SIGNER_WORKFLOW = (
-    "QuintinShaw/openasr/.github/workflows/release-binaries.yml"
+    "chameleon-ai/openasr/.github/workflows/release-binaries.yml"
 )
 HOST_ABI_FIELDS = {
     "schema_version",

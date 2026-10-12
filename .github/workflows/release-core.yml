@@ -47,7 +47,7 @@ jobs:
   resolve:
     name: Resolve version
     # Never let a fork attempt a release; only the canonical repo tags+publishes.
-    if: github.repository_owner == 'QuintinShaw'
+    if: github.repository_owner == 'chameleon-ai'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}

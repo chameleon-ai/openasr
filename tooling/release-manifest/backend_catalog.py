@@ -581,7 +581,7 @@ def verify_release_assets(
                     f"backend '{provider}' release URL is not canonical for {filename}"
                 )
             expected_mirror = (
-                "https://github.com/QuintinShaw/openasr/releases/download/"
+                "https://github.com/chameleon-ai/openasr/releases/download/"
                 f"v{expected_version}/{filename}"
             )
             mirrors = file.get("mirrors", [])

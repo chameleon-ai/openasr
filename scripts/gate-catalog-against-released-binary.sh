@@ -32,7 +32,7 @@
 #
 # Env overrides (for local iteration / testing):
 #   OPENASR_RELEASE_REPO     GitHub repo to pull the release from
-#                            (default: QuintinShaw/openasr)
+#                            (default: chameleon-ai/openasr)
 #   OPENASR_GATE_BINARY      Path to an already-extracted `openasr` binary to
 #                            use instead of downloading one (skips the
 #                            release-resolution/download steps entirely).
@@ -52,7 +52,7 @@ fi
 
 candidate_catalog="$1"
 candidate_signature="$2"
-repo="${OPENASR_RELEASE_REPO:-QuintinShaw/openasr}"
+repo="${OPENASR_RELEASE_REPO:-chameleon-ai/openasr}"
 identity="${OPENASR_GATE_IDENTITY:-https://catalog.openasr.org/v1/catalog.json}"
 
 for f in "$candidate_catalog" "$candidate_signature"; do

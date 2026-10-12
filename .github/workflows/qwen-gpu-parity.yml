@@ -32,7 +32,7 @@ env:
 jobs:
   windows-hip-parity:
     name: qwen GPU vs CPU raw diagnostic (HIP)
-    if: github.repository_owner == 'QuintinShaw'
+    if: github.repository_owner == 'chameleon-ai'
     runs-on: [self-hosted, Windows, X64, HIP]
     steps:
       - uses: actions/checkout@v7

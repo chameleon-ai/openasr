@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   sync:
-    if: github.repository == 'QuintinShaw/openasr'
+    if: github.repository == 'chameleon-ai/openasr'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

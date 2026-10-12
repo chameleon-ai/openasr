@@ -3,7 +3,7 @@
 # replaying the OpenASR-local patches that sit on top of the current pin.
 #
 # The vendored ggml lives at crates/openasr-core/third_party/openasr-ggml and is
-# a git submodule of the QuintinShaw/openasr-ggml fork. Each pin is a clean
+# a git submodule of the chameleon-ai/openasr-ggml fork. Each pin is a clean
 # upstream base commit plus a small stack of OpenASR-local patches (Metal
 # pipeline-cache persistence + isolation, residency-set default, quiet debug
 # logs, GGUF tensor-dim accessors, the Windows backend-dl loader fix, ...). This

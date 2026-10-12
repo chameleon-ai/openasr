@@ -18,7 +18,7 @@ token_file="$3"
 version="${tag#v}"
 [[ "$tag" = "v${version}" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || fail "tag must be canonical vX.Y.Z"
-repository="QuintinShaw/openasr"
+repository="chameleon-ai/openasr"
 asset_name="openasr-${version}-qualification-mutation.lock"
 command -v gh >/dev/null 2>&1 || fail "gh is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"

@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   authorize:
-    if: github.repository == 'QuintinShaw/openasr'
+    if: github.repository == 'chameleon-ai/openasr'
     runs-on: ubuntu-latest
     steps:
       - name: Require one explicit backend-scoped revocation

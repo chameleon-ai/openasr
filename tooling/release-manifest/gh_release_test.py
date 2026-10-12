@@ -63,8 +63,8 @@ class GhReleaseDownloadTests(unittest.TestCase):
                     {
                         "name": "SHA256SUMS",
                         "id": "RA_kwDOTLO0884gEJX_",
-                        "apiUrl": "https://api.github.com/repos/QuintinShaw/openasr/releases/assets/537957887",
-                        "url": "https://github.com/QuintinShaw/openasr/releases/download/untagged-draft/SHA256SUMS",
+                        "apiUrl": "https://api.github.com/repos/chameleon-ai/openasr/releases/assets/537957887",
+                        "url": "https://github.com/chameleon-ai/openasr/releases/download/untagged-draft/SHA256SUMS",
                     }
                 ]
             }
@@ -74,7 +74,7 @@ class GhReleaseDownloadTests(unittest.TestCase):
 
             def run(command, check=True, timeout=None):
                 del check, timeout
-                self.assertEqual(command[-1], "https://api.github.com/repos/QuintinShaw/openasr/releases/assets/537957887")
+                self.assertEqual(command[-1], "https://api.github.com/repos/chameleon-ai/openasr/releases/assets/537957887")
                 dest.write_text("sums\n", encoding="utf-8")
                 return subprocess.CompletedProcess(command, 0)
 
@@ -168,7 +168,7 @@ class GhReleaseDownloadTests(unittest.TestCase):
                             "SHA256SUMS",
                             "backend-plugin-hints.json",
                             "--repo",
-                            "QuintinShaw/openasr",
+                            "chameleon-ai/openasr",
                         ]
                     ),
                     0,
@@ -177,5 +177,5 @@ class GhReleaseDownloadTests(unittest.TestCase):
                 "v0.1.37",
                 ["SHA256SUMS", "backend-plugin-hints.json"],
                 dest_dir,
-                repository="QuintinShaw/openasr",
+                repository="chameleon-ai/openasr",
             )

@@ -21,7 +21,7 @@
 #   OPENASR_CNB_REPO     default openasr/openasr
 #   OPENASR_CNB_API      default https://api.cnb.cool
 #   OPENASR_CNB_STRICT=1 fail the caller on CNB errors
-#   OPENASR_CNB_GITHUB_REPO  git+release source (default QuintinShaw/openasr).
+#   OPENASR_CNB_GITHUB_REPO  git+release source (default chameleon-ai/openasr).
 #                            Never inherit GITHUB_REPOSITORY: Actions sets that
 #                            to the host repo, which is not always this public
 #                            open core. CNB tags must come from here.
@@ -55,7 +55,7 @@ fi
 
 CNB_REPO="${OPENASR_CNB_REPO:-openasr/openasr}"
 CNB_API="${OPENASR_CNB_API:-https://api.cnb.cool}"
-GITHUB_REPO="${OPENASR_CNB_GITHUB_REPO:-QuintinShaw/openasr}"
+GITHUB_REPO="${OPENASR_CNB_GITHUB_REPO:-chameleon-ai/openasr}"
 ACCEPT="application/vnd.cnb.api+json"
 
 cnb_curl() {

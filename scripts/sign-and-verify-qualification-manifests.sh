@@ -24,7 +24,7 @@ version="${1#v}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || fail "version must be X.Y.Z or vX.Y.Z"
 tag="v${version}"
-repository="QuintinShaw/openasr"
+repository="chameleon-ai/openasr"
 promote_cuda_targets="${3:-}"
 
 if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then

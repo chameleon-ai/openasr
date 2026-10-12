@@ -114,8 +114,8 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
             "release_version": identity.version,
             "driver_version": value["driver_version"],
             "generator_sha256": "0" * 64,
-            "repository": "QuintinShaw/openasr",
-            "signer_workflow": "QuintinShaw/openasr/.github/workflows/release-binaries.yml",
+            "repository": "chameleon-ai/openasr",
+            "signer_workflow": "chameleon-ai/openasr/.github/workflows/release-binaries.yml",
             "source_digest": "7" * 40,
             "scope": f"backend-hardware-evidence-v{identity.version}-{identity.provider}",
             "binary_sha256": value["binary_sha256"],
@@ -384,8 +384,8 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
                 raw_audit_paths=[raw_path],
                 release_subject_paths=list(subjects.values()),
                 checksums_path=checksums,
-                repository="QuintinShaw/openasr",
-                signer_workflow="QuintinShaw/openasr/.github/workflows/release-binaries.yml",
+                repository="chameleon-ai/openasr",
+                signer_workflow="chameleon-ai/openasr/.github/workflows/release-binaries.yml",
                 source_digest="7" * 40,
             )
         self.assertEqual(run.call_count, len(subjects))
@@ -406,9 +406,9 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
                 entry_paths=[entry],
                 release_subject_paths=subjects,
                 checksums_path=checksums,
-                repository="QuintinShaw/openasr",
+                repository="chameleon-ai/openasr",
                 signer_workflow=(
-                    "QuintinShaw/openasr/.github/workflows/release-binaries.yml"
+                    "chameleon-ai/openasr/.github/workflows/release-binaries.yml"
                 ),
                 source_digest="7" * 40,
             )
@@ -420,9 +420,9 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
                 entry_paths=[entry],
                 release_subject_paths=subjects,
                 checksums_path=checksums,
-                repository="QuintinShaw/openasr",
+                repository="chameleon-ai/openasr",
                 signer_workflow=(
-                    "QuintinShaw/openasr/.github/workflows/release-binaries.yml"
+                    "chameleon-ai/openasr/.github/workflows/release-binaries.yml"
                 ),
                 source_digest="7" * 40,
             )
@@ -435,9 +435,9 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
             gate.verify_qualification_provenance(
                 evidence_paths=[evidence],
                 raw_audit_paths=[raw],
-                repository="QuintinShaw/openasr",
+                repository="chameleon-ai/openasr",
                 signer_workflow=(
-                    "QuintinShaw/openasr/.github/workflows/"
+                    "chameleon-ai/openasr/.github/workflows/"
                     "qualify-windows-backend.yml"
                 ),
                 source_digest="7" * 40,
@@ -455,9 +455,9 @@ class BackendHardwareEvidenceTests(unittest.TestCase):
                 gate.verify_qualification_provenance(
                     evidence_paths=[evidence],
                     raw_audit_paths=[raw],
-                    repository="QuintinShaw/openasr",
+                    repository="chameleon-ai/openasr",
                     signer_workflow=(
-                        "QuintinShaw/openasr/.github/workflows/"
+                        "chameleon-ai/openasr/.github/workflows/"
                         "qualify-windows-backend.yml"
                     ),
                     source_digest="7" * 40,

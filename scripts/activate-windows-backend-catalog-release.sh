@@ -48,7 +48,7 @@ gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"
 [ -z "$(git status --porcelain --untracked-files=normal)" ] \
   || fail "the open-core worktree must be clean before activation preparation"
 
-repository="${GITHUB_REPOSITORY:-QuintinShaw/openasr}"
+repository="${GITHUB_REPOSITORY:-chameleon-ai/openasr}"
 tag_commit="$(resolve_tag_commit "$repository" "$tag" || true)"
 [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]] || fail "cannot peel ${tag} to one commit"
 git merge-base --is-ancestor "$tag_commit" HEAD \

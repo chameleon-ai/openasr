@@ -18,7 +18,7 @@ tag="$1"
   exit 1
 }
 version="${tag#v}"
-repository="${2:-${GITHUB_REPOSITORY:-QuintinShaw/openasr}}"
+repository="${2:-${GITHUB_REPOSITORY:-chameleon-ai/openasr}}"
 command -v gh >/dev/null 2>&1 || { echo "gh is required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 

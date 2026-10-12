@@ -29,7 +29,7 @@ env:
 jobs:
   windows-hip:
     name: Windows HIP SDK compile
-    if: github.repository_owner == 'QuintinShaw'
+    if: github.repository_owner == 'chameleon-ai'
     runs-on: [self-hosted, Windows, X64, HIP]
     steps:
       - uses: actions/checkout@v7

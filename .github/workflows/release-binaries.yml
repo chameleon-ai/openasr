@@ -1192,7 +1192,7 @@ jobs:
             --minimum-cli-version "$OPENASR_VERSION" \
             "${min_driver_args[@]}" \
             --base-url "https://dl.openasr.org/core/v$OPENASR_VERSION" \
-            --mirror-base-url "https://github.com/QuintinShaw/openasr/releases/download/v$OPENASR_VERSION" \
+            --mirror-base-url "https://github.com/chameleon-ai/openasr/releases/download/v$OPENASR_VERSION" \
             --require-single-target \
             --out "dist/${BACKEND_PACK_NAME}"
           cat "dist/${BACKEND_PACK_NAME}"
@@ -1498,7 +1498,7 @@ jobs:
           }
           tag="v${version}"
           base_url="https://dl.openasr.org/core/${tag}"
-          mirror_base_url="https://github.com/QuintinShaw/openasr/releases/download/${tag}"
+          mirror_base_url="https://github.com/chameleon-ai/openasr/releases/download/${tag}"
           neutral="dist/openasr-${version}-windows-x86_64-neutral.zip"
           [ -f "$neutral" ] || { echo "missing neutral host archive: $neutral" >&2; exit 1; }
           bundle_asset="dist/openasr-${version}-build-provenance.bundle.json"

@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   qualify:
-    if: github.repository == 'QuintinShaw/openasr'
+    if: github.repository == 'chameleon-ai/openasr'
     runs-on: [self-hosted, Windows, X64, "${{ inputs.runner_label }}"]
     timeout-minutes: 180
     env:

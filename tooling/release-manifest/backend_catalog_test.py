@@ -641,7 +641,7 @@ class BackendCatalogTest(unittest.TestCase):
                         "mirrors": [
                             {
                                 "source": "github",
-                                "url": "https://github.com/QuintinShaw/openasr/"
+                                "url": "https://github.com/chameleon-ai/openasr/"
                                 f"releases/download/v1.2.3/{asset.name}",
                             }
                         ],

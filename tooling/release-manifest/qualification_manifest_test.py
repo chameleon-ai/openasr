@@ -53,7 +53,7 @@ class QualificationManifestCompilerTests(unittest.TestCase):
         self.tag = f"v{self.version}"
         self.base_url = f"https://dl.openasr.org/core/{self.tag}"
         self.mirror_url = (
-            f"https://github.com/QuintinShaw/openasr/releases/download/{self.tag}"
+            f"https://github.com/chameleon-ai/openasr/releases/download/{self.tag}"
         )
         self.prefix = f"openasr-{self.version}-windows-x86_64-neutral"
         self.neutral = self.root / f"{self.prefix}.zip"

@@ -29,7 +29,7 @@ jobs:
     # and fails closed on an invalid tag.
     if: >-
       ${{
-        github.repository == 'QuintinShaw/openasr' &&
+        github.repository == 'chameleon-ai/openasr' &&
         (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
       }}
     runs-on: ubuntu-latest

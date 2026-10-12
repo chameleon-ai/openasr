@@ -40,7 +40,7 @@ permissions:
 jobs:
   docker:
     name: Build CUDA image via docker-release
-    if: github.repository_owner == 'QuintinShaw'
+    if: github.repository_owner == 'chameleon-ai'
     uses: ./.github/workflows/docker-release.yml
     with:
       version: ${{ inputs.version }}

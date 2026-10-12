@@ -103,7 +103,7 @@ env:
 jobs:
   resolve:
     name: Resolve version and push plan
-    if: github.repository_owner == 'QuintinShaw'
+    if: github.repository_owner == 'chameleon-ai'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.plan.outputs.version }}
