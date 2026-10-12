@@ -368,7 +368,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workflow: [publish-core-channels.yml, sync-release-to-cnb.yml]
+        workflow: [publish-core-channels.yml]
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ needs.resolve.outputs.tag }}

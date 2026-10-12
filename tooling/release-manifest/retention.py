@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Hot-cache retention planner for Official (B2) and China (CNB) releases.
+"""Hot-cache retention planner for Official (B2) releases.
 
-GitHub keeps the full archive. B2 keeps the last 30 stables + 5 prereleases;
-CNB keeps 15 + 3. The live latest stable is pinned so a prune cannot delete
+GitHub keeps the full archive. B2 keeps the last 30 stables + 5 prereleases.
+The live latest stable is pinned so a prune cannot delete
 the objects the current pointer still names.
 
 Default is log-only. Real deletes require OPENASR_RELEASE_PRUNE=1 and a
@@ -17,7 +17,6 @@ from functools import cmp_to_key
 from typing import Callable, Iterable
 
 OFFICIAL_RETENTION = {"keep_stable": 30, "keep_prerelease": 5}
-CHINA_RETENTION = {"keep_stable": 15, "keep_prerelease": 3}
 
 _SEMVER = re.compile(
     r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
@@ -128,19 +127,19 @@ def plan_retention_for_keys(
 
 def apply_release_retention(
     *,
-    profile: str = "official",
     latest_stable: str | None = None,
     keys: Iterable[str] | None = None,
     prune: bool | None = None,
     delete_keys: Callable[[list[str]], None] | None = None,
     log: Callable[[str], None] = print,
 ) -> dict:
-    limits = CHINA_RETENTION if profile == "china" else OFFICIAL_RETENTION
+    limits = OFFICIAL_RETENTION
     if prune is None:
         prune = os.environ.get("OPENASR_RELEASE_PRUNE") == "1"
     log(
-        f"release retention ({profile}): keepStable={limits['keep_stable']} "
-        f"keepPrerelease={limits['keep_prerelease']} pin={latest_stable or '(none)'}"
+        "release retention: keepStable="
+        f"{limits['keep_stable']} keepPrerelease={limits['keep_prerelease']} "
+        f"pin={latest_stable or '(none)'}"
     )
     key_list = list(keys or [])
     if not key_list:

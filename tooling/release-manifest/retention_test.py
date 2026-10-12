@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from retention import (
-    CHINA_RETENTION,
     OFFICIAL_RETENTION,
     apply_release_retention,
     is_prerelease_version,
@@ -31,12 +30,21 @@ class PlanRetentionTest(unittest.TestCase):
         self.assertNotIn("0.1.1", plan["prune"])
 
     def test_prereleases_do_not_squeeze_stables(self) -> None:
-        versions = [f"0.1.{i}" for i in range(1, 17)] + [f"0.2.0-preview.{i}" for i in range(1, 9)]
-        plan = plan_release_retention(versions, "0.1.16", **CHINA_RETENTION)
+        versions = [f"0.1.{i}" for i in range(1, 41)] + [f"0.2.0-preview.{i}" for i in range(1, 9)]
+        plan = plan_release_retention(versions, "0.1.40", **OFFICIAL_RETENTION)
         kept_stable = [version for version in plan["keep"] if not is_prerelease_version(version)]
         kept_pre = [version for version in plan["keep"] if is_prerelease_version(version)]
-        self.assertEqual(len(kept_stable), 15)
-        self.assertEqual(kept_pre, ["0.2.0-preview.8", "0.2.0-preview.7", "0.2.0-preview.6"])
+        self.assertEqual(len(kept_stable), 30)
+        self.assertEqual(
+            kept_pre,
+            [
+                "0.2.0-preview.8",
+                "0.2.0-preview.7",
+                "0.2.0-preview.6",
+                "0.2.0-preview.5",
+                "0.2.0-preview.4",
+            ],
+        )
         self.assertIn("0.2.0-preview.1", plan["prune"])
         self.assertIn("0.1.1", plan["prune"])
 
@@ -75,7 +83,6 @@ class ApplyRetentionTest(unittest.TestCase):
         logs: list[str] = []
         keys = [f"desktop/releases/v0.1.{i}/a.dmg" for i in range(1, 33)]
         result = apply_release_retention(
-            profile="official",
             latest_stable="0.1.32",
             keys=keys,
             prune=False,
@@ -88,17 +95,23 @@ class ApplyRetentionTest(unittest.TestCase):
 
     def test_prune_deletes_old_keys(self) -> None:
         deleted: list[str] = []
-        keys = [f"desktop/releases/v0.1.{i}/a.dmg" for i in range(1, 18)]
+        keys = [f"desktop/releases/v0.1.{i}/a.dmg" for i in range(1, 34)]
         result = apply_release_retention(
-            profile="china",
-            latest_stable="0.1.17",
+            latest_stable="0.1.33",
             keys=keys,
             prune=True,
             delete_keys=deleted.extend,
             log=lambda _line: None,
         )
         self.assertTrue(result["applied"])
-        self.assertEqual(deleted, ["desktop/releases/v0.1.1/a.dmg", "desktop/releases/v0.1.2/a.dmg"])
+        self.assertEqual(
+            deleted,
+            [
+                "desktop/releases/v0.1.1/a.dmg",
+                "desktop/releases/v0.1.2/a.dmg",
+                "desktop/releases/v0.1.3/a.dmg",
+            ],
+        )
 
 
 if __name__ == "__main__":

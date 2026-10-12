@@ -428,13 +428,12 @@ def main(argv: list[str]) -> int:
             return 1
         for url in urls:
             print(url)
-        apply_release_retention(profile="official", latest_stable=args.version)
+        apply_release_retention(latest_stable=args.version)
         return 0
     if args.command == "prune":
         keys = args.keys_file.read_text(encoding="utf-8").splitlines() if args.keys_file else []
         keys = [line.strip() for line in keys if line.strip() and not line.startswith("#")]
         apply_release_retention(
-            profile="official",
             latest_stable=args.latest_stable,
             keys=keys,
             prune=False,

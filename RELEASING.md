@@ -200,20 +200,14 @@ Key policy: a dedicated B2 application key restricted to the release bucket
 and the `core/` prefix with `listFiles` / `readFiles` / `writeFiles` only
 (no `deleteFiles`), separate from the desktop installer key.
 
-After publishing with `GITHUB_TOKEN`, the orchestrator explicitly dispatches two
-independent GitHub Actions workflows. A token-created release does not trigger
+After publishing with `GITHUB_TOKEN`, the orchestrator explicitly dispatches one
+independent GitHub Actions workflow. A token-created release does not trigger
 new `release: published` workflow runs; those listeners remain available for
-maintainer-created releases. Dispatch jobs run only after `publish-release`
-succeeds, and a failed dispatch can be retried without repeating its sibling:
+maintainer-created releases. The dispatch job runs only after `publish-release`
+succeeds, and a failed dispatch can be retried on its own:
 
 - `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
   catalog/CDN plane is complete.
-- `sync-release-to-cnb.yml` mirrors the published GitHub assets to
-  [cnb.cool/openasr/openasr](https://cnb.cool/openasr/openasr). GitHub stays
-  the signed source; CI downloads each public asset and uploads it. Local
-  `finalize-core-release.sh` must not pull the matrix onto a maintainer
-  laptop for this. Missing `CNB_TOKEN` skips; a token present with a failed
-  upload fails that workflow only and does not roll back GitHub.
 
 ### Qualify and activate one exact backend after publication
 
@@ -330,20 +324,3 @@ gh workflow run docker-release.yml \
 
 Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for
 development and `docker-smoke.yml`; they are not the release path.
-
-## China mirror (CNB)
-
-`sync-release-to-cnb.yml` runs on `release: published` for a stable `vX.Y.Z`
-core tag (not `desktop-v*`). It does not require the tag to be GitHub
-`latest`, so a later repair of an older tag is still valid. The job streams
-one GitHub asset at a time through `scripts/sync-release-to-cnb.sh` and is
-idempotent: already-mirrored names with a matching size are skipped.
-
-Repair or finish a partial mirror:
-
-```bash
-gh workflow run sync-release-to-cnb.yml -f tag=vX.Y.Z
-```
-
-`sync-main-to-cnb.yml` only fast-forwards git `main`. It never copies release
-assets.
