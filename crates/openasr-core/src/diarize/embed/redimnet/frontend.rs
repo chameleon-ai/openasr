@@ -373,8 +373,10 @@ mod tests {
             .collect();
         let data_start = header_start + header_len;
         let raw: Vec<f32> = bytes[data_start..]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         // Normalize to C order. Only 2D fortran arrays occur in the dumps (the
         // mel matrix); reorder column-major -> row-major.

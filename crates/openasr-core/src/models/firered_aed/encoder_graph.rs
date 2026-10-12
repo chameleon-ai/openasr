@@ -1995,8 +1995,10 @@ mod parity_tests {
             include_bytes!("testdata/firered_aed_v2_encoder_frame0_reference.f32");
         assert_eq!(REFERENCE_BYTES.len(), metadata.d_model * 4);
         let expected_frame0: Vec<f32> = REFERENCE_BYTES
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
 
         let actual_frame0 = &output.rows[..metadata.d_model];

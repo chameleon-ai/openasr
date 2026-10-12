@@ -1692,8 +1692,10 @@ mod tests {
 
         let mel_bytes = std::fs::read(&mel_path).expect("read reference mel");
         let mel_values: Vec<f32> = mel_bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(mel_values.len(), 128 * 1100);
         let mel_features = Qwen3AsrMelFeatures {
@@ -1711,8 +1713,10 @@ mod tests {
 
         let ref_bytes = std::fs::read(&output_path).expect("read reference output");
         let ref_values: Vec<f32> = ref_bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(ref_values.len(), 143 * 1024);
         assert_eq!(

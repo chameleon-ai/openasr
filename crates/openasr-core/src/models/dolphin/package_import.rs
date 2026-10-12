@@ -1158,8 +1158,8 @@ mod tests {
         assert_eq!(tensor.dims, vec![FEATURE_DIM as u64, fft_bins as u64]);
         assert_eq!(tensor.data.len(), FEATURE_DIM * fft_bins * 4);
         // Peak-normalized triangles sit within [0, 1].
-        for chunk in tensor.data.chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in tensor.data.as_chunks::<4>().0.iter() {
+            let value = f32::from_le_bytes(*chunk);
             assert!(
                 (0.0..=1.0001).contains(&value),
                 "mel weight out of range: {value}"

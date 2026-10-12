@@ -305,7 +305,7 @@ fn decode_hex_exact<const N: usize>(
         });
     }
     let mut out = [0_u8; N];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk).map_err(|error| {
             QualificationManifestSecurityError::InvalidSignature {
                 message: format!("{field} is not UTF-8: {error}"),

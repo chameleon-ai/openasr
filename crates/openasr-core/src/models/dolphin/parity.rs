@@ -61,8 +61,10 @@ fn load_safetensors_f32(path: &Path) -> HashMap<String, Vec<f32>> {
             "tensor {name} not 4-byte aligned"
         );
         let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         out.insert(name.clone(), values);
     }
@@ -98,8 +100,10 @@ fn load_safetensors_f32_prefixed(path: &Path, prefix: &str) -> HashMap<String, V
             "tensor {name} not 4-byte aligned"
         );
         let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         out.insert(name.clone(), values);
     }
@@ -136,8 +140,10 @@ fn load_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
 
     let data_start = header_start + header_len;
     let values: Vec<f32> = bytes[data_start..]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     (shape, values)
 }

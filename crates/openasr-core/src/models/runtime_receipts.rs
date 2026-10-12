@@ -694,7 +694,7 @@ impl RuntimeReceiptCollector {
         // ordinal (`u64::MAX`) is handed out once; the counter then stores 0 so
         // the next allocation cannot wrap or reuse that identity.
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
                 if ordinal == 0 {
                     return None;
                 }

@@ -448,14 +448,16 @@ mod tests {
                 let raw = &bytes[header_end + start..header_end + end];
                 let values: Vec<f32> = match dtype {
                     "F32" => raw
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
                         .collect(),
                     "BF16" => raw
-                        .chunks_exact(2)
-                        .map(|c| {
-                            f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16)
-                        })
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
                         .collect(),
                     _ => continue,
                 };
@@ -476,8 +478,10 @@ mod tests {
         let header_start = if major == 1 { 10 } else { 12 };
         let data_start = header_start + header_len;
         bytes[data_start..]
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect()
     }
 
@@ -584,8 +588,10 @@ mod tests {
         }
         let data_offset = data_offset.expect("wav data chunk");
         wav_bytes[data_offset..data_offset + data_len]
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
             .collect()
     }
 

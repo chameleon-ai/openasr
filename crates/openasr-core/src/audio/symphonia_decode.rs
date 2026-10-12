@@ -947,8 +947,10 @@ mod tests {
         assert!(status.success(), "ffmpeg must decode the fixture");
         let raw = std::fs::read(&reference_path).unwrap();
         let reference: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
 
         let decoded = decode_opus_fixture(&fixture);

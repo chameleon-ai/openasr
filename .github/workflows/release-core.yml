@@ -349,7 +349,7 @@ jobs:
           tool-cache: true
       - name: Install Linux audio build dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: ./.github/actions/rust-cache
         with:
           shared-key: release-core-finalize-ubuntu-latest

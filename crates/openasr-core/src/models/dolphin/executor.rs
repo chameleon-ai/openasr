@@ -1345,8 +1345,10 @@ mod tests {
             .collect();
         let data_start = header_start + header_len;
         let values: Vec<f32> = bytes[data_start..]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         (shape, values)
     }

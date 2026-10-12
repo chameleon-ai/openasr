@@ -347,13 +347,19 @@ fn requantize_tensor_rows(
         if source_ggml_type == GgufWriteTensorType::F32.ggml_type() {
             row.extend(
                 source_row
-                    .chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes)),
             );
         } else if source_ggml_type == GgufWriteTensorType::F16.ggml_type() {
-            row.extend(source_row.chunks_exact(2).map(|bytes| {
-                crate::nn::half::f16_bits_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]))
-            }));
+            row.extend(
+                source_row
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| crate::nn::half::f16_bits_to_f32(u16::from_le_bytes(*bytes))),
+            );
         } else {
             dequantize_ggml_row_to_f32(source_ggml_type, source_row, ne0, &mut row).map_err(
                 |error| GgufWriteError::TensorStreamingProducer {

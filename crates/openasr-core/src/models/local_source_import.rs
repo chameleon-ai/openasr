@@ -761,8 +761,8 @@ fn decode_f32_payload(tensor_name: &str, data: &[u8]) -> Result<Vec<f32>, LocalS
         )));
     }
     let mut out = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in data.as_chunks::<4>().0.iter() {
+        let value = f32::from_le_bytes(*chunk);
         if !value.is_finite() {
             return Err(validate_error(format!(
                 "safetensors tensor '{tensor_name}' contains non-finite F32 value"
@@ -784,8 +784,8 @@ fn decode_f16_payload_bits(
         )));
     }
     let mut out = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for chunk in data.as_chunks::<2>().0.iter() {
+        out.push(u16::from_le_bytes(*chunk));
     }
     Ok(out)
 }
@@ -818,8 +818,8 @@ fn decode_bf16_payload_as_f32(
         )));
     }
     let mut out = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        let upper = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+    for chunk in data.as_chunks::<2>().0.iter() {
+        let upper = u16::from_le_bytes(*chunk) as u32;
         let value = f32::from_bits(upper << 16);
         if !value.is_finite() {
             return Err(validate_error(format!(

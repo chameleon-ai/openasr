@@ -31,7 +31,7 @@ static NEXT_LOGITS_HEAD_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn next_logits_head_runtime_identity() -> u64 {
     NEXT_LOGITS_HEAD_RUNTIME_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("qwen logits-head runtime identity space exhausted")
@@ -1290,7 +1290,9 @@ mod tests {
             .compute_logits_for_hidden_rows(&hidden, 3)
             .expect("host batch logits");
         let expected = hidden
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|row| {
                 head.compute_logits_for_last_hidden(row)
                     .expect("single-row logits")
@@ -1516,7 +1518,9 @@ mod tests {
             .compute_logits_for_hidden_rows(&head, &hidden, 3)
             .expect("batched logits");
         let repeated_logits = hidden
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|row| {
                 runtime
                     .compute_logits_for_last_hidden(&head, row)
@@ -1533,7 +1537,9 @@ mod tests {
             .compute_top1_tokens_for_hidden_rows(&head, &hidden, 3)
             .expect("batched top-1");
         let repeated = hidden
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|row| {
                 runtime
                     .compute_top1_token_for_last_hidden(&head, row)

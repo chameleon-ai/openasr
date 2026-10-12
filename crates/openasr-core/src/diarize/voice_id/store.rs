@@ -1447,8 +1447,8 @@ fn blob_to_embedding(blob: &[u8], dim: usize) -> Result<SpeakerEmbedding, VoiceI
         )));
     }
     let mut values = Vec::with_capacity(dim);
-    for chunk in blob.chunks_exact(4) {
-        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in blob.as_chunks::<4>().0.iter() {
+        values.push(f32::from_le_bytes(*chunk));
     }
     Ok(SpeakerEmbedding(values))
 }

@@ -23,8 +23,10 @@ fn golden() -> (Vec<f32>, Vec<f32>) {
     let mut off = 12;
     let mut read = |n: usize| -> Vec<f32> {
         let out = GOLDEN[off..off + n * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         off += n * 4;
         out
@@ -198,8 +200,10 @@ fn read_reference_probabilities(path: &std::path::Path) -> Vec<f32> {
         "npy f32 payload alignment"
     );
     bytes[data_start..]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 

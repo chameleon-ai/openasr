@@ -1,4 +1,4 @@
-FROM rust:1.95.0-trixie AS builder
+FROM rust:1.99.0-trixie AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libasound2-dev cmake \

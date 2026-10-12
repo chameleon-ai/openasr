@@ -1173,8 +1173,10 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
 
 fn read_f32_vec(bytes: &[u8], offset: &mut usize, len: usize) -> Option<Vec<f32>> {
     let raw = read_exact(bytes, offset, len.checked_mul(4)?)?;
-    raw.chunks_exact(4)
-        .map(|chunk| Some(f32::from_le_bytes(chunk.try_into().ok()?)))
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| Some(f32::from_le_bytes(*chunk)))
         .collect()
 }
 

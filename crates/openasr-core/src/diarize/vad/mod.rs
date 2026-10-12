@@ -144,8 +144,10 @@ pub(crate) mod test_fixtures {
         assert_eq!(&GOLDEN[0..4], b"FRSG", "golden magic");
         let n_samples = u32::from_le_bytes(GOLDEN[4..8].try_into().unwrap()) as usize;
         GOLDEN[12..12 + n_samples * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 

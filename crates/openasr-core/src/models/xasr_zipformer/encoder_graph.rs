@@ -7830,7 +7830,7 @@ mod tests {
             native: None,
         };
         let mut expected = Vec::with_capacity(DIM * FRAMES);
-        for frame in input_values.chunks_exact(DIM) {
+        for frame in input_values.as_chunks::<DIM>().0.iter() {
             let projected = linear.apply(frame, Some(&bias_values)).expect("linear");
             for c in 0..DIM {
                 expected.push(projected[c] * sigmoid_reference(projected[DIM + c]));
@@ -10405,8 +10405,10 @@ mod tests {
             path.display()
         );
         bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()
     }
 

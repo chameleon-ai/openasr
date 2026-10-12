@@ -143,7 +143,7 @@ jobs:
           git submodule update --init --recursive
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           openasr-ci-verify
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         if: steps.published.outputs.available != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.published.outputs.available != 'true'
@@ -222,7 +222,7 @@ jobs:
       - name: Initialize open-core submodules
         if: steps.published.outputs.available != 'true'
         run: git submodule update --init --recursive
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         if: steps.published.outputs.available != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.published.outputs.available != 'true'

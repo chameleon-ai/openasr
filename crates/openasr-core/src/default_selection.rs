@@ -258,7 +258,7 @@ fn decode_intent_atom(value: &str) -> Result<String, String> {
         return Err("encoded execution-intent atom has an invalid length".to_string());
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0.iter() {
         let digits = std::str::from_utf8(pair)
             .map_err(|_| "encoded execution-intent atom is not ASCII".to_string())?;
         bytes.push(

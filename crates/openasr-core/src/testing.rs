@@ -4045,8 +4045,8 @@ mod tests {
         let fixture_offset = data_start + fixture_tensor.offset_bytes as usize;
         let fixture_bytes =
             &bytes_a[fixture_offset..fixture_offset + fixture_tensor.size_bytes as usize];
-        for chunk in fixture_bytes.chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in fixture_bytes.as_chunks::<4>().0.iter() {
+            let value = f32::from_le_bytes(*chunk);
             assert!(value.is_finite(), "payload must stay finite");
         }
 
@@ -4056,8 +4056,8 @@ mod tests {
         let conv1_offset = data_start + conv1.offset_bytes as usize;
         let conv1_bytes = &bytes_a[conv1_offset..conv1_offset + conv1.size_bytes as usize];
         assert!(
-            conv1_bytes.chunks_exact(2).any(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            conv1_bytes.as_chunks::<2>().0.iter().any(|chunk| {
+                let bits = u16::from_le_bytes(*chunk);
                 matches!(
                     bits,
                     0x3C00 | 0x3800 | 0x4000 | 0xBC00 | 0x3555 | 0x3A00 | 0x3400 | 0xC000

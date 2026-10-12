@@ -99,7 +99,7 @@ pub(crate) fn apply_cmvn(
     mean: &[f32; NUM_MEL_BINS],
     inv_stddev: &[f32; NUM_MEL_BINS],
 ) {
-    for frame in features.chunks_exact_mut(NUM_MEL_BINS) {
+    for frame in features.as_chunks_mut::<NUM_MEL_BINS>().0.iter_mut() {
         for ((value, m), s) in frame.iter_mut().zip(mean).zip(inv_stddev) {
             *value = (*value - *m) * *s;
         }

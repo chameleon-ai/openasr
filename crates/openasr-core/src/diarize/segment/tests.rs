@@ -171,8 +171,10 @@ fn read_golden(path: &str, magic: &[u8]) -> (Vec<usize>, Vec<f32>) {
     }
     let n: usize = dims.iter().product();
     let data = bytes[off..off + n * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     (dims, data)
 }
@@ -485,9 +487,11 @@ fn pyannet_metal_matches_onnx_reference() {
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0f32, f32::max);
     let class_mismatches = actual
-        .chunks_exact(super::NUM_CLASSES)
-        .zip(reference.chunks_exact(super::NUM_CLASSES))
-        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .as_chunks::<{ super::NUM_CLASSES }>()
+        .0
+        .iter()
+        .zip(reference.as_chunks::<{ super::NUM_CLASSES }>().0.iter())
+        .filter(|(actual, expected)| row_argmax(&**actual) != row_argmax(&**expected))
         .count();
     eprintln!(
         "PYANNET_METAL_OFFICIAL frames={frames} max_abs={max_abs:.8} class_mismatches={class_mismatches}"
@@ -584,14 +588,18 @@ fn pyannet_exact_gpu_matches_cpu_and_onnx_reference() {
         .map(|(actual, expected)| (actual - expected).abs())
         .fold(0.0_f32, f32::max);
     let cpu_class_mismatches = actual
-        .chunks_exact(super::NUM_CLASSES)
-        .zip(cpu.chunks_exact(super::NUM_CLASSES))
-        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .as_chunks::<{ super::NUM_CLASSES }>()
+        .0
+        .iter()
+        .zip(cpu.as_chunks::<{ super::NUM_CLASSES }>().0.iter())
+        .filter(|(actual, expected)| row_argmax(&**actual) != row_argmax(&**expected))
         .count();
     let oracle_class_mismatches = actual
-        .chunks_exact(super::NUM_CLASSES)
-        .zip(reference.chunks_exact(super::NUM_CLASSES))
-        .filter(|(actual, expected)| row_argmax(actual) != row_argmax(expected))
+        .as_chunks::<{ super::NUM_CLASSES }>()
+        .0
+        .iter()
+        .zip(reference.as_chunks::<{ super::NUM_CLASSES }>().0.iter())
+        .filter(|(actual, expected)| row_argmax(&**actual) != row_argmax(&**expected))
         .count();
     eprintln!(
         "PYANNET_EXACT_GPU_OFFICIAL provider={requested} placement=hybrid exact_route={route_identity} frames={frames} cpu_max_abs={max_abs:.9} cpu_mean_abs={mean_abs:.9} oracle_max_abs={oracle_max_abs:.9} cpu_class_mismatches={cpu_class_mismatches} oracle_class_mismatches={oracle_class_mismatches}"
@@ -674,9 +682,11 @@ fn pyannet_cpu_and_metal_stay_within_measured_near_tie_envelope_on_aux_audio() {
             "window {window_index} frame count"
         );
         for (frame_index, ((cpu_row, ggml_cpu_row), metal_row)) in cpu_logp
-            .chunks_exact(super::NUM_CLASSES)
-            .zip(ggml_cpu_logp.chunks_exact(super::NUM_CLASSES))
-            .zip(metal_logp.chunks_exact(super::NUM_CLASSES))
+            .as_chunks::<{ super::NUM_CLASSES }>()
+            .0
+            .iter()
+            .zip(ggml_cpu_logp.as_chunks::<{ super::NUM_CLASSES }>().0.iter())
+            .zip(metal_logp.as_chunks::<{ super::NUM_CLASSES }>().0.iter())
             .enumerate()
         {
             for (class, ((cpu, ggml_cpu), metal)) in

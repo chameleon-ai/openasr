@@ -225,7 +225,7 @@ impl FireRedStreamVadModel {
 
         let dnn_out = linear_relu(&memory, t, PROJ, &w.dnn_w, &w.dnn_b, HIDDEN);
         let mut probs = Vec::with_capacity(t);
-        for frame in dnn_out.chunks_exact(HIDDEN) {
+        for frame in dnn_out.as_chunks::<HIDDEN>().0.iter() {
             let mut logit = w.out_b;
             for (v, wt) in frame.iter().zip(w.out_w.iter()) {
                 logit += v * wt;

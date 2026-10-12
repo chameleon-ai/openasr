@@ -931,7 +931,7 @@ mod tests {
         let filters = super::slaney_mel_filterbank(4, 8, 16_000, 0.0, 8_000.0).expect("filterbank");
         assert_eq!(filters.len(), 4 * (8 / 2 + 1));
 
-        let rows = filters.chunks_exact(4).collect::<Vec<_>>();
+        let rows = filters.as_chunks::<4>().0.iter().collect::<Vec<_>>();
         assert_eq!(rows.len(), 5);
 
         let first_bin_non_zero = rows

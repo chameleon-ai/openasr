@@ -1151,11 +1151,11 @@ fn balanced_time_concat<'a>(
         .collect::<Result<Vec<_>, _>>()?;
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        let mut pairs = level.chunks_exact(2);
-        for pair in &mut pairs {
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for pair in pairs.iter() {
             next.push(graph.concat(pair[0], pair[1], 1)?);
         }
-        if let [tail] = pairs.remainder() {
+        if let [tail] = remainder {
             next.push(*tail);
         }
         level = next;

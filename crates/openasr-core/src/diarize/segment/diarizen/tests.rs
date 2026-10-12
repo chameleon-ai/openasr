@@ -196,8 +196,10 @@ fn npy_f32(npz: &std::path::Path, name: &str) -> Vec<f32> {
     let (header, payload) = npy_payload(&bytes);
     assert!(header.contains("'<f4'"), "{name}: {header}");
     let values = payload
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     if !header.contains("'fortran_order': True") {
         return values;
@@ -229,8 +231,10 @@ fn npy_i64(npz: &std::path::Path, name: &str) -> Vec<i64> {
     let (header, payload) = npy_payload(&bytes);
     assert!(header.contains("'<i8'"), "{name}: {header}");
     payload
-        .chunks_exact(8)
-        .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("i64 chunk")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| i64::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -271,7 +275,9 @@ fn median_filter_uses_scipy_reflect_edges() {
     let filtered = median_filter_activity(&activity, 7);
     assert_eq!(
         filtered
-            .chunks_exact(LOCAL_SPEAKERS)
+            .as_chunks::<LOCAL_SPEAKERS>()
+            .0
+            .iter()
             .map(|row| row[0])
             .collect::<Vec<_>>(),
         vec![1, 1, 1, 0, 0, 0, 0]

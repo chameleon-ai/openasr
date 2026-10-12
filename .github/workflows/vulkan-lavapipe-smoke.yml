@@ -71,7 +71,7 @@ jobs:
       - name: vulkaninfo summary (confirm lavapipe device is enumerable)
         run: vulkaninfo --summary
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:

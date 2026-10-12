@@ -520,8 +520,8 @@ jobs:
             echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
             export PATH="${HOME}/.cargo/bin:${PATH}"
           fi
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup default 1.95.0
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
           rustc --version
           cargo --version
 
@@ -1268,8 +1268,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup default 1.95.0
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
           rustc --version
           cargo --version

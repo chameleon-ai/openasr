@@ -243,8 +243,10 @@ impl FireRedStreamVadWeights {
                 });
             }
             let got: Vec<i32> = data[start..end]
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             let want: Vec<i32> = vec![
                 (NUM_BLOCKS + 1) as i32,
@@ -301,8 +303,10 @@ impl FireRedStreamVadWeights {
 
 fn read_f32_le(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 

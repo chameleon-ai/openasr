@@ -712,7 +712,9 @@ pub(super) fn segment_diarizen_local_activity(
         }
         let frame_activity = output
             .activity
-            .chunks_exact(DIARIZEN_LOCAL_SPEAKERS)
+            .as_chunks::<DIARIZEN_LOCAL_SPEAKERS>()
+            .0
+            .iter()
             .map(|row| {
                 row.iter()
                     .enumerate()
@@ -823,7 +825,9 @@ fn aggregate_speaker_count(
 }
 
 fn decode_activity(logp: &[f32], frames: usize) -> Vec<u8> {
-    logp.chunks_exact(NUM_CLASSES)
+    logp.as_chunks::<NUM_CLASSES>()
+        .0
+        .iter()
         .take(frames)
         .map(|row| {
             let class = row

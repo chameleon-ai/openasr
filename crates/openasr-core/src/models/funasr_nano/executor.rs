@@ -1166,8 +1166,10 @@ mod tests {
     fn read_f32(path: &std::path::Path) -> Vec<f32> {
         std::fs::read(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 

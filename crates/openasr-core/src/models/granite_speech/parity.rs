@@ -82,12 +82,16 @@ fn load_safetensors_prefixed(dir: &Path, prefix: &str) -> HashMap<String, Vec<f3
             let raw = &bytes[header_end + start..header_end + end];
             let values: Vec<f32> = match dtype {
                 "F32" => raw
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
                 "BF16" => raw
-                    .chunks_exact(2)
-                    .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap())))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| bf16_to_f32(u16::from_le_bytes(*c)))
                     .collect(),
                 // Bookkeeping scalars (e.g. BatchNorm's `num_batches_tracked`,
                 // an I64 training-step counter) carry no forward-pass value;
@@ -128,8 +132,10 @@ fn load_npy_f32(path: &Path) -> (Vec<usize>, Vec<f32>) {
 
     let data_start = header_start + header_len;
     let values: Vec<f32> = bytes[data_start..]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     (shape, values)
 }
@@ -306,8 +312,10 @@ fn load_npy_i64(path: &Path) -> (Vec<usize>, Vec<i64>) {
 
     let data_start = header_start + header_len;
     let values: Vec<i64> = bytes[data_start..]
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect();
     (shape, values)
 }
@@ -426,8 +434,10 @@ fn load_wav_pcm16_mono_f32(path: &Path) -> Vec<f32> {
     }
     let data_offset = data_offset.expect("wav data chunk");
     bytes[data_offset..data_offset + data_len]
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32 / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c) as f32 / 32768.0)
         .collect()
 }
 

@@ -232,7 +232,9 @@ const POWERSET: [[u8; LOCAL_SPEAKERS]; POWERSET_CLASSES] = [
 
 fn postprocess_logits(logits: &[f32], frames: usize) -> (Vec<u8>, Vec<u8>) {
     let classes = logits
-        .chunks_exact(POWERSET_CLASSES)
+        .as_chunks::<POWERSET_CLASSES>()
+        .0
+        .iter()
         .map(|row| {
             row.iter()
                 .enumerate()

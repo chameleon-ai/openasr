@@ -1428,7 +1428,7 @@ mod tests {
     fn compact_relative_positional_encoding_keeps_bias_channel() {
         let encoding = compact_relative_positional_encoding(3, 2, 4);
         assert_eq!(encoding.len(), (2 + 2 * 3 - 1) * 4);
-        for row in encoding.chunks_exact(4) {
+        for row in encoding.as_chunks::<4>().0.iter() {
             assert_eq!(row[3], 1.0);
         }
     }
@@ -1590,8 +1590,10 @@ mod tests {
         let bytes = std::fs::read(path).expect("read f32 file");
         assert_eq!(bytes.len() % 4, 0, "unaligned f32 file {}", path.display());
         bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()
     }
 }

@@ -56,8 +56,8 @@ COPY --chmod=0755 verify.sh /usr/local/bin/openasr-ci-verify
 USER 1001:1001
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain 1.95.0 --profile minimal \
-    && /github/home/.cargo/bin/rustup default 1.95.0
+      | sh -s -- -y --default-toolchain 1.99.0 --profile minimal \
+    && /github/home/.cargo/bin/rustup default 1.99.0
 
 RUN openasr-ci-verify
 

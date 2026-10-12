@@ -21,7 +21,7 @@ ARG UBUNTU_CODENAME=ubuntu22.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU_CODENAME} AS builder
 
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.99.0
 # CUDA architectures to generate device code for. Includes sm_75 (Turing:
 # RTX 20xx / GTX 16xx / T4 / 2080 Ti) alongside the upstream default
 # (Ampere/Ada/Hopper). See crates/openasr-core/build.rs's

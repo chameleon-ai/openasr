@@ -859,8 +859,10 @@ mod tests {
                     let start = i + 8;
                     let end = (start + size).min(bytes.len());
                     return bytes[start..end]
-                        .chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
                         .collect();
                 }
                 i += 8 + size + (size & 1);
@@ -981,8 +983,10 @@ mod tests {
                 let start = i + 8;
                 let end = (start + size).min(bytes.len());
                 samples = bytes[start..end]
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
                     .collect();
                 break;
             }

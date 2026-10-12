@@ -3480,8 +3480,13 @@ fn vector_values_for_cpu(
         });
     }
     let mut values = Vec::with_capacity(weight.len);
-    for chunk in raw.bytes().chunks_exact(std::mem::size_of::<f32>()) {
-        values.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in raw
+        .bytes()
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+    {
+        values.push(f32::from_ne_bytes(*chunk));
     }
     if values.len() != weight.len {
         return Err(CohereDecoderGraphError::InvalidWeight {

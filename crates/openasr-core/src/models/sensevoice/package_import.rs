@@ -527,10 +527,9 @@ fn remap_sensevoice_tensor_name(source_name: &str) -> Option<(String, bool)> {
         let (layer, tail) = rest.split_once('.')?;
         let layer: usize = layer.parse().ok()?;
         ("enc.blk".to_string(), format!("{}.{tail}", layer + 1))
-    } else if let Some(rest) = source_name.strip_prefix("encoder.tp_encoders.") {
-        ("tp.blk".to_string(), rest.to_string())
     } else {
-        return None;
+        let rest = source_name.strip_prefix("encoder.tp_encoders.")?;
+        ("tp.blk".to_string(), rest.to_string())
     };
     let (layer, tail) = rest.split_once('.')?;
     let suffix = match tail {

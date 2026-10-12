@@ -1196,8 +1196,10 @@ mod tests {
         let read_f32 = |name: &str| -> Vec<f32> {
             std::fs::read(dir.join(name))
                 .unwrap_or_else(|e| panic!("read {name}: {e}"))
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let lfr = read_f32("ref_lfr_zh.bin");
