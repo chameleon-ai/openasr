@@ -490,7 +490,7 @@ fn validate_release_artifact_urls(
             artifact.file_name
         ),
         format!(
-            "https://github.com/QuintinShaw/openasr/releases/download/{release_subject}/{}",
+            "https://github.com/chameleon-ai/openasr/releases/download/{release_subject}/{}",
             artifact.file_name
         ),
     ];
@@ -877,7 +877,7 @@ mod tests {
             "unpacked_tree_sha256": unpacked_tree_sha256,
             "urls": [
                 format!("https://dl.openasr.org/core/v0.1.37/{file_name}"),
-                format!("https://github.com/QuintinShaw/openasr/releases/download/v0.1.37/{file_name}"),
+                format!("https://github.com/chameleon-ai/openasr/releases/download/v0.1.37/{file_name}"),
             ],
         })
     }

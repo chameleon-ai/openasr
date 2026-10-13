@@ -14,7 +14,7 @@ pub const CHINA_CATALOG_ENDPOINT: &str = "https://catalog.bug.im";
 pub const CANONICAL_DL_ENDPOINT: &str = "https://dl.openasr.org";
 pub const CHINA_DL_ENDPOINT: &str = "https://dl.bug.im";
 pub const GITHUB_RELEASE_DOWNLOAD: &str =
-    "https://github.com/QuintinShaw/openasr/releases/download";
+    "https://github.com/chameleon-ai/openasr/releases/download";
 
 pub const CATALOG_ENDPOINT_ENV: &str = "OPENASR_CATALOG_ENDPOINT";
 pub const DL_ENDPOINT_ENV: &str = "OPENASR_DL_ENDPOINT";
