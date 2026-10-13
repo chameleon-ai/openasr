@@ -104,16 +104,27 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
+          # `defaults.run.shell: bash` runs this as
+          # `bash --noprofile --norc -eo pipefail`, so errexit is already on and
+          # `set -uo pipefail` above does not clear it. This step resolves an
+          # optional published CLI and degrades to a local build, so each
+          # failure is handled explicitly below instead of aborting the step.
+          set +e
           available=false
           tag="${RELEASE_TAG}"
           if [ -z "${tag}" ]; then
+            # `releases/latest` 404s until the repository publishes a release.
+            # That is an expected miss here, not a step failure.
             tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
           fi
-          version="${tag#v}"
-          asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
+          asset=""
+          if [ -n "${tag}" ]; then
+            asset="openasr-${tag#v}-${ASSET_SUFFIX}.tar.gz"
+          fi
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if python3 tooling/release-manifest/gh_release.py download \
+          if [ -n "${asset}" ] \
+            && python3 tooling/release-manifest/gh_release.py download \
               "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
@@ -131,11 +142,12 @@ jobs:
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
+            missing="${asset:-published release for ${GITHUB_REPOSITORY}}"
             if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
-              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              echo "::error::published release ${tag} is missing usable ${missing}; refusing a duplicate local build"
               exit 1
             fi
-            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
+            echo "${missing} is not usable; falling back to a local release build for this diagnostic run"
           fi
       - name: Prepare pinned Linux build environment
         if: steps.published.outputs.available != 'true'
@@ -186,16 +198,27 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -uo pipefail
+          # `defaults.run.shell: bash` runs this as
+          # `bash --noprofile --norc -eo pipefail`, so errexit is already on and
+          # `set -uo pipefail` above does not clear it. This step resolves an
+          # optional published CLI and degrades to a local build, so each
+          # failure is handled explicitly below instead of aborting the step.
+          set +e
           available=false
           tag="${RELEASE_TAG}"
           if [ -z "${tag}" ]; then
+            # `releases/latest` 404s until the repository publishes a release.
+            # That is an expected miss here, not a step failure.
             tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
           fi
-          version="${tag#v}"
-          asset="openasr-${version}-${ASSET_SUFFIX}.tar.gz"
+          asset=""
+          if [ -n "${tag}" ]; then
+            asset="openasr-${tag#v}-${ASSET_SUFFIX}.tar.gz"
+          fi
           workdir="${RUNNER_TEMP}/published-cli"
           mkdir -p "${workdir}"
-          if python3 tooling/release-manifest/gh_release.py download \
+          if [ -n "${asset}" ] \
+            && python3 tooling/release-manifest/gh_release.py download \
               "${tag}" "${workdir}" "${asset}" SHA256SUMS --repo "${GITHUB_REPOSITORY}"; then
             python3 tooling/release-manifest/release_asset_verifier.py \
               --asset "${workdir}/${asset}" --checksums "${workdir}/SHA256SUMS" || exit 1
@@ -213,11 +236,12 @@ jobs:
           fi
           echo "available=${available}" >> "${GITHUB_OUTPUT}"
           if [ "${available}" != "true" ]; then
+            missing="${asset:-published release for ${GITHUB_REPOSITORY}}"
             if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
-              echo "::error::published release ${tag} is missing usable ${asset}; refusing a duplicate local build"
+              echo "::error::published release ${tag} is missing usable ${missing}; refusing a duplicate local build"
               exit 1
             fi
-            echo "published ${asset} is not usable; falling back to a local release build for this diagnostic run"
+            echo "${missing} is not usable; falling back to a local release build for this diagnostic run"
           fi
       - name: Initialize open-core submodules
         if: steps.published.outputs.available != 'true'
