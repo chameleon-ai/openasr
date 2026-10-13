@@ -52,6 +52,7 @@ pub(crate) fn run_parent(
         .env_remove("OPENASR_CATALOG_URL")
         .env_remove("OPENASR_CATALOG_FILE")
         .env_remove("OPENASR_CATALOG_IDENTITY")
+        .env_remove("OPENASR_CATALOG_REFRESH")
         .env_remove("OPENASR_GGML_BACKEND")
         .output()
         .context("could not launch qualification child")?;

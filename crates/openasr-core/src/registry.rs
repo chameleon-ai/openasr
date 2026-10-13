@@ -57,8 +57,9 @@ pub const CATALOG_FEATURE_PUNCTUATION: &str = "punctuation";
 const MODELSCOPE_CATALOG_MIRRORS_ENABLED: bool = false;
 
 /// The signed **public** catalog projection compiled into the binary — the
-/// last-resort offline fallback (see [`load_embedded_signed_catalog`]) so a device
-/// that has never been online still shows the model list. This is
+/// DEFAULT source for a canonical catalog load (see
+/// [`load_offline_signed_catalog`]), so a device that has never been online
+/// still shows the model list without contacting the catalog endpoint. This is
 /// `catalog.public.json` (the `public:true` models only — the same signed artifact
 /// served on catalog.openasr.org), NOT the full `catalog.json` (which also carries
 /// staged `public:false` entries): no unreleased model metadata ships in the
@@ -1248,6 +1249,37 @@ pub fn default_catalog_url() -> &'static str {
     DEFAULT_CATALOG_URL
 }
 
+/// Environment override that opts a canonical-catalog load into contacting the
+/// catalog endpoint instead of serving the local bytes.
+///
+/// OpenASR ships the signed public catalog compiled into the binary, so a
+/// default run needs no catalog endpoint at all. Setting this to a truthy value
+/// (`1`/`true`/`yes`/`on`) restores the refresh behaviour: fetch the canonical
+/// catalog over HTTPS, verify it against the production key and the epoch
+/// floor, and persist it to the on-disk signed cache. `OPENASR_OFFLINE` wins
+/// over this variable. An explicit `catalog_url` override is unaffected -- it
+/// is always loaded verbatim.
+pub const OPENASR_CATALOG_REFRESH_ENV_VAR: &str = "OPENASR_CATALOG_REFRESH";
+
+/// Truthy-value parsing shared with the CLI's env switches (`1`/`true`/`yes`/
+/// `on`, case-insensitive); mirrors `openasr-cli`'s `consent::env_flag_set` so
+/// the same spelling enables the same behaviour on both sides.
+fn env_flag_set(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref().map(str::trim),
+        Some(value)
+            if value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+    )
+}
+
+/// Environment variable that forbids all network access for a run. Shared with
+/// the CLI's `--offline` / `OPENASR_OFFLINE` consent switch so an offline run
+/// cannot be talked into a catalog refresh.
+const OPENASR_OFFLINE_ENV_VAR: &str = "OPENASR_OFFLINE";
+
 // Single source of truth for which alternate spellings collapse onto the same
 // canonical quant tag. `canonical_quant_tag` and `is_recognized_quant_alias_token`
 // both derive from this one table so a native-runtime legacy-source-id matcher
@@ -1327,21 +1359,86 @@ pub fn default_catalog_cache_path(openasr_home: impl AsRef<Path>) -> PathBuf {
     openasr_home.as_ref().join("catalog.json")
 }
 
-/// Loads the model catalog from `catalog_url` (default: [`DEFAULT_CATALOG_URL`]),
-/// always through the same fail-closed signature-verification pipeline --
-/// remote (`https://`), local (`file://`/bare filesystem path), and the
-/// on-disk signed cache all require a matching, valid `catalog.signature.json`
-/// sidecar. There is no unsigned/trust-bypass path: a local catalog source is
-/// only ever reachable via an explicit `catalog_url` override, and whoever
-/// supplies it must sign it (see [`catalog_security::verify_local_catalog_signature_manifest`]
-/// and the local-dev key it accepts in addition to the production key).
+/// Loads the model catalog from `catalog_url`, always through the same
+/// fail-closed signature-verification pipeline -- the on-disk signed cache, the
+/// embedded snapshot, local (`file://`/bare filesystem path), and remote
+/// (`https://`) sources all require a matching, valid
+/// `catalog.signature.json` sidecar. There is no unsigned/trust-bypass path: a
+/// local catalog source is only ever reachable via an explicit `catalog_url`
+/// override, and whoever supplies it must sign it (see
+/// [`catalog_security::verify_local_catalog_signature_manifest`] and the
+/// local-dev key it accepts in addition to the production key).
+///
+/// With no `catalog_url` and no requested refresh (see [`CatalogRefresh`]), this
+/// resolves the canonical catalog from LOCAL BYTES ONLY and performs no network
+/// I/O -- the embedded snapshot, or a strictly newer previously-refreshed
+/// on-disk cache. Pass [`load_model_catalog_with_refresh`] to state the refresh
+/// decision explicitly instead of taking it from the environment.
 pub fn load_model_catalog(
     catalog_url: Option<&str>,
     openasr_home: impl AsRef<Path>,
 ) -> Result<ModelCatalog, CatalogError> {
+    load_model_catalog_with_refresh(
+        catalog_url,
+        openasr_home,
+        CatalogRefresh::from_environment(),
+    )
+}
+
+/// Whether a load may contact the network for the CANONICAL catalog.
+///
+/// The canonical catalog is served from local bytes by default -- the
+/// signature-verified snapshot compiled into the binary, or a newer
+/// previously-refreshed on-disk cache -- so an ordinary CLI, server, or FFI
+/// run never resolves or contacts the catalog endpoint. Contacting it is an
+/// explicit opt-in (see [`OPENASR_CATALOG_REFRESH_ENV_VAR`]).
+///
+/// This gates the CANONICAL source only. An explicit `catalog_url` override is
+/// the operator naming a source and is always honoured verbatim, including an
+/// `https://` fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogRefresh(bool);
+
+impl CatalogRefresh {
+    /// The environment's answer, for every surface with no more specific
+    /// instruction.
+    pub fn from_environment() -> Self {
+        Self::requested_or_from_environment(false)
+    }
+
+    /// A caller that DOES carry a more specific instruction (e.g. the CLI's
+    /// `--refresh-catalog`) folds it in here, so the environment variable keeps
+    /// working for surfaces that never expose the flag.
+    ///
+    /// [`OPENASR_OFFLINE_ENV_VAR`] is checked FIRST and vetoes unconditionally:
+    /// a run declared offline must not reach the catalog endpoint just because
+    /// a flag or an inherited variable asked for a refresh.
+    pub fn requested_or_from_environment(explicit: bool) -> Self {
+        if env_flag_set(OPENASR_OFFLINE_ENV_VAR) {
+            return Self(false);
+        }
+        Self(explicit || env_flag_set(OPENASR_CATALOG_REFRESH_ENV_VAR))
+    }
+
+    fn is_requested(self) -> bool {
+        self.0
+    }
+}
+
+pub fn load_model_catalog_with_refresh(
+    catalog_url: Option<&str>,
+    openasr_home: impl AsRef<Path>,
+    refresh: CatalogRefresh,
+) -> Result<ModelCatalog, CatalogError> {
     let home = openasr_home.as_ref();
     let cache_path = default_catalog_cache_path(home);
     let source = catalog_url.unwrap_or(DEFAULT_CATALOG_URL);
+
+    // Canonical catalog, no explicit source, no refresh request: resolve from
+    // local bytes only. See `load_offline_signed_catalog`.
+    if catalog_url.is_none() && !refresh.is_requested() {
+        return load_offline_signed_catalog(source, home, &cache_path);
+    }
 
     match load_verified_catalog_bytes(source, home) {
         Ok((contents, verified)) => {
@@ -1779,15 +1876,19 @@ fn choose_runtime_catalog(
 
 /// Resolve the catalog the runtime should use, picking the signature-verified
 /// source with the HIGHEST `catalog_epoch` across the network/on-disk-cache tier
-/// ([`load_model_catalog`], which already falls back to the on-disk cache and the
-/// embedded snapshot when offline) and the embedded signed snapshot as an
-/// epoch-max floor.
+/// ([`load_model_catalog`], which itself falls back to the on-disk cache and the
+/// embedded snapshot) and the embedded signed snapshot as an epoch-max floor.
 ///
-/// Effect: in a release build the embedded epoch is <= production, so the network
-/// catalog wins and users get the latest models; in a local preview build that
-/// embeds a catalog AHEAD of production, the embedded snapshot wins (test
-/// unreleased models with zero infrastructure). Offline with no cache, the
-/// embedded snapshot is the permanent floor so the runtime still starts.
+/// Effect, by default ([`CatalogRefresh`] not requested): the tier below is
+/// already local-only, and this epoch-max is what lets a binary built against a
+/// catalog AHEAD of what this machine last fetched serve the newer embedded
+/// snapshot instead of a stale cache. Offline with no cache, the embedded
+/// snapshot is the permanent floor so the runtime still starts.
+///
+/// Effect when a refresh IS requested: a successful HTTPS fetch establishes the
+/// freshest catalog (so users get the latest models), while this floor still
+/// lets a strictly-newer embedded snapshot win, as in a local preview build
+/// that embeds a catalog ahead of production.
 ///
 /// Scoped to the canonical [`default_catalog_url`]: an explicit override URL is
 /// honored verbatim, never silently replaced by the bundled catalog. Anti-rollback
@@ -2665,6 +2766,68 @@ fn read_and_verify_catalog_manifest(
     })
 }
 
+/// Resolve the CANONICAL catalog from local bytes only, never contacting the
+/// catalog endpoint (see [`CatalogRefresh`]).
+///
+/// Ranks the two offline tiers by the `catalog_epoch` each verified at and
+/// serves the strictly newest, applying the same freshness rule as
+/// [`choose_runtime_catalog`]: the embedded snapshot displaces the on-disk
+/// cache only when it is strictly newer (this binary was built against a newer
+/// catalog than this machine last fetched), and an epoch tie keeps the cache,
+/// the last artifact an actual refresh produced. Ranking needs the epochs, so
+/// both tiers are loaded through the `*_with_epoch` variants that return them
+/// from the same verification pass.
+///
+/// Both tiers run through the identical fail-closed pipeline as any other
+/// source (production-key signature, sha256, epoch floor, schema validation,
+/// and the staged-entries guard), so this changes which BYTES are preferred --
+/// never what is trusted.
+///
+/// This is NOT a degrade tier, unlike [`load_cached_signed_catalog`]: nothing
+/// failed, because serving local bytes is the expected default path. A marker
+/// left by an earlier run is cleared up front, and a tier that degrades on its
+/// own terms (the embedded snapshot below the recorded epoch floor) re-records
+/// its own status afterwards.
+fn load_offline_signed_catalog(
+    source: &str,
+    home: &Path,
+    cache_path: &Path,
+) -> Result<ModelCatalog, CatalogError> {
+    catalog_security::clear_catalog_degraded(home);
+
+    // Seed only shapes diagnostics if neither tier turns out to be usable;
+    // there is no failed network attempt to narrate here.
+    let offline = CatalogError::ReadCatalog {
+        catalog_source: source.to_string(),
+        message: "resolving the bundled catalog (no refresh was requested)".to_string(),
+    };
+
+    let cache = load_signed_catalog_from_cache_with_epoch(source, home, cache_path, &offline);
+    let embedded = load_embedded_signed_catalog_with_epoch(home);
+
+    match (cache, embedded) {
+        (Ok((cache, cache_epoch)), Ok((embedded, embedded_epoch))) => {
+            // Same freshness rule (and the same tested decision function) the
+            // network path uses: the cache is the "fetched" tier, so it wins
+            // ties and only a strictly newer embedded snapshot displaces it.
+            Ok(
+                match choose_runtime_catalog(Some(cache_epoch), Some(embedded_epoch)) {
+                    RuntimeCatalogChoice::Embedded => embedded,
+                    RuntimeCatalogChoice::Network => cache,
+                },
+            )
+        }
+        (Ok((catalog, _)), Err(_)) => Ok(catalog),
+        (Err(_), Ok((catalog, _))) => Ok(catalog),
+        (Err(cache_error), Err(embedded_error)) => Err(CatalogError::CatalogSecurity {
+            catalog_source: source.to_string(),
+            message: format!(
+                "{cache_error}; the catalog compiled into this binary was also unusable: {embedded_error}"
+            ),
+        }),
+    }
+}
+
 /// Degrade tier for [`load_model_catalog`]/[`load_local_catalog_file_with_identity`]
 /// once their primary source fails: tries the on-disk signed cache, then the
 /// embedded snapshot, recording [`catalog_security::record_catalog_degraded`]
@@ -2714,6 +2877,19 @@ fn load_signed_catalog_from_cache(
     cache_path: &Path,
     error: &CatalogError,
 ) -> Result<ModelCatalog, CatalogError> {
+    load_signed_catalog_from_cache_with_epoch(source, home, cache_path, error)
+        .map(|(catalog, _)| catalog)
+}
+
+/// [`load_signed_catalog_from_cache`] plus the `catalog_epoch` the cached
+/// manifest verified at, so the two offline tiers can be ranked by freshness
+/// without a second read-and-verify of the same bytes.
+fn load_signed_catalog_from_cache_with_epoch(
+    source: &str,
+    home: &Path,
+    cache_path: &Path,
+    error: &CatalogError,
+) -> Result<(ModelCatalog, u64), CatalogError> {
     let cached =
         fs::read_to_string(cache_path).map_err(|cache_error| CatalogError::ReadCatalog {
             catalog_source: source.to_string(),
@@ -2723,17 +2899,19 @@ fn load_signed_catalog_from_cache(
             ),
         })?;
     let verified = read_and_verify_cached_catalog_manifest(source, home, &cached, error)?;
-    parse_and_check_production_catalog(source, &cached, &verified).map_err(|parse_error| {
-        CatalogError::CatalogSecurity {
-            catalog_source: source.to_string(),
-            message: format!("{error}; cached catalog rejected: {parse_error}"),
-        }
-    })
+    let catalog =
+        parse_and_check_production_catalog(source, &cached, &verified).map_err(|parse_error| {
+            CatalogError::CatalogSecurity {
+                catalog_source: source.to_string(),
+                message: format!("{error}; cached catalog rejected: {parse_error}"),
+            }
+        })?;
+    Ok((catalog, verified.catalog_epoch))
 }
 
-/// Load the signed catalog snapshot embedded in the binary at build time. Used as
-/// the last-resort offline fallback (after the network source and the on-disk
-/// cache) so a device that has never been online still sees the model list. The
+/// Load the signed catalog snapshot embedded in the binary at build time. This is
+/// the DEFAULT tier for a canonical catalog load, so a device that has never been
+/// online still sees the model list without contacting the catalog endpoint. The
 /// embedded bytes are signature-verified against the canonical [`DEFAULT_CATALOG_URL`].
 ///
 /// The embedded snapshot is a BOOT-LOCAL candidate (see
@@ -2750,6 +2928,15 @@ fn load_signed_catalog_from_cache(
 /// must never trigger a catalog download, so they prefer a local/env override and
 /// fall back to this embedded snapshot rather than [`load_model_catalog`].
 pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, CatalogError> {
+    load_embedded_signed_catalog_with_epoch(home).map(|(catalog, _)| catalog)
+}
+
+/// [`load_embedded_signed_catalog`] plus the `catalog_epoch` the embedded
+/// manifest verified at, so the two offline tiers can be ranked by freshness in
+/// a single pass instead of re-verifying the same bytes.
+fn load_embedded_signed_catalog_with_epoch(
+    home: &Path,
+) -> Result<(ModelCatalog, u64), CatalogError> {
     let verified = catalog_security::verify_catalog_signature_manifest(
         EMBEDDED_CATALOG_JSON,
         EMBEDDED_CATALOG_SIGNATURE_JSON,
@@ -2776,7 +2963,8 @@ pub fn load_embedded_signed_catalog(home: &Path) -> Result<ModelCatalog, Catalog
             });
         }
     }
-    parse_model_catalog(EMBEDDED_CATALOG_JSON, "<embedded catalog>")
+    let catalog = parse_model_catalog(EMBEDDED_CATALOG_JSON, "<embedded catalog>")?;
+    Ok((catalog, verified.catalog_epoch))
 }
 
 /// The embedded bundled catalog's signature-verified `(catalog_sha256,

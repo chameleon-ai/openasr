@@ -173,6 +173,7 @@ fn spawn_serve(home: &Path, pack: &Path) -> ServeGuard {
         .env_remove("OPENASR_CATALOG_URL")
         .env_remove("OPENASR_CATALOG_FILE")
         .env_remove("OPENASR_CATALOG_IDENTITY")
+        .env_remove("OPENASR_CATALOG_REFRESH")
         .env_remove("OPENASR_MODELS_DIR")
         .args(["serve", "--backend", "native", "--addr", "127.0.0.1:0"])
         .stdout(Stdio::piped())

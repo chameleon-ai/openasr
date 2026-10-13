@@ -691,14 +691,19 @@ const char *openasr_last_error_message(void);
 
 /**
  * Fetches and verifies the signed model catalog, writing an opaque handle
- * through `out_catalog`. `catalog_url` is optional: null uses the built-in
- * production endpoint (the normal case); a non-null override is still held to
- * the same fail-closed signature/epoch pipeline. `home_dir` is the app's
- * OpenASR home (its sandbox directory), used for the verified catalog /
- * signature / epoch cache and as the offline fallback source.
+ * through `out_catalog`. `catalog_url` is optional: null resolves the built-in
+ * bundled catalog (the signed public projection compiled into the binary,
+ * served with no network access); a non-null override is loaded verbatim and is
+ * still held to the same fail-closed signature/epoch pipeline. `home_dir` is the
+ * app's OpenASR home (its sandbox directory), used for the verified catalog /
+ * signature / epoch cache and as a source that can supersede the bundled
+ * snapshot when it is strictly newer.
+ *
+ * Pass a URL (or set `OPENASR_CATALOG_REFRESH=1`) to opt into contacting the
+ * catalog endpoint for a newer published catalog; `OPENASR_OFFLINE` vetoes that.
  *
  * Fails closed with [`OpenAsrStatus::CatalogFailed`] and no handle if the
- * catalog cannot be fetched, its signature does not verify, the epoch rolled
+ * catalog cannot be resolved, its signature does not verify, the epoch rolled
  * back, or it does not parse. Network access happens only inside this explicit
  * call.
  *

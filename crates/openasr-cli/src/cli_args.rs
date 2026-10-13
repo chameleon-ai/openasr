@@ -156,6 +156,7 @@ pub(crate) struct PullCommandOptions<'a> {
     pub(crate) quant: Option<&'a str>,
     pub(crate) size: Option<&'a str>,
     pub(crate) catalog_url: Option<&'a str>,
+    pub(crate) refresh_catalog: bool,
     pub(crate) source: Option<&'a str>,
     pub(crate) accept_license: bool,
     pub(crate) from: Option<&'a Path>,
@@ -273,6 +274,14 @@ pub(crate) enum Command {
         /// Override the model catalog URL or local catalog path.
         #[arg(long)]
         catalog_url: Option<String>,
+        /// Refresh the model catalog from its published endpoint before
+        /// resolving this pull.
+        ///
+        /// Off by default: OpenASR ships the signed public catalog compiled into
+        /// the binary and serves it without contacting the endpoint at all. Set
+        /// `OPENASR_CATALOG_REFRESH=1` to opt in for every command instead.
+        #[arg(long)]
+        refresh_catalog: bool,
         /// Download source: auto, china, global, hf, hf-mirror, or weights.
         /// `china`/`global` pin the region-aware chain's direction explicitly
         /// instead of judging it from locale/timezone (see `auto`).

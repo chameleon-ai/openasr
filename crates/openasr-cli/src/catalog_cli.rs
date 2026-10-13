@@ -5,8 +5,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use openasr_core::{
-    ModelCatalog, OPENASR_CATALOG_FILE_ENV_VAR, default_catalog_cache_path, default_catalog_url,
-    load_local_catalog_file_with_identity, load_model_catalog, load_verified_home_catalog,
+    CatalogRefresh, ModelCatalog, OPENASR_CATALOG_FILE_ENV_VAR, default_catalog_cache_path,
+    default_catalog_url, load_local_catalog_file_with_identity, load_model_catalog,
+    load_model_catalog_with_refresh, load_verified_home_catalog,
     preview_local_catalog_file_with_identity, resolve_local_catalog_env_override,
 };
 
@@ -114,18 +115,27 @@ fn load_catalog(catalog_url: Option<&str>, openasr_home: &Path) -> Result<ModelC
 /// resolver `openasr serve` uses (`OPENASR_CATALOG_FILE`/`_IDENTITY`, then
 /// `OPENASR_CATALOG_URL`, then a checkout catalog, then the signed
 /// `$OPENASR_HOME/catalog.json` cache). Only when none of those exist does it
-/// fall through to the signed production default. Passing `None` must not mean
+/// fall through to the bundled signed catalog. Passing `None` must not mean
 /// "ignore the process catalog env and fetch production".
+///
+/// `refresh` decides whether that final fall-through contacts the catalog
+/// endpoint; it is ignored whenever an explicit source is in play, since
+/// naming a source already states the operator's intent.
 pub(crate) fn load_operator_model_catalog(
     catalog_url: Option<&str>,
     openasr_home: &Path,
+    refresh: CatalogRefresh,
 ) -> Result<ModelCatalog> {
     if let Some(url) = catalog_url.map(str::trim).filter(|url| !url.is_empty()) {
         return load_catalog(Some(url), openasr_home);
     }
     match load_cli_model_catalog(openasr_home)? {
         Some(catalog) => Ok(catalog),
-        None => load_catalog(None, openasr_home),
+        None => Ok(load_model_catalog_with_refresh(
+            None,
+            openasr_home,
+            refresh,
+        )?),
     }
 }
 
@@ -381,9 +391,10 @@ mod tests {
         openasr_core::testing::write_local_dev_signed_catalog(&catalog_path, contents, 1);
         let file_url = format!("file://{}", catalog_path.display());
         let _guard = CatalogEnvGuard::set_url_override(&file_url);
-        let catalog = load_operator_model_catalog(None, &home).expect(
-            "OPENASR_CATALOG_URL must be the operator catalog when --catalog-url is omitted",
-        );
+        let catalog = load_operator_model_catalog(None, &home, CatalogRefresh::from_environment())
+            .expect(
+                "OPENASR_CATALOG_URL must be the operator catalog when --catalog-url is omitted",
+            );
         assert!(
             catalog
                 .models

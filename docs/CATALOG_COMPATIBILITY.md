@@ -138,6 +138,24 @@ Test scenarios (`crates/openasr-core/src/registry/tests/catalog.rs` and
 
 ## Client resilience (load -> cache -> serve)
 
+0. **Local bytes first; the endpoint is opt-in.** A default catalog load
+   (no explicit `catalog_url`, no refresh request) resolves entirely from local
+   bytes and performs no network I/O: `registry::load_offline_signed_catalog`
+   ranks the two offline tiers by the `catalog_epoch` each verified at and
+   serves the strictly newest, so a binary built against a catalog ahead of
+   what this machine last fetched still serves the newer bundled snapshot while
+   an epoch tie keeps the cache. Contacting the catalog endpoint is an explicit
+   opt-in -- `OPENASR_CATALOG_REFRESH=1`, or `openasr pull --refresh-catalog`
+   for that one command -- with `OPENASR_OFFLINE` vetoing both. An explicit
+   `catalog_url` override is unaffected: naming a source already states the
+   operator's intent, so it is loaded verbatim, including an `https://` fetch.
+   Both offline tiers run through the identical fail-closed pipeline as any
+   other source (production-key signature, sha256, epoch floor, schema
+   validation, staged-entries guard), so this changes which BYTES are preferred,
+   never what is trusted. Because serving local bytes is the expected path and
+   not a recovery, it does **not** set the degraded marker; see the status
+   surface below, which now reports degradation only when a *requested* refresh
+   fell through.
 1. **Verify-then-persist.** A catalog is only ever written to
    `$OPENASR_HOME/catalog.json` (+ signature/epoch sidecars) *after* it fully
    verifies, parses, and passes forward-compat filtering + structural
@@ -149,9 +167,9 @@ Test scenarios (`crates/openasr-core/src/registry/tests/catalog.rs` and
    in-memory result either (`persist_catalog_cache` logs and continues) --
    the catalog this call already verified is safe to serve for this request
    regardless of whether the cache write succeeds.
-2. **Fallback chain.** `load_model_catalog`'s primary source
-   (`Ok(verified) => ...`) now falls through to
-   `load_cached_signed_catalog` (on-disk cache, then the embedded snapshot) on
+2. **Fallback chain.** When a refresh *is* requested,
+   `load_model_catalog`'s primary source (`Ok(verified) => ...`) falls through
+   to `load_cached_signed_catalog` (on-disk cache, then the embedded snapshot) on
    ANY post-signature failure -- parse error, structural validation error, or
    the staged-entries anomaly below -- not just a transport/signature
    failure. Before this PR, `let catalog = parse_model_catalog(...)?;`
@@ -159,7 +177,9 @@ Test scenarios (`crates/openasr-core/src/registry/tests/catalog.rs` and
    fallback chain entirely: a signature-valid but structurally-wrong primary
    payload bricked the load with a perfectly good on-disk cache sitting right
    there unused. `load_local_catalog_file_with_identity` (desktop bundled
-   catalog) got the same fix, reusing the identical fallback chain.
+   catalog) got the same fix, reusing the identical fallback chain. The same
+   cache tier also runs inside the offline resolver, so a poisoned or stale
+   cache degrades to the bundled snapshot rather than bricking a default load.
 3. **No same-cause crash loop.** Because (a) a bad primary source now always
    falls back instead of erroring, and (b) a below-floor boot-local candidate
    degrades instead of erroring, there is no longer a `load_*` path that
@@ -179,6 +199,13 @@ Test scenarios (`crates/openasr-core/src/registry/tests/catalog.rs` and
 - **Server `GET /health`**: additive `catalog_degraded: string | null` field
   (`null` = primary source, or no catalog load recorded yet). See
   `crates/openasr-server/generated/http-wire/HealthResponse.ts`.
+
+Because the bundled catalog is now the default *primary* source, a normal
+offline run reports `null` rather than `tier: "embedded"`. A degradation is
+now reported when a *requested* refresh (or an explicit source) fell through to
+a fallback tier, or when a tier degraded on its own terms -- e.g. the embedded
+snapshot sitting below the recorded epoch floor still records
+`tier: "embedded"`, exactly as before.
 
 ## The "staged entries under the production identity" anomaly
 

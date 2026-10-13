@@ -195,7 +195,10 @@ mirror endpoint if used); do not commit downloaded artifacts.
 The signed **public** catalog projection is hosted on OpenASR's own host,
 `catalog.openasr.org` (a Cloudflare Worker + Static Assets under
 `cloudflare/catalog/`), not on Hugging Face — Hugging Face hosts model **weights**
-only, and the HF catalog repo is no longer required to serve clients. Only the
+only, and the HF catalog repo is no longer required to serve clients. Clients do
+not contact this endpoint on an ordinary run: the same bytes are compiled into
+the binary and served from there, and the endpoint is reached only for an
+explicit refresh (`OPENASR_CATALOG_REFRESH=1` / `--refresh-catalog`). Only the
 `public:true` projection (`catalog.public.json`) is hosted; staged `public:false`
 entries are never exposed. Public capability packs remain in that projection
 because `public` is the download/import gate, not the ASR market-list gate. The
@@ -240,17 +243,27 @@ the first manifest signed under it is served):
 
 ## Cache And Rollback Boundary
 
-The catalog cache is a signed fetch-on-error fallback. On a successful HTTPS
+**The catalog ships in the binary; the endpoint is opt-in.** A default catalog
+load (no explicit `catalog_url`, no refresh requested) performs no network I/O
+at all. `load_offline_signed_catalog` ranks the two offline tiers by the
+`catalog_epoch` each verified at and serves the strictly newest, so a binary
+built against a catalog ahead of what this machine last fetched still serves the
+newer bundled snapshot, while an epoch tie keeps the cache. Contacting the
+catalog endpoint is an explicit opt-in: `OPENASR_CATALOG_REFRESH=1`, or
+`openasr pull --refresh-catalog` for that one command, with `OPENASR_OFFLINE`
+vetoing both. An explicit `catalog_url` override is always loaded verbatim.
+
+A requested refresh is the only thing that writes the cache. On a successful
 fetch, OpenASR fetches the adjacent `catalog.signature.json`, verifies the
-Ed25519 signature against the built-in OpenASR catalog key, rejects catalog epoch
-rollback, validates the catalog, and writes the exact validated contents to
-`$OPENASR_HOME/catalog.json`. It also caches
+Ed25519 signature against the built-in OpenASR catalog key, rejects catalog
+epoch rollback, validates the catalog, and writes the exact validated contents
+to `$OPENASR_HOME/catalog.json`. It also caches
 `$OPENASR_HOME/catalog.signature.json` and records the highest accepted epoch in
 `$OPENASR_HOME/catalog.epoch`.
 
-If the next HTTPS fetch fails, OpenASR attempts to load only that signed local
-cache. If the signed local cache is also unavailable, it falls back to a catalog
-snapshot **embedded in the binary** at build time (`include_str!` of the committed
+If a requested refresh then fails, OpenASR attempts to load only that signed
+local cache. If the signed local cache is also unavailable, it falls back to a
+catalog snapshot **embedded in the binary** at build time (`include_str!` of the committed
 PUBLIC projection `catalog.public.json` + `catalog.public.signature.json` — never
 the full catalog, so no staged `public:false` entries ship), verified through the
 same Ed25519 signature and anti-rollback epoch checks and scoped to the default
@@ -258,8 +271,10 @@ catalog (an explicit `OPENASR_CATALOG_URL` override is honoured, not replaced).
 This guarantees a fresh, fully offline install still shows the verified model
 list; because every installer ships the sidecar binary, the offline catalog is
 bundled transitively with no per-installer packaging. The embedded snapshot is
-kept current by the catalog drift and bundled-signature CI gates. Current trust
-comes from HTTPS, signature verification, anti-rollback epoch checks, schema
+kept current by the catalog drift and bundled-signature CI gates. The identical
+pipeline runs in the default local-bytes path, so serving the bundled catalog is
+not a trust bypass -- it is the same verification, minus the fetch. Current
+trust comes from the signature verification, anti-rollback epoch checks, schema
 validation, pinned immutable pack URLs, sha256/size verification, Rust GGUF
 preflight, runtime-source validation, and atomic install.
 

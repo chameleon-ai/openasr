@@ -260,7 +260,9 @@ supplies its own sandbox directory as the OpenASR home (the iOS equivalent of
 for full ownership rules):
 
 ```c
-// Fetch + verify the signed catalog (NULL url = the built-in production endpoint).
+// Fetch + verify the signed catalog. NULL url = the bundled catalog compiled into
+// the binary (no network); pass a URL, or set OPENASR_CATALOG_REFRESH=1, to opt
+// into contacting the catalog endpoint for a newer published catalog.
 OpenAsrStatus openasr_catalog_fetch(const char *catalog_url, const char *home_dir,
                                     OpenAsrCatalog **out_catalog);
 OpenAsrStatus openasr_catalog_fetch_with_engine(const OpenAsrEngine *engine,

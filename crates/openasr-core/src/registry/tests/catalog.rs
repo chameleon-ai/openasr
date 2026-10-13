@@ -2013,6 +2013,213 @@ fn signed_cache_miss_does_not_substitute_embedded_for_custom_source() {
     assert!(error.contains("no usable signed cache"), "{error}");
 }
 
+// ---- Embedded-first canonical catalog resolution (`CatalogRefresh`): the
+// catalog endpoint is contacted only when a refresh is explicitly requested.
+
+/// The load-bearing behavior of embedded-first: a default load (no override, no
+/// refresh) resolves entirely from local bytes and records NO "catalog
+/// degraded" status.
+///
+/// The absent marker is what proves the endpoint was never consulted. Under the
+/// previous network-first order this identical call reached the endpoint, failed,
+/// and only then fell back to the embedded snapshot -- recording
+/// `tier: "embedded"` as a degradation. Serving local bytes is now the expected
+/// primary path, so it is not reported as degraded.
+#[test]
+fn default_catalog_load_serves_the_bundled_catalog_without_contacting_the_endpoint() {
+    let home = tempfile::tempdir().unwrap();
+    crate::test_process_env::with_test_process_env(
+        [(OPENASR_CATALOG_REFRESH_ENV_VAR, None)],
+        || {
+            let catalog = load_model_catalog(None, home.path())
+                .expect("a fresh home must resolve the bundled catalog with no network");
+            assert!(!catalog.models.is_empty());
+            assert_eq!(catalog.catalog_url, DEFAULT_CATALOG_URL);
+            assert!(
+                catalog_security::read_catalog_degraded_status(home.path()).is_none(),
+                "the bundled catalog is the default primary source, not a degraded fallback"
+            );
+        },
+    );
+}
+
+/// The refresh opt-in is a plain truthy env flag, and `OPENASR_OFFLINE` is a
+/// hard veto over it: a run declared offline must never be talked into
+/// contacting the catalog endpoint by an inherited refresh setting.
+#[test]
+fn catalog_refresh_env_var_gates_the_refresh_and_offline_vetoes_it() {
+    use std::ffi::OsString;
+    const OFFLINE: &str = "OPENASR_OFFLINE";
+
+    for truthy in ["1", "true", "yes", "on", "TRUE", "On"] {
+        crate::test_process_env::with_test_process_env(
+            [
+                (
+                    OPENASR_CATALOG_REFRESH_ENV_VAR,
+                    Some(OsString::from(truthy)),
+                ),
+                (OFFLINE, None),
+            ],
+            || {
+                assert!(
+                    CatalogRefresh::from_environment().is_requested(),
+                    "{truthy}"
+                );
+                assert!(
+                    CatalogRefresh::requested_or_from_environment(false).is_requested(),
+                    "{truthy}"
+                );
+            },
+        );
+    }
+    for falsy in ["0", "false", "no", "", "maybe"] {
+        crate::test_process_env::with_test_process_env(
+            [
+                (OPENASR_CATALOG_REFRESH_ENV_VAR, Some(OsString::from(falsy))),
+                (OFFLINE, None),
+            ],
+            || {
+                assert!(
+                    !CatalogRefresh::from_environment().is_requested(),
+                    "{falsy} must not enable the refresh"
+                );
+            },
+        );
+    }
+    // Silent environment: no refresh by default, but an explicit request wins.
+    crate::test_process_env::with_test_process_env(
+        [(OPENASR_CATALOG_REFRESH_ENV_VAR, None), (OFFLINE, None)],
+        || {
+            assert!(!CatalogRefresh::from_environment().is_requested());
+            assert!(CatalogRefresh::requested_or_from_environment(true).is_requested());
+        },
+    );
+    // The offline veto outranks the refresh, explicit or inherited.
+    for offline_value in ["1", "true"] {
+        crate::test_process_env::with_test_process_env(
+            [
+                (OPENASR_CATALOG_REFRESH_ENV_VAR, Some(OsString::from("1"))),
+                (OFFLINE, Some(OsString::from(offline_value))),
+            ],
+            || {
+                assert!(
+                    !CatalogRefresh::from_environment().is_requested(),
+                    "OPENASR_OFFLINE={offline_value} must veto the refresh"
+                );
+                assert!(
+                    !CatalogRefresh::requested_or_from_environment(true).is_requested(),
+                    "OPENASR_OFFLINE={offline_value} must veto even an explicit refresh"
+                );
+            },
+        );
+    }
+}
+
+/// Epoch-max ranking of the two offline tiers: a cache that predates the
+/// snapshot compiled into this binary must not shadow it, or a user who
+/// upgrades OpenASR offline would keep seeing the old model list.
+///
+/// Uses the real, production-signed 2026-07 incident public projection as the
+/// stale cache; this build embeds a strictly newer one.
+#[test]
+fn default_catalog_load_prefers_a_strictly_newer_embedded_snapshot_over_a_stale_cache() {
+    use std::collections::BTreeSet;
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path()).unwrap();
+    fs::copy(
+        incident_fixture_path("public_catalog.json"),
+        default_catalog_cache_path(home.path()),
+    )
+    .unwrap();
+    fs::copy(
+        incident_fixture_path("public_catalog.signature.json"),
+        catalog_security::default_catalog_signature_cache_path(home.path()),
+    )
+    .unwrap();
+
+    let stale_epoch = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(incident_fixture_path("public_catalog.signature.json")).unwrap(),
+    )
+    .unwrap()["catalog_epoch"]
+        .as_u64()
+        .unwrap();
+    let (_, embedded_epoch) = super::embedded_catalog_fingerprint().unwrap();
+    assert!(
+        stale_epoch < embedded_epoch,
+        "fixture must predate the embedded snapshot"
+    );
+
+    crate::test_process_env::with_test_process_env(
+        [(OPENASR_CATALOG_REFRESH_ENV_VAR, None)],
+        || {
+            let catalog = load_model_catalog(None, home.path()).unwrap();
+            let embedded = super::load_embedded_signed_catalog(home.path()).unwrap();
+            let ids = |catalog: &ModelCatalog| -> BTreeSet<String> {
+                catalog.models.iter().map(|m| m.id.clone()).collect()
+            };
+            assert_eq!(
+                ids(&catalog),
+                ids(&embedded),
+                "a strictly newer embedded snapshot must win over a stale cache"
+            );
+        },
+    );
+}
+
+/// The offline path keeps the 2026-07-16 incident guard: a cache holding the
+/// full, non-public projection is validly production-signed (no signature or
+/// epoch violation, so it is a DATA anomaly), and must be refused rather than
+/// served -- without bricking the load either.
+#[test]
+fn default_catalog_load_refuses_a_cache_polluted_with_staged_entries() {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path()).unwrap();
+    fs::copy(
+        incident_fixture_path("full_catalog.json"),
+        default_catalog_cache_path(home.path()),
+    )
+    .unwrap();
+    fs::copy(
+        incident_fixture_path("full_catalog.signature.json"),
+        catalog_security::default_catalog_signature_cache_path(home.path()),
+    )
+    .unwrap();
+
+    crate::test_process_env::with_test_process_env(
+        [(OPENASR_CATALOG_REFRESH_ENV_VAR, None)],
+        || {
+            let catalog = load_model_catalog(None, home.path())
+                .expect("a polluted cache must not brick the default load");
+            assert!(
+                catalog.models.iter().all(|model| model.public),
+                "staged (unreleased) entries must never be served"
+            );
+        },
+    );
+}
+
+/// The refresh gate is scoped to the CANONICAL catalog. An explicit override is
+/// the operator naming a source, so it is loaded verbatim -- here even with a
+/// refresh requested.
+#[test]
+fn explicit_catalog_override_is_loaded_verbatim_even_when_a_refresh_is_requested() {
+    use std::ffi::OsString;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let source_path = temp.path().join("source-catalog.json");
+    crate::testing::write_local_dev_signed_catalog(&source_path, &catalog_json(), 1);
+    let source = format!("file://{}", source_path.display());
+
+    crate::test_process_env::with_test_process_env(
+        [(OPENASR_CATALOG_REFRESH_ENV_VAR, Some(OsString::from("1")))],
+        || {
+            let catalog = load_model_catalog(Some(&source), &home)
+                .expect("an explicit override is authoritative and always loaded");
+            assert_eq!(catalog.models.len(), 2);
+        },
+    );
+}
+
 #[test]
 fn embedded_catalog_degrades_instead_of_bricking_on_epoch_rollback() {
     // Scenario A (docs/CATALOG_COMPATIBILITY.md's "epoch floor at boot"): this

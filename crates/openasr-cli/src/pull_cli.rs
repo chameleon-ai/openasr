@@ -2,10 +2,10 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::{Result, bail};
 use openasr_core::{
-    CatalogPullRequest, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID, DownloadSourcePref,
-    InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog, ModelInstallLicenseDecision,
-    NativeExecutionServices, OpenAsrConfig, PullModelPackRequest, QuantPreference,
-    ResolvedCatalogPull, host_quant_recommendation_profile,
+    CatalogPullRequest, CatalogRefresh, DEFAULT_MODEL_BOOTSTRAP_QUANT, DEFAULT_MODEL_ID,
+    DownloadSourcePref, InstalledPack, LaunchPackRequest, LicenseClass, ModelCatalog,
+    ModelInstallLicenseDecision, NativeExecutionServices, OpenAsrConfig, PullModelPackRequest,
+    QuantPreference, ResolvedCatalogPull, host_quant_recommendation_profile,
     install_model_pack_from_path_with_execution_services, list_installed_packs, load_config,
     model_install_license_decision, openasr_home, remove_model_pack_with_execution_services,
     resolve_catalog_pull_with_profile, resolve_chain, resolve_launch_pack,
@@ -26,7 +26,11 @@ pub(crate) fn pull(
 ) -> Result<()> {
     let home = openasr_home()?;
     let config = load_config(&home)?;
-    let catalog = crate::catalog_cli::load_operator_model_catalog(options.catalog_url, &home)?;
+    let catalog = crate::catalog_cli::load_operator_model_catalog(
+        options.catalog_url,
+        &home,
+        CatalogRefresh::requested_or_from_environment(options.refresh_catalog),
+    )?;
     let pull_request = CatalogPullRequest {
         reference: options.reference.to_string(),
         quant: options.quant.map(ToOwned::to_owned),
@@ -274,7 +278,11 @@ pub(crate) fn ensure_asr_model_installed(
     // Now we need the catalog (cache/embedded-first) -- for alias resolution and
     // to resolve the pull. Loading it only here keeps a declined/installed run
     // from contacting project infrastructure.
-    let catalog = crate::catalog_cli::load_operator_model_catalog(None, &home)?;
+    let catalog = crate::catalog_cli::load_operator_model_catalog(
+        None,
+        &home,
+        CatalogRefresh::from_environment(),
+    )?;
     let catalog_probe = LaunchPackRequest {
         model_ref: &model_ref,
         preference: &QuantPreference::Auto,

@@ -43,6 +43,7 @@ fn clear_inherited_openasr_env(command: &mut Command) {
         "OPENASR_CATALOG_URL",
         "OPENASR_CATALOG_FILE",
         "OPENASR_CATALOG_IDENTITY",
+        "OPENASR_CATALOG_REFRESH",
     ] {
         command.env_remove(key);
     }
