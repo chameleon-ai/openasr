@@ -195,6 +195,41 @@ class ReleaseCompletenessTests(unittest.TestCase):
             self.assertEqual((missing, extra, lock), ([], [], None))
 
 
+    def test_pack_names_cli_emits_zero_backend_entries_under_skip_windows(self) -> None:
+        from select_release_matrix import without_windows_rows
+
+        names = completeness.backend_pack_names(without_windows_rows(MATRIX))
+        self.assertEqual(names, [])
+
+    def test_hints_required_only_when_backend_packs_exist(self) -> None:
+        from select_release_matrix import without_windows_rows
+
+        full = completeness.required_assets("0.1.37", MATRIX, [])
+        self.assertIn("backend-plugin-hints.json", full)
+        self.assertIn("catalog.backends.candidate.json", full)
+        skipped = completeness.required_assets("0.1.37", without_windows_rows(MATRIX), [])
+        self.assertNotIn("backend-plugin-hints.json", skipped)
+        self.assertIn("catalog.backends.candidate.json", skipped)
+
+    def test_compare_accepts_windows_free_actual_list_under_skip_windows(self) -> None:
+        from select_release_matrix import without_windows_rows
+
+        matrix = without_windows_rows(MATRIX)
+        required = completeness.required_assets("0.1.37", matrix, [])
+        self.assertFalse(any("windows" in name for name in required))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            actual = root / "actual.txt"
+            actual.write_text("\n".join(sorted(required)) + "\n", encoding="utf-8")
+            missing, extra, lock = completeness.compare_assets(
+                version="0.1.37",
+                actual=required,
+                matrix=matrix,
+                pack_entries=[],
+            )
+            self.assertEqual((missing, extra, lock), ([], [], None))
+
+
 class CompletenessWorkflowContractTests(unittest.TestCase):
     def test_completeness_job_can_see_drafts_and_uses_shared_expected_set(self) -> None:
         job = WORKFLOW.split("\n  verify-completeness:\n", 1)[1]

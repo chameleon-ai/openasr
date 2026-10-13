@@ -67,6 +67,12 @@ backend_entries=("$workdir"/backend-pack-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
 vulkan_entries=("$workdir"/backend-pack-vulkan-generic.json)
+if [ "${#backend_entries[@]}" -eq 0 ]; then
+  # Skip-windows release: no backend packs were published, so there is
+  # nothing to sync. Anything else is a half-built release: fail, never ship.
+  echo "no backend packs on release ${tag} (skip-windows): nothing to sync"
+  exit 0
+fi
 if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ] || [ "${#backend_entries[@]}" -ne 21 ]; then
   fail "release ${tag} must contain 1 Vulkan, 6 CUDA SM, and 14 HIP gfx backend-pack metadata files"
 fi

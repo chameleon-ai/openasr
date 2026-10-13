@@ -167,6 +167,34 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.compile_entry(args)
 
+    def test_merge_with_no_entries_carries_existing_backends_forward(self):
+        # Skip-windows releases merge nothing new: the candidate keeps
+        # advertising the last-known-good backend packs byte-for-byte.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = {
+                "id": "cuda-old",
+                "vendor": "cuda",
+                "targets": ["sm_86"],
+            }
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({"models": [], "backends": [old]}), encoding="utf-8")
+            out = root / "out.json"
+            backend_catalog.merge_catalog(catalog, [], out)
+            merged = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["id"] for item in merged["backends"]],
+                ["cuda-old"],
+            )
+            self.assertEqual(
+                merged["backends"][0]["activation"], {"state": "published-inert"}
+            )
+            empty = root / "empty.json"
+            empty.write_text(json.dumps({"models": []}), encoding="utf-8")
+            out_empty = root / "out-empty.json"
+            backend_catalog.merge_catalog(empty, [], out_empty)
+            self.assertEqual(json.loads(out_empty.read_text(encoding="utf-8"))["backends"], [])
+
     def test_merge_retains_old_abi_and_rejects_ambiguous_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

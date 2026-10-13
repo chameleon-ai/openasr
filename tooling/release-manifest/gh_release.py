@@ -228,6 +228,12 @@ def _dispatch(argv: list[str]) -> None:
     packs.add_argument("tag")
     packs.add_argument("dest", type=Path)
     packs.add_argument("--repo")
+    packs.add_argument(
+        "--skip-windows",
+        action="store_true",
+        help="Download no backend packs (temporary: no Azure signing, so the "
+        "release carries no Windows legs).",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "download":
@@ -239,9 +245,13 @@ def _dispatch(argv: list[str]) -> None:
 
     import release_completeness
 
+    matrix = release_completeness.load_matrix()
+    if args.skip_windows:
+        matrix = release_completeness.without_windows_rows(matrix)
+
     download_assets(
         args.tag,
-        release_completeness.backend_pack_names(release_completeness.load_matrix()),
+        release_completeness.backend_pack_names(matrix),
         args.dest,
         repository=args.repo,
     )

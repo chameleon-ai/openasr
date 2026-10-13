@@ -6,7 +6,13 @@ import sys
 import unittest
 from pathlib import Path
 
-from select_release_matrix import MATRIX_PATH, load_matrix, select_matrix
+from select_release_matrix import (
+    MATRIX_PATH,
+    is_windows_release_row,
+    load_matrix,
+    select_matrix,
+    without_windows_rows,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +32,38 @@ class SelectReleaseMatrixTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["target"], "x86_64-apple-darwin")
         self.assertEqual(selected[0]["os"], "macos-15-intel")
+
+    def test_skip_windows_drops_every_pc_windows_msvc_row(self) -> None:
+        rows = load_matrix()
+        windows = [row for row in rows if is_windows_release_row(row)]
+        self.assertGreater(len(windows), 0)
+        kept = without_windows_rows(rows)
+        self.assertEqual(len(kept), len(rows) - len(windows))
+        for row in kept:
+            self.assertNotIn("pc-windows-msvc", row.get("target", ""))
+        self.assertTrue(all("pc-windows-msvc" in row.get("target", "") for row in windows))
+
+    def test_skip_windows_with_only_target_keeps_single_non_windows_row(self) -> None:
+        selected = select_matrix(load_matrix(), "x86_64-apple-darwin", True)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["target"], "x86_64-apple-darwin")
+
+    def test_skip_windows_with_windows_only_target_fails_closed(self) -> None:
+        with self.assertRaises(SystemExit):
+            select_matrix(load_matrix(), "x86_64-pc-windows-msvc-neutral", True)
+
+    def test_cli_skip_windows_prints_compact_json_without_windows_rows(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPT), "--skip-windows"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        parsed = json.loads(completed.stdout)
+        self.assertEqual(completed.stdout, json.dumps(parsed, separators=(",", ":")))
+        self.assertGreater(len(parsed), 0)
+        for row in parsed:
+            self.assertNotIn("pc-windows-msvc", row.get("target", ""))
 
     def test_unknown_target_fails_closed(self) -> None:
         with self.assertRaises(SystemExit) as raised:

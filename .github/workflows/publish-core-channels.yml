@@ -85,8 +85,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-metadata
+          # A skip-windows release carries no backend packs: derive the
+          # download set from the release's own asset list so a half-built
+          # matrix fails here instead of passing an empty gate downstream.
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q '^backend-pack-.*\.json$'; then
+            pack_args=()
+          else
+            pack_args=(--skip-windows)
+          fi
           python3 tooling/release-manifest/gh_release.py download-packs \
-            "$TAG" release-metadata
+            "$TAG" release-metadata "${pack_args[@]}"
       - name: Require the finalizer's live distribution invariants
         env:
           GH_TOKEN: ${{ github.token }}
@@ -98,12 +106,24 @@ jobs:
           cuda_entries=(release-metadata/backend-pack-cuda-sm_*.json)
           hip_entries=(release-metadata/backend-pack-hip-gfx*.json)
           vulkan_entries=(release-metadata/backend-pack-vulkan-generic.json)
-          if [ "${#entries[@]}" -ne 21 ] || [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ]; then
-            echo "::error::release must contain exactly 1 Vulkan, 6 CUDA, and 14 HIP backend-pack metadata files"
-            exit 1
+          if [ "${#entries[@]}" -eq 0 ]; then
+            # Skip-windows release: no backend packs were published. The live
+            # catalog gate below still runs; only the backend-pack checks are
+            # vacuous. Anything in between zero and the full set fails closed.
+            echo "::notice::release carries no backend packs (skip-windows): skipping backend distribution checks"
+          else
+            if [ "${#entries[@]}" -ne 21 ] || [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ]; then
+              echo "::error::release must contain exactly 1 Vulkan, 6 CUDA, and 14 HIP backend-pack metadata files"
+              exit 1
+            fi
           fi
           entry_args=()
           for entry in "${entries[@]}"; do entry_args+=(--entry "$entry"); done
+          if [ "${#entries[@]}" -eq 0 ]; then
+            have_backends=false
+          else
+            have_backends=true
+          fi
           cache_bust="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           curl -fsSL "https://catalog.openasr.org/v1/catalog.json?channels=${cache_bust}" -o catalog.json
           curl -fsSL "https://catalog.openasr.org/v1/catalog.signature.json?channels=${cache_bust}" -o catalog.signature.json
@@ -119,13 +139,32 @@ jobs:
           assert hashlib.sha256(raw).hexdigest() == sig["catalog_sha256"], "live catalog sha256 does not match its signature record"
           assert sig["catalog_url"] == "https://catalog.openasr.org/v1/catalog.json", "live catalog has a non-canonical signed identity"
           PY
-          python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-            --catalog catalog.json "${entry_args[@]}"
-          python3 tooling/release-manifest/backend_hardware_evidence.py \
-            "${entry_args[@]}" \
-            --catalog catalog.json --version "$VERSION" >/dev/null
-          python3 tooling/release-manifest/backend_catalog.py verify-cdn \
-            --catalog catalog.json --version "$VERSION"
+          if [ "$have_backends" = "true" ]; then
+            python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+              --catalog catalog.json "${entry_args[@]}"
+            python3 tooling/release-manifest/backend_hardware_evidence.py \
+              "${entry_args[@]}" \
+              --catalog catalog.json --version "$VERSION" >/dev/null
+            python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+              --catalog catalog.json --version "$VERSION"
+          else
+            # No new entries exist to verify against (the --entry CLIs require
+            # at least one), so assert the live catalog shape directly: it must
+            # parse with a backends list (carried forward from the last full
+            # release). verify-cdn still probes whatever payload URLs that
+            # list names.
+            python3 - catalog.json <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          live = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(live.get("backends"), list):
+              raise SystemExit("live catalog backends must be an array")
+          PY
+            python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+              --catalog catalog.json --version "$VERSION"
+          fi
 
   docker-images:
     name: Publish Docker Hub images

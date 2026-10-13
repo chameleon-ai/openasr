@@ -909,7 +909,13 @@ def main() -> int:
 
     merge_parser = subparsers.add_parser("merge")
     merge_parser.add_argument("--catalog", type=Path, required=True)
-    merge_parser.add_argument("--entry", type=Path, action="append", required=True)
+    # Zero --entry is defined (not an error): the base catalog's backends
+    # carry forward unchanged. A skip-windows release merges nothing new, so
+    # the candidate keeps advertising the last-known-good backend packs.
+    # Callers that must not silently merge nothing assert entry presence
+    # themselves before invoking (the aggregation step fails closed on
+    # backend-pack files without matrix targets and vice versa).
+    merge_parser.add_argument("--entry", type=Path, action="append", default=[])
     merge_parser.add_argument("--out", type=Path, required=True)
     verify_assets_parser = subparsers.add_parser("verify-assets")
     verify_assets_parser.add_argument("--entry", type=Path, action="append", required=True)

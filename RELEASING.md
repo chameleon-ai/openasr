@@ -118,6 +118,20 @@ public GitHub Release assets. Full release assembly is available only through
 the `formal_release` capability declared on `workflow_call` and supplied by
 `Release core`.
 
+### Releasing without Windows legs (`skip_windows`)
+
+`Release core` accepts an optional `skip_windows` boolean (default `false`).
+Set it while Windows signing is unavailable: the matrix selection drops every
+`pc-windows-msvc` leg (neutral host, GPU plugins, ARM64) and every downstream
+gate derives its expectation from the release's own artifacts -- a release
+carries all 21 Windows backend packs or none, and anything in between fails
+closed. A skip-windows release ships no Windows artifacts, no update hints,
+and a backend catalog candidate that carries the previous backends forward
+unchanged; the install notes render from real assets, so Windows simply does
+not appear. Dispatching without the flag restores the full matrix with no
+code changes, so this is the only supported way to ship a windows-less
+release -- do not delete matrix rows or relax the signing gate instead.
+
 The core GitHub Release is created as a **draft**. This is load-bearing for the
 Windows plugin topology: provider payload hashes exist only after the release
 matrix has built them, while the neutral host resolves those hashes from the
@@ -146,7 +160,8 @@ in Actions after Environment approval.
    and copies every file declared by the 1 Vulkan, 6 CUDA, and 14 HIP release
    entries to `https://dl.openasr.org/core/vX.Y.Z/`. Uploads are idempotent
    and never overwrite a different object at the same key. GitHub is the
-   provenance mirror, not a runtime download fallback.
+   provenance mirror, not a runtime download fallback. (Under `skip_windows`
+   there are no backend entries: the job verifies the empty set and exits.)
 3. With the worktree checked out at the exact `vX.Y.Z` tag commit (the script
    refuses any other HEAD), run
    `scripts/sign-and-verify-qualification-manifests.sh vX.Y.Z` locally with

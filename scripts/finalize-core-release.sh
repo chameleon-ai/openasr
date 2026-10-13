@@ -88,12 +88,30 @@ import gh_release
 import release_completeness
 
 tag, repository, dest, version = sys.argv[1], sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+have = set(gh_release.list_asset_names(tag, repository))
+wanted_packs = [
+    name
+    for name in release_completeness.backend_pack_names(release_completeness.load_matrix())
+    if name in have
+]
+# A release carries all 21 Windows backend packs or none: anything in between
+# is a half-built matrix leaking into publication (a skip-windows release
+# carries none at all). Fail here, never downstream.
+if wanted_packs and len(wanted_packs) != 21:
+    raise SystemExit(
+        f"release {tag} carries {len(wanted_packs)} backend packs, expected 21 or 0"
+    )
 metadata = [
     "SHA256SUMS",
-    "backend-plugin-hints.json",
     "catalog.backends.candidate.json",
-    *release_completeness.backend_pack_names(release_completeness.load_matrix()),
+    *wanted_packs,
 ]
+if "backend-plugin-hints.json" in have:
+    if not wanted_packs:
+        raise SystemExit(f"release {tag} carries update hints without backend packs")
+    metadata.append("backend-plugin-hints.json")
+elif wanted_packs:
+    raise SystemExit(f"release {tag} carries backend packs without update hints")
 gh_release.download_assets(tag, metadata, dest, repository=repository)
 subjects = []
 for line in (dest / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
@@ -121,8 +139,15 @@ backend_entries=("$workdir"/backend-pack-*.json)
 cuda_entries=("$workdir"/backend-pack-cuda-sm_*.json)
 hip_entries=("$workdir"/backend-pack-hip-gfx*.json)
 vulkan_entries=("$workdir"/backend-pack-vulkan-generic.json)
-if [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ] || [ "${#backend_entries[@]}" -ne 21 ]; then
+if [ "${#backend_entries[@]}" -eq 0 ]; then
+  # Skip-windows release: no backend packs were published, so none may be
+  # verified. The candidate must still exist (carrying the base catalog's
+  # backends forward); anything else is a half-built release, never shippable.
+  skip_windows_packs=true
+elif [ "${#cuda_entries[@]}" -ne 6 ] || [ "${#hip_entries[@]}" -ne 14 ] || [ "${#vulkan_entries[@]}" -ne 1 ] || [ "${#backend_entries[@]}" -ne 21 ]; then
   fail "release ${tag} must contain 1 Vulkan, 6 CUDA SM, and 14 HIP gfx backend-pack metadata files"
+else
+  skip_windows_packs=false
 fi
 checksums="$workdir/SHA256SUMS"
 [ -f "$checksums" ] || fail "release ${tag} has no SHA256SUMS"
@@ -148,23 +173,49 @@ while read -r _checksum asset_name || [ -n "${asset_name:-}" ]; do
     || fail "release subject attestation failed: $(basename "$subject")"
   verified_subjects=$((verified_subjects + 1))
 done < <(tr -d '\r' < "$checksums")
-[ "$verified_subjects" -gt 21 ] || fail "release ${tag} did not expose a complete attested subject set"
+subject_total=$(grep -c . "$checksums" || true)
+if [ "$skip_windows_packs" = "true" ]; then
+  # No Windows subjects exist, so the floor is the release's own subject
+  # list: every listed subject verified, and the list non-empty. (The loop
+  # above already fails closed per subject; this catches a degenerate
+  # near-empty SHA256SUMS the same way the full-release floor does.)
+  [ "$verified_subjects" -eq "$subject_total" ] && [ "$subject_total" -gt 0 ] \
+    || fail "release ${tag} did not verify its complete subject set"
+else
+  [ "$verified_subjects" -gt 21 ] || fail "release ${tag} did not expose a complete attested subject set"
+fi
 
 all_backend_entry_args=()
 for entry in "${backend_entries[@]}"; do
   all_backend_entry_args+=(--entry "$entry")
 done
 
-python3 tooling/release-manifest/backend_catalog.py verify-assets \
-  "${all_backend_entry_args[@]}" \
-  --asset-directory "$workdir" --version "$version"
-
 candidate="$workdir/catalog.backends.candidate.json"
 [ -f "$candidate" ] || fail "release ${tag} has no backend catalog candidate"
-python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-  --catalog "$candidate" "${all_backend_entry_args[@]}"
-python3 tooling/release-manifest/backend_hardware_evidence.py \
-  "${all_backend_entry_args[@]}" --catalog "$candidate" --version "$version" >/dev/null
+if [ "$skip_windows_packs" = "true" ]; then
+  # No new entries exist to verify: the candidate carries the base catalog's
+  # backends forward unchanged (verified in their own releases; packs are
+  # immutable). Assert that shape directly instead: it must parse with a
+  # backends list. The entry-bound verifications below require --entry and
+  # cannot run on empty input.
+  python3 - "$candidate" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+candidate = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not isinstance(candidate.get("backends"), list):
+    raise SystemExit("skip-windows backend catalog candidate must carry a backends list")
+PY
+else
+  python3 tooling/release-manifest/backend_catalog.py verify-assets \
+    "${all_backend_entry_args[@]}" \
+    --asset-directory "$workdir" --version "$version"
+  python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+    --catalog "$candidate" "${all_backend_entry_args[@]}"
+  python3 tooling/release-manifest/backend_hardware_evidence.py \
+    "${all_backend_entry_args[@]}" --catalog "$candidate" --version "$version" >/dev/null
+fi
 
 # The reusable deploy workflow is the only catalog publication path. Initial
 # release publication accepts only its already-verified PublishedInert epoch.

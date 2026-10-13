@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from select_release_matrix import without_windows_rows
+
 import qualification_manifest
 
 MATRIX_PATH = Path(__file__).resolve().parent / "release_binaries_matrix.json"
@@ -120,11 +122,18 @@ def required_assets(
     pack_entries: list[dict[str, Any]],
 ) -> set[str]:
     names = required_cli_archives(version, matrix)
-    names.update(backend_pack_names(matrix))
+    pack_names = backend_pack_names(matrix)
+    names.update(pack_names)
     names.update(required_from_backend_packs(version, pack_entries))
+    # The update-hints file needs a real host ABI + provider set to describe,
+    # so a release with no backend packs (skip-windows) emits none and the
+    # completeness gate must not require it. The backend catalog candidate is
+    # always emitted (carrying existing backends forward when nothing new
+    # merged) and stays required.
+    if pack_names:
+        names.add("backend-plugin-hints.json")
     names.update(
         {
-            "backend-plugin-hints.json",
             "catalog.backends.candidate.json",
             f"openasr-{version}-build-provenance.bundle.json",
             "SHA256SUMS",
@@ -171,20 +180,35 @@ def main() -> int:
 
     packs = sub.add_parser("pack-names")
     packs.add_argument("--matrix", type=Path, default=MATRIX_PATH)
+    packs.add_argument(
+        "--skip-windows",
+        action="store_true",
+        help="Account only non-Windows legs (temporary: no Azure signing).",
+    )
 
     compare = sub.add_parser("compare")
     compare.add_argument("--version", required=True)
     compare.add_argument("--matrix", type=Path, default=MATRIX_PATH)
+    compare.add_argument(
+        "--skip-windows",
+        action="store_true",
+        help="Account only non-Windows legs (temporary: no Azure signing).",
+    )
     compare.add_argument("--pack-dir", type=Path, required=True)
     compare.add_argument("--actual-file", type=Path, required=True)
 
     args = parser.parse_args()
     try:
         if args.command == "pack-names":
-            _emit_lines(backend_pack_names(load_matrix(args.matrix)))
+            matrix = load_matrix(args.matrix)
+            if args.skip_windows:
+                matrix = without_windows_rows(matrix)
+            _emit_lines(backend_pack_names(matrix))
             return 0
 
         matrix = load_matrix(args.matrix)
+        if args.skip_windows:
+            matrix = without_windows_rows(matrix)
         pack_entries = load_pack_entries(args.pack_dir)
         actual = {
             line

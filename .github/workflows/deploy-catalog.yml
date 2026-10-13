@@ -85,14 +85,32 @@ jobs:
           python3 tooling/release-manifest/gh_release.py download-packs \
             "${{ inputs.release_tag }}" staging/release
           mapfile -t entries < <(find staging/release -name 'backend-pack-*.json' -type f | sort)
-          [ "${#entries[@]}" -eq 21 ] || {
-            echo "expected 21 exact release backend entries, found ${#entries[@]}" >&2; exit 1;
-          }
-          entry_args=(); for item in "${entries[@]}"; do entry_args+=(--entry "$item"); done
-          python3 tooling/release-manifest/backend_catalog.py verify-catalog \
-            --catalog "$activation_catalog" "${entry_args[@]}"
-          python3 tooling/release-manifest/backend_hardware_evidence.py \
-            "${entry_args[@]}" --catalog "$activation_catalog" --version "$version"
+          if [ "${#entries[@]}" -eq 0 ]; then
+            # Skip-windows release: no new backend packs were published, so
+            # the candidate carries the base catalog's backends forward
+            # unchanged. Assert that shape directly (it must parse with a
+            # backends list); the entry-bound verifications below require
+            # --entry and cannot run on empty input. Anything in between zero
+            # and the full set fails below: fail, never deploy.
+            python3 - "$activation_catalog" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          candidate = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(candidate.get("backends"), list):
+              raise SystemExit("skip-windows backend catalog candidate must carry a backends list")
+          PY
+          else
+            [ "${#entries[@]}" -eq 21 ] || {
+              echo "expected 21 exact release backend entries, found ${#entries[@]}" >&2; exit 1;
+            }
+            entry_args=(); for item in "${entries[@]}"; do entry_args+=(--entry "$item"); done
+            python3 tooling/release-manifest/backend_catalog.py verify-catalog \
+              --catalog "$activation_catalog" "${entry_args[@]}"
+            python3 tooling/release-manifest/backend_hardware_evidence.py \
+              "${entry_args[@]}" --catalog "$activation_catalog" --version "$version"
+          fi
 
       - name: Replay and verify Qualified to Activated from attested evidence
         if: inputs.activation_transition == 'activated'
@@ -349,8 +367,23 @@ jobs:
 
       - name: Verify signed backend payloads are live before metadata deployment
         run: |
-          python3 tooling/release-manifest/backend_catalog.py verify-cdn \
-            --catalog candidate-catalog.json
+          # A skip-windows candidate carries an empty backends list: there is
+          # nothing to liveness-probe. Anything else with no backends is a
+          # malformed candidate, and verify-cdn already fails closed on that.
+          if python3 - candidate-catalog.json <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          candidate = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          raise SystemExit(0 if candidate.get("backends") else 1)
+          PY
+          then
+            python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+              --catalog candidate-catalog.json
+          else
+            echo "::notice::candidate carries no backend payloads (skip-windows): nothing to liveness-probe"
+          fi
 
       - name: Emit deploy binding outputs
         id: binding

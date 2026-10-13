@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      skip_windows:
+        description: "Drop every pc-windows-msvc leg (temporary: no Azure signing). Formal releases allow only this filter."
+        required: false
+        type: boolean
+        default: false
       cuda_gpu_targets:
         description: "Optional CUDA arch list for a diagnostic workflow_dispatch build (empty = release defaults)"
         required: false
@@ -103,6 +108,7 @@ jobs:
         id: select
         env:
           ONLY_TARGET: ${{ inputs.only_target || '' }}
+          SKIP_WINDOWS: ${{ inputs.skip_windows && '1' || '' }}
           FORMAL_RELEASE: ${{ inputs.formal_release || false }}
           RELEASE_REF: ${{ inputs.ref || '' }}
           CUDA_GPU_TARGETS: ${{ inputs.cuda_gpu_targets || '' }}
@@ -120,6 +126,12 @@ jobs:
             [ -z "$CUDA_GPU_TARGETS" ] || {
               echo "formal release cannot override target-scoped CUDA rows" >&2; exit 1;
             }
+            # skip_windows is the only partial-matrix mechanism a formal
+            # release allows (temporary: no Azure signing). It drops every
+            # pc-windows-msvc leg; everything else builds exactly as listed.
+            [[ "$SKIP_WINDOWS" == "" || "$SKIP_WINDOWS" == "1" ]] || {
+              echo "skip_windows must be true or false" >&2; exit 1;
+            }
             [[ "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
               echo "formal release ref must be one exact vX.Y.Z tag" >&2; exit 1;
             }
@@ -128,7 +140,11 @@ jobs:
               echo "manual release-binaries runs require one diagnostic only_target" >&2; exit 1;
             }
           fi
-          include="$(python3 tooling/release-manifest/select_release_matrix.py --only-target "${ONLY_TARGET}")"
+          select_args=(--only-target "${ONLY_TARGET}")
+          if [ "$SKIP_WINDOWS" = "1" ]; then
+            select_args+=(--skip-windows)
+          fi
+          include="$(python3 tooling/release-manifest/select_release_matrix.py "${select_args[@]}")"
           {
             echo "include<<INCLUDE_EOF"
             echo "${include}"
@@ -1348,60 +1364,111 @@ jobs:
 
       - name: Compile ABI-scoped backend catalog candidate
         if: inputs.only_target == ''
+        env:
+          SELECTED_MATRIX: ${{ needs.select-matrix.outputs.include }}
         run: |
           set -euo pipefail
-          mapfile -t cuda_targets < <(python3 - <<'PY'
+          # GPU provider rows are Windows-only. A skip-windows release carries
+          # none of them, so the target lists are empty and the candidate
+          # carries the base catalog's backends forward below. A selected
+          # matrix that mixes Windows and non-Windows GPU rows fails here,
+          # never silently.
+          list_targets() {
+            python3 - "$1" <<'PY'
           import json
-          from pathlib import Path
+          import os
+          import sys
 
-          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          for row in matrix:
-              if row.get("provider") == "cuda" and not row.get("experimental", False):
-                  print(row["cuda_gpu_target"])
-          PY
-          )
-          mapfile -t hip_targets < <(python3 - <<'PY'
-          import json
-          from pathlib import Path
+          sys.path.insert(0, "tooling/release-manifest")
+          from select_release_matrix import is_windows_release_row
 
-          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
-          for row in matrix:
-              if row.get("provider") == "hip" and not row.get("experimental", False):
-                  print(row["hip_gpu_target"])
+          want = sys.argv[1]
+          selected = json.loads(os.environ["SELECTED_MATRIX"])
+          rows = [row for row in selected if isinstance(row, dict)]
+          has_windows = any(is_windows_release_row(row) for row in rows)
+          targets = [
+              row[f"{want}_gpu_target"]
+              for row in rows
+              if row.get("provider") == want and not row.get("experimental", False)
+          ]
+          if has_windows:
+              if want == "cuda" and len(targets) != 6:
+                  raise SystemExit(
+                      "release matrix must define exactly 6 CUDA SM and 14 HIP gfx targets"
+                  )
+              if want == "hip" and len(targets) != 14:
+                  raise SystemExit(
+                      "release matrix must define exactly 6 CUDA SM and 14 HIP gfx targets"
+                  )
+          elif targets:
+              raise SystemExit(
+                  f"skip-windows selected matrix still carries {want.upper()} provider rows"
+              )
+          # No trailing newline: an empty target list must produce zero
+          # mapfile elements (not one empty string) so the empty/full branch
+          # below keys off the true count.
+          sys.stdout.write("\n".join(targets))
           PY
-          )
-          if [ "${#cuda_targets[@]}" -ne 6 ] || [ "${#hip_targets[@]}" -ne 14 ]; then
-            echo "release matrix must define exactly 6 CUDA SM and 14 HIP gfx targets" >&2
-            exit 1
+          }
+          mapfile -t cuda_targets < <(list_targets cuda)
+          mapfile -t hip_targets < <(list_targets hip)
+          if [ "${#cuda_targets[@]}" -gt 0 ] || [ "${#hip_targets[@]}" -gt 0 ]; then
+            # Full Windows pipeline: the selected matrix carries GPU rows, so
+            # every one of the 6 CUDA SM + 14 HIP gfx + generic Vulkan entries
+            # must have been built. (list_targets already enforced the exact
+            # matrix counts; this binds each target to its built file.)
+            [ "${#cuda_targets[@]}" -eq 6 ] && [ "${#hip_targets[@]}" -eq 14 ] || {
+              echo "release matrix must define exactly 6 CUDA SM and 14 HIP gfx targets" >&2
+              exit 1
+            }
+            cuda_entries=()
+            for target in "${cuda_targets[@]}"; do
+              entry="dist/backend-pack-cuda-sm_${target}.json"
+              [ -f "$entry" ] || { echo "missing required CUDA entry: $entry" >&2; exit 1; }
+              cuda_entries+=("$entry")
+            done
+            hip_entries=()
+            for target in "${hip_targets[@]}"; do
+              entry="dist/backend-pack-hip-${target}.json"
+              [ -f "$entry" ] || { echo "missing required HIP entry: $entry" >&2; exit 1; }
+              hip_entries+=("$entry")
+            done
+            vulkan_entry="dist/backend-pack-vulkan-generic.json"
+            [ -f "$vulkan_entry" ] || { echo "missing required Vulkan entry: $vulkan_entry" >&2; exit 1; }
+            backend_entry_args=()
+            for entry in "$vulkan_entry" "${cuda_entries[@]}" "${hip_entries[@]}"; do
+              backend_entry_args+=(--entry "$entry")
+            done
+          else
+            # Skip-windows release: the selected matrix carries no GPU rows,
+            # so no backend entry may exist. Anything present is a half-built
+            # matrix leaking into a windows-less release: fail, never ship.
+            if compgen -G "dist/backend-pack-*.json" > /dev/null; then
+              echo "skip-windows release must not contain backend-pack entries" >&2
+              exit 1
+            fi
+            backend_entry_args=()
           fi
-          cuda_entries=()
-          for target in "${cuda_targets[@]}"; do
-            entry="dist/backend-pack-cuda-sm_${target}.json"
-            [ -f "$entry" ] || { echo "missing required CUDA entry: $entry" >&2; exit 1; }
-            cuda_entries+=("$entry")
-          done
-          hip_entries=()
-          for target in "${hip_targets[@]}"; do
-            entry="dist/backend-pack-hip-${target}.json"
-            [ -f "$entry" ] || { echo "missing required HIP entry: $entry" >&2; exit 1; }
-            hip_entries+=("$entry")
-          done
-          vulkan_entry="dist/backend-pack-vulkan-generic.json"
-          [ -f "$vulkan_entry" ] || { echo "missing required Vulkan entry: $vulkan_entry" >&2; exit 1; }
-          backend_entry_args=()
-          for entry in "$vulkan_entry" "${cuda_entries[@]}" "${hip_entries[@]}"; do
-            backend_entry_args+=(--entry "$entry")
-          done
+          # Merge runs unconditionally: with entries it binds the new packs,
+          # with none it carries the base catalog's backends forward
+          # unchanged, so the candidate keeps advertising the last-known-good
+          # backend packs. Hints need a real host ABI to describe, so a
+          # windows-less release ships none.
           python3 tooling/release-manifest/backend_catalog.py merge \
             --catalog model-registry/catalog.json \
             "${backend_entry_args[@]}" \
             --out dist/catalog.backends.candidate.json
-          python3 tooling/release-manifest/backend_catalog.py hints \
-            "${backend_entry_args[@]}" \
-            --out dist/backend-plugin-hints.json
           python3 -m json.tool dist/catalog.backends.candidate.json >/dev/null
-          python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
-          (cd dist && sha256sum catalog.backends.candidate.json backend-plugin-hints.json >> SHA256SUMS)
+          if [ "${#backend_entry_args[@]}" -gt 0 ]; then
+            python3 tooling/release-manifest/backend_catalog.py hints \
+              "${backend_entry_args[@]}" \
+              --out dist/backend-plugin-hints.json
+            python3 -m json.tool dist/backend-plugin-hints.json >/dev/null
+            (cd dist && sha256sum catalog.backends.candidate.json backend-plugin-hints.json >> SHA256SUMS)
+          else
+            echo "::notice::no backend packs selected (skip-windows): candidate carries forward existing backends, no hints emitted"
+            (cd dist && sha256sum catalog.backends.candidate.json >> SHA256SUMS)
+          fi
       - name: Upload backend catalog candidate
         if: inputs.only_target == ''
         uses: actions/upload-artifact@v7
@@ -1472,6 +1539,7 @@ jobs:
           ATTEST_3_OUTCOME: ${{ steps.attest_release_3.outcome }}
           ATTEST_3_BUNDLE: ${{ steps.attest_release_3.outputs.bundle-path }}
           QUALIFICATION_SOURCE_DIGEST: ${{ needs.select-matrix.outputs.source_digest }}
+          SELECTED_MATRIX: ${{ needs.select-matrix.outputs.include }}
         run: |
           set -euo pipefail
           bundle_path=""
@@ -1500,7 +1568,6 @@ jobs:
           base_url="https://dl.openasr.org/core/${tag}"
           mirror_base_url="https://github.com/chameleon-ai/openasr/releases/download/${tag}"
           neutral="dist/openasr-${version}-windows-x86_64-neutral.zip"
-          [ -f "$neutral" ] || { echo "missing neutral host archive: $neutral" >&2; exit 1; }
           bundle_asset="dist/openasr-${version}-build-provenance.bundle.json"
           cp -- "$bundle_path" "$bundle_asset"
           python3 -m json.tool "$bundle_asset" >/dev/null
@@ -1511,15 +1578,28 @@ jobs:
             dist/backend-pack-hip-gfx*.json
             dist/backend-pack-vulkan-generic.json
           )
+          if [ "${#backend_entries[@]}" -gt 0 ]; then
+            [ -f "$neutral" ] || { echo "missing neutral host archive: $neutral" >&2; exit 1; }
+          elif [ -f "$neutral" ]; then
+            # Skip-windows release: backend entries and the neutral host must
+            # be absent together. One without the other is a half-built
+            # matrix leaking into a windows-less release: fail, never ship.
+            echo "skip-windows release must not contain the neutral host archive" >&2
+            exit 1
+          fi
           python3 - "${backend_entries[@]}" <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
           sys.path.insert(0, "tooling/release-manifest")
           import qualification_manifest as compiler
 
-          matrix = json.loads(Path("tooling/release-manifest/release_binaries_matrix.json").read_text())
+          # Expected cells come from the SELECTED matrix (the same include the
+          # build legs instantiated), never the full matrix file: a
+          # skip-windows release expects -- and holds -- zero backend entries.
+          matrix = json.loads(os.environ["SELECTED_MATRIX"])
           expected = compiler.expected_artifact_cells(matrix)
           actual = set()
           for entry_path in map(Path, sys.argv[1:]):

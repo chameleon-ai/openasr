@@ -658,5 +658,86 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         self.assertIn("openasr-backend-packs\\$provider\\ggml-$provider.dll", build)
 
 
+class SkipWindowsContractTests(unittest.TestCase):
+    """Temporary no-Azure-signing control: an explicit per-dispatch filter.
+
+    The Windows matrix rows and every wiring assertion above stay intact;
+    skip-windows only filters the computed include and teaches each
+    verification gate to derive its expectation from released artifacts
+    (all 21 packs, none, or fail -- never a partial set silently).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.binaries = WORKFLOW.read_text(encoding="utf-8")
+        cls.core = (ROOT / ".github" / "workflows" / "release-core.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.finalize = (ROOT / "scripts" / "finalize-core-release.sh").read_text(
+            encoding="utf-8"
+        )
+        cls.sync = (ROOT / "scripts" / "sync-windows-backend-cdn.sh").read_text(
+            encoding="utf-8"
+        )
+        cls.verify = (ROOT / "scripts" / "verify-release-completeness.sh").read_text(
+            encoding="utf-8"
+        )
+        cls.deploy = (ROOT / ".github" / "workflows" / "deploy-catalog.yml").read_text(
+            encoding="utf-8"
+        )
+        cls.channels = (
+            ROOT / ".github" / "workflows" / "publish-core-channels.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_windows_rows_are_filtered_never_deleted(self) -> None:
+        matrix = json.loads(MATRIX.read_text(encoding="utf-8"))
+        windows = [row for row in matrix if "pc-windows-msvc" in str(row.get("target", ""))]
+        self.assertGreater(len(windows), 0)
+
+    def test_formal_select_step_allows_only_the_skip_windows_filter(self) -> None:
+        select = self.binaries.split("Select matrix include", 1)[1].split(
+            "include<<INCLUDE_EOF", 1
+        )[0]
+        self.assertIn("skip_windows", select)
+        self.assertIn("--skip-windows", select)
+        self.assertIn("formal release cannot select a partial matrix", select)
+        self.assertIn("skip_windows must be true or false", select)
+
+    def test_aggregation_derives_from_selected_include_not_the_matrix_file(self) -> None:
+        self.assertIn("SELECTED_MATRIX: ${{ needs.select-matrix.outputs.include }}", self.binaries)
+        self.assertIn("skip-windows release must not contain backend-pack entries", self.binaries)
+        self.assertIn("skip-windows release must not contain the neutral host archive", self.binaries)
+        # An empty target list must produce zero mapfile elements, not one
+        # empty string: print() would append a newline that mapfile reads as
+        # an element and routes an empty selection into the full pipeline.
+        self.assertIn('sys.stdout.write("\\n".join(targets))', self.binaries)
+
+    def test_release_core_dispatch_threads_skip_windows_to_binaries(self) -> None:
+        self.assertIn("skip_windows:", self.core)
+        self.assertIn("Drop every pc-windows-msvc leg", self.core)
+        self.assertIn("skip_windows: ${{ inputs.skip_windows }}", self.core)
+
+    def test_finalize_derives_pack_expectations_from_the_release(self) -> None:
+        self.assertIn("skip_windows_packs", self.finalize)
+        self.assertIn("expected 21 or 0", self.finalize)
+        self.assertIn(
+            "skip-windows backend catalog candidate must carry a backends list",
+            self.finalize,
+        )
+
+    def test_sync_and_verify_derive_pack_expectations_from_the_release(self) -> None:
+        self.assertIn("nothing to sync", self.sync)
+        self.assertIn("pack_args=(--skip-windows)", self.verify)
+
+    def test_deploy_and_channels_derive_pack_expectations_from_the_release(self) -> None:
+        self.assertIn(
+            "skip-windows backend catalog candidate must carry a backends list",
+            self.deploy,
+        )
+        self.assertIn("nothing to liveness-probe", self.deploy)
+        self.assertIn("skipping backend distribution checks", self.channels)
+        self.assertIn('have_backends=false', self.channels)
+
+
 if __name__ == "__main__":
     unittest.main()
