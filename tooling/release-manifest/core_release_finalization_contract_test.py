@@ -22,7 +22,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             (
                 "binaries",
                 "\n  binaries:\n",
-                "\n  sync-backend-cdn:\n",
+                "\n  verify-draft-completeness:\n",
                 ROOT / ".github/workflows/release-binaries.yml",
             ),
             (
@@ -179,11 +179,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("orchestrator_run_id: ${{ github.run_id }}", release)
         self.assertIn("activation_transition: published-inert", release)
         self.assertIn("needs: [resolve, prepublication-family]", release)
-        self.assertIn("sync-backend-cdn:", release)
+        self.assertNotIn("sync-backend-cdn:", release)
         self.assertIn("environment: core-release", release)
-        self.assertIn("sync-windows-backend-cdn.sh", release)
-        self.assertIn("--allow-ci", release)
-        self.assertIn("needs: [resolve, release, binaries]", release)
+        self.assertNotIn("sync-windows-backend-cdn.sh", release)
+        self.assertNotIn("--allow-ci", release)
+        self.assertNotIn("needs: [resolve, release, binaries]", release)
         self.assertIn("publish-release:", release)
         self.assertIn("finalize-core-release.sh", release)
         self.assertIn("OPENASR_DEPLOY_CATALOG_RUN_ID: ${{ github.run_id }}", release)
