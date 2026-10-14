@@ -73,7 +73,8 @@ UX and it does not provide an alternate whole-engine sidecar switch.
 
 ## One catalog, two evidence gates
 
-`backend_catalog.py` constructs, merges, and verifies provider entries and CDN
+`backend_catalog.py` constructs, merges, and verifies provider entries and
+release-mirror
 payloads. `backend_target_identity.py` is the shared target vocabulary:
 
 - CUDA: one exact `sm_XX` or `sm_XXX` target;
@@ -124,13 +125,12 @@ is not required. A revoked backend cannot be requalified or reactivated.
 Do not hand-edit provider entries or activation bindings.
 
 ```bash
-# After stage 1 of Release core (draft + binaries + approved CDN sync):
+# After stage 1 of Release core (draft + full matrix at the tag):
 # sign the PublishedInert catalog locally, then review / commit / push.
 scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z
 
-# CDN sync and undraft now run in release-core.yml after core-release
-# Environment approval. Local escape hatch (same scripts the jobs call):
-#   scripts/sync-windows-backend-cdn.sh vX.Y.Z
+# Undraft now runs in release-core.yml after core-release Environment
+# approval. Local escape hatch (same script the job calls):
 #   OPENASR_DEPLOY_CATALOG_RUN_ID=<release-core-run-id> \
 #     scripts/finalize-core-release.sh vX.Y.Z
 
@@ -142,12 +142,14 @@ scripts/activate-windows-backend-catalog-release.sh \
 scripts/revoke-windows-backend-catalog-release.sh vX.Y.Z BACKEND_ID
 ```
 
-The CDN sync writes the immutable provider payloads to B2 but does not change a
-catalog or GitHub release. Catalog preparation writes only the five local
+The signed backend payloads are public as GitHub release assets after stage 1;
+nothing else makes backend bytes live (the `dl.openasr.org` origin is retired
+and remains only the signed identity). Catalog preparation downloads and
+re-verifies them from the draft release, then writes only the five local
 catalog/epoch files; it does not commit, push, deploy, publish, or activate
-anything. `release-core.yml` runs the CDN sync and the finalizer after
-`core-release` Environment approval. The finalizer only publishes a draft
-whose already-deployed catalog exposes the release provider entries as
+anything. `release-core.yml` runs the finalizer after `core-release`
+Environment approval. The finalizer only publishes a draft whose
+already-deployed catalog exposes the release provider entries as
 PublishedInert.
 
 Real-hardware evidence must come from a tag-scoped dispatch of
@@ -166,7 +168,8 @@ revocation script, deployment still requires a separate manual dispatch:
 Only reusable `.github/workflows/deploy-catalog.yml` writes the public catalog.
 For PublishedInert release publication it records `deploy-catalog-binding.json`;
 the finalizer verifies its tag, orchestrator/deploy run, source commit, catalog
-SHA, and signature SHA, then independently compares the live bytes and CDN.
+SHA, and signature SHA, then independently compares the live catalog bytes
+and release mirrors.
 Activation and revocation calls replay their exact transition before the same
 deployment seam. Qualification success alone never deploys anything.
 

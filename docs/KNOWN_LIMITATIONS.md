@@ -287,6 +287,12 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   File computation completes before SSE headers are sent, so admission and
   compute failures retain their HTTP status. There is no queued SSE event;
   use the request's progress endpoint while waiting.
+- Windows GPU backend packs are distributed as GitHub release assets. The
+  `dl.openasr.org` URLs in the signed catalog are identity-only and their
+  origin is retired; the runtime already resolves them to GitHub first
+  overseas. From mainland China the `dl.bug.im`/`dl.openasr.org`
+  transport candidates are retired as well, so pack fetches fall straight
+  through to GitHub, which can be slow or unreachable there.
 
 ## Related docs
 

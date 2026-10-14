@@ -365,11 +365,15 @@ jobs:
           print(f"OK: {len(catalog['models'])} public model(s); sha256 + canonical url consistent")
           PY
 
-      - name: Verify signed backend payloads are live before metadata deployment
+      - name: Verify signed backend release mirrors are live before metadata deployment
         run: |
-          # A skip-windows candidate carries an empty backends list: there is
-          # nothing to liveness-probe. Anything else with no backends is a
-          # malformed candidate, and verify-cdn already fails closed on that.
+          # The signed entries keep their dl.openasr.org identities (retired
+          # origin); the probe runs against the GitHub release mirrors the
+          # matrix already published. A skip-windows candidate carries no
+          # entries for this release: its carried-forward backends were
+          # verified in their own releases, so there is nothing to
+          # liveness-probe. Anything else with no backends is a malformed
+          # candidate, and verify-mirrors already fails closed on that.
           if python3 - candidate-catalog.json <<'PY'
           import json
           import sys
@@ -379,7 +383,7 @@ jobs:
           raise SystemExit(0 if candidate.get("backends") else 1)
           PY
           then
-            python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+            python3 tooling/release-manifest/backend_catalog.py verify-mirrors \
               --catalog candidate-catalog.json
           else
             echo "::notice::candidate carries no backend payloads (skip-windows): nothing to liveness-probe"

@@ -1036,7 +1036,7 @@ CPU family gate; inert bytes are not runtime-selectable.
 build immutable release candidates
 -> sign and attest candidates
 -> generate and sign a staging catalog with every provider PublishedInert
--> run the release-candidate CPU family and packaging/CDN gates
+-> run the release-candidate CPU family and packaging/mirror gates
 -> obtain human release approval
 -> deploy the PublishedInert catalog and publish those exact release bytes
 -> run real-hardware backend evidence on the exact public bytes

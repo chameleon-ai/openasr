@@ -262,11 +262,17 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaises(backend_catalog.BackendCatalogError):
                 backend_catalog.merge_catalog(catalog, [entry, conflict], out)
 
-    def test_verify_catalog_cdn_requires_live_canonical_urls_for_the_release_version(self):
+    def test_verify_catalog_mirrors_requires_live_canonical_urls_for_the_release_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
             plugin_url = "https://dl.openasr.org/core/v0.1.35/hip.dll"
             vendor_url = "https://dl.openasr.org/core/v0.1.35/vendor.zip"
+            plugin_mirror = (
+                backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/hip.dll"
+            )
+            vendor_mirror = (
+                backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/vendor.zip"
+            )
             catalog.write_text(
                 json.dumps(
                     {
@@ -279,12 +285,14 @@ class BackendCatalogTest(unittest.TestCase):
                                     {
                                         "filename": "hip.dll",
                                         "url": plugin_url,
+                                        "mirrors": [{"url": plugin_mirror}],
                                         "size_bytes": 70,
                                         "sha256": "a" * 64,
                                     },
                                     {
                                         "filename": "vendor.zip",
                                         "url": vendor_url,
+                                        "mirrors": [{"url": vendor_mirror}],
                                         "size_bytes": 200,
                                         "sha256": "b" * 64,
                                     },
@@ -308,25 +316,58 @@ class BackendCatalogTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            heads = {plugin_url: (200, 70), vendor_url: (200, 200)}
-            result = backend_catalog.verify_catalog_cdn(
+            heads = {plugin_mirror: (200, 70), vendor_mirror: (200, 200)}
+            result = backend_catalog.verify_catalog_mirrors(
                 catalog, "0.1.35", head=lambda url: heads[url]
             )
             self.assertEqual(result["versions"], ["0.1.35"])
-            self.assertEqual(result["verified_urls"], [plugin_url, vendor_url])
+            self.assertEqual(
+                result["verified_urls"], sorted([plugin_mirror, vendor_mirror])
+            )
 
-            heads[vendor_url] = (404, None)
+            heads[vendor_mirror] = (404, None)
             with self.assertRaises(backend_catalog.BackendCatalogError):
-                backend_catalog.verify_catalog_cdn(
+                backend_catalog.verify_catalog_mirrors(
                     catalog, "0.1.35", head=lambda url: heads[url]
                 )
 
-    def test_verify_catalog_cdn_without_version_gates_every_backend_release(self):
+    def test_verify_catalog_mirrors_requires_a_signed_mirror_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = Path(tmp) / "catalog.json"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "backends": [
+                            {
+                                "id": "hip-gfx1200",
+                                "vendor": "hip",
+                                "version": "0.1.35",
+                                "files": [
+                                    {
+                                        "filename": "hip.dll",
+                                        "url": "https://dl.openasr.org/core/v0.1.35/hip.dll",
+                                        "size_bytes": 70,
+                                        "sha256": "a" * 64,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                backend_catalog.BackendCatalogError,
+                "has no signed GitHub release mirror binding",
+            ):
+                backend_catalog.verify_catalog_mirrors(catalog, "0.1.35")
+
+    def test_verify_catalog_mirrors_without_version_gates_every_backend_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
             urls = {
-                "https://dl.openasr.org/core/v0.1.34/cuda.dll": (200, 10),
-                "https://dl.openasr.org/core/v0.1.35/hip.dll": (200, 20),
+                backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.34/cuda.dll": (200, 10),
+                backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/hip.dll": (200, 20),
             }
             catalog.write_text(
                 json.dumps(
@@ -338,7 +379,8 @@ class BackendCatalogTest(unittest.TestCase):
                                 "files": [
                                     {
                                         "filename": "cuda.dll",
-                                        "url": next(iter(urls)),
+                                        "url": "https://dl.openasr.org/core/v0.1.34/cuda.dll",
+                                        "mirrors": [{"url": list(urls)[0]}],
                                         "size_bytes": 10,
                                         "sha256": "a" * 64,
                                     }
@@ -351,6 +393,7 @@ class BackendCatalogTest(unittest.TestCase):
                                     {
                                         "filename": "hip.dll",
                                         "url": "https://dl.openasr.org/core/v0.1.35/hip.dll",
+                                        "mirrors": [{"url": list(urls)[1]}],
                                         "size_bytes": 20,
                                         "sha256": "b" * 64,
                                     }
@@ -361,16 +404,17 @@ class BackendCatalogTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = backend_catalog.verify_catalog_cdn(
+            result = backend_catalog.verify_catalog_mirrors(
                 catalog, head=lambda url: urls[url]
             )
             self.assertEqual(result["versions"], ["0.1.34", "0.1.35"])
             self.assertEqual(result["verified_urls"], sorted(urls))
 
-    def test_verify_catalog_cdn_rejects_conflicting_duplicate_url_metadata(self):
+    def test_verify_catalog_mirrors_rejects_conflicting_duplicate_url_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
             url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            mirror = backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/shared.zip"
             catalog.write_text(
                 json.dumps(
                     {
@@ -382,6 +426,7 @@ class BackendCatalogTest(unittest.TestCase):
                                     {
                                         "filename": "shared.zip",
                                         "url": url,
+                                        "mirrors": [{"url": mirror}],
                                         "size_bytes": 10,
                                         "sha256": "a" * 64,
                                     }
@@ -394,6 +439,7 @@ class BackendCatalogTest(unittest.TestCase):
                                     {
                                         "filename": "shared.zip",
                                         "url": url,
+                                        "mirrors": [{"url": mirror}],
                                         "size_bytes": 999,
                                         "sha256": "a" * 64,
                                     }
@@ -408,12 +454,13 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 backend_catalog.BackendCatalogError, "conflicting signed metadata"
             ):
-                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+                backend_catalog.verify_catalog_mirrors(catalog, head=lambda _: (200, 10))
 
-    def test_verify_catalog_cdn_rejects_same_size_duplicate_with_different_sha256(self):
+    def test_verify_catalog_mirrors_rejects_same_size_duplicate_with_different_sha256(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
             url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            mirror = backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/shared.zip"
             catalog.write_text(
                 json.dumps(
                     {
@@ -425,6 +472,7 @@ class BackendCatalogTest(unittest.TestCase):
                                     {
                                         "filename": "shared.zip",
                                         "url": url,
+                                        "mirrors": [{"url": mirror}],
                                         "size_bytes": 10,
                                         "sha256": digest * 64,
                                     }
@@ -440,15 +488,16 @@ class BackendCatalogTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 backend_catalog.BackendCatalogError, "conflicting signed metadata"
             ):
-                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+                backend_catalog.verify_catalog_mirrors(catalog, head=lambda _: (200, 10))
 
-    def test_verify_catalog_cdn_probes_identical_duplicate_metadata_once(self):
+    def test_verify_catalog_mirrors_probes_identical_duplicate_metadata_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
-            url = "https://dl.openasr.org/core/v0.1.35/shared.zip"
+            mirror = backend_catalog.GITHUB_MIRROR_BASE + "/v0.1.35/shared.zip"
             record = {
                 "filename": "shared.zip",
-                "url": url,
+                "url": "https://dl.openasr.org/core/v0.1.35/shared.zip",
+                "mirrors": [{"url": mirror}],
                 "size_bytes": 10,
                 "sha256": "a" * 64,
             }
@@ -465,13 +514,13 @@ class BackendCatalogTest(unittest.TestCase):
             )
             calls = []
 
-            backend_catalog.verify_catalog_cdn(
+            backend_catalog.verify_catalog_mirrors(
                 catalog, head=lambda candidate: calls.append(candidate) or (200, 10)
             )
 
-            self.assertEqual(calls, [url])
+            self.assertEqual(calls, [mirror])
 
-    def test_verify_catalog_cdn_requires_filename_exactly_in_canonical_url(self):
+    def test_verify_catalog_mirrors_requires_filename_exactly_in_canonical_url(self):
         with tempfile.TemporaryDirectory() as tmp:
             catalog = Path(tmp) / "catalog.json"
             catalog.write_text(
@@ -497,18 +546,22 @@ class BackendCatalogTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(
-                backend_catalog.BackendCatalogError, "not the canonical CDN URL"
+                backend_catalog.BackendCatalogError, "not the canonical identity URL"
             ):
-                backend_catalog.verify_catalog_cdn(catalog, head=lambda _: (200, 10))
+                backend_catalog.verify_catalog_mirrors(catalog, head=lambda _: (200, 10))
 
-    def test_head_cdn_url_bounds_and_retries_curl(self):
+    def test_head_release_mirror_bounds_and_retries_curl(self):
         completed = backend_catalog.subprocess.CompletedProcess(
             args=[], returncode=0, stdout="HTTP/2 200\ncontent-length: 42\n", stderr=""
         )
         with mock.patch.object(backend_catalog.subprocess, "run", return_value=completed) as run:
-            self.assertEqual(backend_catalog.head_cdn_url("https://example.invalid/file"), (200, 42))
+            self.assertEqual(
+                backend_catalog.head_release_mirror("https://example.invalid/file"),
+                (200, 42),
+            )
 
         command = run.call_args.args[0]
+        self.assertIn("--location", command)
         self.assertIn("--http1.1", command)
         self.assertIn("--connect-timeout", command)
         self.assertIn("--max-time", command)

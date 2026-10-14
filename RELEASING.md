@@ -73,10 +73,12 @@ bump, or CI's `--locked` builds fail:
    - If no GitHub Release exists yet, the workflow creates the **draft**, then
      calls `release-binaries.yml` with `formal_release: true` (Linux
      x86_64/arm64, macOS x86_64/arm64, Windows, plus Vulkan/CUDA/HIP
-     variants), then waits for `core-release` Environment approval and syncs
-     the Windows GPU backend packs to B2. There is no bootstrap macOS/Linux
-     rebuild and no `push: tags` matrix racing the orchestrator. Completeness
-     fails the run if a required archive is missing.
+     variants). The Windows GPU backend packs and every plugin/vendor byte
+     they declare are public as GitHub release assets from that point: the
+     `dl.openasr.org` origin is retired and stays only the signed identity
+     in the catalog. There is no bootstrap macOS/Linux rebuild and no
+     `push: tags` matrix racing the orchestrator. Completeness fails the run
+     if a required archive is missing.
    - If the matching release is still a draft, a second dispatch runs the
      pre-publication family gate, deploys the committed PublishedInert
      catalog, and waits for `core-release` Environment approval to publish
@@ -101,8 +103,9 @@ No pre-release channels: the core releases plain `X.Y.Z` versions only.
 ## Manual runs
 
 `Release core` is `workflow_dispatch` only. The first dispatch (no GitHub
-Release yet) creates the draft, builds the matrix, and syncs backend CDN
-bytes after `core-release` Environment approval. After the generated
+Release yet) creates the draft and builds the attested release matrix; the
+backend payload bytes are live as GitHub release assets from that point.
+After the generated
 PublishedInert catalog has been reviewed, signed, committed, and pushed,
 dispatch it again with the same `version` to run the pre-publication family
 gate, catalog deployment, and `publish-release` (same Environment approval)
@@ -152,17 +155,13 @@ in Actions after Environment approval.
 1. Dispatch `Release core`. Stage 1 creates the draft and lets its single
    formal `release-binaries.yml` call build and checksum the complete release
    matrix, sign the applicable Windows binaries, and attest the full subject
-   set. Do not use the diagnostic one-target dispatch to assemble or mutate a
-   release.
-2. Approve the `sync-backend-cdn` job in the Actions UI. It runs under the
-   `core-release` GitHub Environment (required reviewers) and executes
-   `scripts/sync-windows-backend-cdn.sh vX.Y.Z --allow-ci`. The job verifies
-   and copies every file declared by the 1 Vulkan, 6 CUDA, and 14 HIP release
-   entries to `https://dl.openasr.org/core/vX.Y.Z/`. Uploads are idempotent
-   and never overwrite a different object at the same key. GitHub is the
-   provenance mirror, not a runtime download fallback. (Under `skip_windows`
-   there are no backend entries: the job verifies the empty set and exits.)
-3. With the worktree checked out at the exact `vX.Y.Z` tag commit (the script
+   set. From that point the 1 Vulkan, 6 CUDA, and 14 HIP backend-pack files
+   and every plugin/vendor byte they declare are public as GitHub release
+   assets; the `dl.openasr.org` origin is retired, so GitHub is the runtime
+   download plane, not a provenance mirror. (Under `skip_windows` there are
+   no backend entries and nothing to publish.) Do not use the diagnostic
+   one-target dispatch to assemble or mutate a release.
+2. With the worktree checked out at the exact `vX.Y.Z` tag commit (the script
    refuses any other HEAD), run
    `scripts/sign-and-verify-qualification-manifests.sh vX.Y.Z` locally with
    the production catalog signing seed. It signs the 21 inert exact-cell
@@ -172,28 +171,30 @@ in Actions after Environment approval.
    without the full signature set. If an aborted run leaves
    `openasr-X.Y.Z-qualification-mutation.lock` on the draft and no other
    signer is running, delete that asset before retrying.
-4. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally
-   with the same seed. It verifies all 21 exact entries and their already-live
-   CDN bytes, merges every entry as `PublishedInert`, bumps the epoch, and
+3. Run `scripts/prepare-windows-backend-catalog-release.sh vX.Y.Z` locally
+   with the same seed. It downloads the plugin and vendor payloads from the
+   draft release, verifies all 21 exact entries and their live release
+   mirrors, merges every entry as `PublishedInert`, bumps the epoch, and
    signs the full/public catalogs. It consumes no hardware or
    token-correctness receipt. Review, commit, and push the five catalog/epoch
    files.
-5. Dispatch `Release core` again. Stage 2 re-verifies the draft's complete
+4. Dispatch `Release core` again. Stage 2 re-verifies the draft's complete
    attested subject set (the same completeness gate as the original matrix, so
    a later CI-only fix can still see the draft), then runs the reusable
    pre-publication family contract against the immutable draft CLI and the
    real-pack CPU family gate. The orchestrator then calls the sole deployment
    entrypoint, `.github/workflows/deploy-catalog.yml`, with
    `activation_transition: published-inert`. The deploy job checks the signed
-   catalog, CDN payloads, and released-binary compatibility before writing it.
-   `finalize-notes` then rewrites Install & Verify from the real asset list.
-6. Approve the `publish-release` job in the Actions UI (same `core-release`
+   catalog, release-mirror payloads, and released-binary compatibility before
+   writing it. `finalize-notes` then rewrites Install & Verify from the real
+   asset list.
+5. Approve the `publish-release` job in the Actions UI (same `core-release`
    Environment). It runs `scripts/finalize-core-release.sh` with
    `OPENASR_DEPLOY_CATALOG_RUN_ID` set to this orchestrator run. The
    reusable deploy workflow shares that run id, so the finalizer looks up
    the "Deploy PublishedInert candidate catalog" job on this run, binds the
    exact tag, source commit, catalog SHA, signature SHA, release subjects,
-   and live CDN bytes (retrying the no-credential catalog/CDN plane for up
+   and live catalog bytes (retrying the no-credential catalog plane for up
    to 10 minutes), then removes the GitHub draft flag.
 
 Any failure leaves the GitHub release as a draft.
@@ -201,19 +202,14 @@ Any failure leaves the GitHub release as a draft.
 ### GitHub Environment `core-release`
 
 Create this Environment on `QuintinShaw/openasr` before the first
-Actions-driven publish. Required reviewers must be enabled so the B2 write
-key and the undraft step are not available until a human approves the job
-in the Actions UI.
+Actions-driven publish. Required reviewers must be enabled so the undraft
+step is not available until a human approves the `publish-release` job in
+the Actions UI.
 
-Environment secrets (not repository secrets):
-
-- `B2_S3_ENDPOINT`
-- `B2_APPLICATION_KEY_ID`
-- `B2_APPLICATION_KEY`
-
-Key policy: a dedicated B2 application key restricted to the release bucket
-and the `core/` prefix with `listFiles` / `readFiles` / `writeFiles` only
-(no `deleteFiles`), separate from the desktop installer key.
+No Environment secrets are required: the B2 write credentials of the retired
+`dl.openasr.org` origin are no longer consumed by any workflow, and those
+Environment secrets (and the B2 application key behind them) can be deleted
+on the repository.
 
 After publishing with `GITHUB_TOKEN`, the orchestrator explicitly dispatches one
 independent GitHub Actions workflow. A token-created release does not trigger
@@ -222,7 +218,7 @@ maintainer-created releases. The dispatch job runs only after `publish-release`
 succeeds, and a failed dispatch can be retried on its own:
 
 - `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
-  catalog/CDN plane is complete.
+  catalog plane is complete and the release-mirror gate has passed.
 
 ### Qualify and activate one exact backend after publication
 
@@ -265,7 +261,7 @@ validation commands.
 
 `backends-manifest.json`, its signature, and the whole-engine Windows GPU
 sidecars are historical compatibility tooling for core 0.1.33 and earlier.
-Do not generate, sign, attach, or CDN-sync them for core 0.1.34 or later.
+Do not generate, sign, or attach them for core 0.1.34 or later.
 Current releases distribute one neutral Windows host plus target-scoped
 CUDA/HIP backend packs; the production-signed model/backend catalog is their
 only activation trust plane.
@@ -292,7 +288,7 @@ hand, once the secret exists).
 ## Docker Hub images
 
 `publish-core-channels.yml` runs only after the GitHub draft is published by
-the catalog/CDN finalizer. It builds runtime images from the published Linux
+the catalog finalizer. It builds runtime images from the published Linux
 release assets (no second cargo build inside Docker):
 
 - CPU multi-arch (`linux/amd64` + `linux/arm64`) from

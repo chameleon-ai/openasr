@@ -479,9 +479,9 @@ PY
 python3 tooling/publish-model/scripts/check_catalog_consistency.py \
   || fail "committed catalog/signature pair does not verify under production trust roots"
 
-# Live catalog/CDN can lag the deploy job. Retry the no-credential plane for
+# The live catalog can lag the deploy job. Retry the no-credential plane for
 # up to 10 minutes so a just-written catalog is not a spurious publish failure.
-verify_live_catalog_cdn() {
+verify_live_catalog() {
   local attempt="$1"
   local cache_bust
   cache_bust="$(date +%s)-${attempt}"
@@ -498,7 +498,7 @@ verify_live_catalog_cdn() {
   python3 tooling/release-manifest/backend_hardware_evidence.py \
     "${all_backend_entry_args[@]}" \
     --catalog "$workdir/catalog.json" --version "$version" >/dev/null || return 1
-  python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+  python3 tooling/release-manifest/backend_catalog.py verify-mirrors \
     --catalog "$workdir/catalog.json" --version "$version" || return 1
   if ! cmp -s model-registry/catalog.public.json "$workdir/catalog.json"; then
     echo "live catalog bytes differ from the deploy run's committed catalog" >&2
@@ -511,19 +511,19 @@ verify_live_catalog_cdn() {
   return 0
 }
 
-cdn_ok=false
+live_ok=false
 for attempt in $(seq 1 20); do
-  if verify_live_catalog_cdn "$attempt"; then
-    cdn_ok=true
+  if verify_live_catalog "$attempt"; then
+    live_ok=true
     break
   fi
   if [ "$attempt" -eq 20 ]; then
     break
   fi
-  echo "live catalog/CDN not yet consistent (attempt ${attempt}/20); retrying in 30s" >&2
+  echo "live catalog not yet consistent (attempt ${attempt}/20); retrying in 30s" >&2
   sleep 30
 done
-[ "$cdn_ok" = "true" ] \
+[ "$live_ok" = "true" ] \
   || fail "live catalog bytes differ from the deploy run's committed catalog after 10 minutes of retries"
 
 echo "==> signed catalog exposes ${tag} provider bytes as PublishedInert; publishing release"

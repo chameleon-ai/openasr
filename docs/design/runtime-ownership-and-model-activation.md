@@ -108,7 +108,9 @@ Each exact cell has one collision-free release asset named
 its already provider-qualified `vulkan-windows-*` target without repeating the
 provider). Its detached signature binds the identical basename at
 `https://dl.openasr.org/core/v<version>/`; a mirror may transport those bytes,
-but cannot change their canonical signed identity. CI compiles only unsigned,
+but cannot change their canonical signed identity. That origin is retired:
+GitHub release assets are the live transport and the dl URL stays in the
+signature for identity only. CI compiles only unsigned,
 inert manifests after the successful provenance action emits its exact Sigstore
 bundle. The production catalog seed remains local; one fail-closed maintainer
 command signs every cell on the draft release, uploads only detached signatures,
@@ -121,7 +123,8 @@ set from backend packs and re-verifies every manifest/signature, referenced byte
 and provenance subject while holding that lock. The shared Rust verifier,
 not only the generator script, rechecks the release version, host artifact,
 provider/target plugin name, content-addressed vendor name, provenance bundle,
-and canonical CDN/GitHub URLs before either signing or qualification loading.
+and canonical identity/GitHub mirror URLs before either signing or
+qualification loading.
 
 On Windows, `artifacts.binary` binds both the exact `openasr.exe` member and
 the attested release ZIP that contains it. The ZIP also carries a signed

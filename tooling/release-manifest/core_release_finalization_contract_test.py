@@ -15,6 +15,32 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             "deploy-catalog-binding.json is the sole release/deploy binding",
         )
 
+    def test_retired_b2_cdn_publication_path_is_absent(self) -> None:
+        for missing in (
+            ROOT / "scripts/sync-windows-backend-cdn.sh",
+            ROOT / "tooling/release-manifest/b2_sync.py",
+            ROOT / "tooling/release-manifest/b2_sync_test.py",
+            ROOT / "tooling/release-manifest/retention.py",
+            ROOT / "tooling/release-manifest/retention_test.py",
+        ):
+            self.assertFalse(missing.exists(), f"{missing} must stay deleted")
+        release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
+        for document in (
+            release,
+            (ROOT / ".github/workflows/deploy-catalog.yml").read_text(encoding="utf-8"),
+            (ROOT / ".github/workflows/publish-core-channels.yml").read_text(
+                encoding="utf-8"
+            ),
+            (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8"),
+            (ROOT / "scripts/prepare-windows-backend-catalog-release.sh").read_text(
+                encoding="utf-8"
+            ),
+        ):
+            self.assertNotIn("sync-windows-backend-cdn.sh", document)
+            self.assertNotIn("B2_S3_ENDPOINT", document)
+        for path in (ROOT / "scripts").rglob("*.sh"):
+            self.assertNotIn("b2_sync", path.read_text(encoding="utf-8"))
+
     def test_release_caller_grants_every_permission_requested_by_reusable_jobs(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
         permission_rank = {"read": 1, "write": 2}
@@ -151,7 +177,6 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         finalize = (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8")
-        sync = (ROOT / "scripts/sync-windows-backend-cdn.sh").read_text(encoding="utf-8")
         deploy = (ROOT / ".github/workflows/deploy-catalog.yml").read_text(encoding="utf-8")
         publish = (
             ROOT / "tooling/publish-model/scripts/publish_catalog.sh"
@@ -190,10 +215,11 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("needs: [resolve, finalize-notes, deploy-catalog]", release)
         self.assertIn("verify-assets", prepare)
         self.assertIn("gh_release.download_asset", prepare)
-        self.assertIn("gh_release.download_url", prepare)
+        self.assertNotIn("gh_release.download_url", prepare)
         self.assertIn("publish_catalog.sh", prepare)
         self.assertIn("verify-catalog", prepare)
-        self.assertIn("verify-cdn", prepare)
+        self.assertIn("verify-mirrors", prepare)
+        self.assertNotIn("verify-cdn", prepare)
         self.assertIn("backend_hardware_evidence.py", prepare)
         self.assertNotIn("backend-hardware-audit-*.json", prepare)
         self.assertNotIn("--raw-audit", prepare)
@@ -207,19 +233,13 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
             prepare.index("preflighting local catalog signer toolchain"),
             prepare.index("downloading backend entries"),
         )
-        self.assertLess(prepare.index("verify-cdn"), prepare.index("publish_catalog.sh"))
+        self.assertLess(prepare.index("verify-mirrors"), prepare.index("publish_catalog.sh"))
         self.assertLess(
-            prepare.index("verify-cdn"),
+            prepare.index("verify-mirrors"),
             prepare.index('old_epoch="$(tr -d'),
         )
-        self.assertIn("prepare-windows-backend-catalog-release.sh", sync)
-        self.assertIn("--allow-ci", sync)
-        self.assertIn("refusing to use B2 write credentials in CI without --allow-ci", sync)
-        self.assertNotIn("backend-hardware-evidence-*.json", sync)
-        self.assertNotIn("backend-hardware-audit-*.json", sync)
-        self.assertNotIn("backend_hardware_evidence.py", sync)
-        self.assertIn("hardware/token qualification is post-publication", sync)
-        self.assertIn("verify-cdn", deploy)
+        self.assertIn("verify-mirrors", deploy)
+        self.assertNotIn("verify-cdn", deploy)
         self.assertIn("workflow_call:", deploy)
         self.assertNotIn("push:\n", deploy)
         self.assertIn("gate-activation:", deploy)
@@ -240,11 +260,12 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn('"release_tag": os.environ["RELEASE_TAG"]', deploy)
         self.assertIn('"source_commit": os.environ["GITHUB_SHA"]', deploy)
         self.assertIn('"catalog_signature_sha256"', deploy)
-        self.assertLess(deploy.index("verify-cdn"), deploy.index("Deploy to Cloudflare"))
+        self.assertLess(deploy.index("verify-mirrors"), deploy.index("Deploy to Cloudflare"))
         self.assertIn("catalog.openasr.org/v1/catalog.json", finalize)
         self.assertNotIn("backends-manifest", finalize)
         self.assertIn("verify-catalog", finalize)
-        self.assertIn("verify-cdn", finalize)
+        self.assertIn("verify-mirrors", finalize)
+        self.assertNotIn("verify-cdn", finalize)
         self.assertIn("backend_hardware_evidence.py", finalize)
         self.assertNotIn("backend-hardware-audit-*.json", finalize)
         self.assertNotIn("gpu-correctness-matrix.v1.json", finalize)
@@ -283,7 +304,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertNotIn('for subject in "$workdir"/*', finalize)
         self.assertIn("tr -d '\\r'", finalize)
         self.assertIn("did not succeed", finalize)
-        self.assertLess(finalize.index("verify-cdn"), finalize.index("--draft=false"))
+        self.assertLess(finalize.index("verify-mirrors"), finalize.index("--draft=false"))
         publish = finalize.index(
             'gh release edit "$tag" --repo "$repository" --draft=false --latest'
         )
@@ -325,7 +346,8 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertNotIn("--raw-audit", channels)
         self.assertIn("gate-catalog-against-released-binary.sh", channels)
         self.assertIn("verify-catalog", channels)
-        self.assertIn("verify-cdn", channels)
+        self.assertIn("verify-mirrors", channels)
+        self.assertNotIn("verify-cdn", channels)
         self.assertIn("needs: [resolve, distribution-gate]", channels)
         self.assertIn("git push origin main", channels)
         self.assertNotIn("sync-release-to-cnb.sh", channels)

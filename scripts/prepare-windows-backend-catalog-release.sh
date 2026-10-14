@@ -94,7 +94,10 @@ for entry in "${backend_entries[@]}"; do
   backend_entry_args+=(--entry "$entry")
 done
 
-echo "==> downloading signed plugin and vendor payloads from CDN"
+# The canonical dl.openasr.org origin is retired: its URLs stay in the signed
+# entries only as identities the runtime maps to real transports. The payload
+# bytes themselves are live as draft release assets the formal matrix built.
+echo "==> downloading signed plugin and vendor payloads from the draft release"
 python3 - "$workdir" <<'PY'
 import json
 import sys
@@ -107,16 +110,15 @@ root = Path(sys.argv[1])
 downloaded = set()
 for entry_path in sorted(root.glob("backend-pack-*.json")):
     entry = json.loads(entry_path.read_text(encoding="utf-8"))
-    version = entry["version"]
+    tag = f"v{entry['version']}"
     for file in entry.get("files", []):
         name = file.get("filename")
         if not isinstance(name, str) or not name or Path(name).name != name:
             raise SystemExit(f"unsafe backend release filename: {name!r}")
         if name in downloaded:
             continue
-        url = f"https://dl.openasr.org/core/v{version}/{name}"
-        print(f"downloading {url}", flush=True)
-        gh_release.download_url(url, root / name)
+        print(f"downloading {name}", flush=True)
+        gh_release.download_asset(tag, name, root)
         downloaded.add(name)
 PY
 
@@ -131,10 +133,11 @@ python3 tooling/release-manifest/backend_catalog.py merge \
   "${backend_entry_args[@]}" \
   --out "$workdir/catalog.merged.json"
 
-# Payload first, metadata last: refuse to sign URLs that are not already live.
-# deploy-catalog.yml repeats this read-only gate, and the finalizer checks the
-# deployed signed projection once more before publishing the draft release.
-python3 tooling/release-manifest/backend_catalog.py verify-cdn \
+# Payload first, metadata last: refuse to sign mirrors that are not already
+# live as release assets. deploy-catalog.yml repeats this read-only gate, and
+# the finalizer checks the deployed signed projection once more before
+# publishing the draft release.
+python3 tooling/release-manifest/backend_catalog.py verify-mirrors \
   --catalog "$workdir/catalog.merged.json" \
   --version "$version"
 

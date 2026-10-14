@@ -5,8 +5,10 @@ This tool never signs or downloads payload bytes. It derives every byte identity
 from the staged release files. Merging preserves prior ABI-scoped entries so
 older neutral hosts can keep resolving their compatible pack, and replaces
 same-ABI slots in place when a later plugin build reuses the stable target id.
-verify-cdn HEADs the signed file URLs so a release cannot go public while the
-canonical CDN prefix is empty.
+verify-mirrors HEADs each entry's signed GitHub release mirror, so a release
+cannot go public while its backend assets are not live (the canonical
+dl.openasr.org identity stays signed for runtime URL derivation; that origin
+is retired and is never probed).
 """
 
 from __future__ import annotations
@@ -25,6 +27,12 @@ from typing import Any
 
 class BackendCatalogError(ValueError):
     pass
+
+
+# The signed transport mirror for backend payloads. `files[].url` stays the
+# canonical dl identity (retired origin, kept for runtime URL derivation);
+# this GitHub release location is where the bytes are live.
+GITHUB_MIRROR_BASE = "https://github.com/chameleon-ai/openasr/releases/download"
 
 
 def _write_utf8_lf(path: Path, value: object) -> None:
@@ -581,8 +589,7 @@ def verify_release_assets(
                     f"backend '{provider}' release URL is not canonical for {filename}"
                 )
             expected_mirror = (
-                "https://github.com/chameleon-ai/openasr/releases/download/"
-                f"v{expected_version}/{filename}"
+                f"{GITHUB_MIRROR_BASE}/v{expected_version}/{filename}"
             )
             mirrors = file.get("mirrors", [])
             if not isinstance(mirrors, list) or not any(
@@ -635,14 +642,17 @@ def verify_catalog_entries(catalog_path: Path, entry_paths: list[Path]) -> dict[
     }
 
 
-def head_cdn_url(url: str) -> tuple[int, int | None]:
-    # Cloudflare on dl.openasr.org rejects Python-urllib's default User-Agent
-    # with HTTP 403. curl is the maintainer-host probe used everywhere else.
+def head_release_mirror(url: str) -> tuple[int, int | None]:
+    # github.com 302-redirects /releases/download/ URLs to the signed
+    # production-asset endpoint; --location follows it so the final status and
+    # content-length are the ones compared against the signed size. curl, not
+    # urllib, is the maintainer-host probe used everywhere else.
     completed = subprocess.run(
         [
             "curl",
             "-sS",
             "-I",
+            "--location",
             "--http1.1",
             "--connect-timeout",
             "5",
@@ -661,7 +671,7 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
     )
     if completed.returncode != 0:
         raise BackendCatalogError(
-            f"CDN HEAD failed for {url}: {completed.stderr.strip() or completed.returncode}"
+            f"release mirror HEAD failed for {url}: {completed.stderr.strip() or completed.returncode}"
         )
     status: int | None = None
     length: int | None = None
@@ -675,19 +685,25 @@ def head_cdn_url(url: str) -> tuple[int, int | None]:
             if value.isdigit():
                 length = int(value)
     if status is None:
-        raise BackendCatalogError(f"CDN HEAD failed for {url}: no HTTP status")
+        raise BackendCatalogError(f"release mirror HEAD failed for {url}: no HTTP status")
     return status, length
 
 
-def verify_catalog_cdn(
+def verify_catalog_mirrors(
     catalog_path: Path,
     version: str | None = None,
     head: Callable[[str], tuple[int, int | None]] | None = None,
 ) -> dict[str, object]:
-    """Require signed GPU provider file URLs to be live before deployment."""
+    """Require signed entries' GitHub release mirrors to be live before deployment.
+
+    Every entry must still carry its canonical dl identity in `files[].url`
+    (retired origin, kept for signed compatibility and runtime URL derivation)
+    and must bind the GitHub mirror as a transport; the probe runs against the
+    mirror, never the retired origin.
+    """
 
     catalog = _read_json(catalog_path)
-    head_fn = head or head_cdn_url
+    head_fn = head or head_release_mirror
     seen: dict[str, tuple[str, str, int, str]] = {}
     checked_versions: set[str] = set()
     for entry in catalog.get("backends", []):
@@ -712,22 +728,31 @@ def verify_catalog_cdn(
             canonical_url = f"https://dl.openasr.org/core/v{entry_version}/{filename}"
             if not entry_version or url != canonical_url:
                 raise BackendCatalogError(
-                    f"backend file '{filename}' is not the canonical CDN URL for {entry_version or '<missing version>'}"
+                    f"backend file '{filename}' is not the canonical identity URL for {entry_version or '<missing version>'}"
+                )
+            mirror_url = f"{GITHUB_MIRROR_BASE}/v{entry_version}/{filename}"
+            mirrors = file.get("mirrors", [])
+            if not isinstance(mirrors, list) or not any(
+                isinstance(mirror, dict) and mirror.get("url") == mirror_url
+                for mirror in mirrors
+            ):
+                raise BackendCatalogError(
+                    f"backend file '{filename}' has no signed GitHub release mirror binding"
                 )
             identity = (entry_version, filename, size, sha256)
-            if url in seen:
-                if seen[url] != identity:
+            if mirror_url in seen:
+                if seen[mirror_url] != identity:
                     raise BackendCatalogError(
-                        f"conflicting signed metadata for duplicate CDN URL '{url}': "
-                        f"first={seen[url]!r} later={identity!r}"
+                        f"conflicting signed metadata for duplicate mirror URL '{mirror_url}': "
+                        f"first={seen[mirror_url]!r} later={identity!r}"
                     )
                 continue
-            seen[url] = identity
+            seen[mirror_url] = identity
             checked_versions.add(entry_version)
     if not seen:
         scope = f"version {version}" if version is not None else "the catalog"
         raise BackendCatalogError(
-            f"catalog has no GPU backend files for {scope} to verify on CDN"
+            f"catalog has no GPU backend files for {scope} to verify on their release mirrors"
         )
 
     def probe(item: tuple[str, tuple[str, str, int, str]]) -> str:
@@ -735,9 +760,10 @@ def verify_catalog_cdn(
         status, length = head_fn(url)
         if status != 200 or length != size:
             raise BackendCatalogError(
-                f"CDN object missing or size-mismatched for '{filename}': "
+                f"release mirror missing or size-mismatched for '{filename}': "
                 f"HEAD {url} -> {status} content-length={length} signed_size={size}. "
-                f"Run scripts/sync-windows-backend-cdn.sh v{entry_version} before catalog deployment."
+                f"The formal release matrix must have uploaded every backend file as a "
+                f"release asset for v{entry_version} before catalog deployment."
             )
         return url
 
@@ -924,11 +950,11 @@ def main() -> int:
     verify_catalog_parser = subparsers.add_parser("verify-catalog")
     verify_catalog_parser.add_argument("--catalog", type=Path, required=True)
     verify_catalog_parser.add_argument("--entry", type=Path, action="append", required=True)
-    verify_cdn_parser = subparsers.add_parser("verify-cdn")
-    verify_cdn_parser.add_argument("--catalog", type=Path, required=True)
-    verify_cdn_parser.add_argument(
+    verify_mirrors_parser = subparsers.add_parser("verify-mirrors")
+    verify_mirrors_parser.add_argument("--catalog", type=Path, required=True)
+    verify_mirrors_parser.add_argument(
         "--version",
-        help="limit the gate to one X.Y.Z release; omit to verify every signed backend URL",
+        help="limit the gate to one X.Y.Z release; omit to verify every signed backend release mirror",
     )
     hints_parser = subparsers.add_parser("hints")
     hints_parser.add_argument("--entry", type=Path, action="append", required=True)
@@ -958,10 +984,10 @@ def main() -> int:
                     verify_catalog_entries(args.catalog, args.entry), sort_keys=True
                 )
             )
-        elif args.command == "verify-cdn":
+        elif args.command == "verify-mirrors":
             print(
                 json.dumps(
-                    verify_catalog_cdn(args.catalog, args.version), sort_keys=True
+                    verify_catalog_mirrors(args.catalog, args.version), sort_keys=True
                 )
             )
         elif args.command == "hints":

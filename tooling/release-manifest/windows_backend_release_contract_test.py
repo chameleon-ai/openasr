@@ -676,9 +676,6 @@ class SkipWindowsContractTests(unittest.TestCase):
         cls.finalize = (ROOT / "scripts" / "finalize-core-release.sh").read_text(
             encoding="utf-8"
         )
-        cls.sync = (ROOT / "scripts" / "sync-windows-backend-cdn.sh").read_text(
-            encoding="utf-8"
-        )
         cls.verify = (ROOT / "scripts" / "verify-release-completeness.sh").read_text(
             encoding="utf-8"
         )
@@ -725,8 +722,7 @@ class SkipWindowsContractTests(unittest.TestCase):
             self.finalize,
         )
 
-    def test_sync_and_verify_derive_pack_expectations_from_the_release(self) -> None:
-        self.assertIn("nothing to sync", self.sync)
+    def test_verify_derives_pack_expectations_from_the_release(self) -> None:
         self.assertIn("pack_args=(--skip-windows)", self.verify)
 
     def test_deploy_and_channels_derive_pack_expectations_from_the_release(self) -> None:
