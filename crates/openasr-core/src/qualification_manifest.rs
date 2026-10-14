@@ -20,9 +20,9 @@ use crate::{
 };
 
 pub const QUALIFICATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const QUALIFICATION_ATTESTATION_REPOSITORY: &str = "QuintinShaw/openasr";
+pub const QUALIFICATION_ATTESTATION_REPOSITORY: &str = "chameleon-ai/openasr";
 pub const QUALIFICATION_ATTESTATION_SIGNER_WORKFLOW: &str =
-    "QuintinShaw/openasr/.github/workflows/release-binaries.yml";
+    "chameleon-ai/openasr/.github/workflows/release-binaries.yml";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

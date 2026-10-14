@@ -192,18 +192,17 @@ Model packs are distributed separately under their own upstream licenses. See
 
 Yes for the open-core CLI and local server. Each core release publishes
 checksummed archives on
-[GitHub Releases](https://github.com/QuintinShaw/openasr/releases) (macOS,
-Linux, Windows, plus CUDA/ROCm/Vulkan/musl variants where applicable) and
-matching runtime images on
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (`latest` /
-`<version>` for CPU multi-arch, `cuda-latest` / `cuda-<version>` for CUDA
-amd64). The separate macOS/Windows desktop apps ship from
+[GitHub Releases](https://github.com/chameleon-ai/openasr/releases) (macOS,
+Linux, Windows, plus CUDA/ROCm/Vulkan/musl variants where applicable). The
+separate macOS/Windows desktop apps ship from
 [openasr.org/download](https://openasr.org/download/).
 
 ## Is there an official Docker image?
 
-Yes. `quintinshaw/openasr` on Docker Hub. Images contain the release binary and
-model-registry metadata only — mount a volume at `/data`, then
+Not on a registry — the published image channels were retired. Build one from
+the repository (`Dockerfile` / `Dockerfile.cuda`, `compose.yaml`). Each image
+contains the release binary and model-registry metadata only —
+mount a volume at `/data`, then
 `docker exec … openasr pull <model> --yes` before calling the HTTP API. The
 server never auto-pulls. They do not ship `perf/` bench-suite fixtures or
 baselines, so `openasr bench-suite` inside the container will fail looking for
@@ -221,8 +220,6 @@ the desktop app, or `POST /v1/pairing/requests` then approve with
 (self-signed). Behind a TLS-terminating reverse proxy, drop `--tls-self-signed`
 from the command and set `OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1` — that env
 only waives TLS, never pairing, and only belongs on a trusted boundary.
-
-Longer guide: [openasr.org/docs/docker](https://openasr.org/docs/docker/).
 
 ## Is ffmpeg required?
 

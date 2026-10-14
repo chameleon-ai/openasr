@@ -6,8 +6,7 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
 ## Current limitations
 
 - OpenASR publishes binary archives and SHA-256 checksums for macOS, Linux, and
-  Windows on [GitHub Releases](https://github.com/QuintinShaw/openasr/releases).
-  Homebrew installation is available; see the [installation guide](../README.md#for-developers).
+  Windows on [GitHub Releases](https://github.com/chameleon-ai/openasr/releases).
   Building from source remains supported. Public model-pack distribution is limited to catalog entries
   explicitly marked `public:true`.
 - `GET /v1/models` and other served-identity listings verify GGUF metadata

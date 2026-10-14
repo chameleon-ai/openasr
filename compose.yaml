@@ -1,7 +1,7 @@
 services:
-  # Local source-build services. Published images are on Docker Hub:
-  #   docker pull quintinshaw/openasr:latest
-  #   docker pull quintinshaw/openasr:cuda-latest
+  # Local source-build services (no published images are maintained; build
+  # from this checkout with `docker compose up` / `docker compose --profile
+  # gpu up openasr-cuda`).
   openasr:
     build:
       context: .

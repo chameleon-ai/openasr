@@ -31,8 +31,9 @@ defined by code and tests; [Architecture](../ARCHITECTURE.md) maps the code,
 
 ## Boundaries
 
-- Homebrew, binary archives, and Docker distribution already exist; see
-  [installation](../README.md#for-developers) and [Releasing](../RELEASING.md).
+- GitHub Release binary archives and source-build Docker containers already
+  exist; see [installation](../README.md#for-developers) and
+  [Releasing](../RELEASING.md).
 - Broad streaming-quality and multilingual guarantees remain qualification work,
   not promises inferred from a family being registered or a pack being public.
 - Model onboarding follows [Model Onboarding](MODEL_ONBOARDING.md), rather than

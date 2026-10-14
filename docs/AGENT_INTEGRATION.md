@@ -23,8 +23,8 @@ convention: any file host on GitHub is a valid registry entry, no separate
 publishing step. Install it into a project with:
 
 ```bash
-npx skills add QuintinShaw/openasr --skill openasr --agent claude-code
-# or interactively: npx skills add QuintinShaw/openasr
+npx skills add chameleon-ai/openasr --skill openasr --agent claude-code
+# or interactively: npx skills add chameleon-ai/openasr
 ```
 
 This copies the whole skill directory -- `SKILL.md` plus

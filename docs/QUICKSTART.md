@@ -14,7 +14,7 @@ telemetry.
 ## 1. Build
 
 ```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git && cd openasr
+git clone --recurse-submodules https://github.com/chameleon-ai/openasr.git && cd openasr
 cargo build --release -p openasr-cli
 # the binary is target/release/openasr -- put it on your PATH, or prefix the
 # commands below with `cargo run -p openasr-cli --`.

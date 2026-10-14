@@ -7,9 +7,9 @@
 **Turn speech into text, entirely on your device.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![CI](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/QuintinShaw/openasr)](https://github.com/QuintinShaw/openasr/releases)
-[![Downloads](https://img.shields.io/github/downloads/QuintinShaw/openasr/total)](https://github.com/QuintinShaw/openasr/releases)
+[![CI](https://github.com/chameleon-ai/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/chameleon-ai/openasr/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/chameleon-ai/openasr)](https://github.com/chameleon-ai/openasr/releases)
+[![Downloads](https://img.shields.io/github/downloads/chameleon-ai/openasr/total)](https://github.com/chameleon-ai/openasr/releases)
 
 [Website](https://openasr.org) · [Documentation](docs/DOCS_INDEX.md) · [License](LICENSE)
 
@@ -56,14 +56,11 @@ No terminal needed. Install the app, drop in an audio file, and get your transcr
 ### CLI quickstart
 
 ```bash
-# Option A: Homebrew (macOS / Linux)
-brew install quintinshaw/tap/openasr
-
-# Option B: one-line installer (macOS / Linux)
+# Option A: one-line installer (macOS / Linux)
 curl -fsSL https://dl.openasr.org/install.sh | sh
 
-# Option C: grab a prebuilt binary from Releases
-# https://github.com/QuintinShaw/openasr/releases
+# Option B: grab a prebuilt binary from Releases
+# https://github.com/chameleon-ai/openasr/releases
 
 # Transcribe a file (first run offers to download a model — you confirm first)
 openasr transcribe recording.wav
@@ -93,25 +90,20 @@ Drop-in compatible with OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`) for 
 
 ### Docker
 
-Published images track each core release on
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr) (runtime binary +
-model-registry metadata only; pull models at runtime into a volume mounted at
-`/data`). They do not include `bench-suite` fixtures or committed baselines
-under `perf/`; run `openasr bench-suite` from a git checkout. The HTTP server
-never auto-downloads a pack — install one first:
+Images are built from this repository (runtime binary + model-registry
+metadata only; pull models at runtime into a volume mounted at `/data`). They
+do not include `bench-suite` fixtures or committed baselines under `perf/`;
+run `openasr bench-suite` from a git checkout. The HTTP server never
+auto-downloads a pack — install one first:
 
 ```bash
-docker pull quintinshaw/openasr:latest
-docker run --rm -d --name openasr \
-  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker compose up -d openasr
 docker logs openasr
 # pairing admin token: <token> (saved at /data/pairing-admin-token)
 docker exec openasr openasr pull whisper-small --yes
 
 # NVIDIA GPU (requires NVIDIA Container Toolkit; sm_75 / Turing+)
-docker pull quintinshaw/openasr:cuda-latest
-docker run --rm -d --name openasr-cuda --gpus all \
-  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+docker compose --profile gpu up -d openasr-cuda
 ```
 
 The default command listens on `0.0.0.0:8080` with HTTPS (`--tls-self-signed`)
@@ -141,24 +133,18 @@ mandatory. Do not set it on an untrusted network.
 docker run --rm -d --name openasr \
   -p 8080:8080 -v openasr-data:/data \
   -e OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1 \
-  quintinshaw/openasr:latest \
+  openasr:local \
   serve --addr 0.0.0.0:8080 --pairing-admin-token-file /data/pairing-admin-token
 ```
 
-| Tag | Platforms | Notes |
-| --- | --- | --- |
-| `latest`, `<version>`, `sha-<short>` | `linux/amd64`, `linux/arm64` | CPU |
-| `cuda-latest`, `cuda-<version>`, `cuda-sha-<short>` | `linux/amd64` | CUDA 13.2 runtime; fail-closed if no GPU is visible |
-
 Vulkan, ROCm, and musl builds ship as GitHub Release archives only (not as
 images). Local source builds: `Dockerfile` / `Dockerfile.cuda` and
-`compose.yaml`. Longer guide (tags, compose, networking):
-[openasr.org/docs/docker](https://openasr.org/docs/docker/).
+`compose.yaml`.
 
 ### Building from source
 
 ```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git
+git clone --recurse-submodules https://github.com/chameleon-ai/openasr.git
 cd openasr
 cargo build --release -p openasr-cli
 ```

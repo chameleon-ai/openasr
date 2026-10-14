@@ -7,9 +7,9 @@
 **语音转文字,完全在你自己的设备上运行。**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![CI](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/QuintinShaw/openasr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/QuintinShaw/openasr)](https://github.com/QuintinShaw/openasr/releases)
-[![Downloads](https://img.shields.io/github/downloads/QuintinShaw/openasr/total)](https://github.com/QuintinShaw/openasr/releases)
+[![CI](https://github.com/chameleon-ai/openasr/actions/workflows/ci.yml/badge.svg)](https://github.com/chameleon-ai/openasr/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/chameleon-ai/openasr)](https://github.com/chameleon-ai/openasr/releases)
+[![Downloads](https://img.shields.io/github/downloads/chameleon-ai/openasr/total)](https://github.com/chameleon-ai/openasr/releases)
 
 [官网](https://openasr.org) · [文档](docs/DOCS_INDEX.md) · [License](LICENSE)
 
@@ -56,14 +56,11 @@
 ### CLI 快速上手
 
 ```bash
-# 方式一: Homebrew (macOS / Linux)
-brew install quintinshaw/tap/openasr
-
-# 方式二: 一行安装脚本 (macOS / Linux)
+# 方式一: 一行安装脚本 (macOS / Linux)
 curl -fsSL https://dl.openasr.org/install.sh | sh
 
-# 方式三: 从 Releases 页面下载预编译二进制
-# https://github.com/QuintinShaw/openasr/releases
+# 方式二: 从 Releases 页面下载预编译二进制
+# https://github.com/chameleon-ai/openasr/releases
 
 # 转写一个文件 (首次运行会提示下载默认模型,需要你确认)
 openasr transcribe recording.wav
@@ -93,24 +90,19 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 
 ### Docker
 
-每个 core release 会同步发布到
-[Docker Hub](https://hub.docker.com/r/quintinshaw/openasr)(仅运行时二进制 +
-model-registry 元数据;模型权重在运行时拉取到挂载在 `/data` 的卷)。镜像不含
-`perf/` 下的 bench-suite 夹具与基线，容器里直接跑 `openasr bench-suite`
-会找不到文件；基准请在 git 检出里跑。HTTP 服务 **不会**自动下载模型——先显式安装:
+镜像从本仓库构建(仅运行时二进制 + model-registry 元数据;模型权重在运行时
+拉取到挂载在 `/data` 的卷)。镜像不含 `perf/` 下的 bench-suite 夹具与基线，
+容器里直接跑 `openasr bench-suite` 会找不到文件；基准请在 git 检出里跑。
+HTTP 服务 **不会**自动下载模型——先显式安装:
 
 ```bash
-docker pull quintinshaw/openasr:latest
-docker run --rm -d --name openasr \
-  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:latest
+docker compose up -d openasr
 docker logs openasr
 # pairing admin token: <token> (saved at /data/pairing-admin-token)
 docker exec openasr openasr pull whisper-small --yes
 
 # NVIDIA GPU(需要 NVIDIA Container Toolkit; sm_75 / Turing 及以上)
-docker pull quintinshaw/openasr:cuda-latest
-docker run --rm -d --name openasr-cuda --gpus all \
-  -p 8080:8080 -v openasr-data:/data quintinshaw/openasr:cuda-latest
+docker compose --profile gpu up -d openasr-cuda
 ```
 
 默认命令在 `0.0.0.0:8080` 上启用 HTTPS（`--tls-self-signed`）和设备配对。配对完成前，未认证的 `/v1/*` 请求返回 401；`GET /health` 仍是存活探针。直连容器请用 `curl -k`，或钉住自签证书。
@@ -125,24 +117,17 @@ docker run --rm -d --name openasr-cuda --gpus all \
 docker run --rm -d --name openasr \
   -p 8080:8080 -v openasr-data:/data \
   -e OPENASR_ALLOW_INSECURE_NON_LOOPBACK=1 \
-  quintinshaw/openasr:latest \
+  openasr:local \
   serve --addr 0.0.0.0:8080 --pairing-admin-token-file /data/pairing-admin-token
 ```
 
-| 标签 | 平台 | 说明 |
-| --- | --- | --- |
-| `latest`、`<version>`、`sha-<short>` | `linux/amd64`、`linux/arm64` | CPU |
-| `cuda-latest`、`cuda-<version>`、`cuda-sha-<short>` | `linux/amd64` | CUDA 13.2 runtime;看不到 GPU 时失败即停 |
-
 Vulkan / ROCm / musl 变体只以 GitHub Release 压缩包形式提供(不做镜像)。本地
-源码构建见 `Dockerfile` / `Dockerfile.cuda` 与 `compose.yaml`。更完整的标签、
-组网与 compose 说明:
-[openasr.org/docs/docker](https://openasr.org/docs/docker/)。
+源码构建见 `Dockerfile` / `Dockerfile.cuda` 与 `compose.yaml`。
 
 ### 从源码构建
 
 ```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git
+git clone --recurse-submodules https://github.com/chameleon-ai/openasr.git
 cd openasr
 cargo build --release -p openasr-cli
 ```

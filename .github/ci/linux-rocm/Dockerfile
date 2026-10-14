@@ -58,6 +58,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 RUN openasr-ci-verify
 
-LABEL org.opencontainers.image.source="https://github.com/QuintinShaw/openasr" \
+LABEL org.opencontainers.image.source="https://github.com/chameleon-ai/openasr" \
       org.opencontainers.image.description="Pinned Linux ROCm 7.2.1 build environment for OpenASR CI" \
       org.opencontainers.image.licenses="Apache-2.0"

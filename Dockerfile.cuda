@@ -1,16 +1,10 @@
 # CUDA-enabled *source-build* image for local NVIDIA GPU development
 # (Turing/sm_75 and up -- RTX 20xx, GTX 16xx, T4, and newer Ampere/Ada/Hopper).
 #
-# Published images on Docker Hub are assembled from the released
-# `openasr-<version>-linux-x86_64-cuda.tar.gz` asset via Dockerfile.cuda.release
-# (see .github/workflows/docker-release.yml). That path is preferred for
-# releases because crates/openasr-core's default CUDA arch list already
-# includes sm_75 (see crates/openasr-core/src/cuda_targets.rs), so the
-# published binary matches this image's Turing floor without a second compile.
-#
-# Keep this Dockerfile for:
+# The Docker Hub image channel is retired, so this source-build image is the
+# container form for CUDA and serves:
 #   - `docker compose --profile gpu` / unreleased tree testing
-#   - validating a CUDA build when no release asset exists yet
+#   - validating a CUDA build
 #
 # CUDA toolkit version (13.2.0) and base OS (Ubuntu 22.04) match the
 # `linux-x86_64-cuda` leg in .github/workflows/release-binaries.yml so the

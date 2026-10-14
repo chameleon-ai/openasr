@@ -21,7 +21,7 @@ The native backend (ggml) is a **git submodule compiled from source**, so a plai
 `git clone` will not build until you fetch it:
 
 ```bash
-git clone --recurse-submodules https://github.com/QuintinShaw/openasr.git
+git clone --recurse-submodules https://github.com/chameleon-ai/openasr.git
 # or, in an existing clone:
 git submodule update --init --recursive
 ```
@@ -80,12 +80,11 @@ docker logs openasr-docker-smoke
 docker rm -f openasr-docker-smoke
 ```
 
-Published release images live on Docker Hub (`quintinshaw/openasr`,
-`quintinshaw/openasr:cuda-*`) and are assembled from GitHub Release assets by
-`.github/workflows/docker-release.yml` via `Dockerfile.release` /
-`Dockerfile.cuda.release`. See [RELEASING.md](RELEASING.md#docker-hub-images).
-Runtime images contain the binary and model-registry metadata only; they do
-not include `perf/` bench-suite fixtures or baselines.
+No published registry images are maintained (the Docker Hub channel was
+retired); the source-build image above is the only container form. It
+contains the binary and model-registry metadata only and does not include
+`perf/` bench-suite fixtures or baselines. See
+[RELEASING.md](RELEASING.md#post-publication-distribution-gate).
 
 ## Formatting and linting
 

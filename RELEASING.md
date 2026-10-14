@@ -201,7 +201,7 @@ Any failure leaves the GitHub release as a draft.
 
 ### GitHub Environment `core-release`
 
-Create this Environment on `QuintinShaw/openasr` before the first
+Create this Environment on `chameleon-ai/openasr` before the first
 Actions-driven publish. Required reviewers must be enabled so the undraft
 step is not available until a human approves the `publish-release` job in
 the Actions UI.
@@ -211,14 +211,13 @@ No Environment secrets are required: the B2 write credentials of the retired
 Environment secrets (and the B2 application key behind them) can be deleted
 on the repository.
 
-After publishing with `GITHUB_TOKEN`, the orchestrator explicitly dispatches one
-independent GitHub Actions workflow. A token-created release does not trigger
-new `release: published` workflow runs; those listeners remain available for
-maintainer-created releases. The dispatch job runs only after `publish-release`
-succeeds, and a failed dispatch can be retried on its own:
-
-- `publish-core-channels.yml` moves Docker/Homebrew only after the canonical
-  catalog plane is complete and the release-mirror gate has passed.
+After publishing, no secondary artifact is published anymore: the Docker Hub
+and Homebrew channels are retired. The post-publication distribution gate
+(`verify-release-distribution.yml`) re-verifies the canonical distribution
+state instead of publishing it. A token-created release does not trigger a
+`release: published` workflow run, so the gate runs automatically only for
+maintainer-created releases; it can also be dispatched manually against any
+published tag (see "Post-publication distribution gate" below).
 
 ### Qualify and activate one exact backend after publication
 
@@ -266,71 +265,24 @@ Current releases distribute one neutral Windows host plus target-scoped
 CUDA/HIP backend packs; the production-signed model/backend catalog is their
 only activation trust plane.
 
-## Homebrew tap
+## Post-publication distribution gate
 
-`publish-core-channels.yml` bumps
-`Formula/openasr.rb` in [`QuintinShaw/homebrew-tap`](https://github.com/QuintinShaw/homebrew-tap)
-(version + per-target sha256 for `macos-arm64`, `linux-x86_64`, `linux-arm64`,
-read from the just-published release's `SHA256SUMS`) and pushes straight to
-that repo's `main`. It uses `scripts/update-homebrew-formula.py`, which fails
-closed if the formula's shape does not match what it expects (e.g. a target's
-`url` line has no corresponding `--sha256` given), rather than risk writing a
-formula with a stale hash paired with the new version.
+The Docker Hub and Homebrew secondary channels are retired: no user-facing
+artifact is published outside the GitHub Release. What remains after
+publication is verification of the canonical distribution state.
 
-This needs a `HOMEBREW_TAP_TOKEN` repository secret: a **fine-grained GitHub
-PAT** scoped to the `QuintinShaw/homebrew-tap` repository only, with
-**Contents: Read and write** permission (nothing else). If the secret is not
-set, the job prints a `::notice::` and skips -- the release itself still
-succeeds and stays green; the tap formula just does not get bumped for that
-release (bump it manually by re-running the `update-homebrew-tap` job, or by
-hand, once the secret exists).
-
-## Docker Hub images
-
-`publish-core-channels.yml` runs only after the GitHub draft is published by
-the catalog finalizer. It builds runtime images from the published Linux
-release assets (no second cargo build inside Docker):
-
-- CPU multi-arch (`linux/amd64` + `linux/arm64`) from
-  `openasr-<version>-linux-x86_64.tar.gz` / `linux-arm64.tar.gz` via
-  `Dockerfile.release`
-- CUDA (`linux/amd64` only) from `openasr-<version>-linux-x86_64-cuda.tar.gz`
-  via `Dockerfile.cuda.release`
-
-Images push to Docker Hub under the `quintinshaw` namespace:
-
-```text
-quintinshaw/openasr:<version>
-quintinshaw/openasr:latest
-quintinshaw/openasr:sha-<short>
-quintinshaw/openasr:cuda-<version>
-quintinshaw/openasr:cuda-latest
-quintinshaw/openasr:cuda-sha-<short>
-```
-
-`latest` / `cuda-latest` move only on a successful formal release
-(`mark_latest: true`). Images ship the CLI binary plus bundled
-`model-registry` metadata only -- never model weights. Data lives under
-`OPENASR_HOME=/data`.
-
-This needs a `DOCKER_PAT` repository secret: a Docker Hub access token for
-user `quintinshaw` with permission to push `quintinshaw/openasr`. If the
-secret is not set, the job prints a `::notice::` and builds without pushing
--- the GitHub Release itself still succeeds; only the Hub publish is skipped.
-A red Docker job fails that leg of the workflow only and does not delete or
-roll back the already-published Release.
-
-The distribution gate and Homebrew formula updater check out helper scripts
-from the repository default branch, not the release tag, so a later CI-only
-fix still applies when repairing an already-public tag. Docker images still
-build from the tag's Dockerfiles and the published Linux tarballs.
-
-Manual dry-run / re-publish against an existing tag:
+`verify-release-distribution.yml` re-verifies the live signed catalog plane
+and the backend release mirrors against the just-published release. It checks
+out its helper scripts from the repository default branch, not the release
+tag, so a later CI-only fix still applies when re-checking an already-public
+tag; the release bytes themselves come from the published tag via
+`download-packs`, `SHA256SUMS`, and the live catalog. It runs on
+`release: published` (maintainer-created releases only -- a token-created
+release does not trigger it) and can be dispatched manually against any
+published tag:
 
 ```bash
-gh workflow run publish-core-channels.yml -f tag=vX.Y.Z
-gh workflow run docker-release.yml \
-  -f version=X.Y.Z -f tag=vX.Y.Z -f push=false -f mark_latest=false -f variants=all
+gh workflow run verify-release-distribution.yml -f tag=vX.Y.Z
 ```
 
 Local source-build Dockerfiles (`Dockerfile`, `Dockerfile.cuda`) remain for

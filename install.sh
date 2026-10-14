@@ -27,7 +27,7 @@
 
 set -eu
 
-REPO="QuintinShaw/openasr"
+REPO="chameleon-ai/openasr"
 GITHUB="https://github.com"
 
 prefix="${OPENASR_INSTALL_PREFIX:-$HOME/.local/bin}"

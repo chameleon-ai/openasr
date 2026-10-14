@@ -28,7 +28,7 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         for document in (
             release,
             (ROOT / ".github/workflows/deploy-catalog.yml").read_text(encoding="utf-8"),
-            (ROOT / ".github/workflows/publish-core-channels.yml").read_text(
+            (ROOT / ".github/workflows/verify-release-distribution.yml").read_text(
                 encoding="utf-8"
             ),
             (ROOT / "scripts/finalize-core-release.sh").read_text(encoding="utf-8"),
@@ -325,10 +325,10 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn('"${#backend_entries[@]}" -ne 21', finalize)
         self.assertLess(finalize.index("verify-catalog"), finalize.index("--draft=false"))
 
-    def test_release_matrix_has_one_formal_entrypoint_and_channels_wait_for_publish(self) -> None:
+    def test_release_matrix_has_one_formal_entrypoint_and_gate_waits_for_publish(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
         binaries = (ROOT / ".github/workflows/release-binaries.yml").read_text(encoding="utf-8")
-        channels = (ROOT / ".github/workflows/publish-core-channels.yml").read_text(
+        gate = (ROOT / ".github/workflows/verify-release-distribution.yml").read_text(
             encoding="utf-8"
         )
 
@@ -337,50 +337,51 @@ class CoreReleaseFinalizationContractTests(unittest.TestCase):
         self.assertIn("formal_release: true", release)
         self.assertNotIn("docker-images:", release)
         self.assertNotIn("update-homebrew-tap:", release)
-        self.assertIn("types: [published]", channels)
-        self.assertIn("uses: ./.github/workflows/docker-release.yml", channels)
-        self.assertIn("releases/latest", channels)
-        self.assertIn("distribution-gate:", channels)
-        self.assertIn("backend_hardware_evidence.py", channels)
-        self.assertNotIn("backend-hardware-audit-*.json", channels)
-        self.assertNotIn("--raw-audit", channels)
-        self.assertIn("gate-catalog-against-released-binary.sh", channels)
-        self.assertIn("verify-catalog", channels)
-        self.assertIn("verify-mirrors", channels)
-        self.assertNotIn("verify-cdn", channels)
-        self.assertIn("needs: [resolve, distribution-gate]", channels)
-        self.assertIn("git push origin main", channels)
-        self.assertNotIn("sync-release-to-cnb.sh", channels)
-        gate = channels.split("\n  distribution-gate:\n", 1)[1].split(
-            "\n  docker-images:\n", 1
-        )[0]
-        self.assertIn("github.event.repository.default_branch", gate)
-        self.assertNotIn("needs.resolve.outputs.tag", gate.split("Download release trust metadata", 1)[0])
-        brew = channels.split("\n  update-homebrew-tap:\n", 1)[1]
-        brew_checkout = brew.split("\n      - name: Check for tap credentials\n", 1)[0]
-        self.assertIn("github.event.repository.default_branch", brew_checkout)
-        self.assertNotIn("needs.resolve.outputs.tag", brew_checkout)
-        self.assertIn("ref: ${{ needs.resolve.outputs.tag }}", channels)
+        self.assertNotIn("dispatch-channels:", release)
+        self.assertIn("types: [published]", gate)
+        self.assertIn("releases/latest", gate)
+        self.assertIn("distribution-gate:", gate)
+        self.assertIn("backend_hardware_evidence.py", gate)
+        self.assertNotIn("backend-hardware-audit-*.json", gate)
+        self.assertNotIn("--raw-audit", gate)
+        self.assertIn("gate-catalog-against-released-binary.sh", gate)
+        self.assertIn("verify-catalog", gate)
+        self.assertIn("verify-mirrors", gate)
+        self.assertNotIn("verify-cdn", gate)
+        # The gate verifies; it must never publish anything user-facing.
+        self.assertNotIn("git push origin main", gate)
+        self.assertNotIn("uses: ./.github/workflows/docker-release.yml", gate)
+        self.assertNotIn("sync-release-to-cnb.sh", gate)
+        gate_job = gate.split("\n  distribution-gate:\n", 1)[1]
+        self.assertIn("github.event.repository.default_branch", gate_job)
+        self.assertNotIn("needs.resolve.outputs.tag", gate_job.split("Download release trust metadata", 1)[0])
 
-    def test_token_publication_explicitly_dispatches_channels_after_publish(self) -> None:
+    def test_retired_docker_hub_and_homebrew_channels_are_absent(self) -> None:
+        for missing in (
+            ROOT / ".github/workflows/docker-release.yml",
+            ROOT / ".github/workflows/docker-cuda-release.yml",
+            ROOT / ".github/workflows/publish-core-channels.yml",
+            ROOT / "Dockerfile.release",
+            ROOT / "Dockerfile.cuda.release",
+            ROOT / "scripts/update-homebrew-formula.py",
+        ):
+            self.assertFalse(missing.exists(), f"{missing} must stay deleted")
+        for path in (
+            ROOT / ".github/workflows/release-core.yml",
+            ROOT / ".github/workflows/verify-release-distribution.yml",
+        ):
+            text = path.read_text(encoding="utf-8")
+            lowered = text.lower()
+            self.assertNotIn("quintinshaw", lowered)
+            self.assertNotIn("homebrew", lowered)
+            self.assertNotIn("docker-release", lowered)
+            self.assertNotIn("DOCKER_PAT", text)
+            self.assertNotIn("HOMEBREW_TAP_TOKEN", text)
+
+    def test_token_publication_no_longer_dispatches_secondary_channels(self) -> None:
         release = (ROOT / ".github/workflows/release-core.yml").read_text(encoding="utf-8")
-        dispatch = release.split("\n  dispatch-channels:\n", 1)[1]
-        self.assertIn("needs: [resolve, publish-release]", dispatch)
-        self.assertIn("if: needs.resolve.outputs.should_finalize == 'true' && success()", dispatch)
-        self.assertIn("actions: write", dispatch)
-        self.assertIn("contents: read", dispatch)
-        self.assertNotIn("contents: write", dispatch)
-        self.assertNotIn("secrets.", dispatch)
-        self.assertIn("fail-fast: false", dispatch)
-        self.assertIn("workflow: [publish-core-channels.yml]", dispatch)
-        self.assertIn("RELEASE_TAG: ${{ needs.resolve.outputs.tag }}", dispatch)
-        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", dispatch)
-        self.assertIn("WORKFLOW: ${{ matrix.workflow }}", dispatch)
-        self.assertIn(
-            'gh workflow run "$WORKFLOW" --repo "$GITHUB_REPOSITORY" '
-            '--ref "$DEFAULT_BRANCH" -f "tag=$RELEASE_TAG"',
-            dispatch,
-        )
+        self.assertNotIn("dispatch-channels:", release)
+        self.assertNotIn("gh workflow run", release)
 
     def test_china_asset_mirror_is_removed_no_cnb_references_remain(self) -> None:
         for missing in (

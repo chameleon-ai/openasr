@@ -57,6 +57,6 @@ USER 1001:1001
 
 RUN openasr-ci-verify
 
-LABEL org.opencontainers.image.source="https://github.com/QuintinShaw/openasr" \
+LABEL org.opencontainers.image.source="https://github.com/chameleon-ai/openasr" \
       org.opencontainers.image.description="Pinned Linux build environment for OpenASR CI" \
       org.opencontainers.image.licenses="Apache-2.0"

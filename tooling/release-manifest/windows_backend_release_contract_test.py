@@ -682,8 +682,8 @@ class SkipWindowsContractTests(unittest.TestCase):
         cls.deploy = (ROOT / ".github" / "workflows" / "deploy-catalog.yml").read_text(
             encoding="utf-8"
         )
-        cls.channels = (
-            ROOT / ".github" / "workflows" / "publish-core-channels.yml"
+        cls.verify_gate = (
+            ROOT / ".github" / "workflows" / "verify-release-distribution.yml"
         ).read_text(encoding="utf-8")
 
     def test_windows_rows_are_filtered_never_deleted(self) -> None:
@@ -731,8 +731,8 @@ class SkipWindowsContractTests(unittest.TestCase):
             self.deploy,
         )
         self.assertIn("nothing to liveness-probe", self.deploy)
-        self.assertIn("skipping backend distribution checks", self.channels)
-        self.assertIn('have_backends=false', self.channels)
+        self.assertIn("skipping backend distribution checks", self.verify_gate)
+        self.assertIn('have_backends=false', self.verify_gate)
 
 
 if __name__ == "__main__":

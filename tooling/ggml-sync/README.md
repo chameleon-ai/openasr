@@ -2,7 +2,7 @@
 
 The ggml backend is vendored as a git submodule at
 `crates/openasr-core/third_party/openasr-ggml` (a submodule of the
-`QuintinShaw/openasr-ggml` fork). `crates/openasr-core/build.rs` compiles it from
+`chameleon-ai/openasr-ggml` fork). `crates/openasr-core/build.rs` compiles it from
 source with CMake, so the vendored tree is the real backend, not a mirror.
 
 ## Pin shape

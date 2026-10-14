@@ -23,11 +23,6 @@ Local engineering scripts for validation and iteration.
   - Replace the `<!-- install-verify:start/end -->` section of a release
     body in place (used by `.github/workflows/release-core.yml`'s
     `finalize-notes` job).
-- `update-homebrew-formula.py`
-  - Bump `Formula/openasr.rb`'s version and per-target sha256 in place (used
-    by `.github/workflows/publish-core-channels.yml` after the release is public
-    against a checkout of `QuintinShaw/homebrew-tap`). See `RELEASING.md`'s
-    "Homebrew tap" section.
 - `generate_longform_pause_probe.py`
   - Generate a deterministic longform pause probe from a local speech WAV — a
     test-data generator for longform planner validation.
