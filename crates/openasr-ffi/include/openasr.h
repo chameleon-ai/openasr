@@ -700,7 +700,8 @@ const char *openasr_last_error_message(void);
  * snapshot when it is strictly newer.
  *
  * Pass a URL (or set `OPENASR_CATALOG_REFRESH=1`) to opt into contacting the
- * catalog endpoint for a newer published catalog; `OPENASR_OFFLINE` vetoes that.
+ * catalog endpoint for a newer published catalog; `OPENASR_OFFLINE` vetoes
+ * that.
  *
  * Fails closed with [`OpenAsrStatus::CatalogFailed`] and no handle if the
  * catalog cannot be resolved, its signature does not verify, the epoch rolled

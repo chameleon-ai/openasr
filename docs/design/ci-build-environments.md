@@ -64,7 +64,7 @@ CLI.
 | Cache | Key | Failure mode |
 | --- | --- | --- |
 | `./.github/actions/rust-cache` | `release-binaries-${{ matrix.target }}` (and `release-binaries-xcframework`) | `continue-on-error: true` plus an explicit `::warning::`. A cache miss or action outage must not fail the release. |
-| cbindgen | `cbindgen-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}` | Miss installs with `cargo install cbindgen --locked`. |
+| cbindgen | `cbindgen-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}` | Miss installs the version pinned in `./.github/actions/setup-cbindgen` (`CBINDGEN_VERSION`). Do not float it: the committed FFI header is byte-compared against this generator, so a new cbindgen release can re-wrap doc comments and fail the header drift gate with no source change. |
 | docker-smoke buildx | `type=gha` | Layer cache only; the smoke assertions are unchanged. |
 | Windows HIP SDK | `hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-${{ runner.os }}` | Unchanged. |
 | Vulkan loader zip | `vulkan-loader-${{ env.VULKAN_LOADER_VERSION }}` | Unchanged; hash is rechecked on every run. |

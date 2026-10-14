@@ -1,5 +1,5 @@
 name: Setup cbindgen
-description: Restore ~/.cargo/bin/cbindgen from cache, otherwise cargo-install it.
+description: Restore ~/.cargo/bin/cbindgen from cache, otherwise cargo-install the pinned version.
 
 runs:
   using: composite
@@ -16,13 +16,21 @@ runs:
     - name: Install cbindgen
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        # Pinned because the committed crates/openasr-ffi/include/openasr.h is
+        # byte-compared against this generator (scripts/generate-ffi-header.sh
+        # --check). Doc-comment re-wrapping changed between cbindgen releases,
+        # so a floating install turns the FFI header drift gate red on a cache
+        # miss without any source change. Bump deliberately: regenerate the
+        # header locally with the same version and commit the result.
+        CBINDGEN_VERSION: 0.29.4
       run: |
         set -euo pipefail
         if command -v cbindgen >/dev/null 2>&1; then
           cbindgen --version
           exit 0
         fi
-        cargo install cbindgen --locked
+        cargo install cbindgen --version "$CBINDGEN_VERSION" --locked
         cbindgen --version
 
     - name: Verify cached cbindgen

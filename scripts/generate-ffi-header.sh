@@ -13,7 +13,9 @@ crate_dir="$repo_root/crates/openasr-ffi"
 header_path="$crate_dir/include/openasr.h"
 
 if ! command -v cbindgen >/dev/null 2>&1; then
-  echo "error: cbindgen not found on PATH. Install with: cargo install cbindgen --locked" >&2
+  echo "error: cbindgen not found on PATH. Install the version pinned in" >&2
+  echo "       .github/actions/setup-cbindgen (cargo install cbindgen --version <pinned> --locked)," >&2
+  echo "       otherwise --check disagrees with the committed header." >&2
   exit 1
 fi
 

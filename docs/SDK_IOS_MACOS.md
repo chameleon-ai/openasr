@@ -72,7 +72,9 @@ imply they are the official OpenASR app. See
 ```bash
 # One-time: install cbindgen if you don't have it (only needed after
 # changing crates/openasr-ffi/src/lib.rs's public surface).
-cargo install cbindgen --locked
+# Use the version pinned in .github/actions/setup-cbindgen (CBINDGEN_VERSION);
+# a different version can re-wrap doc comments and fail --check.
+cargo install cbindgen --version 0.29.4 --locked
 scripts/generate-ffi-header.sh          # regenerate crates/openasr-ffi/include/openasr.h
 scripts/generate-ffi-header.sh --check  # CI gate: fails if the committed header is stale
 
