@@ -152,7 +152,7 @@ jobs:
             # at least one), so assert the live catalog shape directly: it must
             # parse with a backends list (carried forward from the last full
             # release). verify-mirrors still probes the release mirrors that
-            # list names.
+            # list names (all carried-forward versions, so no --version filter).
             python3 - catalog.json <<'PY'
           import json
           import sys
@@ -163,5 +163,5 @@ jobs:
               raise SystemExit("live catalog backends must be an array")
           PY
             python3 tooling/release-manifest/backend_catalog.py verify-mirrors \
-              --catalog catalog.json --version "$VERSION"
+              --catalog catalog.json
           fi
