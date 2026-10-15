@@ -1578,6 +1578,16 @@ jobs:
             dist/backend-pack-hip-gfx*.json
             dist/backend-pack-vulkan-generic.json
           )
+          # nullglob drops unmatched globs but keeps the literal Vulkan path,
+          # so prune missing files: a skip-windows release must see an empty set.
+          pruned_entries=()
+          for candidate in "${backend_entries[@]}"; do
+            [ -f "$candidate" ] && pruned_entries+=("$candidate")
+          done
+          backend_entries=()
+          for candidate in ${pruned_entries[@]+"${pruned_entries[@]}"}; do
+            backend_entries+=("$candidate")
+          done
           if [ "${#backend_entries[@]}" -gt 0 ]; then
             [ -f "$neutral" ] || { echo "missing neutral host archive: $neutral" >&2; exit 1; }
           elif [ -f "$neutral" ]; then
