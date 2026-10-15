@@ -1759,10 +1759,15 @@ jobs:
             echo "remove/revoke those signatures explicitly, rebuild the inert bytes, then rerun local signing" >&2
             exit 1
           }
-          # nullglob drops optional unmatched artifact patterns instead of
-          # passing them to `gh` as literal paths.
+          # nullglob drops unmatched globs but keeps literal paths, so prune
+          # missing optionals (skip-windows ships no backend-plugin-hints.json).
           shopt -s nullglob
           assets=(staging/*.tar.gz staging/*.zip staging/*.dll staging/backend-pack-*.json staging/backend-plugin-hints.json staging/catalog.backends.candidate.json staging/openasr-*-build-provenance.bundle.json staging/openasr-*-qualification-*.json staging/*.sha256 staging/SHA256SUMS)
+          pruned_assets=()
+          for asset in ${assets[@]+"${assets[@]}"}; do
+            [ -e "$asset" ] && pruned_assets+=("$asset")
+          done
+          assets=(${pruned_assets[@]+"${pruned_assets[@]}"})
           # --clobber so a re-run (retrying a flaky leg) replaces stale assets
           # instead of failing on "asset already exists".
           [ "$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)" = "true" ] || {
