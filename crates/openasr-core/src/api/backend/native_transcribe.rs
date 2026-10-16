@@ -3410,20 +3410,15 @@ fn run_native_transcription_impl(
                         && let Some(spans) = vad_speech_spans
                         && let Some(word_end) =
                             last_word_end_sample(&slice, &transcription, plan.sample_rate_hz)
-                        && let Some(span_end) = spans
-                            .iter()
-                            .filter(|span| {
-                                span.start_sample <= word_end && word_end < span.end_sample
-                            })
-                            .map(|span| span.end_sample)
-                            .max()
-                        && let abandoned_end = midspan_refill_abandoned_end(
+                        && let Some(abandoned_end) = midspan_refill_abandoned_end(
                             &slice,
                             plan.slices.len(),
                             spans,
-                            span_end,
                             word_end,
                             plan.sample_rate_hz,
+                            plan.slices
+                                .get(slice.index + 1)
+                                .map(|next| next.start_sample),
                         )
                         && let Some(tail) = midspan_refill_slice(
                             &slice,
@@ -3953,6 +3948,17 @@ const MIDSPAN_REFILL_OVERLAP_SECONDS: f32 = 0.5;
 /// recovered words.
 const MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS: f32 = 1.0;
 
+/// The real gap the region immediately after a clean stop's last word must be
+/// clear for before an interior refill extends onto later VAD islands (see
+/// [`midspan_refill_abandoned_end`]). An island that begins within this gap of
+/// the last word is the last word's own region re-attested rather than
+/// separate abandoned speech: a repeated hook the model just emitted, which
+/// the re-decode would echo back as a stacked duplicate, or a music-bed
+/// fragmentation whose bursts the re-anchored decode cannot ground and so
+/// re-reads as the committed word. Only when the nearest island sits at least
+/// this far past the last word is the tail speech worth re-decoding.
+const MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS: f32 = 1.0;
+
 /// The follow-up slice a mid-span clean stop turns into a refill re-decode,
 /// or `None` when there is nothing to recover.
 ///
@@ -4020,21 +4026,34 @@ fn midspan_refill_slice(
     })
 }
 
-/// Where a clean-stop refill's abandoned tail ends: the carried span's end
-/// for an interior slice, and -- for the last planned slice, when the VAD
-/// attests a meaningful undecoded tail -- the latest VAD span end inside the
-/// slice past the last word, capped at the slice's content end.
+/// Where a clean-stop refill's abandoned tail ends, or `None` when nothing is
+/// recoverable: the carried span's end for an interior slice -- extended past
+/// any later VAD island no window reaches (see below) -- and, for the last
+/// planned slice, when the VAD attests a meaningful undecoded tail, the latest
+/// VAD span end inside the slice past the last word, capped at the slice's
+/// content end.
 ///
-/// The interior answer is deliberate: the next planned window starts inside
-/// the standard overlap and re-decodes whatever the carried span leaves
-/// behind, so staking a committed claim further along would collide with it
-/// at the seam. The last planned slice has no such successor -- audio its
-/// carried span ends before is this slice's own still un-decoded content --
-/// but it extends only onto speech the VAD actually attests. Ending the
-/// tail where the attestation ends (never at the content end blind) keeps
-/// the refill out of the dead air a clean stop usually leaves behind, where
-/// the model either hallucinates a tail or re-reads the committed last word
-/// far enough to survive seam de-duping as a duplicate; and requiring the
+/// `next_window_start_sample` is the start of the next planned window (the
+/// last planned slice, which has no successor, is passed `None`). For an
+/// interior slice the next window starts inside the standard overlap and, fed
+/// by this slice's carry, re-decodes the continuation -- but only as far back
+/// as its own start. A clean stop therefore abandons (a) the shallow leftover
+/// of the VAD span the last word sat in, and (b) any later VAD island: discrete
+/// speech that begins before the next window starts yet ends before this window
+/// closes, so neither this slice's decode nor the next window reaches back to
+/// it. Recovering that island is the point of the extension; a span that runs
+/// to or past this window's end is never an island, because the next window
+/// decodes it over the same carry, and staking a committed claim here only
+/// collides with the successor at the seam. Neither is an island that starts
+/// within [`MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS`] of the last word: that
+/// near region is the last word's own re-attestation, and extending into it
+/// buys a stacked duplicate rather than recovered speech. The last planned slice has no such
+/// successor, so it owns the tail out to the attested speech -- only where the
+/// VAD attests a meaningful undecoded tail, and never past the content end.
+/// Ending the tail where the attestation ends (never at the content end blind)
+/// keeps the refill out of the dead air a clean stop usually leaves behind,
+/// where the model either hallucinates a tail or re-reads the committed last
+/// word far enough to survive seam de-duping as a duplicate; and requiring the
 /// attestation to run at least
 /// [`MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS`] past the last word keeps a
 /// VAD span that merely dies just past the placed word (late-stop jitter)
@@ -4043,27 +4062,73 @@ fn midspan_refill_abandoned_end(
     slice: &AudioSlice,
     planned_slice_count: usize,
     spans: &[LongFormVadSlice],
-    span_end_sample: usize,
     word_end_sample: usize,
     sample_rate_hz: u32,
-) -> usize {
-    if slice.index + 1 != planned_slice_count {
-        return span_end_sample;
-    }
-    let min_extra_samples = (f64::from(MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS)
-        * f64::from(sample_rate_hz)) as usize;
-    let latest_span_end = spans
+    next_window_start_sample: Option<usize>,
+) -> Option<usize> {
+    // The leftover of the VAD span the last word sat in: the shallow end a
+    // normal late stop lands just before. `None` when the last word overshoots
+    // its span into a VAD gap -- the tail-into-silence shape in which only a
+    // later abandoned island, if one is reachable, gives a recoverable end.
+    let carrier_span_end = spans
         .iter()
-        .filter(|span| {
-            span.start_sample < slice.content_end_sample && span.end_sample > word_end_sample
-        })
+        .filter(|span| span.start_sample <= word_end_sample && word_end_sample < span.end_sample)
         .map(|span| span.end_sample)
         .max();
-    let target = match latest_span_end {
-        Some(end) if end - word_end_sample >= min_extra_samples => end,
-        _ => span_end_sample,
-    };
-    target.min(slice.content_end_sample)
+
+    if slice.index + 1 != planned_slice_count {
+        // Interior slice. Start from the carrier span's leftover and extend
+        // onto the later islands no window reaches: speech that begins before
+        // the next window starts, so the next window cannot decode it, but ends
+        // strictly before this window closes, so it is not a span the next
+        // window will take over over this slice's carry. Only when the nearest
+        // such island sits at least the minimum gap past the last word is the
+        // tail abandoned speech: a closer one is the last word's own region
+        // re-attested, and the re-decode would echo it back as a duplicate.
+        let next_start = next_window_start_sample.unwrap_or(slice.end_sample);
+        let min_gap =
+            (f64::from(MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS) * f64::from(sample_rate_hz)) as usize;
+        let mut nearest_gap: Option<usize> = None;
+        let mut island_end: Option<usize> = None;
+        for span in spans.iter().filter(|s| {
+            s.start_sample > word_end_sample
+                && s.end_sample < slice.end_sample
+                && s.start_sample < slice.content_end_sample
+                && s.start_sample < next_start
+        }) {
+            let gap = span.start_sample - word_end_sample;
+            nearest_gap = Some(match nearest_gap {
+                Some(closest) => closest.min(gap),
+                None => gap,
+            });
+            island_end = Some(match island_end {
+                Some(kept) => kept.max(span.end_sample),
+                None => span.end_sample,
+            });
+        }
+        match (nearest_gap, island_end) {
+            (Some(gap), Some(island_end)) if gap >= min_gap => {
+                let end = carrier_span_end;
+                Some(end.map_or(island_end, |kept| kept.max(island_end)))
+            }
+            _ => carrier_span_end,
+        }
+    } else {
+        let min_extra_samples = (f64::from(MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS)
+            * f64::from(sample_rate_hz)) as usize;
+        let latest_span_end = spans
+            .iter()
+            .filter(|span| {
+                span.start_sample < slice.content_end_sample && span.end_sample > word_end_sample
+            })
+            .map(|span| span.end_sample)
+            .max();
+        let target = match latest_span_end {
+            Some(end) if end - word_end_sample >= min_extra_samples => end,
+            _ => carrier_span_end?,
+        };
+        Some(target.min(slice.content_end_sample))
+    }
 }
 
 /// Thresholds for the per-slice collapsed-word-run drop (longform driver), in
@@ -6281,7 +6346,8 @@ mod guard_tail_tests {
         ];
         let word_end = (239.06 * RATE as f32) as usize;
         let span_end = (239.74 * RATE as f32) as usize;
-        let end = midspan_refill_abandoned_end(&parent, 4, &spans, span_end, word_end, RATE);
+        let end = midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None)
+            .expect("a deep attested final-slice tail is recoverable");
         // ...but it stops where the attestation ends, not at the content end.
         assert_eq!(end, (248.31 * RATE as f32) as usize);
         assert!(
@@ -6308,8 +6374,8 @@ mod guard_tail_tests {
         let word_end = (226.8 * RATE as f32) as usize;
         let span_end = (226.9 * RATE as f32) as usize;
         assert_eq!(
-            midspan_refill_abandoned_end(&parent, 4, &spans, span_end, word_end, RATE),
-            span_end,
+            midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None),
+            Some(span_end),
             "a VAD span dying just past the word is jitter, not an abandoned tail"
         );
         assert!(
@@ -6326,8 +6392,8 @@ mod guard_tail_tests {
         let parent = slice(221.0, 227.0);
         let spans = vec![vad_slice(218.0, 227.0)];
         let word_end = (225.5 * RATE as f32) as usize;
-        let span_end = (227.0 * RATE as f32) as usize;
-        let end = midspan_refill_abandoned_end(&parent, 4, &spans, span_end, word_end, RATE);
+        let end = midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None)
+            .expect("a final slice has no next window to own the span's tail");
         assert_eq!(end, parent.content_end_sample);
         midspan_refill_slice(&parent, end, word_end, RATE, 4, 4, true)
             .expect("a final slice has no next window to own the span's tail");
@@ -6347,25 +6413,89 @@ mod guard_tail_tests {
         };
         let spans = vec![vad_slice(239.02, 239.74), vad_slice(240.46, 249.5)];
         let word_end = (239.06 * RATE as f32) as usize;
-        let span_end = (239.74 * RATE as f32) as usize;
         assert_eq!(
-            midspan_refill_abandoned_end(&parent, 4, &spans, span_end, word_end, RATE),
-            parent.content_end_sample,
+            midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None),
+            Some(parent.content_end_sample),
             "the extension is capped where the slice's audio ends"
         );
     }
 
     #[test]
-    fn abandoned_end_never_extends_an_interior_slice() {
-        // Whatever the VAD attests past the last word, the next planned window
-        // owns it -- the interior target stays at the carried span's end.
-        let parent = slice(234.45, 248.57); // index 3 of a 5-slice plan
-        let spans = vec![vad_slice(239.02, 239.74), vad_slice(240.46, 248.31)];
-        let word_end = (239.06 * RATE as f32) as usize;
-        let span_end = (239.74 * RATE as f32) as usize;
-        assert_eq!(
-            midspan_refill_abandoned_end(&parent, 5, &spans, span_end, word_end, RATE),
-            span_end
+    fn interior_slice_extends_onto_a_reachable_later_island() {
+        // The claire-uvr shape: an interior window whose clean stop lands its
+        // last word just past the end of its VAD span (into a gap), with a
+        // later discrete island of speech that ends before the window closes
+        // yet begins before the next window starts. Neither this slice's
+        // decode nor the next window reaches back to it, so the abandoned tail
+        // extends onto the island and spawns a refill for it.
+        let parent = slice(230.69, 250.0); // index 3 of a 5-slice plan
+        let spans = vec![
+            vad_slice(236.58, 239.0),  // the span the last word just overshot
+            vad_slice(246.46, 249.75), // the later island no window reaches
+        ];
+        let word_end = (239.15 * RATE as f32) as usize;
+        let next_start = (249.5 * RATE as f32) as usize;
+        let end =
+            midspan_refill_abandoned_end(&parent, 5, &spans, word_end, RATE, Some(next_start))
+                .expect("a later island no window reaches is recoverable");
+        assert_eq!(end, (249.75 * RATE as f32) as usize);
+        let tail = midspan_refill_slice(&parent, end, word_end, RATE, 5, 5, false)
+            .expect("the interior slice's reachable island spawns a refill");
+        assert_eq!(tail.end_sample, (249.75 * RATE as f32) as usize);
+    }
+
+    #[test]
+    fn interior_slice_does_not_extend_onto_the_next_window() {
+        // A later span is NOT an abandoned island in either of two ways: it
+        // begins at or after the next window starts (the next window decodes it
+        // over the same carry), or it runs to/past this window's end (also the
+        // next window's claim). Neither is taken here, so no refill is spawned.
+        let parent = slice(230.69, 250.0); // index 3 of a 5-slice plan
+        let word_end = (239.15 * RATE as f32) as usize;
+        let next_start = (249.5 * RATE as f32) as usize;
+        let next_owned = vec![
+            vad_slice(236.58, 239.0),
+            vad_slice(249.6, 250.3), // begins at/after the next window start
+        ];
+        assert!(
+            midspan_refill_abandoned_end(&parent, 5, &next_owned, word_end, RATE, Some(next_start))
+                .is_none(),
+            "a speech span the next window decodes is not claimed"
+        );
+        let runs_to_end = vec![
+            vad_slice(236.58, 239.0),
+            vad_slice(246.46, 250.5), // runs to/past this window's end
+        ];
+        assert!(
+            midspan_refill_abandoned_end(
+                &parent,
+                5,
+                &runs_to_end,
+                word_end,
+                RATE,
+                Some(next_start)
+            )
+            .is_none(),
+            "a span running to the window end is the next window's"
+        );
+        // A span that begins within the minimum gap of the last word is the
+        // last word's own region re-read (a repeated-hook echo), not separate
+        // abandoned speech.
+        let leading_echo = vec![
+            vad_slice(236.58, 239.0),
+            vad_slice(239.5, 240.1), // starts 0.35 s after the last word
+        ];
+        assert!(
+            midspan_refill_abandoned_end(
+                &parent,
+                5,
+                &leading_echo,
+                word_end,
+                RATE,
+                Some(next_start)
+            )
+            .is_none(),
+            "a span hugging the last word is a re-read, not an abandoned island"
         );
     }
 }
