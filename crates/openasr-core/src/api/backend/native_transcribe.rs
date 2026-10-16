@@ -3099,6 +3099,7 @@ fn run_native_transcription_impl(
             // as `index:[start..end]s` refill-window facts for the provenance
             // string channel (see `midspan_refill_slice`).
             let mut midspan_refills: Vec<String> = Vec::new();
+            let mut refill_loop_drops: Vec<String> = Vec::new();
             // Monotonic identity assigned to every slice that actually decoded
             // with an in-decoder speaker model. The assembler carries this
             // provenance beside each surviving segment through overlap trim and
@@ -3185,16 +3186,16 @@ fn run_native_transcription_impl(
                 // `guard_cut_tail_slice`, mid-span clean stop:
                 // `midspan_refill_slice`) inserts itself directly behind the
                 // slice it recovers, ahead of the next planned window.
-                let mut slices_to_run: Vec<(AudioSlice, bool)> = plan
+                let mut slices_to_run: Vec<(AudioSlice, bool, bool)> = plan
                     .slices
                     .iter()
                     .zip(vad_gated.iter())
-                    .map(|(slice, &gated)| (slice.clone(), gated))
+                    .map(|(slice, &gated)| (slice.clone(), gated, false))
                     .collect();
                 let mut recovery_tails_spawned = 0usize;
                 let mut run_cursor = 0usize;
                 while run_cursor < slices_to_run.len() {
-                    let (slice, gated) = slices_to_run[run_cursor].clone();
+                    let (slice, gated, refill_crossed_gap) = slices_to_run[run_cursor].clone();
                     run_cursor += 1;
                     if execution_context.control.wait_at_slice_boundary()
                         == super::transcription_control::SliceBoundaryControl::Canceled
@@ -3315,7 +3316,7 @@ fn run_native_transcription_impl(
                             tail.start_sample as f64 / rate,
                             tail.end_sample as f64 / rate,
                         );
-                        slices_to_run.insert(run_cursor, (tail, false));
+                        slices_to_run.insert(run_cursor, (tail, false, false));
                     }
                     // A guard-cut slice only describes its audio up to its last
                     // placed word; remember that cut so the push below commits
@@ -3390,6 +3391,27 @@ fn run_native_transcription_impl(
                         );
                         collapsed_run_drops.push(format!("{slice_index}:{dropped_words}"));
                     }
+                    // A refill that crossed the abandonment gap holds no dense
+                    // speech in its window, so a loop out of it is the model
+                    // answering the bed, not the island: dropped whole, before
+                    // the carry update and assembly, for the same reasons.
+                    let refill_loop_words = if refill_crossed_gap {
+                        drop_loop_shaped_refill(
+                            &mut transcription.text,
+                            &mut transcription.segments,
+                        )
+                    } else {
+                        0
+                    };
+                    if refill_loop_words > 0 {
+                        log_refill_loop_drop(
+                            slice_index,
+                            slice.start_sample,
+                            slice.content_end_sample,
+                            refill_loop_words,
+                        );
+                        refill_loop_drops.push(format!("{slice_index}:{refill_loop_words}"));
+                    }
                     // A clean stop placed inside the slice's carried VAD span
                     // abandons that span's tail (see `midspan_refill_slice`):
                     // the VAD says speech is still ongoing where the model
@@ -3410,7 +3432,7 @@ fn run_native_transcription_impl(
                         && let Some(spans) = vad_speech_spans
                         && let Some(word_end) =
                             last_word_end_sample(&slice, &transcription, plan.sample_rate_hz)
-                        && let Some(abandoned_end) = midspan_refill_abandoned_end(
+                        && let Some(abandoned) = midspan_refill_abandoned_end(
                             &slice,
                             plan.slices.len(),
                             spans,
@@ -3422,7 +3444,7 @@ fn run_native_transcription_impl(
                         )
                         && let Some(tail) = midspan_refill_slice(
                             &slice,
-                            abandoned_end,
+                            abandoned.end_sample,
                             word_end,
                             plan.sample_rate_hz,
                             plan.slices.len(),
@@ -3444,7 +3466,7 @@ fn run_native_transcription_impl(
                             tail.start_sample as f64 / rate,
                             tail.end_sample as f64 / rate,
                         );
-                        slices_to_run.insert(run_cursor, (tail, false));
+                        slices_to_run.insert(run_cursor, (tail, false, abandoned.crossed_gap));
                         midspan_refill_commit_end = Some(word_end);
                     }
                     ran_any_slice = true;
@@ -3567,6 +3589,12 @@ fn run_native_transcription_impl(
                 longform_provenance.push(format!(
                     "core.native.longform.midspan-refill:slices={}",
                     midspan_refills.join(";")
+                ));
+            }
+            if !refill_loop_drops.is_empty() {
+                longform_provenance.push(format!(
+                    "core.native.decode.refill-loop-drop:slices={}",
+                    refill_loop_drops.join(";")
                 ));
             }
             let (assembled, assemble_stats, speaker_scope_by_segment) =
@@ -3959,6 +3987,24 @@ const MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS: f32 = 1.0;
 /// this far past the last word is the tail speech worth re-decoding.
 const MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS: f32 = 1.0;
 
+/// How long an abandoned island must last before a refill re-decodes it (see
+/// [`midspan_refill_abandoned_end`]). The gap rule above admits an island the
+/// model stopped at least a second short of; this one asks the island itself to
+/// hold something. On a quiet recording the VAD's absolute floor flags the bed
+/// itself, and the island that survives is a blip of room tone the model has
+/// nothing to say about -- where it answers with an interjection ("Oh, Lord.")
+/// invented for the silence. A dropped phrase is longer than a second by
+/// construction, so the floor costs only the blips.
+const MIDSPAN_REFILL_ISLAND_MIN_SECONDS: f32 = 1.0;
+
+/// How many times a refill's modal word bigram must repeat before the refill
+/// counts as a loop rather than speech (see [`refill_is_loop_shaped`]).
+const MIDSPAN_REFILL_LOOP_MIN_REPEATS: usize = 3;
+
+/// How much of a refill's adjacent word pairs its modal bigram must cover
+/// before the refill counts as a loop (see [`refill_is_loop_shaped`]).
+const MIDSPAN_REFILL_LOOP_MIN_PAIR_SHARE: f32 = 0.5;
+
 /// The follow-up slice a mid-span clean stop turns into a refill re-decode,
 /// or `None` when there is nothing to recover.
 ///
@@ -4026,6 +4072,21 @@ fn midspan_refill_slice(
     })
 }
 
+/// The tail a clean-stop refill re-decodes, and whether reaching it meant
+/// crossing the abandonment gap onto a later island.
+#[derive(Debug, PartialEq, Eq)]
+struct AbandonedTail {
+    end_sample: usize,
+    /// The tail reaches a VAD island at least
+    /// [`MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS`] past the last word: geometry
+    /// only an abandonment gap can produce. A gap means no dense speech runs
+    /// across the refill's window, which is what makes
+    /// [`refill_is_loop_shaped`] a safe verdict on its decode -- a hook the
+    /// guard cut in half would be loop-shaped too, but cannot sit behind a
+    /// gap.
+    crossed_gap: bool,
+}
+
 /// Where a clean-stop refill's abandoned tail ends, or `None` when nothing is
 /// recoverable: the carried span's end for an interior slice -- extended past
 /// any later VAD island no window reaches (see below) -- and, for the last
@@ -4047,7 +4108,10 @@ fn midspan_refill_slice(
 /// collides with the successor at the seam. Neither is an island that starts
 /// within [`MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS`] of the last word: that
 /// near region is the last word's own re-attestation, and extending into it
-/// buys a stacked duplicate rather than recovered speech. The last planned slice has no such
+/// buys a stacked duplicate rather than recovered speech. Nor is one shorter
+/// than [`MIDSPAN_REFILL_ISLAND_MIN_SECONDS`], which on a quiet recording is
+/// the bed crossing the VAD floor rather than a phrase the model walked past.
+/// The last planned slice has no such
 /// successor, so it owns the tail out to the attested speech -- only where the
 /// VAD attests a meaningful undecoded tail, and never past the content end.
 /// Ending the tail where the attestation ends (never at the content end blind)
@@ -4065,7 +4129,7 @@ fn midspan_refill_abandoned_end(
     word_end_sample: usize,
     sample_rate_hz: u32,
     next_window_start_sample: Option<usize>,
-) -> Option<usize> {
+) -> Option<AbandonedTail> {
     // The leftover of the VAD span the last word sat in: the shallow end a
     // normal late stop lands just before. `None` when the last word overshoots
     // its span into a VAD gap -- the tail-into-silence shape in which only a
@@ -4086,8 +4150,9 @@ fn midspan_refill_abandoned_end(
         // tail abandoned speech: a closer one is the last word's own region
         // re-attested, and the re-decode would echo it back as a duplicate.
         let next_start = next_window_start_sample.unwrap_or(slice.end_sample);
-        let min_gap =
-            (f64::from(MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS) * f64::from(sample_rate_hz)) as usize;
+        let rate = f64::from(sample_rate_hz);
+        let min_gap = (f64::from(MIDSPAN_REFILL_ISLAND_MIN_GAP_SECONDS) * rate) as usize;
+        let min_island = (f64::from(MIDSPAN_REFILL_ISLAND_MIN_SECONDS) * rate) as usize;
         let mut nearest_gap: Option<usize> = None;
         let mut island_end: Option<usize> = None;
         for span in spans.iter().filter(|s| {
@@ -4095,6 +4160,7 @@ fn midspan_refill_abandoned_end(
                 && s.end_sample < slice.end_sample
                 && s.start_sample < slice.content_end_sample
                 && s.start_sample < next_start
+                && s.end_sample - s.start_sample >= min_island
         }) {
             let gap = span.start_sample - word_end_sample;
             nearest_gap = Some(match nearest_gap {
@@ -4106,12 +4172,24 @@ fn midspan_refill_abandoned_end(
                 None => span.end_sample,
             });
         }
-        match (nearest_gap, island_end) {
-            (Some(gap), Some(island_end)) if gap >= min_gap => {
-                let end = carrier_span_end;
-                Some(end.map_or(island_end, |kept| kept.max(island_end)))
-            }
-            _ => carrier_span_end,
+        let island_end = match (nearest_gap, island_end) {
+            (Some(gap), Some(island_end)) if gap >= min_gap => Some(island_end),
+            _ => None,
+        };
+        match (carrier_span_end, island_end) {
+            (Some(carrier), Some(island_end)) => Some(AbandonedTail {
+                end_sample: carrier.max(island_end),
+                crossed_gap: island_end > carrier,
+            }),
+            (Some(carrier), None) => Some(AbandonedTail {
+                end_sample: carrier,
+                crossed_gap: false,
+            }),
+            (None, Some(island_end)) => Some(AbandonedTail {
+                end_sample: island_end,
+                crossed_gap: true,
+            }),
+            (None, None) => None,
         }
     } else {
         let min_extra_samples = (f64::from(MIDSPAN_REFILL_FINAL_EXTENSION_MIN_SECONDS)
@@ -4127,8 +4205,92 @@ fn midspan_refill_abandoned_end(
             Some(end) if end - word_end_sample >= min_extra_samples => end,
             _ => carrier_span_end?,
         };
-        Some(target.min(slice.content_end_sample))
+        Some(AbandonedTail {
+            end_sample: target.min(slice.content_end_sample),
+            crossed_gap: false,
+        })
     }
+}
+
+/// Whether a refill's decoded words are a stutter-scale loop: the modal
+/// normalized word bigram repeats at least [`MIDSPAN_REFILL_LOOP_MIN_REPEATS`]
+/// times and covers at least [`MIDSPAN_REFILL_LOOP_MIN_PAIR_SHARE`] of the
+/// refill's adjacent word pairs. Normalization is the assembler's word fold, so
+/// "Soaring." and "soaring" count as one phrase.
+///
+/// A refill that crossed an abandonment gap decodes a stretch of audio with no
+/// dense speech in it (see [`AbandonedTail::crossed_gap`]), so when the VAD
+/// island there is the bed rather than a phrase, the decode has nothing to
+/// ground on and loops: "Soin, soin, soin." over the music of a spa recording,
+/// "I'm pretty." over a voice modulator's SFX. Such a refill is the model's
+/// own answer to silence, and the words it placed carry that answer, not the
+/// island. The three-repeat floor keeps a real refill out of the rule: no
+/// island phrase the suite decodes repeats a bigram three times over half its
+/// windows, while a hook the guard cut in half does -- which is why the call
+/// site applies this only to gap-crossing refills.
+fn refill_is_loop_shaped(segments: &[Segment]) -> bool {
+    let units: Vec<String> = segments
+        .iter()
+        .flat_map(|segment| segment.words.iter())
+        .flat_map(|word| crate::longform::normalize_words(&word.word))
+        .collect();
+    let pairs = units.len().saturating_sub(1);
+    if pairs == 0 {
+        return false;
+    }
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
+    for pair in units.windows(2) {
+        *counts
+            .entry((pair[0].as_str(), pair[1].as_str()))
+            .or_default() += 1;
+    }
+    counts.values().copied().max().is_some_and(|best| {
+        best >= MIDSPAN_REFILL_LOOP_MIN_REPEATS
+            && best as f32 / pairs as f32 >= MIDSPAN_REFILL_LOOP_MIN_PAIR_SHARE
+    })
+}
+
+/// Drop a loop-shaped refill's whole decode, re-deriving the top-level text
+/// from the now-empty word list under the same guard
+/// [`drop_collapsed_word_runs`] uses: the text is rewritten only where the
+/// words account for it exactly, so a family whose text holds more than its
+/// word list keeps it. Returns the dropped word count.
+fn drop_loop_shaped_refill(text: &mut String, segments: &mut Vec<Segment>) -> usize {
+    if !refill_is_loop_shaped(segments) {
+        return 0;
+    }
+    let pre_drop_join = crate::transcript_text::join_segment_texts(
+        segments
+            .iter()
+            .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
+    );
+    let dropped: usize = segments.iter().map(|segment| segment.words.len()).sum();
+    segments.clear();
+    if pre_drop_join.trim() == text.trim() {
+        text.clear();
+    }
+    dropped
+}
+
+/// `OPENASR_TIMING` event for a refill dropped as a loop: which slice's refill,
+/// over which window, and how many words the loop held. The sibling
+/// `longform_slice_transcript` line shows the raw decode as decoded.
+fn log_refill_loop_drop(
+    slice_index: usize,
+    start_sample: usize,
+    end_sample: usize,
+    dropped_words: usize,
+) {
+    crate::stage_timing::log_detail_event(
+        "native_transcribe",
+        format!(
+            "stage=longform_refill_loop_drop index={slice_index} \
+             slice=[{:.2}..{:.2}]s dropped={dropped_words}",
+            start_sample as f32 / 16_000.0,
+            end_sample as f32 / 16_000.0,
+        ),
+    );
 }
 
 /// Thresholds for the per-slice collapsed-word-run drop (longform driver), in
@@ -4156,6 +4318,17 @@ const DEGENERATE_RUN_MIN_WORDS: usize = 3;
 /// (≈16+ words/s) is past any fluent pace, pile or not.
 const DEGENERATE_RUN_LONG_MIN_WORDS: usize = 5;
 const DEGENERATE_RUN_MIN_COMMON_SHORT_SECONDS: f32 = 0.15;
+/// A run of exactly this many words is degenerate on geometry alone once every
+/// one of its windows is this narrow. Two words on one instant is stronger
+/// evidence than the three-word pile the caps above catch: the fastest fluent
+/// pair still advances ~0.1 s between starts, so a pair whose windows are both
+/// at the alignment's floor was placed by nothing but the carry. A refill over
+/// a bed leaves exactly this -- "Relax. Relax." both words at 99.08 s -- and
+/// with the three-word floor it survives into the transcript. Longer runs stay
+/// on the second signal, because a hook the guard cut mid-phrase piles four
+/// words on one instant while every one of them is real.
+const DEGENERATE_RUN_ZERO_WIDTH_MIN_WORDS: usize = 2;
+const DEGENERATE_RUN_ZERO_WIDTH_SECONDS: f32 = 0.05;
 /// A short collapsed pile is still a degenerate echo when the model decoded
 /// it weakly: the median token confidence across the pile sits under this
 /// value. Hallucinated piles over silence or breath ("heat can Suggest",
@@ -4230,8 +4403,13 @@ fn find_collapsed_word_runs(
             max_start = max_start.max(words[j].start);
             j += 1;
         }
-        if j - i >= DEGENERATE_RUN_MIN_WORDS
-            && is_degenerate_run(&words[i..j], slice_head && i == 0, prev_tail_units)
+        let zero_width_pair = j - i == DEGENERATE_RUN_ZERO_WIDTH_MIN_WORDS
+            && words[i..j]
+                .iter()
+                .all(|word| word.end - word.start <= DEGENERATE_RUN_ZERO_WIDTH_SECONDS);
+        if zero_width_pair
+            || (j - i >= DEGENERATE_RUN_MIN_WORDS
+                && is_degenerate_run(&words[i..j], slice_head && i == 0, prev_tail_units))
         {
             let end = if words.len() - j <= DEGENERATE_RUN_TAIL_ABSORB_WORDS {
                 words.len()
@@ -6014,7 +6192,7 @@ mod vad_slice_gate_tests {
 #[cfg(test)]
 mod guard_tail_tests {
     use super::{
-        guard_cut_content_end_sample, guard_cut_tail_slice, last_word_end_sample,
+        AbandonedTail, guard_cut_content_end_sample, guard_cut_tail_slice, last_word_end_sample,
         midspan_refill_abandoned_end, midspan_refill_slice,
     };
     use crate::api::backend::{
@@ -6347,7 +6525,8 @@ mod guard_tail_tests {
         let word_end = (239.06 * RATE as f32) as usize;
         let span_end = (239.74 * RATE as f32) as usize;
         let end = midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None)
-            .expect("a deep attested final-slice tail is recoverable");
+            .expect("a deep attested final-slice tail is recoverable")
+            .end_sample;
         // ...but it stops where the attestation ends, not at the content end.
         assert_eq!(end, (248.31 * RATE as f32) as usize);
         assert!(
@@ -6375,7 +6554,10 @@ mod guard_tail_tests {
         let span_end = (226.9 * RATE as f32) as usize;
         assert_eq!(
             midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None),
-            Some(span_end),
+            Some(AbandonedTail {
+                end_sample: span_end,
+                crossed_gap: false
+            }),
             "a VAD span dying just past the word is jitter, not an abandoned tail"
         );
         assert!(
@@ -6393,7 +6575,8 @@ mod guard_tail_tests {
         let spans = vec![vad_slice(218.0, 227.0)];
         let word_end = (225.5 * RATE as f32) as usize;
         let end = midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None)
-            .expect("a final slice has no next window to own the span's tail");
+            .expect("a final slice has no next window to own the span's tail")
+            .end_sample;
         assert_eq!(end, parent.content_end_sample);
         midspan_refill_slice(&parent, end, word_end, RATE, 4, 4, true)
             .expect("a final slice has no next window to own the span's tail");
@@ -6415,7 +6598,10 @@ mod guard_tail_tests {
         let word_end = (239.06 * RATE as f32) as usize;
         assert_eq!(
             midspan_refill_abandoned_end(&parent, 4, &spans, word_end, RATE, None),
-            Some(parent.content_end_sample),
+            Some(AbandonedTail {
+                end_sample: parent.content_end_sample,
+                crossed_gap: false
+            }),
             "the extension is capped where the slice's audio ends"
         );
     }
@@ -6438,8 +6624,12 @@ mod guard_tail_tests {
         let end =
             midspan_refill_abandoned_end(&parent, 5, &spans, word_end, RATE, Some(next_start))
                 .expect("a later island no window reaches is recoverable");
-        assert_eq!(end, (249.75 * RATE as f32) as usize);
-        let tail = midspan_refill_slice(&parent, end, word_end, RATE, 5, 5, false)
+        assert_eq!(end.end_sample, (249.75 * RATE as f32) as usize);
+        assert!(
+            end.crossed_gap,
+            "reaching the island means crossing the gap, which is what the loop drop keys on"
+        );
+        let tail = midspan_refill_slice(&parent, end.end_sample, word_end, RATE, 5, 5, false)
             .expect("the interior slice's reachable island spawns a refill");
         assert_eq!(tail.end_sample, (249.75 * RATE as f32) as usize);
     }
@@ -6497,6 +6687,179 @@ mod guard_tail_tests {
             .is_none(),
             "a span hugging the last word is a re-read, not an abandoned island"
         );
+    }
+
+    #[test]
+    fn interior_slice_refuses_an_island_too_short_to_hold_a_phrase() {
+        // The ploomet shape: the VAD floor crosses a bed, and the island that
+        // survives is 0.72 s of room tone. Re-decoding it buys the model's
+        // answer to silence ("Oh, Lord."), so an island shorter than the floor
+        // is not claimed even with the gap behind it.
+        let parent = slice(230.69, 250.0); // index 3 of a 5-slice plan
+        let word_end = (239.15 * RATE as f32) as usize;
+        let next_start = (249.5 * RATE as f32) as usize;
+        let blip = vec![vad_slice(236.58, 239.0), vad_slice(243.4, 244.12)];
+        assert!(
+            midspan_refill_abandoned_end(&parent, 5, &blip, word_end, RATE, Some(next_start))
+                .is_none(),
+            "a sub-second island is bed, not a phrase the model walked past"
+        );
+        // A long island behind the same gap is still claimed.
+        let phrase = vec![vad_slice(236.58, 239.0), vad_slice(243.4, 246.9)];
+        let end =
+            midspan_refill_abandoned_end(&parent, 5, &phrase, word_end, RATE, Some(next_start))
+                .expect("a phrase-length island behind the gap is still recoverable");
+        assert_eq!(end.end_sample, (246.9 * RATE as f32) as usize);
+        assert!(end.crossed_gap);
+    }
+
+    #[test]
+    fn a_carrier_span_tail_does_not_report_a_crossed_gap() {
+        // A late stop inside the carried VAD span leaves a shallow tail. No gap
+        // was crossed, so the loop drop must not read it as a bed refill.
+        let parent = slice(230.69, 250.0); // index 3 of a 5-slice plan
+        let word_end = (238.5 * RATE as f32) as usize;
+        let next_start = (249.5 * RATE as f32) as usize;
+        let spans = vec![vad_slice(236.58, 239.0)];
+        let end =
+            midspan_refill_abandoned_end(&parent, 5, &spans, word_end, RATE, Some(next_start))
+                .expect("the carrier span's leftover is recoverable");
+        assert_eq!(end.end_sample, (239.0 * RATE as f32) as usize);
+        assert!(
+            !end.crossed_gap,
+            "the last word sits inside its span, so no gap was crossed"
+        );
+    }
+
+    fn word(start: f32, end: f32, text: &str) -> WordTimestamp {
+        WordTimestamp {
+            word: text.to_string(),
+            start,
+            end,
+            confidence: None,
+        }
+    }
+
+    fn segments_of(words: Vec<WordTimestamp>) -> Vec<Segment> {
+        vec![Segment {
+            start: 0.0,
+            end: 10.0,
+            text: String::new(),
+            speaker: None,
+            speaker_label: None,
+            speaker_person_id: None,
+            speaker_snapshot_label: None,
+            words,
+        }]
+    }
+
+    #[test]
+    fn a_loop_shaped_refill_is_recognized_and_real_recovery_is_not() {
+        // The ploomet/mikan shape: over a bed the re-decode falls back to one
+        // short phrase, twice over half its pairs.
+        let loops = segments_of(vec![
+            word(2.68, 2.78, "Soin,"),
+            word(2.98, 3.29, "soin,"),
+            word(3.21, 4.81, "soin."),
+            word(6.34, 6.44, "Soaring..."),
+            word(6.34, 6.44, "Soaring..."),
+            word(6.34, 6.44, "Soaring..."),
+            word(9.0, 9.4, "Soaring..."),
+        ]);
+        assert!(
+            super::refill_is_loop_shaped(&loops),
+            "one bigram over half the pairs is a loop, not a recovered phrase"
+        );
+        let alternating = segments_of(vec![
+            word(0.0, 0.3, "I'm"),
+            word(0.3, 0.9, "pretty."),
+            word(0.9, 1.2, "I'm"),
+            word(1.2, 1.8, "pretty."),
+            word(1.8, 2.1, "I'm"),
+            word(2.1, 2.7, "pretty."),
+            word(2.7, 3.0, "I'm"),
+        ]);
+        assert!(super::refill_is_loop_shaped(&alternating));
+        // The claire-uvr recovery: five distinct words, no repeat at all.
+        let recovered = segments_of(vec![
+            word(7.76, 8.02, "She"),
+            word(7.92, 8.29, "came"),
+            word(8.19, 8.61, "from"),
+            word(8.51, 9.2, "Planet"),
+            word(9.1, 10.7, "Claire."),
+        ]);
+        assert!(
+            !super::refill_is_loop_shaped(&recovered),
+            "recovered speech is not a loop"
+        );
+        // Two words never loop: the three-repeat floor is what keeps a short
+        // real refill out of the rule.
+        let short = segments_of(vec![word(1.46, 1.67, "Oh,"), word(1.57, 2.22, "Lord.")]);
+        assert!(!super::refill_is_loop_shaped(&short));
+        assert!(!super::refill_is_loop_shaped(&segments_of(vec![word(
+            0.0, 0.3, "Okay."
+        )])));
+    }
+
+    #[test]
+    fn dropping_a_loop_shaped_refill_empties_text_the_words_account_for() {
+        let mut text =
+            String::from("Soin, soin, soin. Soaring... Soaring... Soaring... Soaring...");
+        let mut segments = segments_of(vec![
+            word(2.68, 2.78, "Soin,"),
+            word(2.98, 3.29, "soin,"),
+            word(3.21, 4.81, "soin."),
+            word(6.34, 6.44, "Soaring..."),
+            word(6.34, 6.44, "Soaring..."),
+            word(6.34, 6.44, "Soaring..."),
+            word(9.0, 9.4, "Soaring..."),
+        ]);
+        let dropped = super::drop_loop_shaped_refill(&mut text, &mut segments);
+        assert_eq!(dropped, 7);
+        assert!(segments.is_empty());
+        assert!(
+            text.is_empty(),
+            "text the words accounted for is re-derived empty: {text:?}"
+        );
+        // A decode that is not a loop is left alone, text included.
+        let mut text = String::from("She came from Planet Claire.");
+        let mut segments = segments_of(vec![
+            word(7.76, 8.02, "She"),
+            word(7.92, 8.29, "came"),
+            word(8.19, 8.61, "from"),
+            word(8.51, 9.2, "Planet"),
+            word(9.1, 10.7, "Claire."),
+        ]);
+        assert_eq!(super::drop_loop_shaped_refill(&mut text, &mut segments), 0);
+        assert_eq!(text, "She came from Planet Claire.");
+        assert_eq!(segments[0].words.len(), 5);
+    }
+
+    #[test]
+    fn a_zero_width_pair_drops_and_a_piled_hook_quad_keeps() {
+        // The ploomet shape: both echo words sit on one instant.
+        let echo = vec![word(99.08, 99.08, "Relax."), word(99.08, 99.08, "Relax.")];
+        assert_eq!(
+            super::find_collapsed_word_runs(&echo, &[], true),
+            vec![(0, 2)],
+            "two words on one instant cannot be speech"
+        );
+        // A real hook the guard cut mid-phrase piles four words on one instant,
+        // but every one of them is real: the three-word rule still wants a
+        // second signal, and the confident pile does not provide one.
+        let hook = vec![
+            word(26.75, 26.75, "coming"),
+            word(26.75, 26.75, "and"),
+            word(26.75, 26.75, "they"),
+            word(26.75, 26.75, "don't"),
+        ];
+        assert!(
+            super::find_collapsed_word_runs(&hook, &[], true).is_empty(),
+            "a confident four-word pile keeps the historical second-signal rule"
+        );
+        // Two words with real widths are speech and stay.
+        let spoken = vec![word(12.88, 13.19, "I"), word(13.09, 13.51, "know")];
+        assert!(super::find_collapsed_word_runs(&spoken, &[], true).is_empty());
     }
 }
 
