@@ -4550,8 +4550,15 @@ fn drop_collapsed_word_runs(
             .iter()
             .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
     );
+    // The segment texts this transcript text is a join of, captured before the
+    // loop rewrites any of them (see the re-derive below).
+    let pre_drop_text_units: Vec<String> = segments
+        .iter()
+        .flat_map(|segment| crate::longform::normalize_words(&segment.text))
+        .collect();
     let mut dropped_words = 0usize;
     let mut dropped_spans: Vec<(f32, f32)> = Vec::new();
+    let mut rederived_segment_text = false;
     for (segment_index, segment) in segments.iter_mut().enumerate() {
         let runs = find_collapsed_word_runs(&segment.words, prev_tail_units, segment_index == 0);
         if runs.is_empty() {
@@ -4563,6 +4570,9 @@ fn drop_collapsed_word_runs(
             dropped_spans.push((first.start, last.end));
             dropped_words += hi - lo;
         }
+        let joined_before = crate::transcript_text::join_segment_texts(
+            segment.words.iter().map(|word| word.word.trim()),
+        );
         let survivors: Vec<WordTimestamp> = segment
             .words
             .iter()
@@ -4570,26 +4580,60 @@ fn drop_collapsed_word_runs(
             .filter(|(index, _)| !runs.iter().any(|&(lo, hi)| *index >= lo && *index < hi))
             .map(|(_, word)| word.clone())
             .collect();
-        if crate::transcript_text::join_segment_texts(
-            segment.words.iter().map(|word| word.word.trim()),
-        )
-        .trim()
-            == segment.text.trim()
+        let joined_survivors = crate::transcript_text::join_segment_texts(
+            survivors.iter().map(|word| word.word.trim()),
+        );
+        if joined_before.trim() == segment.text.trim()
+            || segment_text_is_superset_of_words(&segment.text, &joined_survivors)
         {
-            segment.text = crate::transcript_text::join_segment_texts(
-                survivors.iter().map(|word| word.word.trim()),
-            );
+            segment.text = joined_survivors;
+            rederived_segment_text = true;
         }
         segment.words = survivors;
     }
-    if dropped_words > 0 && pre_drop_join.trim() == text.trim() {
-        *text = crate::transcript_text::join_segment_texts(
-            segments
-                .iter()
-                .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
-        );
+    if dropped_words > 0 {
+        // The transcript text is the join of the segment texts, so it follows
+        // any segment text re-derived above -- but only once that is provably
+        // what it held, or a transcript carrying text the words never covered
+        // would lose it.
+        if rederived_segment_text && crate::longform::normalize_words(text) == pre_drop_text_units {
+            *text =
+                crate::transcript_text::join_segment_texts(segments.iter().map(|s| s.text.trim()));
+        } else if pre_drop_join.trim() == text.trim() {
+            *text = crate::transcript_text::join_segment_texts(
+                segments
+                    .iter()
+                    .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
+            );
+        }
     }
     (dropped_words, dropped_spans)
+}
+
+/// Whether a segment's text is a strict in-order superset of the words that
+/// survived a collapsed-run drop: the words are the text's own units, and
+/// everything between them is content the drop just removed.
+///
+/// This is the collapse-over-a-bed shape. A slice over a music bed decodes
+/// "Tap, tap, tap" twenty times and pins the tail copies on one instant, so the
+/// words keep a handful of real placements while the text still carries the
+/// whole echo; rebuilding from the survivors takes the echo out.
+///
+/// The runs dropped here are echoed filler by construction (the finder only
+/// fires on words piled onto one instant), so the text's copies of them are
+/// echo too. Text shorter than its words, or saying units the words do not, is
+/// refused: there the words are the degraded view and the text is the model's
+/// own reading, and rebuilding would delete a phrase the drop never touched.
+fn segment_text_is_superset_of_words(segment_text: &str, joined_words: &str) -> bool {
+    let text_units = crate::longform::normalize_words(segment_text);
+    let word_units = crate::longform::normalize_words(joined_words);
+    if word_units.is_empty() || word_units.len() >= text_units.len() {
+        return false;
+    }
+    let mut rest = text_units.iter();
+    word_units
+        .iter()
+        .all(|unit| rest.any(|candidate| candidate == unit))
 }
 
 /// `OPENASR_TIMING` event for a per-slice collapsed-run drop: which slice
@@ -13017,6 +13061,65 @@ mod tests {
         assert!(segments[0].words.is_empty());
         assert!(segments[0].text.is_empty());
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn collapsed_run_drop_strips_the_echo_the_segment_text_still_carried() {
+        // The ali shape: a slice over a music bed decodes "Tap, tap, tap"
+        // twenty times and pins the tail copies on one instant, so the words
+        // hold a few real placements while the text still carries every echo.
+        // Dropping the piled words must take the echo out of the text too.
+        let mut words = vec![
+            word_at("Tap,", 1.02, 1.72),
+            word_at("tap,", 2.51, 3.65),
+            word_at("tap.", 3.55, 4.65),
+        ];
+        // Six piled copies: the collapsed run the finder drops.
+        for _ in 0..6 {
+            words.push(word_at("tap,", 28.75, 28.75));
+        }
+        let echo = "Tap, tap, tap. tap, tap, tap, tap, tap, tap, tap, tap, tap";
+        let (_, mut segment) = segment_with_words(words);
+        segment.text = echo.to_string();
+        let mut text = echo.to_string();
+        let mut segments = vec![segment];
+        let (dropped, _) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
+        assert_eq!(dropped, 6);
+        assert_eq!(
+            segments[0].text, "Tap, tap, tap.",
+            "the text's echoed copies go with the words that carried them"
+        );
+        assert_eq!(
+            text, "Tap, tap, tap.",
+            "the transcript text follows the segment it is a join of"
+        );
+    }
+
+    #[test]
+    fn collapsed_run_drop_keeps_segment_text_the_words_do_not_cover() {
+        // The words are the degraded view here, not the text: they carry less
+        // than the segment says and are not a subset of it, so the text keeps
+        // its own reading rather than being rebuilt from a partial list.
+        let words = vec![
+            word_at("Tap,", 1.02, 1.72),
+            word_at("tap,", 2.51, 3.65),
+            word_at("tap,", 3.55, 4.65),
+        ];
+        let mut words = words;
+        for _ in 0..6 {
+            words.push(word_at("tap,", 28.75, 28.75));
+        }
+        let (_, mut segment) = segment_with_words(words);
+        segment.text = "The knock on the door was answered.".to_string();
+        let mut text = segment.text.clone();
+        let mut segments = vec![segment];
+        let (dropped, _) = drop_collapsed_word_runs(&mut text, &mut segments, &[]);
+        assert_eq!(dropped, 6);
+        assert_eq!(
+            segments[0].text, "The knock on the door was answered.",
+            "text the words never covered must not be rebuilt away"
+        );
+        assert_eq!(text, "The knock on the door was answered.");
     }
 
     #[test]
