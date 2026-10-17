@@ -3880,6 +3880,102 @@ fn tail_coverage_challenger_picks_the_round_reaching_furthest() {
 }
 
 #[test]
+fn tail_coverage_stub_admission_semantics() {
+    // The re-race pool appends the guard-cut round-1 stub as a T=0 entry after
+    // the clean rounds, and the challenger walk decides. Winner (a clean T=0
+    // carry-less round) stopped at 26.80 s; the clean rounds sit short of the
+    // tail while the stub's pre-trip placements run to 29.26 s -- the bibi
+    // shape, where only the stub transcribed the repeated phrase the guard
+    // cut. The stub's slot (last) must take the window.
+    let mut pool: Vec<(f32, Option<f32>, bool)> =
+        vec![(0.7_f32, Some(29.18_f32), false), (1.0, Some(28.9), false)];
+    let stub_frontier = 29.26_f32;
+    pool.push((0.0, Some(stub_frontier), false));
+    let stub_index = pool.len() - 1;
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        Some(stub_index),
+        "the stub's strict frontier lead must beat the hot clean rounds"
+    );
+
+    // A clean round that reaches further than the stub keeps the window: the
+    // stub only recovers a tail no clean round covered.
+    let mut pool = vec![(0.4_f32, Some(29.9_f32), false)];
+    pool.push((0.0, Some(stub_frontier), false));
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.4, 26.80),
+        Some(0)
+    );
+
+    // A tie keeps the clean round: the stub is appended after the clean pool,
+    // and the challenger walk only advances on a strict frontier win.
+    let mut pool = vec![(0.4_f32, Some(stub_frontier), false)];
+    pool.push((0.0, Some(stub_frontier), false));
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.4, 26.80),
+        Some(0)
+    );
+
+    // The stub within the progress margin of the winner covers no new audio.
+    let pool = [(0.0_f32, Some(27.1_f32), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        None
+    );
+
+    // A stub-only pool (every temperature round truncated) still challenges:
+    // the guard-cut slice is left to its own tail rescue, and the ladder is
+    // its only rescue.
+    let pool = [(0.0_f32, Some(stub_frontier), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        Some(0)
+    );
+}
+
+#[test]
+fn tail_stub_claim_gate_shapes() {
+    // bibi shape: a healthy winner leaves a small audible tail no clean
+    // round transcribed, and the stub was cut mid-window (29.26 in 29.35)
+    // holding the repeated phrase the guard looped on. The rescue exists for
+    // exactly this; it must be admitted.
+    assert!(super::whisper_tail_stub_may_claim(2.55, 29.26, 29.35));
+
+    // The shortfall cap is inclusive: a shortfall at the bound is still a
+    // small tail, not a broken winner.
+    assert!(super::whisper_tail_stub_may_claim(
+        super::WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS,
+        29.26,
+        29.35
+    ));
+
+    // Past the cap the winner is the broken side of the seam (claire 5.18,
+    // gilbert 5.26, ali 6.79, tequila-uvr 14.31 and 23.01, lobster 13.18):
+    // a degenerate-repeat stub's kept prefix cannot rescue that window, only
+    // shorten it.
+    for shortfall in [5.18_f32, 5.26, 6.79, 13.18, 14.31, 23.01] {
+        assert!(
+            !super::whisper_tail_stub_may_claim(shortfall, 29.26, 29.35),
+            "shortfall {shortfall} s must be refused"
+        );
+    }
+
+    // Frontier margin: 0.06 inside the window end is a real mid-phrase cut;
+    // 0.04 inside and a frontier exactly on the end are the loop's
+    // placements tiling to the slice end -- the tail claim is attention
+    // drift.
+    assert!(super::whisper_tail_stub_may_claim(2.55, 29.29, 29.35));
+    assert!(!super::whisper_tail_stub_may_claim(2.55, 29.31, 29.35));
+    assert!(!super::whisper_tail_stub_may_claim(2.55, 29.35, 29.35));
+
+    // The gates are independent: a small shortfall does not excuse a pinned
+    // frontier (ali/tequila shapes), and a stub cut mid-window does not
+    // excuse a broken winner (lobster).
+    assert!(!super::whisper_tail_stub_may_claim(0.01, 27.65, 27.65));
+    assert!(!super::whisper_tail_stub_may_claim(13.18, 25.87, 28.85));
+}
+
+#[test]
 fn token_stream_subsequence_shapes() {
     // In-order, non-contiguous: the longer stream carries everything the
     // shorter one says, in the same order, with more around it.

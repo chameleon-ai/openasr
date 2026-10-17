@@ -7481,6 +7481,7 @@ fn whisper_splice_unvoiced_tail_echo(
 /// row captured during THIS round's decode (the word-timing path uses it), so
 /// the surviving candidate's alignments must come from the same round that
 /// won, not an earlier discarded one.
+#[derive(Clone)]
 struct WhisperDecodeCandidate {
     text_trimmed: String,
     token_alignments: Vec<WhisperGeneratedTokenAlignment>,
@@ -7711,6 +7712,29 @@ const WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS: f32 = 2.0;
 /// that adds no new audio never triggers the swap.
 const WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS: f32 = 0.5;
 
+/// How much untranscribed audio the ladder's winner may leave at the end of
+/// its window before the guard-cut round-1 stub may take the window back as
+/// its tail rescue. The stub's adoption re-stamps the WHOLE window onto text
+/// that ends at the guard's kept prefix, so it only pays behind a winner that
+/// is otherwise healthy and stopped just short (bibi: a ~2.5 s repeated
+/// phrase behind a clean 26.8 s transcript). Once the winner's own tail
+/// shortfall is 5+ s the winner is the broken side of the seam, and handing
+/// its window to a degenerate-repeat stub trades one wrong transcript for a
+/// shorter, worse-timed one (the ali/claire/gilbert/lobster/tequila shapes,
+/// where the stub's kept prefix dropped real words the clean winner held).
+const WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS: f32 = 5.0;
+
+/// How far short of the window end the stub's placed frontier must sit before
+/// the stub may claim the tail in the audible-tail coverage re-race. A stub
+/// cut mid-phrase shows the guard stopped the transcript short of real audio
+/// (bibi: 29.26 in a 29.35 s window) -- the shape the rescue exists for. A
+/// stub whose frontier lands ON the window end (to the frame) looped while
+/// its cross-attention tiled the whole window: its placements reach the end
+/// by attention drift, not by covering it, and its kept prefix has abandoned
+/// the very tail it would claim. 0.05 s clears a stamp's rounding without
+/// admitting a pinned frontier.
+const WHISPER_LADDER_TAIL_STUB_WINDOW_END_MARGIN_SECONDS: f32 = 0.05;
+
 /// How far below the decoded region the window's trailing envelope may sit
 /// (dB) and still count as speech the winner failed to transcribe. Mirrors
 /// [`WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB`]: the same 6 dB tolerance the
@@ -7903,6 +7927,32 @@ struct WhisperLadderRound {
     candidate: WhisperDecodeCandidate,
     result: WhisperGreedyDecodeResult,
     evidence: Option<f32>,
+}
+
+/// Whether the guard-cut round-1 stub may enter the audible-tail coverage
+/// re-race when its placed frontier is `stub_frontier_seconds` in a window
+/// ending at `window_end_seconds` and the race winner leaves
+/// `tail_shortfall_seconds` of audible tail unclaimed.
+///
+/// Both bars keep the rescue pointed at the one shape it fixes. The
+/// shortfall cap: adopting the stub re-stamps the whole window onto text that
+/// ends at the guard's kept prefix, so the swap only pays behind a winner
+/// that is healthy but stopped just short. Past the cap the winner itself is
+/// the broken side of the seam and a degenerate-repeat stub's kept prefix
+/// cannot rescue it, only shorten it. The frontier margin: a stub cut
+/// mid-phrase shows the guard stopped the transcript short of real audio,
+/// while a stub whose frontier pins to the window end looped with its
+/// cross-attention tiling the window -- its placements reach the end by
+/// attention drift, its kept prefix abandoned the tail, and its tail claim
+/// is hollow.
+fn whisper_tail_stub_may_claim(
+    tail_shortfall_seconds: f32,
+    stub_frontier_seconds: f32,
+    window_end_seconds: f32,
+) -> bool {
+    tail_shortfall_seconds <= WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS
+        && stub_frontier_seconds + WHISPER_LADDER_TAIL_STUB_WINDOW_END_MARGIN_SECONDS
+            <= window_end_seconds
 }
 
 /// The pool position of the round that covers the most audio past the race
@@ -8503,6 +8553,17 @@ fn run_whisper_decode_loop(
         // at, for the re-race logs and its temperature cap below.
         let mut best_round = 1usize;
         let mut best_temperature = 0.0_f32;
+        // The round-1 decode, preserved before the rounds below can replace
+        // it. The ladder only runs because it was guard-cut, and a guard cut
+        // can fall mid-phrase: the guard sees the token cycle, not the audio,
+        // so a genuine repeated run ("yeah" x 6) that the loop locked onto is
+        // cut the same way a silence loop is. The audible-tail coverage
+        // re-race below may hand the window back to this decode when no clean
+        // round covers the tail its pre-trip placements reach into -- a
+        // guard-cut slice is left to its own tail rescue, and the ladder is
+        // its only rescue.
+        let mut guard_cut_stub: Option<(WhisperDecodeCandidate, WhisperGreedyDecodeResult)> =
+            Some((best.0.clone(), best.1.clone()));
         if whisper_ladder_debug_enabled() {
             eprintln!(
                 "openasr_whisper_greedy_decode stage=temperature_ladder event=ladder_start initial_prompt_text={:?}",
@@ -8922,12 +8983,16 @@ fn run_whisper_decode_loop(
         // the resulting hole actually is -- where each round's placed words
         // END relative to the window -- and, when the winner leaves a
         // speech-level tail unclaimed, hand the window to the round that
-        // reaches furthest into it. Fail-open at every step: no word
-        // placements, no measurable tail, or no qualifying challenger leaves
-        // the ladder's own winner exactly as the race picked it.
-        if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
-            && !clean_rounds.is_empty()
-        {
+        // reaches furthest into it. The guard-cut round-1 stub is a pool
+        // member too: its word pass keeps the full pre-trip placements, so a
+        // cut that fell mid-phrase (the guard sees the token cycle, not the
+        // audio) still lets its transcript claim the tail no clean round
+        // transcribed -- while the audibility gate keeps a loop-over-silence
+        // stub out, its placements riding on audio nothing left behind.
+        // Fail-open at every step: no word placements, no measurable tail, or
+        // no qualifying challenger leaves the ladder's own winner exactly as
+        // the race picked it.
+        if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention {
             // The last placed word's end, in slice-relative seconds: where
             // this round's transcription of the window stops.
             let placed_frontier = |cand: &WhisperDecodeCandidate,
@@ -8941,49 +9006,107 @@ fn run_whisper_decode_loop(
                     word_audio_rms_frames,
                 )
             };
-            let window_end = audio_duration_seconds.max(0.0);
-            let winner_frontier = placed_frontier(&best.0, &best.1);
-            let tail_shortfall = winner_frontier
-                .filter(|frontier| {
-                    window_end - frontier >= WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS
-                })
-                .zip(word_audio_rms_frames)
-                .filter(|(frontier, rms_frames)| {
-                    whisper_slice_tail_is_audible(rms_frames, *frontier, window_end)
-                })
-                .map(|(frontier, _)| window_end - frontier);
-            if let Some(tail_shortfall) = tail_shortfall {
-                let winner_frontier = winner_frontier.expect("audible tail implies a frontier");
-                let pool_frontiers: Vec<(f32, Option<f32>, bool)> = clean_rounds
-                    .iter()
-                    .map(|round| {
-                        (
-                            round.temperature,
-                            placed_frontier(&round.candidate, &round.result),
-                            !round.evidence.is_some_and(|secs| {
+            // The round-1 stub joins the pool alongside the clean rounds when
+            // it is not already the winner: a guard cut falls where the token
+            // cycle did, not where the speech did, so while its text ends at
+            // the cut its word pass keeps the full pre-trip placements -- the
+            // only copies of a genuine repeated phrase the guard looped on
+            // that any clean round ever decoded here. The audible-tail gate
+            // below keeps it out of the loop-over-silence shape, where those
+            // placements ride on audio no one is leaving behind; the stub's
+            // own bars ([`whisper_tail_stub_may_claim`]) keep it out of the
+            // two shapes where re-stamping the whole window onto its kept
+            // prefix loses more than it recovers -- a 5+ s shortfall means
+            // the winner is the broken side, and a frontier pinned to the
+            // window end means the tail claim is attention drift. The same
+            // minimum-evidence refusal that marks a collapsed clean round
+            // applies.
+            let stub_frontier = if best.1.guard_trip_ngram_len.is_some() {
+                // The stub is the winner already: there is nothing to take
+                // the window back from it.
+                None
+            } else {
+                guard_cut_stub.as_ref().and_then(|(cand, result)| {
+                    placed_frontier(cand, result).filter(|_| {
+                        whisper_ladder_evidence_span_seconds(cand, audio_duration_seconds)
+                            .is_some_and(|secs| {
                                 secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
-                            }),
-                        )
+                            })
                     })
-                    .collect();
-                if let Some(index) = whisper_tail_coverage_challenger(
-                    &pool_frontiers,
-                    best_temperature,
-                    winner_frontier,
-                ) {
-                    eprintln!(
-                        "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_coverage_won round={} temperature={} replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} challenger_frontier_secs={:.2}",
-                        clean_rounds[index].round,
-                        clean_rounds[index].temperature,
-                        pool_frontiers[index].1.unwrap_or_default(),
-                    );
-                    let challenger = clean_rounds.swap_remove(index);
-                    best = (challenger.candidate, challenger.result);
-                    best_evidence = challenger.evidence;
-                    // Every pool member but the carry-less round decoded the
-                    // carry prompt, so a swap back onto one leaves the carry
-                    // head-skip recovery below free to run.
-                    carry_less_round_won = false;
+                })
+            };
+            if !clean_rounds.is_empty() || stub_frontier.is_some() {
+                let window_end = audio_duration_seconds.max(0.0);
+                let winner_frontier = placed_frontier(&best.0, &best.1);
+                let tail_shortfall = winner_frontier
+                    .filter(|frontier| {
+                        window_end - frontier >= WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS
+                    })
+                    .zip(word_audio_rms_frames)
+                    .filter(|(frontier, rms_frames)| {
+                        whisper_slice_tail_is_audible(rms_frames, *frontier, window_end)
+                    })
+                    .map(|(frontier, _)| window_end - frontier);
+                if let Some(tail_shortfall) = tail_shortfall {
+                    let winner_frontier = winner_frontier.expect("audible tail implies a frontier");
+                    let mut pool_frontiers: Vec<(f32, Option<f32>, bool)> = clean_rounds
+                        .iter()
+                        .map(|round| {
+                            (
+                                round.temperature,
+                                placed_frontier(&round.candidate, &round.result),
+                                !round.evidence.is_some_and(|secs| {
+                                    secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
+                                }),
+                            )
+                        })
+                        .collect();
+                    let stub_index = stub_frontier
+                        .filter(|&frontier| {
+                            whisper_tail_stub_may_claim(tail_shortfall, frontier, window_end)
+                        })
+                        .map(|frontier| {
+                            pool_frontiers.push((0.0, Some(frontier), false));
+                            pool_frontiers.len().saturating_sub(1)
+                        });
+                    if let Some(index) = whisper_tail_coverage_challenger(
+                        &pool_frontiers,
+                        best_temperature,
+                        winner_frontier,
+                    ) {
+                        let challenger_frontier = pool_frontiers[index].1.unwrap_or_default();
+                        if Some(index) == stub_index {
+                            // Adopting the guard-cut round, which is how the
+                            // race-denial path already keeps a stub's window:
+                            // the transcript carries its pre-trip word
+                            // placements and its cut's stop reason, while its
+                            // text ends at the guard's kept prefix.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_stub_won replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} stub_frontier_secs={challenger_frontier:.2}",
+                            );
+                            if let Some((stub_candidate, stub_decode)) = guard_cut_stub.take() {
+                                best_evidence = whisper_ladder_evidence_span_seconds(
+                                    &stub_candidate,
+                                    audio_duration_seconds,
+                                );
+                                best = (stub_candidate, stub_decode);
+                                carry_less_round_won = false;
+                            }
+                        } else {
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_coverage_won round={} temperature={} replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} challenger_frontier_secs={challenger_frontier:.2}",
+                                clean_rounds[index].round, clean_rounds[index].temperature,
+                            );
+                            let challenger = clean_rounds.swap_remove(index);
+                            best = (challenger.candidate, challenger.result);
+                            best_evidence = challenger.evidence;
+                            // Every pool member but the carry-less round
+                            // decoded the carry prompt, so a swap back onto
+                            // one leaves the carry head-skip recovery below
+                            // free to run.
+                            carry_less_round_won = false;
+                        }
+                    }
                 }
             }
         }
