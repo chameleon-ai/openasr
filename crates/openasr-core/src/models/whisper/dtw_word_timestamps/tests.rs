@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn cross_attention_center_frame_is_the_mass_weighted_index() {
+    // Single peak at frame 2 (0-based): center = 2.5 (frame + 0.5).
+    let centered = cross_attention_center_frame(&[0.0, 0.0, 1.0, 0.0]);
+    assert!((centered.unwrap() - 2.5).abs() < 1e-6);
+    // Empty and all-zero rows carry no weight to center on.
+    assert!(cross_attention_center_frame(&[]).is_none());
+    assert!(cross_attention_center_frame(&[0.0, 0.0, 0.0]).is_none());
+    // A non-finite row refuses rather than producing a misleading center.
+    assert!(cross_attention_center_frame(&[1.0, f32::NAN, 1.0]).is_none());
+    // A two-frame mass spreads its center across them.
+    let spread = cross_attention_center_frame(&[1.0, 1.0]).unwrap();
+    assert!((spread - 1.0).abs() < 1e-6, "spread={spread}");
+}
+
+#[test]
 fn whisper_dtw_onset_lead_is_the_flat_baseline() {
     // The onset lead is the single flat constant (no density-scaled curve); the
     // runtime reads it via whisper_dtw_onset_lead, whose env-override fallback is

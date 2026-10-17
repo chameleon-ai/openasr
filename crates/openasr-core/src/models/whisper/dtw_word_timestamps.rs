@@ -2099,12 +2099,12 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
             let mut run_word_ranges: Vec<(usize, usize)> = Vec::new();
             for (lo, hi) in &runs {
                 let run_word_start = words.len();
-                let Some((band_start, band_end)) =
-                    run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution)
-                else {
-                    run_word_ranges.push((run_word_start, words.len()));
-                    continue;
-                };
+                let bounds =
+                    run_frame_bounds(*lo, *hi, &token_ids, timestamp_begin, frame_resolution);
+                // A run the decoder bracketed with no usable band falls back to
+                // the whole window rather than losing its words: an absent band
+                // is not an absent run.
+                let (band_start, band_end) = bounds.unwrap_or((0, frame_resolution));
                 let attention: Vec<Vec<f32>> = full_window[*lo..=*hi]
                     .iter()
                     .map(|row| row[band_start.min(row.len())..band_end.min(row.len())].to_vec())
@@ -2117,6 +2117,26 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
                     })
                     .collect();
                 let Some(spans) = dtw_align_token_frames(&attention) else {
+                    // An empty, ragged or non-finite attention matrix is the one
+                    // run the DTW cannot order. The run's words are still in the
+                    // decode text, so place them by center of mass instead of
+                    // deleting a phrase the transcript keeps saying.
+                    let fallback = whisper_run_center_of_mass_words(
+                        token_alignments,
+                        (*lo, *hi),
+                        (band_start, band_end),
+                        generated_probabilities,
+                        probabilities_aligned,
+                        seconds_per_frame,
+                        &decode_text,
+                    );
+                    if std::env::var_os("OPENASR_WHISPER_DEBUG_DTW_SPANS").is_some() {
+                        eprintln!(
+                            "  run=[{lo}..{hi}] dtw_unavailable fallback_words={}",
+                            fallback.len()
+                        );
+                    }
+                    words.extend(fallback);
                     run_word_ranges.push((run_word_start, words.len()));
                     continue;
                 };
@@ -2428,6 +2448,97 @@ pub(crate) fn whisper_cross_attention_word_timestamps(
             reason: format!("whisper cross-attention word timestamp token decode failed: {error}"),
         },
     )
+}
+
+/// Center of mass of one token's attention row, as a frame index, or `None`
+/// when the row is empty or carries no finite weight to center on.
+///
+/// Deliberately frame-based rather than duration-normalized: on this path the
+/// frames map to absolute wall-clock time from the clip start at a fixed 0.02 s
+/// each (see the `frame_resolution` comment in the caller), so a center has to
+/// be scaled by `seconds_per_frame` and offset by its own band. Squeezing it
+/// into `[0, duration]` instead -- what [`cross_attention_center_seconds`] does
+/// for the whole-window degrade -- would compress every timestamp of a clip
+/// shorter than the 30 s window.
+fn cross_attention_center_frame(frame_probs: &[f32]) -> Option<f32> {
+    let mut weighted_frame = 0.0_f64;
+    let mut total = 0.0_f64;
+    for (frame_index, prob) in frame_probs.iter().copied().enumerate() {
+        if !prob.is_finite() {
+            return None;
+        }
+        let prob = f64::from(prob.max(0.0));
+        weighted_frame += (frame_index as f64 + 0.5) * prob;
+        total += prob;
+    }
+    (total > 0.0).then(|| (weighted_frame / total) as f32)
+}
+
+/// Per-run center-of-mass word fallback: the degrade [`dtw_align_token_frames`]
+/// names for a run it cannot align. Every token of the run takes its attention
+/// center inside the run's own band, folded into word windows by the midpoint
+/// boundary rule with no onset lead and then span-capped, exactly as the
+/// whole-window center-of-mass tier above does.
+///
+/// The windows are coarser than DTW's, but a run placed here is a run whose
+/// words survive. The decode text carries every run's tokens whatever the
+/// alignment does, so dropping an unalignable run silently deleted a phrase
+/// from the word list -- and from every cue lane built on it -- while the text
+/// still said it: the same dropped-speech failure the whole-window tier exists
+/// to prevent, one run at a time.
+///
+/// Returns empty when the fold cannot decode the run's tokens: there is nothing
+/// to place for a run whose own words do not decode.
+fn whisper_run_center_of_mass_words<E>(
+    token_alignments: &[WhisperGeneratedTokenAlignment],
+    run: (usize, usize),
+    band: (usize, usize),
+    generated_probabilities: &[f32],
+    probabilities_aligned: bool,
+    seconds_per_frame: f32,
+    decode_text_token_ids: &dyn Fn(&[u32]) -> Result<String, E>,
+) -> Vec<crate::WordTimestamp> {
+    let (lo, hi) = run;
+    let (band_start, band_end) = band;
+    if hi >= token_alignments.len() {
+        return Vec::new();
+    }
+    let mut token_times: Vec<Seq2SeqTokenTime> = Vec::new();
+    for index in lo..=hi {
+        let row = &token_alignments[index].frame_probs;
+        // The rows are window-absolute, so the band indexes into them directly;
+        // `min` on both ends keeps a short row from slicing out of range.
+        let lo_frame = band_start.min(row.len());
+        let hi_frame = band_end.min(row.len()).max(lo_frame);
+        let Some(center_in_band) = cross_attention_center_frame(&row[lo_frame..hi_frame]) else {
+            continue;
+        };
+        let probability = (probabilities_aligned && index < generated_probabilities.len())
+            .then(|| generated_probabilities[index]);
+        token_times.push(Seq2SeqTokenTime {
+            token_id: token_alignments[index].token_id,
+            center_seconds: (band_start as f32 + center_in_band) * seconds_per_frame,
+            probability,
+        });
+    }
+    if token_times.is_empty() {
+        return Vec::new();
+    }
+    match seq2seq_word_timestamps_from_token_times(
+        &token_times,
+        (band_start as f32) * seconds_per_frame,
+        (band_end as f32) * seconds_per_frame,
+        BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+        decode_text_token_ids,
+        MIDPOINT_BOUNDARY_FRACTION,
+        NO_ONSET_LEAD,
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+    ) {
+        Ok(words) => whisper_cap_dtw_word_spans(words, seconds_per_frame),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn cross_attention_center_seconds(
