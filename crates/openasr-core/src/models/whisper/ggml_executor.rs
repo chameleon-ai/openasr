@@ -7385,12 +7385,13 @@ const WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS: f32 = 0.5;
 const WHISPER_LADDER_TAIL_MAX_DEFICIT_DB: f32 = 6.0;
 
 /// Minimum count of salvaged (letters/digits-bearing) content tokens the
-/// ladder's incumbent must hold before the carry-less round may replace it.
-/// The subsequence check is only a content-preservation rule when the
-/// incumbent actually salvaged content: a two-word stub ("I. Rock." on
-/// music noise) survives as a subsequence of almost any longer decode, BPE
-/// fragmenting it into single tokens, so preserving it proves nothing and
-/// hands the window to whatever the carry-less round hallucinated.
+/// ladder's incumbent must hold before the carry-less round may replace it, and
+/// below which the stub re-race treats the incumbent as stub-shaped rather than
+/// a real transcript. A two-word stub ("I. Rock." on music noise) survives a
+/// subsequence check against almost any longer decode, BPE fragmenting it into
+/// single tokens, so a small incumbent's own count says nothing either way;
+/// the carry-less path reads that as a reason to refuse adoption, the stub
+/// re-race as a reason to let the recovery stand.
 const WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS: usize = 4;
 
 /// True when `kept` appears in `other` as an in-order (not necessarily
@@ -7404,6 +7405,71 @@ fn whisper_token_stream_is_subsequence(kept: &[u32], other: &[u32]) -> bool {
     let mut other = other.iter().copied();
     kept.iter()
         .all(|token| other.by_ref().any(|next| next == *token))
+}
+
+/// A guard-cut ladder round's salvaged content: its generated token stream with
+/// the timestamp stamps removed, a guard-cut round's kept loop cycle truncated
+/// to the pre-loop prefix (the kept cycle is the loop itself, not content), and
+/// its dominant short cycle stripped. Returns the surviving stream beside the
+/// count of its letters/digits-bearing tokens -- the same content notion the
+/// carry-less adoption's subsequence check uses.
+fn whisper_ladder_salvaged_stream(
+    tokenizer: &WhisperTokenizer,
+    result: &WhisperGreedyDecodeResult,
+) -> (Vec<u32>, usize) {
+    let stripped: Vec<u32> = result
+        .generated_tokens
+        .iter()
+        .copied()
+        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+        .collect();
+    let content = match result.guard_trip_ngram_len {
+        Some(cycle) => &stripped[..stripped.len().saturating_sub(cycle)],
+        None => &stripped[..],
+    };
+    let salvaged = whisper_stream_without_dominant_cycle(content);
+    let content_tokens = salvaged
+        .iter()
+        .filter(|token_id| {
+            tokenizer
+                .decode_text_token_ids(&[**token_id])
+                .is_ok_and(|text| text.chars().any(char::is_alphanumeric))
+        })
+        .count();
+    (salvaged, content_tokens)
+}
+
+/// Whether the stub re-race may hand a guard-tripped incumbent's window to a
+/// clean challenger, or the incumbent must keep it.
+///
+/// The re-race exists to recover speech a genuine loop stub left out, so it is
+/// refused only for the one shape where that recovery would cost real text: the
+/// incumbent is a full transcript and the challenger carries less than half as
+/// much content.
+///
+/// "Full transcript" is read off the guard's own cut rather than the text. A
+/// round that transcribed the window and only looped on its trailing silence
+/// lost a short tail to the repeat guard (bibi: 110 tokens kept of 120); a round
+/// that re-locked onto a loop lost the speech itself and kept a fraction of what
+/// it emitted (ploomet: 51 of 128). Stripping the dominant cycle cannot tell the
+/// two apart on its own, because a loop whose wording drifts ("...relax you." /
+/// "...relax you!") is not an exactly repeated cycle; the cut ratio can.
+///
+/// `pre_trip_tokens` is 0 when the round recorded no per-token rows, which leaves
+/// the ratio undefined; the veto then stands down and the re-race runs as before.
+fn whisper_ladder_stub_pool_may_replace(
+    incumbent_content_tokens: usize,
+    incumbent_kept_tokens: usize,
+    incumbent_pre_trip_tokens: usize,
+    challenger_content_tokens: usize,
+) -> bool {
+    let loop_was_only_a_tail = incumbent_pre_trip_tokens > 0
+        && incumbent_kept_tokens.saturating_mul(2) >= incumbent_pre_trip_tokens;
+    let incumbent_is_full_transcript = incumbent_content_tokens
+        >= WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS
+        && loop_was_only_a_tail;
+    !incumbent_is_full_transcript
+        || challenger_content_tokens.saturating_mul(2) >= incumbent_content_tokens
 }
 
 /// The token stream with its dominant short cycle removed: the period `n`
@@ -8371,6 +8437,17 @@ fn run_whisper_decode_loop(
                 // cannot take over from any other round.
                 let cl_has_content =
                     cl_clean && cand.text_trimmed.chars().any(|c| c.is_alphanumeric());
+                // Strip timestamp stamps and the dominant short cycle from a
+                // round's generated stream: the content-preservation comparison
+                // shared by both adoption paths below.
+                let strip_stream = |stream: &[u32]| -> Vec<u32> {
+                    let stripped: Vec<u32> = stream
+                        .iter()
+                        .copied()
+                        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+                        .collect();
+                    whisper_stream_without_dominant_cycle(&stripped)
+                };
                 if best.1.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
                     let mut entrants = std::mem::take(&mut clean_rounds);
                     if cl_has_content {
@@ -8409,23 +8486,54 @@ fn run_whisper_decode_loop(
                             }
                         }
                         let winner = entrants.remove(winner_index);
-                        // Log before `best` takes ownership of the winner.
-                        eprintln!(
-                            "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={} temperature={} stop_reason={:?} evidence_secs={:?} text={:?}",
-                            winner.round,
-                            winner.temperature,
-                            winner.result.stop_reason,
-                            winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
-                            winner.candidate.text_trimmed
-                        );
-                        best_round = winner.round;
-                        best_temperature = winner.temperature;
-                        carry_less_round_won = winner.round == cl_round;
-                        best = (winner.candidate, winner.result);
-                        best_evidence = winner.evidence;
-                        // The rounds that lost this race stay in the pool for
-                        // the audible-tail coverage re-race below.
-                        clean_rounds = entrants;
+                        // A guard-tripped incumbent is not necessarily a stub:
+                        // a round that transcribed the window and only looped on
+                        // its trailing silence keeps the whole real transcript in
+                        // its pre-trip prefix. The re-race exists to recover
+                        // speech a loop stub left out, so it must not trade such
+                        // a transcript for a challenger carrying a fraction of
+                        // its content.
+                        let (_, incumbent_content_tokens) =
+                            whisper_ladder_salvaged_stream(tokenizer, &best.1);
+                        let (_, challenger_content_tokens) =
+                            whisper_ladder_salvaged_stream(tokenizer, &winner.result);
+                        if whisper_ladder_stub_pool_may_replace(
+                            incumbent_content_tokens,
+                            best.1.generated_tokens.len(),
+                            best.0.token_alignments.len(),
+                            challenger_content_tokens,
+                        ) {
+                            // Log before `best` takes ownership of the winner.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={} temperature={} stop_reason={:?} evidence_secs={:?} text={:?}",
+                                winner.round,
+                                winner.temperature,
+                                winner.result.stop_reason,
+                                winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                                winner.candidate.text_trimmed
+                            );
+                            best_round = winner.round;
+                            best_temperature = winner.temperature;
+                            carry_less_round_won = winner.round == cl_round;
+                            best = (winner.candidate, winner.result);
+                            best_evidence = winner.evidence;
+                            // The rounds that lost this race stay in the pool
+                            // for the audible-tail coverage re-race below.
+                            clean_rounds = entrants;
+                        } else {
+                            // The incumbent's salvaged content would be lost:
+                            // keep its window and restore the pool (winner
+                            // included) for the tail-coverage re-race.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_kept_incumbent round={} temperature={} evidence_secs={:?} text={:?}",
+                                winner.round,
+                                winner.temperature,
+                                winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                                winner.candidate.text_trimmed
+                            );
+                            entrants.insert(winner_index, winner);
+                            clean_rounds = entrants;
+                        }
                     }
                 } else if cl_has_content {
                     let coverage_ok = match (best_evidence, cl_evidence) {
@@ -8435,14 +8543,6 @@ fn run_whisper_decode_loop(
                         }
                         _ => true,
                     };
-                    let strip_stream = |stream: &[u32]| -> Vec<u32> {
-                        let stripped: Vec<u32> = stream
-                            .iter()
-                            .copied()
-                            .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
-                            .collect();
-                        whisper_stream_without_dominant_cycle(&stripped)
-                    };
                     // The content the incumbent has actually salvaged. A
                     // guard-cut stub's kept loop cycle is the loop itself,
                     // not content: its salvaged content is the pre-loop
@@ -8450,33 +8550,11 @@ fn run_whisper_decode_loop(
                     // guard-cut stream (and a stamp the winning decode
                     // rendered under a different token id is a re-stamp, not
                     // a loss). Every other incumbent counts its whole stream.
-                    let stripped_best: Vec<u32> = best
-                        .1
-                        .generated_tokens
-                        .iter()
-                        .copied()
-                        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
-                        .collect();
-                    // The trip cycle counts raw tokens (a timestamp may ride
-                    // in it), so the trimmed tail may run a token longer than
-                    // the stripped cycle: saturate at the stream start, where
-                    // the stub's whole stripped stream is one kept cycle.
-                    let best_content = match best.1.guard_trip_ngram_len {
-                        Some(cycle) => &stripped_best[..stripped_best.len().saturating_sub(cycle)],
-                        None => &stripped_best[..],
-                    };
-                    let salvaged_stream = whisper_stream_without_dominant_cycle(best_content);
+                    let (salvaged_stream, salvaged_content_tokens) =
+                        whisper_ladder_salvaged_stream(tokenizer, &best.1);
                     // The saved tokens must themselves be salvage (see
                     // WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS): a tiny
                     // stub's subsequence test passes against nearly anything.
-                    let salvaged_content_tokens = salvaged_stream
-                        .iter()
-                        .filter(|token_id| {
-                            tokenizer
-                                .decode_text_token_ids(&[**token_id])
-                                .is_ok_and(|text| text.chars().any(char::is_alphanumeric))
-                        })
-                        .count();
                     let keeps_incumbent_content = salvaged_content_tokens
                         >= WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS
                         && whisper_token_stream_is_subsequence(

@@ -3539,6 +3539,41 @@ fn token_stream_subsequence_shapes() {
 }
 
 #[test]
+fn stub_pool_refuses_a_short_clean_stub_that_would_drop_a_real_transcription() {
+    // The bibi shape: the guard-tripped incumbent transcribed the whole window
+    // (it lost only a short trailing loop to the guard: 110 kept of 120) and the
+    // clean pool winner is a one-word stub, so adopting it drops real text.
+    assert!(
+        !super::whisper_ladder_stub_pool_may_replace(108, 110, 120, 2),
+        "a one-word stub must not replace a full-window transcript"
+    );
+
+    // The ploomet shape: the incumbent's guard cut took most of what it emitted
+    // (51 kept of 128), so it is a loop stub whatever lead-in it kept. No veto:
+    // the recovery stands even though the challenger is thin.
+    assert!(
+        super::whisper_ladder_stub_pool_may_replace(4, 51, 128, 2),
+        "a loop-dominated incumbent is a stub, not a transcript"
+    );
+
+    // A full transcript the challenger matches (or beats) on content still
+    // changes hands -- the oregon shape, where the clean round holds the phrase
+    // the guard-cut round lost.
+    assert!(super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 80));
+    assert!(super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 20));
+
+    // Half the incumbent's content is the tie point; under it is a collapse.
+    assert!(!super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 19));
+
+    // A pure loop stub salvaged nothing at all.
+    assert!(super::whisper_ladder_stub_pool_may_replace(2, 30, 120, 0));
+
+    // No per-token rows leaves the cut ratio undefined: stand down rather than
+    // guess, so the re-race runs as it did before the veto.
+    assert!(super::whisper_ladder_stub_pool_may_replace(108, 110, 0, 2));
+}
+
+#[test]
 fn dominant_cycle_stripping_shapes() {
     // The jc shape: a *Squeak* cycle (5 tokens) x 3 interleaved with real
     // words -- the cycle is the dominant one and is stripped wholesale, the
