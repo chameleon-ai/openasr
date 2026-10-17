@@ -3100,6 +3100,10 @@ fn run_native_transcription_impl(
             // string channel (see `midspan_refill_slice`).
             let mut midspan_refills: Vec<String> = Vec::new();
             let mut refill_loop_drops: Vec<String> = Vec::new();
+            // Slices whose mid-span refill decoded nothing past the parent's
+            // committed tail, as `index:dropped_words` facts for the
+            // provenance string channel (see `drop_reread_refill`).
+            let mut midspan_reread_drops: Vec<String> = Vec::new();
             // Monotonic identity assigned to every slice that actually decoded
             // with an in-decoder speaker model. The assembler carries this
             // provenance beside each surviving segment through overlap trim and
@@ -3186,16 +3190,21 @@ fn run_native_transcription_impl(
                 // `guard_cut_tail_slice`, mid-span clean stop:
                 // `midspan_refill_slice`) inserts itself directly behind the
                 // slice it recovers, ahead of the next planned window.
-                let mut slices_to_run: Vec<(AudioSlice, bool, bool)> = plan
+                // The trailing entry is the mid-span refill's parent word end
+                // (this entry's sample, see `drop_reread_refill`): `None` for
+                // planned slices and guard-cut tails, which have no refill
+                // re-read to adjudicate.
+                let mut slices_to_run: Vec<(AudioSlice, bool, bool, Option<usize>)> = plan
                     .slices
                     .iter()
                     .zip(vad_gated.iter())
-                    .map(|(slice, &gated)| (slice.clone(), gated, false))
+                    .map(|(slice, &gated)| (slice.clone(), gated, false, None))
                     .collect();
                 let mut recovery_tails_spawned = 0usize;
                 let mut run_cursor = 0usize;
                 while run_cursor < slices_to_run.len() {
-                    let (slice, gated, refill_crossed_gap) = slices_to_run[run_cursor].clone();
+                    let (slice, gated, refill_crossed_gap, refill_parent_word_end) =
+                        slices_to_run[run_cursor].clone();
                     run_cursor += 1;
                     if execution_context.control.wait_at_slice_boundary()
                         == super::transcription_control::SliceBoundaryControl::Canceled
@@ -3316,7 +3325,7 @@ fn run_native_transcription_impl(
                             tail.start_sample as f64 / rate,
                             tail.end_sample as f64 / rate,
                         );
-                        slices_to_run.insert(run_cursor, (tail, false, false));
+                        slices_to_run.insert(run_cursor, (tail, false, false, None));
                     }
                     // A guard-cut slice only describes its audio up to its last
                     // placed word; remember that cut so the push below commits
@@ -3412,6 +3421,28 @@ fn run_native_transcription_impl(
                         );
                         refill_loop_drops.push(format!("{slice_index}:{refill_loop_words}"));
                     }
+                    // A mid-span refill whose decode re-stamps the parent's
+                    // committed tail word and nothing past it recovered
+                    // nothing (see `drop_reread_refill`): dropped whole before
+                    // assembly, the way a loop-shaped refill is.
+                    let reread_refill_words = refill_parent_word_end.map_or(0, |parent_word_end| {
+                        let rate = plan.sample_rate_hz as f32;
+                        drop_reread_refill(
+                            &mut transcription.text,
+                            &mut transcription.segments,
+                            &prev_slice_tail_words,
+                            (parent_word_end as f32 - slice.content_start_sample as f32) / rate,
+                        )
+                    });
+                    if reread_refill_words > 0 {
+                        log_reread_refill_drop(
+                            slice_index,
+                            slice.start_sample,
+                            slice.content_end_sample,
+                            reread_refill_words,
+                        );
+                        midspan_reread_drops.push(format!("{slice_index}:{reread_refill_words}"));
+                    }
                     // A clean stop placed inside the slice's carried VAD span
                     // abandons that span's tail (see `midspan_refill_slice`):
                     // the VAD says speech is still ongoing where the model
@@ -3466,7 +3497,10 @@ fn run_native_transcription_impl(
                             tail.start_sample as f64 / rate,
                             tail.end_sample as f64 / rate,
                         );
-                        slices_to_run.insert(run_cursor, (tail, false, abandoned.crossed_gap));
+                        slices_to_run.insert(
+                            run_cursor,
+                            (tail, false, abandoned.crossed_gap, Some(word_end)),
+                        );
                         midspan_refill_commit_end = Some(word_end);
                     }
                     ran_any_slice = true;
@@ -3595,6 +3629,12 @@ fn run_native_transcription_impl(
                 longform_provenance.push(format!(
                     "core.native.decode.refill-loop-drop:slices={}",
                     refill_loop_drops.join(";")
+                ));
+            }
+            if !midspan_reread_drops.is_empty() {
+                longform_provenance.push(format!(
+                    "core.native.decode.refill-reread-drop:slices={}",
+                    midspan_reread_drops.join(";")
                 ));
             }
             let (assembled, assemble_stats, speaker_scope_by_segment) =
@@ -4005,6 +4045,13 @@ const MIDSPAN_REFILL_LOOP_MIN_REPEATS: usize = 3;
 /// before the refill counts as a loop (see [`refill_is_loop_shaped`]).
 const MIDSPAN_REFILL_LOOP_MIN_PAIR_SHARE: f32 = 0.5;
 
+/// How close to the parent's last word end a refill word's start may sit and
+/// still count as placed at or past it (see [`drop_reread_refill`]). A word
+/// genuinely beginning after the parent's last word can be stamped a few
+/// frames early by placement jitter; a re-stamped copy of that word slides
+/// well into the refill's overlap, clearly before the line.
+const MIDSPAN_REFILL_REREAD_ONSET_JITTER_SECONDS: f32 = 0.05;
+
 /// The follow-up slice a mid-span clean stop turns into a refill re-decode,
 /// or `None` when there is nothing to recover.
 ///
@@ -4286,6 +4333,105 @@ fn log_refill_loop_drop(
         "native_transcribe",
         format!(
             "stage=longform_refill_loop_drop index={slice_index} \
+             slice=[{:.2}..{:.2}]s dropped={dropped_words}",
+            start_sample as f32 / 16_000.0,
+            end_sample as f32 / 16_000.0,
+        ),
+    );
+}
+
+/// A mid-span refill that re-decoded nothing past the parent's committed
+/// tail: its whole word list is a normalized re-read of the parent slice's
+/// tail AND no word it placed starts at or past the parent's last word end
+/// (minus placement jitter), so the decode re-stamped the parent's own last
+/// word -- which the refill window opens 0.5 s inside -- instead of
+/// recovering the audio the parent left uncommitted. The parent's commit end
+/// was cut back for exactly this refill, so the assembler's overlap trim can
+/// no longer eat the re-read, and its seam rules read the straddling window
+/// as a new occurrence: left alone, its words enter the transcript as a
+/// stacked duplicate of the committed tail word. Drop the decode whole --
+/// words and, under the same join guard as [`drop_loop_shaped_refill`], the
+/// text -- the way a loop-shaped refill is.
+///
+/// The two conditions together keep the rule off the shapes a refill is for.
+/// A re-read that continues into genuine new speech ("No you dead ne?" behind
+/// `...the "no you dead ne?"`) keeps its past-tail words and survives whole.
+/// And a refill whose any word starts at or past the parent's last word end
+/// placed a real occurrence after it -- a second repetition, a dropped tail
+/// word -- whatever its text, so it survives whole as well.
+///
+/// `prev_tail_units` is the parent's normalized tail words
+/// ([`tail_normalized_words`] as retained for the next decode); a recovery
+/// tail is decoded directly behind its parent, so the tail it must match
+/// against is exactly the one the loop above holds. `parent_word_end_seconds`
+/// is the parent's last word end in the refill slice's content-relative
+/// domain (0.5 s for an unclamped refill window). Returns the dropped word
+/// count.
+fn drop_reread_refill(
+    text: &mut String,
+    segments: &mut Vec<Segment>,
+    prev_tail_units: &[String],
+    parent_word_end_seconds: f32,
+) -> usize {
+    if prev_tail_units.is_empty() {
+        return 0;
+    }
+    let refill_units: Vec<String> = segments
+        .iter()
+        .flat_map(|segment| segment.words.iter())
+        .flat_map(|word| crate::longform::normalize_words(&word.word))
+        .collect();
+    if refill_units.is_empty() {
+        return 0;
+    }
+    let max_match = refill_units.len().min(prev_tail_units.len());
+    let mut reread_units = 0usize;
+    for len in (1..=max_match).rev() {
+        if refill_units[..len] == prev_tail_units[prev_tail_units.len() - len..] {
+            reread_units = len;
+            break;
+        }
+    }
+    // A re-read with genuine continuation behind it: the continuation is the
+    // point of the refill, so the decode stands and the seam rules do their
+    // normal work on it.
+    if reread_units < refill_units.len() {
+        return 0;
+    }
+    let any_word_past_tail = segments.iter().any(|segment| {
+        segment.words.iter().any(|word| {
+            word.start >= parent_word_end_seconds - MIDSPAN_REFILL_REREAD_ONSET_JITTER_SECONDS
+        })
+    });
+    if any_word_past_tail {
+        return 0;
+    }
+    let pre_drop_join = crate::transcript_text::join_segment_texts(
+        segments
+            .iter()
+            .flat_map(|segment| segment.words.iter().map(|word| word.word.trim())),
+    );
+    let dropped: usize = segments.iter().map(|segment| segment.words.len()).sum();
+    segments.clear();
+    if pre_drop_join.trim() == text.trim() {
+        text.clear();
+    }
+    dropped
+}
+
+/// `OPENASR_TIMING` event for a refill dropped as a pure re-read of the
+/// parent's committed tail: which slice's refill, over which window, and how
+/// many words the re-read held.
+fn log_reread_refill_drop(
+    slice_index: usize,
+    start_sample: usize,
+    end_sample: usize,
+    dropped_words: usize,
+) {
+    crate::stage_timing::log_detail_event(
+        "native_transcribe",
+        format!(
+            "stage=longform_refill_reread_drop index={slice_index} \
              slice=[{:.2}..{:.2}]s dropped={dropped_words}",
             start_sample as f32 / 16_000.0,
             end_sample as f32 / 16_000.0,
@@ -6904,6 +7050,115 @@ mod guard_tail_tests {
         // Two words with real widths are speech and stay.
         let spoken = vec![word(12.88, 13.19, "I"), word(13.09, 13.51, "know")];
         assert!(super::find_collapsed_word_runs(&spoken, &[], true).is_empty());
+    }
+
+    /// The bibi shape: in the refill window's domain the parent's last word
+    /// ends at the 0.5 s overlap edge, and the re-decode re-stamps that tail
+    /// word and nothing past it: a pure re-read, dropped whole with the text
+    /// it accounted for.
+    #[test]
+    fn a_pure_reread_refill_is_dropped_whole() {
+        let mut text = String::from("Mario.");
+        let mut segments = segments_of(vec![word(0.40, 0.77, "Mario.")]);
+        let dropped =
+            super::drop_reread_refill(&mut text, &mut segments, &["mario".to_string()], 0.5);
+        assert_eq!(
+            dropped, 1,
+            "a re-read that recovers nothing past the tail is dropped"
+        );
+        assert!(segments.is_empty());
+        assert!(
+            text.is_empty(),
+            "the text the words accounted for: {text:?}"
+        );
+        // The other side of the jitter: an onset 0.06 s before the tail is
+        // still not past it, so the pure re-read drops.
+        let mut text = String::from("Mario.");
+        let mut segments = segments_of(vec![word(0.44, 0.81, "Mario.")]);
+        assert_eq!(
+            super::drop_reread_refill(&mut text, &mut segments, &["mario".to_string()], 0.5),
+            1
+        );
+        // No parent tail to match: the rule has nothing to prove against.
+        let mut text = String::from("Mario.");
+        let mut segments = segments_of(vec![word(0.40, 0.77, "Mario.")]);
+        assert_eq!(
+            super::drop_reread_refill(&mut text, &mut segments, &[], 0.5),
+            0
+        );
+        assert_eq!(segments[0].words.len(), 1);
+    }
+
+    /// A re-read with genuine continuation behind it stands: the
+    /// continuation is the point of the refill, so the decode keeps its
+    /// words and the seam rules do their normal work on it.
+    #[test]
+    fn a_reread_refill_with_continuation_is_kept() {
+        let mut text = String::from("No you dead ne? No you");
+        let mut segments = segments_of(vec![
+            word(0.41, 0.60, "No"),
+            word(0.62, 0.80, "you"),
+            word(0.82, 1.10, "dead"),
+            word(1.12, 1.34, "ne?"),
+            word(1.40, 1.62, "No"),
+            word(1.64, 1.90, "you"),
+        ]);
+        let dropped = super::drop_reread_refill(
+            &mut text,
+            &mut segments,
+            &[
+                "no".to_string(),
+                "you".to_string(),
+                "dead".to_string(),
+                "ne".to_string(),
+            ],
+            0.5,
+        );
+        assert_eq!(dropped, 0, "a re-read with continuation behind it is kept");
+        assert_eq!(segments[0].words.len(), 6);
+        assert_eq!(text, "No you dead ne? No you");
+    }
+
+    /// A word that starts at or inside the jitter of the parent's last word
+    /// end placed a real occurrence after it -- whatever its text: the
+    /// shape that keeps a genuine second repetition starting ahead of the
+    /// parent's tail and running well past it.
+    #[test]
+    fn a_refill_word_starting_past_the_parent_tail_is_kept() {
+        let mut text = String::from("No you dead ne?");
+        let mut segments = segments_of(vec![
+            word(0.46, 0.60, "No"),
+            word(0.62, 0.80, "you"),
+            word(0.82, 1.10, "dead"),
+            word(1.12, 1.34, "ne?"),
+        ]);
+        let dropped = super::drop_reread_refill(
+            &mut text,
+            &mut segments,
+            &[
+                "no".to_string(),
+                "you".to_string(),
+                "dead".to_string(),
+                "ne".to_string(),
+            ],
+            0.5,
+        );
+        assert_eq!(dropped, 0, "an onset at or past the tail keeps the decode");
+        assert_eq!(segments[0].words.len(), 4);
+    }
+
+    /// A refill that decodes words matching nothing at the parent's tail is
+    /// no re-read at all: a genuine mid-span recovery ("Whoa!" after the
+    /// pause) is kept whole.
+    #[test]
+    fn a_non_reread_refill_is_kept() {
+        let mut text = String::from("Whoa!");
+        let mut segments = segments_of(vec![word(0.40, 0.70, "Whoa!")]);
+        let dropped =
+            super::drop_reread_refill(&mut text, &mut segments, &["mario".to_string()], 0.5);
+        assert_eq!(dropped, 0, "new words are not a re-read and are kept");
+        assert_eq!(segments[0].words.len(), 1);
+        assert_eq!(text, "Whoa!");
     }
 }
 

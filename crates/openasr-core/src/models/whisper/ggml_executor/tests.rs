@@ -3120,6 +3120,385 @@ fn splice_degenerate_tail_run_is_a_noop_when_the_alignments_misalign() {
     assert_eq!(words.len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// whisper_splice_unvoiced_tail_echo
+// ---------------------------------------------------------------------------
+
+/// Fictional unit decode for the pure shape tests: content tokens decode to
+/// word-like text, 9 to a bare period, anything else undecodable.
+fn tail_echo_unit_text(tokens: &[u32]) -> Option<String> {
+    let mut text = String::new();
+    for &token_id in tokens {
+        text.push_str(match token_id {
+            1 => "Luigi",
+            2 => "Booze",
+            3 => "Mario",
+            4 => "Boo",
+            7 => "hoo",
+            9 => ".",
+            _ => return None,
+        });
+    }
+    Some(text)
+}
+
+fn tail_echo_is_timestamp(token_id: u32) -> bool {
+    token_id >= 1000
+}
+
+/// The pure shape (a): a content unit of 1..=4 tokens emitted twice
+/// back-to-back at a clean decode's tail, with no timestamp between the
+/// copies -- the no-<|notimestamps|> stream leaves the whole decode in one
+/// run, the echo the only structure in it. The shorter matching unit wins, so
+/// a longer exact loop sheds one copy per round.
+#[test]
+fn tail_echo_removal_finds_a_same_run_unit_echo() {
+    // "...Booze Luigi Luigi": the second [Luigi] is the removable copy.
+    assert_eq!(
+        whisper_tail_echo_removal(&[2, 1, 1], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        Some((2, 2))
+    );
+    // A three-copy loop sheds its final copy this round.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 1, 1], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        Some((2, 2))
+    );
+    // A 4-token unit (the cap boundary) repeats: the whole unit's second copy.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1, 2, 3, 4, 1, 2, 3, 4],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((4, 7))
+    );
+}
+
+/// The pure shape (b): the final two text runs are the same short unit, a
+/// pair of timestamp tokens separating the copies. The whole final run is the
+/// second copy.
+#[test]
+fn tail_echo_removal_finds_a_cross_run_unit_echo() {
+    // [ts] [Luigi] [ts] [Luigi].
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 1, 1050, 1],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((3, 3))
+    );
+    // A 3-token unit across the timestamp pair.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 2, 1, 1050, 2, 1],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((4, 5))
+    );
+}
+
+/// Everything the pass must not treat as an echo: a punct-only unit, a unit
+/// past the token cap, distinct tail words, and an undecodable unit.
+#[test]
+fn tail_echo_removal_refuses_shapes_that_are_not_echoes() {
+    // A punct-only tail repeats nothing that was spoken.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 9, 1050, 9],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        None
+    );
+    // A 5-token unit is the tail-repeat collapse's terrain, never an echo.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1, 2, 3, 4, 7, 1, 2, 3, 4, 7],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        None
+    );
+    // Distinct words at the tail: no repetition at all.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 2, 3], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        None
+    );
+    // The shape matches but the unit decodes to nothing: not speech.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 5, 5], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        None
+    );
+}
+
+/// The full pass over the quiet flank: a clean-stop decode whose final run
+/// verbatim re-emits the previous run's short unit. The window is mostly
+/// voiced speech, and the second copy sits in the window's quiet tail, so
+/// the echo's placed words are over silence far below the window's content
+/// level -- the splice removes the copy from the tokens, the probabilities,
+/// and the alignments, drains its placed words, and re-derives the text to
+/// the single copy.
+#[test]
+fn splice_unvoiced_tail_echo_splices_the_second_copy_over_silence() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [he] [ts(50)] [he]: the final run repeats the previous run's
+    // 2-token unit; both copies placed, the second over silence.
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 2.30, 2.50)];
+    // A 3.0 s window that is voiced speech (the first 2.0 s) over a quiet
+    // tail (the last 1.0 s): the second copy's region (2.15..2.65 s, the
+    // padded 2.30..2.50 word) sits wholly in the quiet tail, far below the
+    // window's own p75 content level.
+    let mut envelope = vec![0.05_f32; 100];
+    envelope.extend(std::iter::repeat_n(0.0005_f32, 50));
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&envelope),
+        3.0,
+    )
+    .expect("splice");
+    assert!(spliced, "an unvoiced second copy must be spliced");
+    assert_eq!(decode.generated_tokens, vec![ts, 1, 2, ts + 50]);
+    assert_eq!(decode.generated_probabilities.len(), 4);
+    assert_eq!(alignments.len(), 4);
+    assert_eq!(
+        alignments.iter().map(|a| a.token_id).collect::<Vec<_>>(),
+        decode.generated_tokens.as_slice()
+    );
+    let expected_text = tokenizer
+        .decode_text_token_ids(&[1, 2])
+        .expect("decode text");
+    assert_eq!(decode.text, expected_text);
+    assert_eq!(
+        words.len(),
+        1,
+        "the second copy's placed word must be drained"
+    );
+    assert_eq!(words[0].word, "he");
+}
+
+/// The acoustic layer: sustained speech under the second copy is a genuine
+/// call-out ("Luigi? Luigi?"), so the splice must refuse the identical shape.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_second_copy_is_real_speech() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    // Speech on the frames under the second copy's region (0.95..1.5 s).
+    let mut speech = vec![0.0005_f32; 75];
+    for sample in speech[50..60].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&speech),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(
+        !spliced,
+        "sustained speech under the second copy is real audio"
+    );
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// The dense-window flank: an all-voiced window whose median+5 dB anchor sits
+/// above the region's peak, so the sibling silence test calls the region
+/// silent, yet the region rides at the window's own content level (p75 ==
+/// p75). A genuine repeated word, not an unvoiced echo: the unvoiced test
+/// must refuse the splice the median anchor alone would fire.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_region_carries_window_voice() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 2.30, 2.50)];
+    // A dense 3.0 s window, every frame at the same speech level; the
+    // second copy's region rides right at it.
+    let levels = vec![0.05_f32; 150];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&levels),
+        3.0,
+    )
+    .expect("no-op");
+    assert!(
+        !spliced,
+        "a region at the window's content level is voiced, not an echo"
+    );
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// The pure acoustic test: the region's p75 against the window's p75 at the
+/// 0.5x floor, with the fail-open refusals (no envelope, too-narrow region,
+/// zero content level).
+#[test]
+fn tail_echo_region_unvoiced_discriminates_the_quiet_region_from_content() {
+    // A 3.0 s window: voiced speech (0.05) for the first 2.0 s, a quiet
+    // tail (0.0005) for the last 1.0 s.
+    let mut levels: Vec<f32> = vec![0.05_f32; 100];
+    levels.extend(std::iter::repeat_n(0.0005_f32, 50));
+    // The quiet tail's region: p75 0.0005 < 0.025 (half the window p75).
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 2.20, 2.60, 3.0),
+        Some(true)
+    );
+    // A voiced region in the body: p75 0.05, not below 0.025.
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 0.30, 0.70, 3.0),
+        Some(false)
+    );
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(None, 0.30, 0.70, 3.0),
+        None
+    );
+    // The region clips down below the four-frame floor.
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 0.00, 0.06, 3.0),
+        None
+    );
+    let silent = vec![0.0_f32; 150];
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&silent), 0.30, 0.70, 3.0),
+        None
+    );
+}
+
+/// A guard-cut decode's tail is a retained loop prefix the next slice may
+/// continue: never splice it, whatever its shape.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_on_a_non_stop_reason() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(
+        tokens.clone(),
+        Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard,
+    );
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let quiet = vec![0.0005_f32; 75];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&quiet),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a guard-cut decode must not be spliced");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// A range list that no longer pairs 1:1 with the token stream's runs is
+/// untrustworthy: refuse rather than gate on a shifted word range.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_run_ranges_misalign() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // Two runs in the tokens, one entry in the range list.
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let quiet = vec![0.0005_f32; 75];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 2)],
+        Some(&quiet),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "misaligned ranges must refuse the splice");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// No envelope means the silence cannot be confirmed: fail open and keep the
+/// decode even when the shape is a perfect echo.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_without_an_envelope() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        None,
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "without an envelope the splice must refuse");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
 /// One alignment row whose cross-attention peaks at `frame` (0..1500).
 fn ladder_alignment_peaking_at(frame: usize) -> WhisperGeneratedTokenAlignment {
     WhisperGeneratedTokenAlignment {

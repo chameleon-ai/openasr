@@ -6984,6 +6984,57 @@ fn whisper_degenerate_tail_region_silence(
     Some(false)
 }
 
+/// Layer (b) of the unvoiced tail-echo gate, the dense-window flank of the
+/// shared sibling test above: whether the echo region's loud quarter (75th
+/// percentile frame RMS) sits below the window's own loud quarter scaled by
+/// [`WHISPER_TAIL_ECHO_UNVOICED_FRACTION`].
+///
+/// The sibling test anchors "speech" to the window MEDIAN plus 5 dB; in a
+/// dense-speech window the median is itself at speech level, so that anchor
+/// sits above a genuine utterance's peak and reads voiced speech as silence
+/// (a real fourth "I like beans!" measured below median+5dB). The window's
+/// p75 is its typical CONTENT level, and the comparison is scale-free in
+/// either mix: an unvoiced echo region rides far below the window's content
+/// (measured 0.18x on the bibi slice), while a genuine repeated word rides
+/// at it (measured 0.77x). Same fail-open contract as the sibling: `None`
+/// when the envelope is missing or the region clips down, and the splice
+/// refuses it.
+fn whisper_tail_echo_region_unvoiced(
+    levels: Option<&[f32]>,
+    region_start_seconds: f64,
+    region_end_seconds: f64,
+    duration_seconds: f64,
+) -> Option<bool> {
+    let levels = levels?;
+    if levels.len() < 4 || duration_seconds <= 0.0 {
+        return None;
+    }
+    let seconds_per_frame = WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    let last_frame = levels.len() - 1;
+    let start_s = region_start_seconds.max(0.0).min(duration_seconds);
+    let end_s = region_end_seconds.max(start_s).min(duration_seconds);
+    let frame_start = ((start_s / seconds_per_frame) as usize).min(last_frame);
+    let frame_end = ((end_s / seconds_per_frame) as usize)
+        .min(last_frame)
+        .max(frame_start + 1);
+    if frame_end - frame_start < 4 {
+        return None;
+    }
+    let mut window: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    window.sort_by(f64::total_cmp);
+    let window_p75 = window[(window.len() * 3 / 4).min(window.len().saturating_sub(1))];
+    if !(window_p75 > 0.0 && window_p75.is_finite()) {
+        return None;
+    }
+    let mut region: Vec<f64> = levels[frame_start..frame_end]
+        .iter()
+        .map(|sample| f64::from(*sample))
+        .collect();
+    region.sort_by(f64::total_cmp);
+    let region_p75 = region[(region.len() * 3 / 4).min(region.len().saturating_sub(1))];
+    Some(region_p75 < window_p75 * WHISPER_TAIL_ECHO_UNVOICED_FRACTION)
+}
+
 /// Splice the decode's degenerate final text run out of the generated tokens,
 /// the parallel probabilities, and the cross-attention alignments, re-derive
 /// the text, and drop the run's placed words from `words` (its half-open word
@@ -7141,6 +7192,288 @@ fn whisper_splice_degenerate_tail_run(
         "openasr_whisper_ggml_executor stage=decode_loop event=degenerate_tail_splice status=spliced dropped_tokens={drop} dropped_words={dropped_words} kept_tokens={kept_tokens} span_seconds={span_seconds:.3} band_seconds={band_seconds:.3}"
     );
     Ok(true)
+}
+
+/// Maximum size of the short repeated unit the unvoiced tail-echo pass
+/// removes, in tokens. Word-scale echoes ("Luigi. Luigi.", "Yeah. Yeah.")
+/// run one to four BPE tokens per copy; larger repeated blocks are the
+/// tail-repeat collapse's terrain, and a punct-only tail repeats nothing
+/// that was spoken.
+const WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS: usize = 4;
+
+/// How many times the tail-echo pass splices in one decode: an exact loop a
+/// guard floor let through ("Luigi." x 5 stopping clean) sheds one copy per
+/// round, each round re-verifying the new final copy's audio, until the tail
+/// holds a single occurrence.
+const WHISPER_TAIL_ECHO_MAX_ROUNDS: usize = 4;
+
+/// Loudness fraction of the window's p75 that the echo region's own p75 must
+/// sit strictly below for the unvoiced test [`whisper_tail_echo_region_unvoiced`]
+/// to pass. Measured separation between the two classes: an unvoiced echo
+/// region rides ~0.18x of the window's content level, a genuine repeated word
+/// ~0.77x; 0.5 (i.e. -6 dB) is the middle of that gap.
+const WHISPER_TAIL_ECHO_UNVOICED_FRACTION: f64 = 0.5;
+
+/// Env opt-out (defaults on) for the unvoiced tail-echo splice.
+fn whisper_tail_echo_splice_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DISABLE_TAIL_ECHO_SPLICE").is_none()
+}
+
+/// Debug env: log each round's tail-echo shape and acoustic verdict for
+/// every clean-stop decode, so a deployment can trace why a tail echo was
+/// (or was not) spliced.
+fn whisper_tail_echo_debug() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DEBUG_TAIL_ECHO").is_some()
+}
+
+/// Does a candidate echo unit carry content: its decoded text bears at least
+/// one ASCII letter or digit. A punct-only unit ("." ".") is not an echo of
+/// speech and never splices.
+fn whisper_tail_echo_unit_has_content(
+    tokens: &[u32],
+    decode_unit_text: &dyn Fn(&[u32]) -> Option<String>,
+) -> bool {
+    decode_unit_text(tokens).is_some_and(|text| text.chars().any(|ch| ch.is_ascii_alphanumeric()))
+}
+
+/// The short unit echoed back-to-back at a clean decode's tail, as the
+/// inclusive index range of the SECOND (removable) copy, or `None`. The shape
+/// the tail-repeat collapse is too large to fold (its blocks run
+/// [`WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS`]+ tokens) and the degenerate-repeat
+/// guard is too few copies to trip (a clean stop after two occurrences of one
+/// word; with advancing timestamps the cycle is not even exact). Two forms:
+///
+/// 1. Cross-run: the final two text runs are the same 1..=
+///    [`WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS`]-token unit, a pair of timestamp
+///    tokens separating the copies. The whole final run is the second copy.
+/// 2. Same-run: the final run's tail is the unit emitted twice, no timestamp
+///    between the copies (the no-`<|notimestamps|>` stream leaves the whole
+///    decode in one run, the echo the only structure in it). The shorter
+///    matching unit wins, so a longer exact loop sheds one copy per pass
+///    round rather than swallowing whole phrases.
+fn whisper_tail_echo_removal(
+    tokens: &[u32],
+    is_timestamp: &dyn Fn(u32) -> bool,
+    decode_unit_text: &dyn Fn(&[u32]) -> Option<String>,
+) -> Option<(usize, usize)> {
+    let runs = text_token_runs(tokens, is_timestamp);
+    let (lo, hi) = *runs.last()?;
+    if runs.len() >= 2 {
+        let (lo_prev, hi_prev) = runs[runs.len() - 2];
+        let m_last = hi.saturating_sub(lo).saturating_add(1);
+        let m_prev = hi_prev.saturating_sub(lo_prev).saturating_add(1);
+        if m_last == m_prev
+            && (1..=WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS).contains(&m_last)
+            && tokens[lo_prev..=hi_prev] == tokens[lo..=hi]
+            && whisper_tail_echo_unit_has_content(&tokens[lo..=hi], decode_unit_text)
+        {
+            return Some((lo, hi));
+        }
+    }
+    let run_len = hi.saturating_sub(lo).saturating_add(1);
+    for n in 1..=WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS {
+        if run_len >= 2 * n
+            && tokens[lo + run_len - 2 * n..lo + run_len - n] == tokens[lo + run_len - n..=hi]
+            && whisper_tail_echo_unit_has_content(&tokens[lo + run_len - n..=hi], decode_unit_text)
+        {
+            return Some((lo + run_len - n, hi));
+        }
+    }
+    None
+}
+
+/// Splice an unvoiced short tail echo out of a clean-stop decode: the tokens,
+/// the parallel probabilities, and the cross-attention alignments drop the
+/// second copy's range, the text re-derives, and the copy's placed words are
+/// drained from `words`. Same splice mechanics as the degenerate-tail splice.
+///
+/// A decode can end by echoing the short unit it just emitted -- a closing
+/// name or exclamation duplicated back-to-back over the silence the window's
+/// tail holds ("...Booze. Luigi. Luigi."). No existing pass sees it: the
+/// degenerate-repeat guard needs a trip floor of many occurrences and the
+/// decode ends on an honest stop token, the tail-repeat collapse's repeated
+/// block is clause-scale, and the degenerate-tail splice's words fold onto
+/// one instant while this echo's two copies sit at separate placed instants.
+///
+/// Its signature needs all three layers, and all must agree before anything
+/// is dropped:
+/// (a) the decode's text tail is the short content-bearing unit emitted
+///     back-to-back ([`whisper_tail_echo_removal`]);
+/// (b1) the second copy's placed words sit over silence: no sustained speech
+///      run in the slice-local envelope under the removed words' windows plus
+///      their placement margin ([`whisper_degenerate_tail_region_silence`]);
+///      and
+/// (b2) the region is unvoiced in the dense-window sense: the region's
+///      loud quarter sits below the window's own loud quarter scaled by
+///      [`WHISPER_TAIL_ECHO_UNVOICED_FRACTION`]
+///      ([`whisper_tail_echo_region_unvoiced`]).
+///
+/// (b1) alone is not dense-window safe: it anchors "speech" to the window
+/// MEDIAN plus 5 dB, and in a window that is mostly speech the median is
+/// itself at speech level, so the anchor sits above a genuine utterance's
+/// peak and reads voiced speech as silence (a real fourth "I like beans!"
+/// measured below that anchor in a dense window). (b2) compares the region
+/// against the window's TYPICAL CONTENT level (its p75) instead: an unvoiced
+/// echo region rides far below it (measured ~0.18x), a genuine repeated word
+/// rides at it (measured ~0.77x), and the 0.5x floor sits in the gap. The
+/// conjunction is strictly more conservative than (b1) alone, so it can only
+/// keep words (b1) would have cut. Together the layers keep the genuine
+/// echo out on both flanks: a real "Luigi? Luigi?" call-out voices its
+/// second copy at speech level and both acoustic tests refuse to drop it; a
+/// non-repeated closing unit has no echo shape so the envelope is never even
+/// consulted.
+///
+/// Gated like the degenerate-tail splice on a clean STOP-token decode and run
+/// after word placement, since the acoustic layer reads the placed windows
+/// the echo stamped on the audio. Every other failure degrades to a no-op
+/// (fail-open): a missing or misaligned run-word pairing, an undecodable
+/// unit, words the unit's text does not account for, or an unverdictable
+/// region all keep the decode as decoded. The pass rounds up to
+/// [`WHISPER_TAIL_ECHO_MAX_ROUNDS`] so a multi-copy exact loop sheds one
+/// verified copy per round.
+fn whisper_splice_unvoiced_tail_echo(
+    tokenizer: &WhisperTokenizer,
+    decode: &mut WhisperGreedyDecodeResult,
+    token_alignments: &mut Vec<WhisperGeneratedTokenAlignment>,
+    words: &mut Vec<crate::WordTimestamp>,
+    run_word_ranges: &[(usize, usize)],
+    word_audio_rms_frames: Option<&[f32]>,
+    audio_duration_seconds: f32,
+) -> Result<bool, WhisperGgmlExecutorError> {
+    if !whisper_tail_echo_splice_enabled()
+        || !whisper_stop_reason_is_stop_token(&decode.stop_reason)
+        || decode.generated_tokens.is_empty()
+        || words.is_empty()
+    {
+        return Ok(false);
+    }
+    let decode_unit_text = |token_ids: &[u32]| tokenizer.decode_text_token_ids(token_ids).ok();
+    let mut spliced = false;
+    for _round in 0..WHISPER_TAIL_ECHO_MAX_ROUNDS {
+        // Runs are re-read from the CURRENT stream each round (an earlier
+        // round may have spliced it); the word ranges paired with it must
+        // still line up 1:1, since a shifted pairing is as off as it is
+        // untrustworthy.
+        let is_timestamp = |token_id: u32| {
+            tokenizer
+                .first_timestamp_token_id()
+                .is_some_and(|begin| token_id >= begin)
+        };
+        let runs = text_token_runs(&decode.generated_tokens, &is_timestamp);
+        if runs.is_empty() || run_word_ranges.len() != runs.len() {
+            break;
+        }
+        let Some((rem_lo, rem_hi)) =
+            whisper_tail_echo_removal(&decode.generated_tokens, &is_timestamp, &decode_unit_text)
+        else {
+            break;
+        };
+        let Some(&word_range) = run_word_ranges.last() else {
+            break;
+        };
+        let Some(run_words) = words.get(word_range.0..word_range.1) else {
+            break;
+        };
+        // The removed unit's placed words are the tail of the final run's
+        // words whose normalized text is the unit's own text: the whole run's
+        // words for the cross-run shape, a tail of them for the same-run one.
+        // A DTW run that aligned nothing holds no words to gate on, so the
+        // pass refuses rather than gate on the wrong range.
+        let Some(unit_text) = decode_unit_text(&decode.generated_tokens[rem_lo..=rem_hi]) else {
+            break;
+        };
+        let unit_units = crate::longform::normalize_words(&unit_text);
+        let words_len = word_range.1.saturating_sub(word_range.0);
+        let mut removed_span: Option<(usize, usize)> = None;
+        for k in 1..=words_len {
+            let tail = &run_words[words_len - k..];
+            let tail_units: Vec<String> = tail
+                .iter()
+                .flat_map(|word| crate::longform::normalize_words(&word.word))
+                .collect();
+            if tail_units == unit_units {
+                removed_span = Some((word_range.1 - k, word_range.1));
+                break;
+            }
+        }
+        let Some((word_lo, word_hi)) = removed_span else {
+            break;
+        };
+        let Some(removed_words) = words.get(word_lo..word_hi).filter(|w| !w.is_empty()) else {
+            break;
+        };
+        let region_start = f64::from(
+            removed_words
+                .iter()
+                .map(|word| word.start)
+                .fold(f32::INFINITY, f32::min),
+        ) - WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS;
+        let region_end = f64::from(
+            removed_words
+                .iter()
+                .map(|word| word.end)
+                // Placed ends are clamped to [0, duration] by the placement pass.
+                .fold(0.0_f32, f32::max),
+        ) + WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS;
+        let region_silence = whisper_degenerate_tail_region_silence(
+            word_audio_rms_frames,
+            region_start,
+            region_end,
+            f64::from(audio_duration_seconds),
+        );
+        // The sibling test alone is not dense-window safe: its median+5 dB
+        // anchor sits above a genuine utterance's peak in a loud window and
+        // reads voiced speech as silence. The p75/p75 flank requires the
+        // region to sit far below the window's own content level, which real
+        // repeats do not. Both verdicts must agree to fire.
+        let region_unvoiced = whisper_tail_echo_region_unvoiced(
+            word_audio_rms_frames,
+            region_start,
+            region_end,
+            f64::from(audio_duration_seconds),
+        );
+        let fire = region_silence == Some(false) && region_unvoiced == Some(true);
+        if whisper_tail_echo_debug() {
+            eprintln!(
+                "openasr_whisper_ggml_executor stage=decode_loop event=tail_echo_probe tokens=[{}..{}] removed_words=[{}..{}] region=[{:.3}..{:.3}]s region_silence={region_silence:?} region_unvoiced={region_unvoiced:?} fire={fire}",
+                rem_lo, rem_hi, word_lo, word_hi, region_start, region_end
+            );
+        }
+        if !fire {
+            break;
+        }
+        let token_count = decode.generated_tokens.len();
+        // The parallel vectors are 1:1 with the tokens in the word-timestamp
+        // path; splice them at the same range only when their length matches.
+        if decode.generated_probabilities.len() == token_count {
+            splice_out_range(&mut decode.generated_probabilities, rem_lo, rem_hi + 1);
+        }
+        if token_alignments.len() == token_count {
+            splice_out_range(token_alignments, rem_lo, rem_hi + 1);
+        }
+        splice_out_range(&mut decode.generated_tokens, rem_lo, rem_hi + 1);
+        let text = tokenizer
+            .decode_text_token_ids(&decode.generated_tokens)
+            .map_err(
+                |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                    reason: format!("whisper tail-echo splice token decode failed: {error}"),
+                },
+            )?;
+        decode.text = text;
+        // The removed words are the tail of the word list (the final run's
+        // own tail, and runs and words share token order), so draining them
+        // leaves the surviving runs' words where the carry and the segment
+        // builder expect them.
+        let dropped_words = word_hi - word_lo;
+        words.drain(word_lo..word_hi);
+        spliced = true;
+        eprintln!(
+            "openasr_whisper_ggml_executor stage=decode_loop event=tail_echo_splice status=spliced dropped_tokens={} dropped_words={dropped_words} kept_tokens={}",
+            rem_hi - rem_lo + 1,
+            decode.generated_tokens.len()
+        );
+    }
+    Ok(spliced)
 }
 
 /// What one decode round produced, carried up for the fallback ladder to keep
@@ -8767,7 +9100,22 @@ fn run_whisper_decode_loop(
             audio_duration_seconds,
         )
         .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
-        if spliced_degenerate_tail {
+        // Second splice over the same run/word pairing: a clean decode that
+        // ends on a short unit echoed back-to-back over the window's silent
+        // tail ("...Luigi. Luigi."), the shape the guard and the collapse
+        // above leave in. After a degenerate splice it re-reads the shifted
+        // stream and refuses on its parity check, so the two never overlap.
+        let spliced_tail_echo = whisper_splice_unvoiced_tail_echo(
+            tokenizer,
+            &mut decode,
+            &mut step_runner_token_alignments,
+            &mut words,
+            &degenerate_tail_run_word_ranges,
+            word_audio_rms_frames,
+            audio_duration_seconds,
+        )
+        .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+        if spliced_degenerate_tail || spliced_tail_echo {
             text = decode.text.trim().to_string();
             if text.is_empty() {
                 eprintln!(
