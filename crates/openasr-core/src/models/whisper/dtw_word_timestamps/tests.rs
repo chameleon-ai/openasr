@@ -296,6 +296,78 @@ fn refine_dtw_onsets_refuses_when_the_window_opens_on_a_quiet_head() {
     assert!((out[0].end - 2.6).abs() < 1e-4);
 }
 
+/// mikan "This" (truth start 26.360, fold window 26.238..26.574): the fold opens
+/// 0.12 s before a short word whose entire onset is a two-frame /d/ burst
+/// peaking 0.074 -- 0.9x its own core run -- and the burst sits 0.18 s in,
+/// inside the core landing's 0.25 s floor. Both head-hunt gates exist for
+/// exactly this shape: two frames of sustain is enough for a head that is
+/// loud relative to its core, and a head landing measures distance-to-audio,
+/// so it clears the lower floor. Without either the start lands on the core
+/// 0.30 s in -- 0.11 s past the truth onset, 39% of the truth window covered.
+#[test]
+fn refine_dtw_onsets_lands_a_brief_loud_two_frame_head_inside_the_core_floor() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // The previous word's ambience bleed: above the near-floor head line
+    // (1.19x) from the second frame on, below the speech threshold
+    // (1.58x) throughout -- and below the first two frames, so the
+    // window-start veto has nothing to anchor on.
+    for s in env[102..109].iter_mut() {
+        *s = 0.0012;
+    }
+    // The head: two frames at 0.9x the core, 0.18 s into the window, with a
+    // four-frame drop before the core so the cluster reads as its own.
+    for s in env[109..111].iter_mut() {
+        *s = 0.045;
+    }
+    // The core run the search would otherwise land on.
+    for s in env[115..131].iter_mut() {
+        *s = 0.05;
+    }
+    let words = vec![word_ts("a", 2.0, 2.34), word_ts("b", 2.5, 3.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.18).abs() < 0.01, "start={}", out[0].start);
+    assert!((out[1].start - 2.5).abs() < 1e-4);
+}
+
+/// The protection the two-frame sustain leans on: the same two-frame patch at
+/// 0.3x the core's peak is a breath or SFX pop, not a head (mikan's clip is
+/// full of them), and the peak ratio still routes the push to the core.
+#[test]
+fn refine_dtw_onsets_refuses_a_brief_weak_patch_as_a_head() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    for s in env[102..109].iter_mut() {
+        *s = 0.0012;
+    }
+    for s in env[109..111].iter_mut() {
+        *s = 0.015;
+    }
+    for s in env[115..131].iter_mut() {
+        *s = 0.05;
+    }
+    let words = vec![word_ts("a", 2.0, 2.34), word_ts("b", 2.5, 3.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.30).abs() < 0.01, "start={}", out[0].start);
+}
+
+/// The head floor is a floor for head landings only: a core run 0.22 s in --
+/// inside the core landing's own 0.25 s calibration-error floor -- is still
+/// refused, so relaxing the head path did not widen the core path.
+#[test]
+fn refine_dtw_onsets_keeps_the_core_push_floor_when_no_head_qualifies() {
+    let mut env = vec![0.001f32; 750];
+    env[400] = 0.5;
+    // A modest core (6x the floor: high enough to be a run, low enough that
+    // the one frame inside the front half keeps the front mean hollow).
+    for s in env[111..121].iter_mut() {
+        *s = 0.006;
+    }
+    let words = vec![word_ts("a", 2.0, 2.5), word_ts("b", 3.0, 3.5)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
+}
+
 /// A long dense cluster at the window start that is far weaker than the core
 /// is breath or room noise, not a head: the peak ratio keeps it from vetoing
 /// a genuine parked-word push to the loud core.
@@ -512,6 +584,30 @@ fn refine_dtw_onsets_refuses_a_bed_level_front() {
     assert!((out[1].start - 2.0).abs() < 1e-4, "start={}", out[1].start);
 }
 
+/// A genuine pause front over a dense slice is still trusted when the median
+/// itself is the noise: the front sits above the absolute quiet line (0.0185
+/// vs 0.0066 = 0.3 x median) because the pause carries the slice's own floor,
+/// but at 13% of the slice peak it clears the peak-quiet gate and the word
+/// advances to its real onset at the word's own run (3.8 s) rather than
+/// staying stretched back across the pause at its fold start. The dense
+/// fixture (median 0.022, peak 0.143 -> contrast 6.5) isolates the
+/// dense-branch absolute veto the peak-quiet gate overrides.
+#[test]
+fn refine_dtw_onsets_rescues_a_genuine_pause_front_below_peak_fraction() {
+    let mut env = vec![0.022f32; 750];
+    env[400] = 0.143; // clip peak = 0.143; contrast 6.5x stays on the dense branch
+    for s in env[100..150].iter_mut() {
+        *s = 0.0185; // pause front: above the 0.0066 quiet line, 13% of peak
+    }
+    for s in env[190..200].iter_mut() {
+        *s = 0.143; // the word's own onset run at [3.8, 4.0)
+    }
+    let words = vec![word_ts("a", 0.5, 0.6), word_ts("b", 2.0, 4.0)];
+    let out = whisper_refine_dtw_word_onsets(words, Some(&env), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+    assert!((out[1].end - 4.0).abs() < 1e-4);
+}
+
 /// No envelope (a run without cross-attention word timestamps) is a byte-exact
 /// no-op.
 #[test]
@@ -633,6 +729,94 @@ fn refine_dtw_offsets_refuses_a_bed_level_back() {
     let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
     assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
     assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+/// A genuine pause back over a dense slice is still trusted when the median
+/// itself is the noise: the back sits above the absolute quiet line (0.016
+/// vs 0.0066 = 0.3 x median) but at 11% of the slice peak it clears the
+/// peak-quiet gate and the word retreats to its run's offset (2.6 s) rather
+/// than staying stretched across the trailing pause. Trailing mirror of the
+/// onset-peak-quiet case on the same dense fixture (median 0.022, peak
+/// 0.143 -> contrast 6.5).
+#[test]
+fn refine_dtw_offsets_rescues_a_genuine_pause_back_below_peak_fraction() {
+    let mut env = vec![0.022f32; 750];
+    env[400] = 0.143; // clip peak = 0.143; contrast 6.5x stays on the dense branch
+    for s in env[100..130].iter_mut() {
+        *s = 0.143; // the word's own run at [2.0, 2.6)
+    }
+    for s in env[130..200].iter_mut() {
+        *s = 0.016; // pause back: above the 0.0066 quiet line, 11% of peak
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 2.6).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[2].end - 4.5).abs() < 1e-4);
+}
+
+/// A back that sits just above the peak-quiet gate is not a trusted pause:
+/// a back mean of 0.02 on the 0.143 peak is 0.14 of peak (-17.1 dB), above
+/// the 0.13 (=-17.7 dB) back gate even though below the front gate's 0.16,
+/// and the absolute quiet line (0.0066) no longer excuses it. This is
+/// arnold's "smoking" shape: a back half carrying the word's own soft tail
+/// and the next word's lead-in must not have its end trimmed to the loud
+/// core, so the word keeps its fold end at 4.0 s.
+#[test]
+fn refine_dtw_offsets_refuses_a_back_above_the_peak_quiet_gate() {
+    let mut env = vec![0.022f32; 750];
+    env[400] = 0.143; // clip peak = 0.143; contrast 6.5x stays on the dense branch
+    for s in env[100..130].iter_mut() {
+        *s = 0.143; // the word's own run at [2.0, 2.6)
+    }
+    for s in env[130..200].iter_mut() {
+        *s = 0.02; // soft-tail back: 0.14 of peak, above the 0.13 gate
+    }
+    let words = vec![
+        word_ts("a", 0.5, 0.6),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[2].end - 4.5).abs() < 1e-4);
+}
+
+/// A word whose own audio runs to the window edge is never retracted onto the
+/// *previous* word's run out in the pre-window lead: the scan stops at the last
+/// run inside the window, and with no trailing quiet there is no tail to retreat
+/// to, so the word keeps its fold end. This is arnold's "entire" shape -- a
+/// low-SNR body the relative search floor keeps counting, with no gap before
+/// the window end -- whose end was pulled back onto the preceding word's audio
+/// at the window's very front, collapsing the window to zero width.
+#[test]
+fn refine_dtw_offsets_never_lands_the_end_before_the_windows_own_audio() {
+    let mut env = vec![0.04f32; 750];
+    env[400] = 0.17; // clip peak 0.17; median 0.04 -> contrast 4.25 (dense)
+    for s in env[80..100].iter_mut() {
+        *s = 0.06; // the previous word's audio in the pre-lead [1.6, 2.0)
+    }
+    for s in env[100..111].iter_mut() {
+        *s = 0.002; // real pause [2.0, 2.2)
+    }
+    for s in env[111..200].iter_mut() {
+        *s = 0.017; // the word's own low-SNR body [2.22, 4.0), running to the edge
+    }
+    let words = vec![
+        word_ts("a", 1.6, 2.0),
+        word_ts("b", 2.0, 4.0),
+        word_ts("c", 4.0, 4.5),
+    ];
+    let out = whisper_refine_dtw_word_offsets(words, Some(&env), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[1].end - out[1].start) > 0.5, "window kept its audio");
+    assert!((out[2].end - 4.5).abs() < 1e-4);
 }
 
 /// A word's decaying tail broken by a short below-floor micro-pause (3 frames,

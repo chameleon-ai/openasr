@@ -657,11 +657,51 @@ fn whisper_dtw_onset_head_margin_db() -> f64 {
         .unwrap_or(WHISPER_DTW_ONSET_HEAD_MARGIN_DB)
 }
 
-/// Minimum frames above the head line in a head cluster (0.08 s of audio).
+/// Minimum frames above the head line in a head cluster (0.04 s of audio).
 /// Shorter than the sustained-run requirement: an onset head rises and dips
-/// through frication, so a real head (3-4 above-threshold frames) shreds
-/// under the core's five-consecutive test.
-const WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES: usize = 4;
+/// through frication, so a real head shreds under the core's five-consecutive
+/// test. Two frames, not four: a short word's whole onset can be a brief burst
+/// whose level dwarfs its own core's. Traced on mikan against the fold
+/// windows (`OPENASR_WHISPER_DEBUG_DTW_SPANS`): "on" (truth 34.420, fold
+/// 34.201..34.704) carries a three-frame head at 34.512 peaking 0.106, 1.9x
+/// the core run's own 0.056, that four frames refused -- the start landed on
+/// the core, 0.15 s past the truth onset, covering 17% of the truth window;
+/// "This" (truth 26.360, fold 26.238..26.574) carries a two-frame /d/ burst
+/// at 26.452 peaking 0.074 (0.9x core). Swept over the 30-clip suite: MEAN
+/// TempErr 0.114 -> 0.114, MEAN-uvr 0.118 -> 0.118, InWin unchanged on all
+/// 30 clips, 25 word starts toward truth against 16 away (the four-frame
+/// setting: 20 vs 9), "on" 0.15 -> 0.01 s error at full truth coverage,
+/// "This" 0.11 -> 0.01 at full coverage, dog byte-identical.
+const WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES: usize = 2;
+
+/// Deployment env override for the head-cluster sustain
+/// ([`WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES`]); a bare environment falls back
+/// to the compiled default.
+fn whisper_dtw_onset_head_sustain_frames() -> usize {
+    std::env::var("OPENASR_WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES)
+}
+
+/// Minimum push a *head* landing must clear, in seconds. The core landing's
+/// floor ([`WHISPER_DTW_ONSET_MIN_PUSH_S`]) exists to skip adjustments smaller
+/// than the fold's own calibration error, but a head landing measures
+/// distance-to-audio, not fold error: a fold that opens 0.12 s before a short
+/// word's onset puts the word's own burst 0.20 s in, and a 0.25 s floor
+/// refuses exactly the landing that would fix it (mikan's "This", 0.204 s to
+/// its /d/ burst at 0.083 -- 1.26x the core's own peak).
+const WHISPER_DTW_ONSET_HEAD_MIN_PUSH_S: f32 = 0.15;
+
+/// Deployment env override for the head-landing push floor
+/// ([`WHISPER_DTW_ONSET_HEAD_MIN_PUSH_S`]); a bare environment falls back to
+/// the compiled default.
+fn whisper_dtw_onset_head_min_push_s() -> f32 {
+    std::env::var("OPENASR_WHISPER_DTW_ONSET_HEAD_MIN_PUSH_S")
+        .ok()
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .unwrap_or(WHISPER_DTW_ONSET_HEAD_MIN_PUSH_S)
+}
 
 /// Below-line frames tolerated inside a head cluster before it splits.
 /// Mirrors the offset pass's run gap tolerance: a word's onset head rises
@@ -760,7 +800,67 @@ fn whisper_dtw_silence_ceiling(noise_floor: f64, clip_peak: f64) -> f64 {
 /// thin-floor clips (where the relative threshold is already tighter). When it
 /// refuses, the word keeps its fold position (an overshoot into the pause),
 /// which is the safe direction: coverage over precision.
+///
+/// The line has one escape hatch: on a noisy or music-backed recording the
+/// median is the pause itself, so a genuine pause sitting at 0.5-1.0x the
+/// median can never drop below it and is refused forever. A word half that is
+/// quiet against the slice's own *peak* still reads as true silence there (see
+/// [`WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION`] and
+/// [`WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION`]), so this line only
+/// veto-blocks the word halves that are not.
 const WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE: f64 = 0.3;
+
+/// Deployment env override for the absolute-quiet median multiple
+/// ([`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]); a bare environment falls
+/// back to the compiled default, staying byte-identical to it.
+fn whisper_dtw_hollow_absolute_median_multiple() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE)
+}
+
+/// Max share of the slice's *peak* envelope level a word front half's mean may
+/// hold while the front still reads as a trusted pause on a dense slice,
+/// overriding the absolute-quiet median multiple
+/// ([`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]).
+///
+/// The absolute-quiet line judges the pause against the slice median, but on a
+/// noisy or music-backed recording the median is the pause itself: arnold's
+/// contrast-6.3 slice reads 0.82x the median behind "the" and 0.56x behind
+/// "in", both above the 0.3x line and blocked forever, so both words stretch
+/// back across their pauses. The slice *peak*, by contrast, is the loudest
+/// speech; a pause front far below it is silence no matter what the floor
+/// carries. Measured over the absq-vetoed corpus (front-mean vs slice peak,
+/// dB): the genuine pause fronts cluster at -18 to -21 dB (arnold, mikan)
+/// while every bed dip the absolute line exists to protect sits at -7 to
+/// -10.5 dB (claire, lobster, thriller, tequila, sakuracon, and the refusing
+/// unit-test fixture at -10.5 dB). 0.16 (-16 dB) is the gap between those
+/// two populations: below it the absolute veto is lifted, above it the line
+/// keeps its full force, so this only ever unblocks fronts that are quiet
+/// against the loudest audio in the slice. Swept over the 30-clip test
+/// corpus (regenerated whisper-large-v3-turbo suite, judged against the
+/// committed baseline): MEAN TempErr 0.116 -> 0.115 with MEAN InWin 90%
+/// unchanged and no clip losing a point, every bed-dip-protected clip
+/// (claire, lobster, thriller, tequila, sakuracon, beans, coming, malfina,
+/// ...) byte-identical, and the stretched-word SUM 79 -> 72; arnold's two
+/// pause-stretched front halves land on their onsets (start error 0.43 s /
+/// 0.40 s -> 0.03 s / 0.04 s) while its "smoking" back keeps the fold end
+/// under the stricter
+/// [`WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION`]. The classifier-retune
+/// alternative (thin-floor contrast 8 -> 6) adds nothing on top of this gate
+/// (-0.000 MEAN, -3 InWin pts) and stays at 8.0.
+const WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION: f64 = 0.16;
+
+/// Deployment env override for the front-mean peak fraction
+/// ([`WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION`]); a bare environment
+/// falls back to the compiled default, staying byte-identical to it.
+fn whisper_dtw_hollow_front_mean_max_peak_fraction() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION)
+}
 
 /// Multiple of the slice median (the noise floor) the edge-refiner silence
 /// ceiling never drops below.
@@ -904,7 +1004,10 @@ fn whisper_refine_dtw_word_onsets(
         //   2. its mean is below a fraction of the slice's noise floor, so a
         //      bed-level dip on a dense slice (which clears every relative gate)
         //      never reads as a pause (see
-        //      [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]);
+        //      [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]) -- except a
+        //      front quiet against the slice's own peak, which is true
+        //      silence even when the median itself is noise (see
+        //      [`WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION`]);
         //   3. no *sustained* run of front frames crosses the silence ceiling,
         //      so a music floor never masquerades as a pause (see
         //      [`WHISPER_DTW_HOLLOW_FRONT_MAX_PEAK_FRACTION`]) while a single
@@ -917,7 +1020,7 @@ fn whisper_refine_dtw_word_onsets(
         // On a dense slice (median ~0.03) a bed dip at 0.015 is 0.5× median
         // and is blocked; on a quiet clip (median ~0.001) true silence at
         // 0.001 is 1.0× median and passes the relative gate anyway.
-        let absolute_quiet_threshold = noise_floor * WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+        let absolute_quiet_threshold = noise_floor * whisper_dtw_hollow_absolute_median_multiple();
         let is_dense_slice =
             clip_peak / noise_floor.max(f64::EPSILON) < whisper_dtw_thin_floor_contrast();
         let mut ceiling_sustained = false;
@@ -934,8 +1037,15 @@ fn whisper_refine_dtw_word_onsets(
             }
         }
         let front_above = (0..front_len).filter(|&i| is_above(i)).count() as f64 / front_len as f64;
+        // The absolute-quiet veto is lifted when the front is quiet against the
+        // slice's own peak: on a dense slice that is true silence even though
+        // it sits above the median-scaled line.
+        let front_mean_quiet_vs_peak =
+            front_mean < clip_peak * whisper_dtw_hollow_front_mean_max_peak_fraction();
         if front_mean >= threshold
-            || (is_dense_slice && front_mean >= absolute_quiet_threshold)
+            || (is_dense_slice
+                && front_mean >= absolute_quiet_threshold
+                && !front_mean_quiet_vs_peak)
             || ceiling_sustained
             || front_above > WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
         {
@@ -1043,7 +1153,8 @@ fn whisper_refine_dtw_word_onsets(
             let landing_s = ((frame_start + landing) as f64 * seconds_per_frame) as f32;
             let push = landing_s - raw_start as f32;
             f64::from(landing_s) < raw_end
-                && (WHISPER_DTW_ONSET_MIN_PUSH_S..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push)
+                && (whisper_dtw_onset_head_min_push_s()..=WHISPER_DTW_ONSET_MAX_PUSH_S)
+                    .contains(&push)
         };
         // Rule 1 -- a head inside the skipped region: a dense cluster at the
         // full speech floor is the word's real onset; land on it instead of
@@ -1059,7 +1170,7 @@ fn whisper_refine_dtw_word_onsets(
         while index < rel && head_rel.is_none() {
             if f64::from(region[index]) >= threshold {
                 let (above, span) = head_cluster(threshold, index);
-                if above >= WHISPER_DTW_ONSET_HEAD_SUSTAIN_FRAMES
+                if above >= whisper_dtw_onset_head_sustain_frames()
                     && above as f64 / span as f64 >= WHISPER_DTW_ONSET_HEAD_MIN_ACTIVE_FRACTION
                     && cluster_peak(index, span)
                         >= core_peak * WHISPER_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
@@ -1113,7 +1224,15 @@ fn whisper_refine_dtw_word_onsets(
         // A word's start may only move forward into later audio, never backward.
         // The minimum push guards against a sub-calibration-error wiggle; the
         // maximum caps how deep into a pause we trust the envelope to lead us.
-        if !(WHISPER_DTW_ONSET_MIN_PUSH_S..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push) {
+        // A Rule 1 head landing clears the lower floor of distance-to-audio
+        // instead (the fold may already open a fraction before a short word's
+        // onset, so its own burst can sit inside the core's calibration error).
+        let min_push = if head_rel.is_some() {
+            whisper_dtw_onset_head_min_push_s()
+        } else {
+            WHISPER_DTW_ONSET_MIN_PUSH_S
+        };
+        if !(min_push..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push) {
             continue;
         }
         word.start = onset_s;
@@ -1124,6 +1243,37 @@ fn whisper_refine_dtw_word_onsets(
 /// Share of a word's back half tolerated above the floor before the word is no
 /// longer hollow (a speech offset bleeding into the back half).
 const WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX: f32 = 0.5;
+/// Max share of the slice's *peak* envelope level a word back half's mean may
+/// hold while the back still reads as a trusted pause on a dense slice: the
+/// trailing mirror of [`WHISPER_DTW_HOLLOW_FRONT_MEAN_MAX_PEAK_FRACTION`],
+/// swept *stricter* than the front (0.13 vs 0.16).
+///
+/// A word's back half is less clean pause evidence than its front: it can
+/// carry the word's own soft tail (a decaying /g/ or final burst that dips
+/// under the 5 dB search floor, where the trailing-tail lookahead cannot
+/// reach it) plus the *next* word's lead-in audio. arnold's "smoking" back
+/// mean sits at 0.141 of the slice peak (-17.0 dB), above the 0.16 front
+/// line's shadow but above a 0.13 (=-17.7 dB) back line, and trimming its end
+/// to the loud core shaves real speech (the fold end 3.293 sits 0.12 s past
+/// the 3.17 s truth; the 3.0 s pull is 0.17 s short). Swept over the 30-clip
+/// corpus at 0.16 -> 0.13: the MEAN TempErr stands at 0.1146 (0.116 committed
+/// baseline), MEAN InWin 90.0 -> 90.0 (+0.02 pt), arnold 0.072 -> 0.069 with
+/// "smoking" back at its fold end, warriors reclaims its InWin point
+/// ("Alright," restored to its truth-aligned end) while every back-half win
+/// the 0.16 line earned (mikan, rye, warriors, bibi, ...) still lands -- the
+/// losing pulls (rye "Sorry.", ali "tap,", tenma "As") sit in the 0.13-0.16
+/// band and cost one word each.
+const WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION: f64 = 0.13;
+
+/// Deployment env override for the back-mean peak fraction
+/// ([`WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION`]); a bare environment
+/// falls back to the compiled default, staying byte-identical to it.
+fn whisper_dtw_hollow_back_mean_max_peak_fraction() -> f64 {
+    std::env::var("OPENASR_WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION)
+}
 /// dB above the clip's own noise floor (the median envelope level) that counts
 /// as real speech; the trailing-silence counterpart of
 /// [`WHISPER_DTW_ONSET_FLOOR_MARGIN_DB`].
@@ -1275,6 +1425,16 @@ const WHISPER_DTW_HOLLOW_CEILING_SUSTAIN_FRAMES: usize = 3;
 /// threshold, so the search floor is the lower of the absolute floor and the
 /// region's own peak minus [`WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB`].
 ///
+/// The pre-lead is for a window parked *behind* its audio and nothing else.
+/// When the word's own audio runs on to the window edge -- a low-SNR body the
+/// relative search floor keeps counting, a cut at the band end -- there is no
+/// tail to retreat to, and stepping over that audio onto an earlier run (in the
+/// worst case out in the lead, where the previous word's decay crosses the fold's
+/// boundary) ends the window before the word's own audio starts: arnold's
+/// "entire" collapsed from [284.27, 284.76] s to [284.27, 284.39] s, stopping a
+/// third of a second short of its own. Only a later run quieter than the window's
+/// own peak is a bed to step over; at the word's own level it is the word.
+///
 /// As with onsets, the back must stay below a small fraction of the clip's
 /// *peak*: a music or noise bed never reads as digital zero, so a low passage
 /// inside a music-backed clip is not a trusted trailing pause and a pull would
@@ -1349,7 +1509,10 @@ fn whisper_refine_dtw_word_offsets(
         // onset pass's front-half check: (1) its *mean* is below the noise floor;
         // (2) its mean is below a fraction of the slice's noise floor, so a
         // bed-level dip on a dense slice never reads as trailing silence (see
-        // [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]); (3) no *sustained* run
+        // [`WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE`]) -- except a back
+        // quiet against the slice's own peak, which is true silence even when
+        // the median itself is noise (see
+        // [`WHISPER_DTW_HOLLOW_BACK_MEAN_MAX_PEAK_FRACTION`]); (3) no *sustained* run
         // of back frames crosses the silence ceiling, so a music floor never
         // masquerades as trailing silence while a single bed crackle does not
         // void a legitimate pause; (4) fewer than half its frames are above
@@ -1362,7 +1525,7 @@ fn whisper_refine_dtw_word_offsets(
         // On a dense slice (median ~0.03) a bed dip at 0.015 is 0.5× median
         // and is blocked; on a quiet clip (median ~0.001) true silence at
         // 0.001 is 1.0× median and passes the relative gate anyway.
-        let absolute_quiet_threshold = noise_floor * WHISPER_DTW_HOLLOW_ABSOLUTE_MEDIAN_MULTIPLE;
+        let absolute_quiet_threshold = noise_floor * whisper_dtw_hollow_absolute_median_multiple();
         // The absolute check only applies on dense slices (contrast < 8). On thin
         // floors the relative threshold is already tight and the ceiling is
         // raised to 3× median; the absolute check would only block genuine
@@ -1384,8 +1547,13 @@ fn whisper_refine_dtw_word_offsets(
         }
         let back_above =
             (back_start..window_len).filter(|&i| is_above(i)).count() as f64 / back_len as f64;
+        // The absolute-quiet veto is lifted when the back is quiet against the
+        // slice's own peak: on a dense slice that is true silence even though
+        // it sits above the median-scaled line.
+        let back_mean_quiet_vs_peak =
+            back_mean < clip_peak * whisper_dtw_hollow_back_mean_max_peak_fraction();
         if back_mean >= threshold
-            || (is_dense_slice && back_mean >= absolute_quiet_threshold)
+            || (is_dense_slice && back_mean >= absolute_quiet_threshold && !back_mean_quiet_vs_peak)
             || ceiling_sustained
             || back_above > WHISPER_DTW_HOLLOW_BACK_ACTIVE_MAX as f64
         {
@@ -1412,44 +1580,75 @@ fn whisper_refine_dtw_word_offsets(
         let floor = threshold
             .min(region_peak * 10.0_f64.powf(-WHISPER_DTW_OFFSET_PEAK_FLOOR_MARGIN_DB / 20.0));
         // Gap-tolerant runs above the floor, gathered in order as (above-frame
-        // count, last above frame).
-        let mut runs: Vec<(usize, usize)> = Vec::new();
+        // count, first above frame, last above frame, run peak).
+        let window_rel = frame_start - region_frame_start;
+        let mut runs: Vec<(usize, usize, usize, f64)> = Vec::new();
         let mut run_above = 0usize;
+        let mut run_first = 0usize;
         let mut run_last = 0usize;
+        let mut run_peak = 0.0f64;
         let mut in_run = false;
         let mut below_gap = 0usize;
         for (i, &sample) in region.iter().enumerate() {
-            if f64::from(sample) >= floor {
+            let level = f64::from(sample);
+            if level >= floor {
                 if !in_run {
                     in_run = true;
                     run_above = 0;
+                    run_first = i;
+                    run_peak = 0.0;
                 }
                 run_above += 1;
                 run_last = i;
+                run_peak = run_peak.max(level);
                 below_gap = 0;
             } else if in_run {
                 below_gap += 1;
                 if below_gap > WHISPER_DTW_OFFSET_RUN_GAP_TOLERANCE_FRAMES {
-                    runs.push((run_above, run_last));
+                    runs.push((run_above, run_first, run_last, run_peak));
                     in_run = false;
                     below_gap = 0;
                 }
             }
         }
         if in_run {
-            runs.push((run_above, run_last));
+            runs.push((run_above, run_first, run_last, run_peak));
         }
+        // The loudest level inside the word's own window: this word's own speech,
+        // against which a later run reads as this word's audio continuing (not a
+        // bed to step over).
+        let window_peak = region[window_rel.min(region_len)..]
+            .iter()
+            .fold(0.0f64, |peak, sample| peak.max(f64::from(*sample)));
         let mut offset_rel: Option<usize> = None;
-        for &(run_count, run_end_index) in runs.iter().rev() {
+        for (index, &(run_count, _run_first, run_last, _run_peak)) in runs.iter().enumerate().rev()
+        {
             if run_count >= WHISPER_DTW_OFFSET_SUSTAIN_FRAMES {
                 let mut quiet = 0usize;
-                let mut probe = run_end_index;
+                let mut probe = run_last;
                 while probe + 1 < region_len && f64::from(region[probe + 1]) < floor {
                     probe += 1;
                     quiet += 1;
                 }
                 if quiet >= min_quiet_frames {
-                    offset_rel = Some(run_end_index);
+                    // A later *sustained* run at the word's own window peak means
+                    // this word's audio runs to the window edge -- a low-SNR body
+                    // the relative floor keeps counting, a cut at the band end --
+                    // so there is no tail to retreat to and landing on an earlier
+                    // run would put the end ahead of the word's own audio (arnold's
+                    // "entire" retracted onto the preceding "an" that way, ending
+                    // a third of a second before its own audio starts). Only a
+                    // later run quieter than the window's peak is a bed, not this
+                    // word's speech, and may be stepped over. Refusing keeps the
+                    // fold end, the safe direction.
+                    let steps_over_the_words_own_audio =
+                        runs[index + 1..].iter().any(|&(count, _, _, peak)| {
+                            count >= WHISPER_DTW_OFFSET_SUSTAIN_FRAMES
+                                && peak >= window_peak * (1.0 - 1e-6)
+                        });
+                    if !steps_over_the_words_own_audio {
+                        offset_rel = Some(run_last);
+                    }
                     break;
                 }
             }
