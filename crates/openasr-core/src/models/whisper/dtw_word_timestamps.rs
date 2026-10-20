@@ -971,7 +971,29 @@ fn whisper_refine_dtw_word_onsets(
     // start (`max_edge` unbounded), and the leading-silence advance anchor only
     // covers the window-front leak shape, so nothing else audio-side corrects
     // a head word the anchor cannot reach.
-    for word in words.iter_mut() {
+    //
+    // Standing push trace (`OPENASR_WHISPER_DEBUG_PUSH`): one line per word
+    // recording the fold window, the landing (the sustained-run core or the
+    // Rule 1 head hunt), the push, the slice's floor and +5 dB search line,
+    // the landing run's frames and the
+    // neighbours' pre-refinement fold windows. Every remedy attempt since the
+    // gates-only baseline had to reverse-engineer these fields from two
+    // separate span logs; the trace makes a sweep self-documenting. No
+    // behavior change in a bare environment.
+    let dbg_push = std::env::var_os("OPENASR_WHISPER_DEBUG_PUSH").is_some();
+    // The loop mutates starts in place, so the neighbours' fold windows the
+    // trace reports must be the pre-refinement originals.
+    let fold_windows: Vec<(f32, f32)> = if dbg_push {
+        words.iter().map(|w| (w.start, w.end)).collect()
+    } else {
+        Vec::new()
+    };
+    let fold_range = |index: usize| -> String {
+        fold_windows
+            .get(index)
+            .map_or_else(String::new, |(a, b)| format!("{:.3}..{:.3}", a, b))
+    };
+    for (word_index, word) in words.iter_mut().enumerate() {
         let raw_start = f64::from(word.start);
         let raw_end = f64::from(word.end);
         let span = raw_end - raw_start;
@@ -997,6 +1019,23 @@ fn whisper_refine_dtw_word_onsets(
         let window_len = window.len();
         let is_above = |index: usize| f64::from(window[index]) >= threshold;
         let front_len = (window_len / 2).clamp(1, window_len);
+        let dbg_head = if dbg_push {
+            Some(format!(
+                "word={word_index} {} fold={raw_start:.3}..{raw_end:.3} floor={floor:.4} thr={thr:.4} prev={prev_fold} next={next_fold}",
+                word.word,
+                floor = noise_floor,
+                thr = threshold,
+                prev_fold = fold_range(word_index.checked_sub(1).unwrap_or(usize::MAX)),
+                next_fold = fold_range(word_index + 1)
+            ))
+        } else {
+            None
+        };
+        let dbg_emit = |head: &Option<String>, extra: &str, status: &str| {
+            if let Some(head) = head {
+                eprintln!("[dtw-pdebug] {head} {extra} status={status}");
+            }
+        };
         // A hollow word: the front half sits in true silence, not just a quiet
         // passage. Four conditions on the front half of the window:
         //   1. its *mean* level is below the noise floor (not just a fraction of
@@ -1049,6 +1088,7 @@ fn whisper_refine_dtw_word_onsets(
             || ceiling_sustained
             || front_above > WHISPER_DTW_HOLLOW_FRONT_ACTIVE_MAX as f64
         {
+            dbg_emit(&dbg_head, "", "gate");
             continue;
         }
         // The onset: the first speech run (>= sustain frames above the floor)
@@ -1097,6 +1137,7 @@ fn whisper_refine_dtw_word_onsets(
             }
         }
         let Some(rel) = onset_rel else {
+            dbg_emit(&dbg_head, "", "runless");
             continue;
         };
         // A word that begins with a quiet or fragmented onset head (a
@@ -1166,6 +1207,7 @@ fn whisper_refine_dtw_word_onsets(
         // unusable candidate from both re-targeting the push and (below)
         // suppressing the window-start veto.
         let mut head_rel: Option<usize> = None;
+        let mut head_run_last: Option<usize> = None;
         let mut index = min_quiet_frames;
         while index < rel && head_rel.is_none() {
             if f64::from(region[index]) >= threshold {
@@ -1177,6 +1219,7 @@ fn whisper_refine_dtw_word_onsets(
                     && legal_landing(index)
                 {
                     head_rel = Some(index);
+                    head_run_last = Some(index + span - 1);
                 }
                 index += span;
             } else {
@@ -1187,6 +1230,26 @@ fn whisper_refine_dtw_word_onsets(
         let onset_s = head_rel.map_or(core_s, |head| {
             ((frame_start + head) as f64 * seconds_per_frame) as f32
         });
+
+        let dbg_landing = if dbg_push {
+            let run_range = head_rel.map_or_else(
+                || format!("{}..{}", frame_start + rel, frame_start + core_end),
+                |head| {
+                    format!(
+                        "{}..{}",
+                        frame_start + head,
+                        frame_start + head_run_last.unwrap_or(head)
+                    )
+                },
+            );
+            format!(
+                "landing={landing:.3} src={src} run={run_range}",
+                landing = onset_s,
+                src = if head_rel.is_some() { "head" } else { "core" },
+            )
+        } else {
+            String::new()
+        };
         // Rule 2 -- the window already opens on the head: a dense cluster of
         // near-floor audio spanning the window's own start proves the fold
         // placed the word on its onset head, so the loud run ahead is the
@@ -1209,6 +1272,14 @@ fn whisper_refine_dtw_word_onsets(
                     && cluster_peak(first, span)
                         >= core_peak * WHISPER_DTW_ONSET_HEAD_MIN_CORE_PEAK_RATIO
                 {
+                    dbg_emit(
+                        &dbg_head,
+                        &format!(
+                            "{dbg_landing} push={push:.3}",
+                            push = onset_s - raw_start as f32
+                        ),
+                        "refused-rule2",
+                    );
                     continue;
                 }
             }
@@ -1218,6 +1289,14 @@ fn whisper_refine_dtw_word_onsets(
         // would have to move too -- a rehouse, not an edge correction. Refuse
         // it (the offset pass refuses its mirror case the same way).
         if f64::from(onset_s) >= raw_end {
+            dbg_emit(
+                &dbg_head,
+                &format!(
+                    "{dbg_landing} push={push:.3}",
+                    push = onset_s - raw_start as f32
+                ),
+                "refused-invert",
+            );
             continue;
         }
         let push = onset_s - raw_start as f32;
@@ -1233,9 +1312,15 @@ fn whisper_refine_dtw_word_onsets(
             WHISPER_DTW_ONSET_MIN_PUSH_S
         };
         if !(min_push..=WHISPER_DTW_ONSET_MAX_PUSH_S).contains(&push) {
+            dbg_emit(
+                &dbg_head,
+                &format!("{dbg_landing} push={push:.3}"),
+                "refused-push",
+            );
             continue;
         }
         word.start = onset_s;
+        dbg_emit(&dbg_head, &format!("{dbg_landing} push={push:.3}"), "push");
     }
     words
 }
