@@ -7914,6 +7914,79 @@ const WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS: f32 = 0.5;
 /// conservative head-only splice.
 const WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH: f32 = 0.05;
 
+/// Two placed words this far apart or wider bound a hole the carry may have
+/// skipped: the model treated earlier carried words as already spoken and
+/// jumped the real speech BETWEEN them, leaving a mid-slice gap with no word
+/// stamps over ordinary audio (the same produced shape as the head skip, but
+/// interior). Everyday inter-clause pauses of this width are normal in every
+/// healthy decode, so the gap alone proves nothing -- [`WhisperCarryHole`] is
+/// only emitted when the gap also passes the acoustic gate.
+const WHISPER_CARRY_HOLE_MIN_GAP_SECONDS: f32 = 0.4;
+
+/// Interior-hole acoustic gate: the hole's peak RMS-envelope frame may sit at
+/// most this many dB under the placed words' frame percentile. The peak is the
+/// statistic that works where the mean fails: a real pause is silent across
+/// its whole width, while a skipped hole keeps sounding (a swallowed repeated
+/// word, a phrase the carry jumped) even when only a consonant onset or one
+/// loud frame stays under the gap, and a mean over the gap dilutes that onset
+/// into the pause floor. False triggers (an audible real pause) are cheap:
+/// the re-decode runs once per slice pool and a recovered word only enters the
+/// transcript if its own majority time credits it to the hole.
+const WHISPER_CARRY_HOLE_MAX_DEFICIT_DB: f32 = 6.0;
+
+/// A base re-decode word is credited to a hole when its majority time sits
+/// inside the hole window widened by this much on the START side. The re-decode
+/// places words on its own timing, and a swallowed repeated word commonly
+/// starts while the carried decode's preceding word is still being stretched
+/// over the gap; without the start margin its midpoint would sit just behind
+/// the hole's open edge and the recovery would drop the very word it exists
+/// for.
+const WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS: f32 = 0.5;
+
+/// The END-side widening of the hole window. Much smaller than the start
+/// margin because a re-decode word landing this far into the NEXT carried word
+/// is usually that word, not the hole's: swallowing happens at the hole's
+/// open edge. Stretched enough that a repeated word the recovery itself
+/// re-times against the carried decode's stretched right word still credits
+/// to its hole (its placement can trail the gap's end by ~a fifth of a
+/// second), with the covered rule + audio-support gate below catching whatever
+/// that slack admits wrong.
+const WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS: f32 = 0.25;
+
+/// Audio-support deficit for a grafted word's OWN span, tighter than the hole
+/// gate: a stamp placed over real speech (even a soft consonant onset DTW put
+/// a syllable early, 8 dB soft) still clears it, while a loop-filler word
+/// stamped into the hole's pause air sits 15-20 dB under the placed words.
+/// Between the worst real recovered word and the ghosts is where the line
+/// goes.
+const WHISPER_CARRY_HOLE_WORD_MAX_DEFICIT_DB: f32 = 12.0;
+
+/// A re-decode word wider than this is one of the re-decode's own stretched
+/// stamps (the same swallow shape the carried decode's wide words are, plated
+/// over a hole plus the following onset), not the narrow stamp of the lost
+/// word; grafted wide stamps duplicate the carried stretch and score as
+/// insertions. Real recovered speech across the suite grafts at <= 0.9 s.
+const WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS: f32 = 1.0;
+
+/// A re-decode word with mean token probability below this is loop filler
+/// ("Mhm.", "mmmm", a hallucinated lyric) rather than the missed speech,
+/// which decodes confidently even when the carry's repetition pressure broke
+/// its context.
+const WHISPER_CARRY_HOLE_MIN_GRAFT_WORD_CONFIDENCE: f32 = 0.55;
+
+/// A detected interior carry-skip hole: the gap between the placed words at
+/// `boundary` (+1) is at least [`WHISPER_CARRY_HOLE_MIN_GAP_SECONDS`] wide and
+/// still audible at the slice's placed-word level, so it plausibly holds
+/// speech the carry skipped. `lo`/`hi` are the slice-relative window bounds
+/// (the left word's end, the right word's start).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WhisperCarryHole {
+    /// Index of the left (earlier) of the two words that flank the hole.
+    boundary: usize,
+    lo: f32,
+    hi: f32,
+}
+
 /// One temperature-ladder round's decode, kept so the ladder's races can hand
 /// the whole set around without re-decoding. `round` is its 1-based rung (1 =
 /// the guard-tripped temperature-0 incumbent, `WHISPER_TEMPERATURE_LADDER.len()
@@ -8095,6 +8168,306 @@ fn whisper_carry_head_skip_graft(
     } else {
         Some(WhisperCarryHeadSkipGraft::Splice { hole_words })
     }
+}
+
+/// Largest single RMS-envelope frame over the slice-relative seconds
+/// `[lo, hi)` -- the peaked counterpart to [`whisper_slice_envelope_level`],
+/// for gates that must catch a brief onset inside an otherwise quiet range (a
+/// mean over the range would dilute a 0.2 s consonant onset into the pause
+/// floor). Non-finite frames do not raise the peak. `None` when the range is
+/// empty, falls outside the measured envelope, or carries no signal.
+fn whisper_slice_envelope_peak(rms_frames: &[f32], lo: f32, hi: f32) -> Option<f32> {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    if rms_frames.len() < 2 || hi <= lo || lo < 0.0 {
+        return None;
+    }
+    let lo_frame = (lo as f64 / FRAME_SECONDS).floor() as usize;
+    let hi_frame = (hi as f64 / FRAME_SECONDS).floor() as usize;
+    let lo_frame = lo_frame.min(rms_frames.len());
+    let hi_frame = hi_frame.min(rms_frames.len());
+    if hi_frame <= lo_frame {
+        return None;
+    }
+    let peak = rms_frames[lo_frame..hi_frame]
+        .iter()
+        .copied()
+        .fold(0.0_f32, |peak, frame| {
+            if frame.is_finite() {
+                peak.max(frame)
+            } else {
+                peak
+            }
+        });
+    (peak > 0.0_f32).then_some(peak)
+}
+
+/// The RMS-envelope frames under every placed word, as the hole gate's
+/// reference sample (helper so the percentile and the gate share framing).
+fn whisper_carry_word_level_frames(rms_frames: &[f32], words: &[crate::WordTimestamp]) -> Vec<f32> {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    words
+        .iter()
+        .filter(|word| word.end > word.start)
+        .filter_map(|word| {
+            let lo_frame = (word.start as f64 / FRAME_SECONDS).floor() as usize;
+            let hi_frame = (word.end as f64 / FRAME_SECONDS).floor() as usize;
+            let lo_frame = lo_frame.min(rms_frames.len());
+            let hi_frame = hi_frame.min(rms_frames.len());
+            (hi_frame > lo_frame).then(|| rms_frames[lo_frame..hi_frame].to_vec())
+        })
+        .flatten()
+        .collect()
+}
+
+/// Peaked reference level for the interior-hole gate: the 90th-percentile
+/// RMS-envelope frame under the slice's placed words themselves. Speech is
+/// quiet far more often than loud, so a percentile of the word frames sits
+/// well under a shout yet still far above a real pause's floor, which keeps
+/// the gate from admitting every wide inter-clause breath while the gap's own
+/// peak (even a lone soft onset frame) still clears it.
+fn whisper_carry_word_surface_level(
+    rms_frames: &[f32],
+    words: &[crate::WordTimestamp],
+) -> Option<f32> {
+    let mut frames = whisper_carry_word_level_frames(rms_frames, words);
+    if frames.is_empty() {
+        return None;
+    }
+    frames.sort_by(f32::total_cmp);
+    let index = frames.len().saturating_sub(1).saturating_mul(90) / 100;
+    frames
+        .get(index)
+        .copied()
+        .filter(|frame| frame.is_finite() && *frame > 0.0)
+}
+
+/// Interior carry-skip holes in a placed word list: consecutive word pairs
+/// whose gap is at least [`WHISPER_CARRY_HOLE_MIN_GAP_SECONDS`] wide AND still
+/// audible at the slice's placed-word level (deficit gate
+/// [`WHISPER_CARRY_HOLE_MAX_DEFICIT_DB`]), i.e. real speech the carried decode
+/// left unstamped between the words it did place. The head before the first
+/// word and the tail after the last word are deliberately not holes -- those
+/// carry shapes have their own recoveries (the head-skip graft and the
+/// ladder's audible-tail re-race), and re-covering them here would graft the
+/// same audio twice.
+fn whisper_carry_interior_holes(
+    words: &[crate::WordTimestamp],
+    rms_frames: Option<&[f32]>,
+) -> Vec<WhisperCarryHole> {
+    let Some(rms_frames) = rms_frames else {
+        return Vec::new();
+    };
+    let Some(surface) = whisper_carry_word_surface_level(rms_frames, words) else {
+        return Vec::new();
+    };
+    let trace_holes = whisper_ladder_debug_enabled();
+    if trace_holes {
+        eprintln!(
+            "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan words={} surface={surface:.5}",
+            words.len()
+        );
+    }
+    words
+        .windows(2)
+        .enumerate()
+        .filter_map(|(boundary, pair)| {
+            let (left, right) = (&pair[0], &pair[1]);
+            let (lo, hi) = (left.end, right.start);
+            if hi - lo < WHISPER_CARRY_HOLE_MIN_GAP_SECONDS {
+                return None;
+            }
+            let peak = whisper_slice_envelope_peak(rms_frames, lo, hi);
+            let hole = peak
+                .and_then(|peak| {
+                    let deficit = 20.0_f32 * (surface / peak).log10();
+                    (deficit.is_finite() && deficit <= WHISPER_CARRY_HOLE_MAX_DEFICIT_DB)
+                        .then_some(WhisperCarryHole { boundary, lo, hi })
+                });
+            if trace_holes {
+                match peak {
+                    None => eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan_gap boundary={boundary} gap={lo:.2}..{hi:.2} peak=none rejected=unmeasurable"
+                    ),
+                    Some(peak) => eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan_gap boundary={boundary} gap={lo:.2}..{hi:.2} peak={peak:.5} deficit={:.1} admitted={}",
+                        20.0_f32 * (surface / peak).log10(),
+                        hole.is_some()
+                    ),
+                }
+            }
+            hole
+        })
+        .collect()
+}
+
+/// Lowercased ASCII-alphanumeric word units of a display token ("heart...the"
+/// -> ["heart", "the"]), so the dedupe can say whether a placed word already
+/// COVERED a recovered word's content regardless of the merged/punctuated
+/// form DTW stitching reports it in.
+fn whisper_carry_normalized_word_units(word: &str) -> Vec<String> {
+    word.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|unit| !unit.is_empty())
+        .map(|unit| unit.chars().flat_map(|c| c.to_lowercase()).collect())
+        .collect()
+}
+
+/// The interior-hole graft decision: the re-decode words to insert into the
+/// carried word list, each consumed by the hole its majority time credits it
+/// to, or `None` when the re-decode supplies nothing the carried decode
+/// lacks. Pure so the unit tests pin the credit window, the dedupe and the
+/// nothing-to-insert abort exactly as they pin the head-skip graft.
+fn whisper_carry_interior_hole_graft(
+    carried_words: &[crate::WordTimestamp],
+    recovered_words: &[crate::WordTimestamp],
+    holes: &[WhisperCarryHole],
+    rms_frames: Option<&[f32]>,
+) -> Option<Vec<crate::WordTimestamp>> {
+    let trace_graft =
+        whisper_ladder_debug_enabled() && !holes.is_empty() && !recovered_words.is_empty();
+    if trace_graft {
+        for (hole_index, hole) in holes.iter().enumerate() {
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_window hole={} window={:.2}..{:.2}",
+                hole_index,
+                hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS,
+                hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS
+            );
+        }
+    }
+    // Audio support for admitted words: a re-decode word is only the lost
+    // speech when the audio under ITS OWN span actually sounds like the speech
+    // the rest of the slice decodes at. The re-decode's DTW stamps live on
+    // their own time grid and can trail into a neighboring pause, and a
+    // pause-ghost word (loop filler stamped over silence) sounds orders of
+    // magnitude below the placed words, so measured under the placed words'
+    // surface level it fails the same deficit gate the hole itself passed.
+    let support_level =
+        rms_frames.and_then(|rms| whisper_carry_word_surface_level(rms, carried_words));
+    let mut hole_words: Vec<Vec<crate::WordTimestamp>> = vec![Vec::new(); holes.len()];
+    let mut used = vec![false; recovered_words.len()];
+    let mut grafted = 0usize;
+    for (hole_index, hole) in holes.iter().enumerate() {
+        let window_lo = hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS;
+        let window_hi = hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS;
+        for (index, word) in recovered_words.iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            // Content-bearing stamps only: a lone "." or a mojibake run is a
+            // DTW artifact, not the swallowed word a hole holds.
+            if !word.word.trim().chars().any(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            let majority = 0.5 * (word.start + word.end);
+            if majority < window_lo || majority > window_hi {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=outside_window",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // The re-decode's own stretched stamps and its low-probability
+            // fill are not the lost word; they are its copy of the SAME
+            // swallow/loop noise that stretched (or filled) this hole in the
+            // decode that came before, only re-timed onto its own grid. The
+            // lost word is narrow and confident.
+            if word.end - word.start >= WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS
+                || word.confidence.is_none_or(|confidence| {
+                    confidence < WHISPER_CARRY_HOLE_MIN_GRAFT_WORD_CONFIDENCE
+                })
+            {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=degrade",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // Skip the re-decode word when a placed word with the same
+            // content already stretches OVER it: the carried decode did not
+            // lose that word, it just stamped it wide (the stretch swallowed
+            // the repeat run). Stretching is what puts the narrow recovered
+            // word's majority point inside the wider placed span, and the
+            // text match keeps genuinely different words (a recovery that
+            // starts its own repeat under a stretched "and") admitted.
+            let covered = carried_words.iter().any(|placed| {
+                placed.start <= majority && majority <= placed.end && {
+                    let placed_units = whisper_carry_normalized_word_units(&placed.word);
+                    whisper_carry_normalized_word_units(&word.word)
+                        .iter()
+                        .any(|unit| placed_units.contains(unit))
+                }
+            });
+            if covered {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=covered_by_stretch",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // Audio support: skip a stamp whose own span sits on silence (a
+            // pause wrinkle word the loop emitted into the hole's air rather
+            // than the hole's lost speech).
+            if let Some(rms_frames) = rms_frames {
+                let supported = match (
+                    support_level,
+                    whisper_slice_envelope_peak(rms_frames, word.start, word.end),
+                ) {
+                    (Some(surface), Some(peak)) => {
+                        20.0_f32 * (surface / peak).log10()
+                            <= WHISPER_CARRY_HOLE_WORD_MAX_DEFICIT_DB
+                    }
+                    _ => false,
+                };
+                if !supported {
+                    if trace_graft {
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=no_audio_support",
+                            hole_index, word.word, word.start, word.end
+                        );
+                    }
+                    continue;
+                }
+            }
+            used[index] = true;
+            grafted += 1;
+            if trace_graft {
+                eprintln!(
+                    "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_admitted hole={} word={:?} span={:.2}..{:.2} majority={majority:.2}",
+                    hole_index, word.word, word.start, word.end
+                );
+            }
+            hole_words[hole_index].push(word.clone());
+        }
+        hole_words[hole_index].sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    if grafted == 0 {
+        return None;
+    }
+    // Splice at the hole boundaries. Holes are emitted in boundary order (one
+    // hole per consecutive-word pair), so a single forward scan files every
+    // hole's recovered words between exactly the words that flank it.
+    let mut spliced = Vec::with_capacity(carried_words.len() + grafted);
+    let mut hole_front = 0usize;
+    for (index, word) in carried_words.iter().enumerate() {
+        spliced.push(word.clone());
+        while hole_front < holes.len() && holes[hole_front].boundary == index {
+            spliced.extend(std::mem::take(&mut hole_words[hole_front]));
+            hole_front += 1;
+        }
+    }
+    Some(spliced)
 }
 
 /// The tail mirror of [`whisper_slice_head_is_audible`], for the ladder's
@@ -9257,27 +9630,32 @@ fn run_whisper_decode_loop(
             }
         }
     }
-    // Carry head-skip recovery (word splice): the longform carry seeds this
-    // slice's prompt with the previous slice's tail tokens in <startofprev>.
-    // Because the model has already "spoken" the carried words, it can treat
-    // them as the start of THIS window's content and begin emitting mid-
-    // slice, never generating words for the real speech at the slice head
-    // (the first cross-attention-placed word lands seconds into the slice
-    // while the audio ahead of it is at ordinary speech level). When that
-    // shape shows up, re-decode the SAME encoded slice with the base (carry-
-    // less) prompt and graft only the re-decode's hole words (majority time
-    // before the carried first word) in front of the carried words. The
-    // carried decode's tokens, text tail, carry and stop reason stay
-    // untouched, so every slice after this one is conditioned exactly as
-    // before and no downstream content changes. The rare case where the
-    // carried decode's own words are all degenerate zero-width tags (no real
-    // content after the skip at all) instead swaps in the re-decode's word
-    // list wholesale. Every healthy slice (first word inside the overlap
-    // re-read, or a quiet head) takes no action here and stays untouched.
+    // Carry recovery (word splice): the longform carry seeds this slice's
+    // prompt with the previous slice's tail tokens in <startofprev>. Because
+    // the model has already "spoken" the carried words, it can treat them as
+    // the start of THIS window's content in two ways: it may begin emitting
+    // mid-slice (never generating words for the real speech at the slice
+    // head; the first cross-attention-placed word lands seconds into the
+    // slice while the audio ahead of it is at ordinary speech level), or it
+    // may jump over interior audio and leave a mid-slice hole between two
+    // placed words whose gap sounds like ordinary speech. When either shape
+    // shows up, re-decode the SAME encoded slice once with the base (carry-
+    // less) prompt and graft the re-decode's words the carried decode
+    // lacked: head words (majority time before the carried first word) in
+    // front of the carried words, hole words (majority time credited to a
+    // detected hole) between the words that flank their hole. The carried
+    // decode's tokens, text tail, carry and stop reason stay untouched, so
+    // every slice after this one is conditioned exactly as before and no
+    // downstream content changes. The rare case where the carried decode's
+    // own words are all degenerate zero-width tags (no real content after
+    // the skip at all) instead swaps in the re-decode's word list wholesale.
+    // Every healthy slice (first word inside the overlap re-read, no audible
+    // holes, or quiet heads/pauses) takes no action here and stays
+    // untouched.
     if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
         // When the ladder's carry-less round already won, its decode IS the
         // base-prompt re-decode: running this recovery would re-decode the
-        // same slice and graft the same head words a second time.
+        // same slice and graft the same words a second time.
         && !carry_less_round_won
         && request_options.longform_prompt_carry_enabled()
         && request_options
@@ -9297,7 +9675,11 @@ fn run_whisper_decode_loop(
             } else {
                 None
             };
-        if let Some((rms_frames, carried_first_start)) = head_skip_candidate {
+        let interior_holes = whisper_carry_interior_holes(&words, word_audio_rms_frames);
+        if head_skip_candidate.is_some() || !interior_holes.is_empty() {
+            let carried_first_start = head_skip_candidate
+                .map(|(_, first)| first)
+                .unwrap_or_else(|| words.first().map(|word| word.start).unwrap_or(0.0));
             // Base (carry-less) prompt for the re-decode. It is shorter than
             // the carry prompt, so its generated-token budget is larger, but
             // prompt + generated still sums to `max_target_positions` -- the
@@ -9353,43 +9735,60 @@ fn run_whisper_decode_loop(
                                 &recovered_candidate.token_alignments,
                                 &recovered_decode.generated_probabilities,
                                 audio_duration_seconds,
-                                Some(rms_frames),
+                                word_audio_rms_frames,
                             )
                             .unwrap_or_default();
-                            match whisper_carry_head_skip_graft(
-                                &words,
-                                &recovered_words,
-                                carried_first_start,
-                            ) {
-                                None => {
-                                    if whisper_ladder_debug_enabled() {
-                                        let recovered_first = recovered_words
-                                            .first()
-                                            .map(|word| word.start)
-                                            .unwrap_or(f32::NAN);
-                                        eprintln!(
-                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=no_hole_words stop_reason={:?} recovered_words={} recovered_first_word={recovered_first:.2}s carried_first_word={carried_first_start:.2}s",
-                                            recovered_decode.stop_reason,
-                                            recovered_words.len(),
-                                        );
-                                    }
+                            let head_graft = head_skip_candidate.as_ref().map(|(_, head_first)| {
+                                whisper_carry_head_skip_graft(&words, &recovered_words, *head_first)
+                            });
+                            let head_graft_is_none = head_graft.is_none();
+                            if matches!(head_graft, Some(Some(WhisperCarryHeadSkipGraft::Swap))) {
+                                let recovered_text = recovered_decode.text.trim().to_string();
+                                if !recovered_text.is_empty()
+                                    && recovered_text.chars().any(|c| c.is_alphanumeric())
+                                {
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
+                                        recovered_words[0].start,
+                                        recovered_words.len(),
+                                        words.len()
+                                    );
+                                    text = recovered_text;
+                                    words = recovered_words;
                                 }
-                                Some(WhisperCarryHeadSkipGraft::Swap) => {
-                                    let recovered_text = recovered_decode.text.trim().to_string();
-                                    if !recovered_text.is_empty()
-                                        && recovered_text.chars().any(|c| c.is_alphanumeric())
-                                    {
-                                        eprintln!(
-                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
-                                            recovered_words[0].start,
-                                            recovered_words.len(),
-                                            words.len()
-                                        );
-                                        text = recovered_text;
-                                        words = recovered_words;
-                                    }
+                            } else {
+                                // Interior hole splice first: a head splice
+                                // prepends words to the list, which would
+                                // shift every hole boundary index past its
+                                // own meaning, while the head graft was
+                                // already judged against the un-prepended
+                                // list.
+                                if let Some(hole_spliced) = whisper_carry_interior_hole_graft(
+                                    &words,
+                                    &recovered_words,
+                                    &interior_holes,
+                                    word_audio_rms_frames,
+                                ) {
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=words_spliced holes={} grafted_words={} carried_words={}",
+                                        interior_holes.len(),
+                                        hole_spliced.len() - words.len(),
+                                        words.len()
+                                    );
+                                    words = hole_spliced;
+                                    // The holes hold speech the decode never
+                                    // emitted, so its text disagrees with
+                                    // the spliced words; rebuild it from the
+                                    // placed word stamps so segment text and
+                                    // word stamps agree.
+                                    text = crate::transcript_text::join_segment_texts(
+                                        words.iter().map(|word| word.word.trim()),
+                                    );
                                 }
-                                Some(WhisperCarryHeadSkipGraft::Splice { hole_words }) => {
+                                if let Some(Some(WhisperCarryHeadSkipGraft::Splice {
+                                    hole_words,
+                                })) = head_graft
+                                {
                                     // Head-only splice: the grafted words precede the
                                     // carried first word, the rest of the carried
                                     // decode (and its token stream, which feeds the
@@ -9406,6 +9805,20 @@ fn run_whisper_decode_loop(
                                     spliced.extend_from_slice(&words);
                                     words = spliced;
                                     text = format!("{prefix} {text}");
+                                }
+                                if head_skip_candidate.is_some()
+                                    && head_graft_is_none
+                                    && whisper_ladder_debug_enabled()
+                                {
+                                    let recovered_first = recovered_words
+                                        .first()
+                                        .map(|word| word.start)
+                                        .unwrap_or(f32::NAN);
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=no_hole_words stop_reason={:?} recovered_words={} recovered_first_word={recovered_first:.2}s carried_first_word={carried_first_start:.2}s",
+                                        recovered_decode.stop_reason,
+                                        recovered_words.len(),
+                                    );
                                 }
                             }
                         }

@@ -4109,6 +4109,15 @@ fn head_skip_word(word: &str, start: f32, end: f32) -> crate::WordTimestamp {
     }
 }
 
+fn hole_word(word: &str, start: f32, end: f32, confidence: f32) -> crate::WordTimestamp {
+    crate::WordTimestamp {
+        word: word.to_string(),
+        start,
+        end,
+        confidence: Some(confidence),
+    }
+}
+
 #[test]
 fn carry_head_skip_graft_aborts_leave_carried_decode_untouched() {
     // A `None` graft is the abort postcondition: the caller keeps the carried
@@ -4198,6 +4207,227 @@ fn carry_head_skip_graft_swaps_only_degenerate_covered_heads() {
         whisper_carry_head_skip_graft(&tags, &late_onset, 14.08),
         Some(WhisperCarryHeadSkipGraft::Splice { .. })
     ));
+}
+
+fn rms_frames_for(levels: &[(usize, usize, f32)], frame_count: usize) -> Vec<f32> {
+    let mut frames = vec![0.0_f32; frame_count];
+    for (lo, hi, level) in levels {
+        frames[*lo..*hi]
+            .iter_mut()
+            .for_each(|frame| *frame = *level);
+    }
+    frames
+}
+
+#[test]
+fn carry_interior_holes_gate_on_width_and_audibility() {
+    // Words at an ordinary speech level with a 0.5 s audible gap, a 0.3 s
+    // too-narrow gap and a 0.9 s silent gap: only the first is a hole.
+    let words = vec![
+        head_skip_word("This", 0.00, 1.00),
+        head_skip_word("gap", 1.50, 2.00),
+        head_skip_word("too-narrow", 2.30, 3.00),
+        head_skip_word("silent", 3.90, 4.40),
+    ];
+    let frames = rms_frames_for(
+        &[
+            (0, 50, 0.5),
+            (75, 100, 0.5),
+            (115, 150, 0.5),
+            (195, 220, 0.5),
+            (50, 75, 0.45),
+        ],
+        220,
+    );
+    let holes = whisper_carry_interior_holes(&words, Some(&frames));
+    assert_eq!(
+        holes,
+        vec![WhisperCarryHole {
+            boundary: 0,
+            lo: 1.0,
+            hi: 1.5
+        }]
+    );
+    // No RMS envelope: no holes, fail closed.
+    assert!(whisper_carry_interior_holes(&words, None).is_empty());
+}
+
+#[test]
+fn carry_interior_hole_graft_credits_words_to_their_holes() {
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 4.00),
+        head_skip_word("more", 6.00, 7.00),
+    ];
+    let holes = vec![
+        WhisperCarryHole {
+            boundary: 0,
+            lo: 1.0,
+            hi: 3.0,
+        },
+        WhisperCarryHole {
+            boundary: 1,
+            lo: 4.0,
+            hi: 6.0,
+        },
+    ];
+    let recovered = vec![
+        hole_word("is", 1.10, 1.60, 0.9),
+        hole_word("like", 1.90, 2.40, 0.9),
+        hole_word(".", 2.00, 2.30, 0.9),
+        hole_word("a", 4.10, 4.40, 0.9),
+        hole_word("lot", 4.50, 4.90, 0.9),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &holes, None)
+        .expect("the hole words splice into the carried list");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    // Each recovered word lands between exactly the words that flank ITS
+    // hole, in start order; the punctuation stamp is dropped.
+    assert_eq!(
+        spliced_text,
+        vec!["Before.", "is", "like", "after", "a", "lot", "more"]
+    );
+    // A re-decode word whose majority time misses every hole window grafts
+    // nothing.
+    let unrelated = vec![hole_word("Nowhere", 8.00, 8.50, 0.9)];
+    assert!(whisper_carry_interior_hole_graft(&carried, &unrelated, &holes, None).is_none());
+    // Nothing at all: None means the caller keeps the carried decode.
+    assert!(whisper_carry_interior_hole_graft(&carried, &[], &holes, None).is_none());
+}
+
+#[test]
+fn carry_interior_hole_graft_skips_stretched_covered_words() {
+    // A carried word whose span stretches over the hole's side swallows the
+    // repeat run's text: when the re-decode reports that same text there,
+    // the carried decode did not lose it, it stretched it -- skip.
+    let carried = vec![
+        head_skip_word("and", 1.63, 2.71),
+        head_skip_word("narrow", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.63,
+        hi: 3.0,
+    };
+    // Majority 2.17 sits inside the stretched "and" ...
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &carried,
+            &[hole_word("and", 1.70, 2.30, 0.9)],
+            &[hole],
+            None,
+        )
+        .is_none()
+    );
+    // ... but a DIFFERENT word under the same stretch is the recovery the
+    // hole exists for: no text match means no cover.
+    let spliced = whisper_carry_interior_hole_graft(
+        &carried,
+        &[hole_word("stupidity", 1.80, 2.40, 0.98)],
+        &[hole],
+        None,
+    )
+    .expect("different content under a stretched word is the lost speech");
+    assert_eq!(spliced.len(), 3);
+    assert_eq!(spliced[1].word, "stupidity");
+    assert_eq!(spliced[2].word, "narrow");
+}
+
+#[test]
+fn carry_interior_hole_graft_demands_audio_support() {
+    // A recovered word stamped into the hole's PAUSE air (loop filler the
+    // re-decode itself produced) sits orders of magnitude below the placed
+    // words' surface level and is rejected, while a stamp over real speech
+    // clears the same deficit gate.
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.0,
+        hi: 3.0,
+    };
+    // Frames: words at 0.10 over [0, 3.5s) (50 frames/s), a loud first
+    // half of the gap and a near-silent pause around the ghost word.
+    let frames = rms_frames_for(
+        &[
+            (0, 50, 0.10),
+            (150, 175, 0.10),
+            (50, 110, 0.09),
+            (116, 130, 0.005),
+        ],
+        175,
+    );
+    let ghost = hole_word("It...", 2.30, 2.60, 0.9);
+    let real = hole_word("stupidity", 2.10, 2.40, 0.9);
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &carried,
+            std::slice::from_ref(&ghost),
+            &[hole],
+            Some(&frames)
+        )
+        .is_none()
+    );
+    let spliced =
+        whisper_carry_interior_hole_graft(&carried, &[ghost.clone(), real], &[hole], Some(&frames))
+            .expect("the supported word survives the ghost's rejection");
+    assert_eq!(spliced.len(), 3);
+    assert_eq!(spliced[1].word, "stupidity");
+}
+
+#[test]
+fn carry_interior_hole_graft_rejects_stretched_and_unconfident_recoveries() {
+    // The re-decode's own stretched stamp over the hole is its copy of the
+    // carried decode's swallow (a wide "performed token", not the narrow
+    // lost word); its low-probability filler is loop noise. The lost word is
+    // narrow and confident.
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.0,
+        hi: 3.0,
+    };
+    // A 1.6 s re-decode stamp centered in the window: rejected by width.
+    let stretched = hole_word("one.", 1.30, 2.90, 0.99);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[stretched], &[hole], None).is_none());
+    // A confident narrow word grafted where a fill would sit: width decides.
+    let recovered = vec![
+        hole_word("one.", 0.80, 2.40, 0.99),
+        hole_word("is", 2.10, 2.40, 0.90),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None)
+        .expect("the confident narrow stamp survives");
+    assert_eq!(
+        spliced.iter().map(|w| w.word.as_str()).collect::<Vec<_>>(),
+        vec!["Before.", "is", "after"]
+    );
+    // A narrow loop filler: rejected by confidence.
+    let filler = hole_word("Mhm.", 2.30, 2.60, 0.31);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[filler], &[hole], None).is_none());
+    // No confidence evidence at all fails the floor (withheld, not guessed).
+    let unprobable = head_skip_word("is", 2.10, 2.40);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[unprobable], &[hole], None).is_none());
+}
+
+#[test]
+fn carry_normalized_word_units_split_merged_stamps() {
+    assert_eq!(
+        whisper_carry_normalized_word_units("heart...the"),
+        vec!["heart".to_string(), "the".to_string()]
+    );
+    assert_eq!(
+        whisper_carry_normalized_word_units("I,"),
+        vec!["i".to_string()]
+    );
+    assert!(whisper_carry_normalized_word_units("?!").is_empty());
 }
 
 #[test]
