@@ -4337,6 +4337,108 @@ fn carry_interior_hole_graft_skips_stretched_covered_words() {
 }
 
 #[test]
+fn carry_interior_hole_graft_rejects_duplicate_restates() {
+    // Same-content re-stamp: the re-decode re-times a word the carry already
+    // stamped, so its span overlaps the carried stamp (the mikan "Puff" shape).
+    // Width and confidence pass; the span overlap is what rejects it.
+    let mikan = vec![
+        head_skip_word("that?", 121.89, 122.13),
+        head_skip_word("Puff", 125.37, 125.57),
+    ];
+    let mikan_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 122.13,
+        hi: 125.37,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &mikan,
+            &[hole_word("Puff", 125.11, 125.48, 0.9)],
+            &[mikan_hole],
+            None,
+        )
+        .is_none()
+    );
+
+    // Right-boundary echo: the re-decode re-times the right-boundary word
+    // earlier into the gap (the malfina "Oh" at 335.42 ahead of the carried
+    // "Oh" at 336.88): same content as the right boundary, placed before it,
+    // no span overlap -- a re-stamp, not the speech the hole holds.
+    let malfina = vec![
+        head_skip_word("hurt.", 334.91, 335.83),
+        head_skip_word("Oh", 336.88, 337.10),
+    ];
+    let malfina_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 335.83,
+        hi: 336.88,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &malfina,
+            &[hole_word("Oh", 335.42, 335.54, 0.96)],
+            &[malfina_hole],
+            None,
+        )
+        .is_none()
+    );
+
+    // Slot conflict: the re-decode misreads a normal (narrow) placed word with
+    // different text (the rye "for" over the carried "four"); the graft's
+    // majority sits inside that narrow placed word, so the carry already owns
+    // the slot. A same-slot word under a STRETCHED placed word would be the
+    // recovery, so this is gated on the placed word being narrow.
+    let rye = vec![
+        head_skip_word("know,", 336.50, 336.72),
+        head_skip_word("four", 337.42, 337.71),
+        head_skip_word("hour", 337.61, 338.12),
+    ];
+    let rye_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 336.72,
+        hi: 337.42,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &rye,
+            &[hole_word("for", 337.42, 337.69, 0.73)],
+            &[rye_hole],
+            None,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn carry_interior_hole_graft_keeps_genuine_repeats() {
+    // A same-content repeat that does NOT overlap the carried copy is the
+    // speaker saying the word twice (phoebe's second "Stupidity" after the
+    // carried "stupidity"): the carry caught the first, the re-decode the
+    // second -- the duplicate gate must not swallow it.
+    let phoebe = vec![
+        head_skip_word("stupidity", 112.95, 114.07),
+        head_skip_word("and", 115.63, 116.68),
+        head_skip_word("ignorance", 116.61, 117.08),
+    ];
+    let phoebe_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 114.07,
+        hi: 115.63,
+    };
+    let spliced = whisper_carry_interior_hole_graft(
+        &phoebe,
+        &[hole_word("Stupidity", 115.56, 116.07, 0.97)],
+        &[phoebe_hole],
+        None,
+    )
+    .expect("a non-overlapping repeat is new speech, not a duplicate");
+    assert!(spliced.len() == 4);
+    assert_eq!(spliced[0].word, "stupidity");
+    assert_eq!(spliced[1].word, "Stupidity");
+    assert_eq!(spliced[2].word, "and");
+}
+
+#[test]
 fn carry_interior_hole_graft_demands_audio_support() {
     // A recovered word stamped into the hole's PAUSE air (loop filler the
     // re-decode itself produced) sits orders of magnitude below the placed

@@ -7949,8 +7949,8 @@ const WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS: f32 = 0.5;
 /// open edge. Stretched enough that a repeated word the recovery itself
 /// re-times against the carried decode's stretched right word still credits
 /// to its hole (its placement can trail the gap's end by ~a fifth of a
-/// second), with the covered rule + audio-support gate below catching whatever
-/// that slack admits wrong.
+/// second), with the duplicate gate + audio-support gate below catching
+/// whatever that slack admits wrong.
 const WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS: f32 = 0.25;
 
 /// Audio-support deficit for a grafted word's OWN span, tighter than the hole
@@ -7973,6 +7973,16 @@ const WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS: f32 = 1.0;
 /// which decodes confidently even when the carry's repetition pressure broke
 /// its context.
 const WHISPER_CARRY_HOLE_MIN_GRAFT_WORD_CONFIDENCE: f32 = 0.55;
+
+/// A placed word wider than this is a STRETCH (the carry stretched the stamp
+/// over audio it actually skipped) rather than the narrow stamp of a single
+/// spoken word. The slot-conflict duplicate gate below only treats NARROW
+/// placed words as owning their time slot: a re-decode word stamped over a
+/// stretched, differently-worded placed word is exactly the recovery the hole
+/// exists for (the speech the stretch swallowed), while one stamped over a
+/// normal-width placed word with different text is a word-for-word misread of
+/// that word, not new speech to graft.
+const WHISPER_CARRY_HOLE_MAX_SLOT_CONFLICT_WIDTH_SECONDS: f32 = 0.5;
 
 /// A detected interior carry-skip hole: the gap between the placed words at
 /// `boundary` (+1) is at least [`WHISPER_CARRY_HOLE_MIN_GAP_SECONDS`] wide and
@@ -8313,6 +8323,73 @@ fn whisper_carry_normalized_word_units(word: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a re-decode word that credits to a hole is a DUPLICATE of content
+/// the carried decode already owns, in which case grafting it would emit a
+/// word the transcript already has (or a word-for-word misread of one).
+/// Returns the rejection reason, or `None` when the word is genuinely new
+/// speech for the hole. The re-decode runs on the SAME slice and re-stamps the
+/// words the carry placed, only on its own timing grid, so a grafted word that
+/// re-states an already-placed word is a duplicate, not a recovery. Pure so
+/// the unit tests pin each reject shape exactly as they pin the admissible
+/// recovery.
+fn whisper_carry_graft_duplicate_reason(
+    word: &crate::WordTimestamp,
+    majority: f32,
+    carried_words: &[crate::WordTimestamp],
+    right_boundary: Option<&crate::WordTimestamp>,
+) -> Option<&'static str> {
+    let word_units = whisper_carry_normalized_word_units(&word.word);
+    // Same-content re-stamp: a placed word with the same content whose span
+    // OVERLAPS the graft's span. The carry already stamped this word over this
+    // audio; the re-decode is just re-timing it. Subsumes the old stretch-cover
+    // case (a stretched same-content placed word spanning the graft's majority
+    // necessarily overlaps the graft's span). A same-content placed word that
+    // is only a NEIGHBOR (no span overlap) is a genuine repeat the speaker made
+    // twice -- the carry caught the first, the re-decode the second -- and
+    // stays.
+    for placed in carried_words {
+        if placed.start < word.end
+            && word.start < placed.end
+            && whisper_carry_normalized_word_units(&placed.word)
+                .iter()
+                .any(|unit| word_units.contains(unit))
+        {
+            return Some("duplicate_overlap");
+        }
+    }
+    // Right-boundary echo: the graft's content matches the word the carry
+    // placed right after the hole and the graft sits at or before that word --
+    // the re-decode re-timed the right-boundary word earlier into the gap
+    // instead of supplying the missing speech between the words. Only the RIGHT
+    // boundary is gated: a same-content left-boundary match with no overlap is
+    // a legitimate repeat after the boundary.
+    if let Some(right) = right_boundary
+        && majority <= right.start
+        && whisper_carry_normalized_word_units(&right.word)
+            .iter()
+            .any(|unit| word_units.contains(unit))
+    {
+        return Some("boundary_echo");
+    }
+    // Slot conflict over a normal word: a placed word of DIFFERENT content
+    // already owns the graft's majority time and is narrow (a normal stamp, not
+    // a stretch) -- the re-decode is misreading that word, not adding speech
+    // the carry skipped. New words recovered under a stretched placed word are
+    // the recovery, so only narrow placed words own their slot.
+    for placed in carried_words {
+        if placed.start <= majority
+            && majority <= placed.end
+            && placed.end - placed.start < WHISPER_CARRY_HOLE_MAX_SLOT_CONFLICT_WIDTH_SECONDS
+            && !whisper_carry_normalized_word_units(&placed.word)
+                .iter()
+                .any(|unit| word_units.contains(unit))
+        {
+            return Some("slot_conflict");
+        }
+    }
+    None
+}
+
 /// The interior-hole graft decision: the re-decode words to insert into the
 /// carried word list, each consumed by the hole its majority time credits it
 /// to, or `None` when the re-decode supplies nothing the carried decode
@@ -8388,25 +8465,20 @@ fn whisper_carry_interior_hole_graft(
                 }
                 continue;
             }
-            // Skip the re-decode word when a placed word with the same
-            // content already stretches OVER it: the carried decode did not
-            // lose that word, it just stamped it wide (the stretch swallowed
-            // the repeat run). Stretching is what puts the narrow recovered
-            // word's majority point inside the wider placed span, and the
-            // text match keeps genuinely different words (a recovery that
-            // starts its own repeat under a stretched "and") admitted.
-            let covered = carried_words.iter().any(|placed| {
-                placed.start <= majority && majority <= placed.end && {
-                    let placed_units = whisper_carry_normalized_word_units(&placed.word);
-                    whisper_carry_normalized_word_units(&word.word)
-                        .iter()
-                        .any(|unit| placed_units.contains(unit))
-                }
-            });
-            if covered {
+            // Skip the re-decode word when it duplicates content the carried
+            // decode already owns (a same-word re-stamp over this audio, a
+            // re-timing of the right-boundary word into the gap, or a
+            // word-for-word misread of a normal placed word) rather than
+            // supplying the speech the hole holds.
+            if let Some(reason) = whisper_carry_graft_duplicate_reason(
+                word,
+                majority,
+                carried_words,
+                carried_words.get(hole.boundary.saturating_add(1)),
+            ) {
                 if trace_graft {
                     eprintln!(
-                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=covered_by_stretch",
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected={reason}",
                         hole_index, word.word, word.start, word.end
                     );
                 }
