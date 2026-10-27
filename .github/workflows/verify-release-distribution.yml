@@ -153,7 +153,7 @@ jobs:
             # forward from the last full release). Mirror re-verification is
             # skipped: carried-forward entries predate the chameleon-ai mirror
             # bindings that verify-mirrors requires, so probing them here fails
-            # on legacy QuintinShaw/openasr URLs. They were verified when their
+            # on legacy openasr release URLs. They were verified when their
             # own releases published; migrating those bindings is a separate
             # catalog task, not this release gate.
             python3 - catalog.json <<'PY'
