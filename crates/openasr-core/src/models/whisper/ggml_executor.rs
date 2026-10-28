@@ -6984,6 +6984,57 @@ fn whisper_degenerate_tail_region_silence(
     Some(false)
 }
 
+/// Layer (b) of the unvoiced tail-echo gate, the dense-window flank of the
+/// shared sibling test above: whether the echo region's loud quarter (75th
+/// percentile frame RMS) sits below the window's own loud quarter scaled by
+/// [`WHISPER_TAIL_ECHO_UNVOICED_FRACTION`].
+///
+/// The sibling test anchors "speech" to the window MEDIAN plus 5 dB; in a
+/// dense-speech window the median is itself at speech level, so that anchor
+/// sits above a genuine utterance's peak and reads voiced speech as silence
+/// (a real fourth "I like beans!" measured below median+5dB). The window's
+/// p75 is its typical CONTENT level, and the comparison is scale-free in
+/// either mix: an unvoiced echo region rides far below the window's content
+/// (measured 0.18x on the bibi slice), while a genuine repeated word rides
+/// at it (measured 0.77x). Same fail-open contract as the sibling: `None`
+/// when the envelope is missing or the region clips down, and the splice
+/// refuses it.
+fn whisper_tail_echo_region_unvoiced(
+    levels: Option<&[f32]>,
+    region_start_seconds: f64,
+    region_end_seconds: f64,
+    duration_seconds: f64,
+) -> Option<bool> {
+    let levels = levels?;
+    if levels.len() < 4 || duration_seconds <= 0.0 {
+        return None;
+    }
+    let seconds_per_frame = WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    let last_frame = levels.len() - 1;
+    let start_s = region_start_seconds.max(0.0).min(duration_seconds);
+    let end_s = region_end_seconds.max(start_s).min(duration_seconds);
+    let frame_start = ((start_s / seconds_per_frame) as usize).min(last_frame);
+    let frame_end = ((end_s / seconds_per_frame) as usize)
+        .min(last_frame)
+        .max(frame_start + 1);
+    if frame_end - frame_start < 4 {
+        return None;
+    }
+    let mut window: Vec<f64> = levels.iter().map(|sample| f64::from(*sample)).collect();
+    window.sort_by(f64::total_cmp);
+    let window_p75 = window[(window.len() * 3 / 4).min(window.len().saturating_sub(1))];
+    if !(window_p75 > 0.0 && window_p75.is_finite()) {
+        return None;
+    }
+    let mut region: Vec<f64> = levels[frame_start..frame_end]
+        .iter()
+        .map(|sample| f64::from(*sample))
+        .collect();
+    region.sort_by(f64::total_cmp);
+    let region_p75 = region[(region.len() * 3 / 4).min(region.len().saturating_sub(1))];
+    Some(region_p75 < window_p75 * WHISPER_TAIL_ECHO_UNVOICED_FRACTION)
+}
+
 /// Splice the decode's degenerate final text run out of the generated tokens,
 /// the parallel probabilities, and the cross-attention alignments, re-derive
 /// the text, and drop the run's placed words from `words` (its half-open word
@@ -7143,11 +7194,294 @@ fn whisper_splice_degenerate_tail_run(
     Ok(true)
 }
 
+/// Maximum size of the short repeated unit the unvoiced tail-echo pass
+/// removes, in tokens. Word-scale echoes ("Luigi. Luigi.", "Yeah. Yeah.")
+/// run one to four BPE tokens per copy; larger repeated blocks are the
+/// tail-repeat collapse's terrain, and a punct-only tail repeats nothing
+/// that was spoken.
+const WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS: usize = 4;
+
+/// How many times the tail-echo pass splices in one decode: an exact loop a
+/// guard floor let through ("Luigi." x 5 stopping clean) sheds one copy per
+/// round, each round re-verifying the new final copy's audio, until the tail
+/// holds a single occurrence.
+const WHISPER_TAIL_ECHO_MAX_ROUNDS: usize = 4;
+
+/// Loudness fraction of the window's p75 that the echo region's own p75 must
+/// sit strictly below for the unvoiced test [`whisper_tail_echo_region_unvoiced`]
+/// to pass. Measured separation between the two classes: an unvoiced echo
+/// region rides ~0.18x of the window's content level, a genuine repeated word
+/// ~0.77x; 0.5 (i.e. -6 dB) is the middle of that gap.
+const WHISPER_TAIL_ECHO_UNVOICED_FRACTION: f64 = 0.5;
+
+/// Env opt-out (defaults on) for the unvoiced tail-echo splice.
+fn whisper_tail_echo_splice_enabled() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DISABLE_TAIL_ECHO_SPLICE").is_none()
+}
+
+/// Debug env: log each round's tail-echo shape and acoustic verdict for
+/// every clean-stop decode, so a deployment can trace why a tail echo was
+/// (or was not) spliced.
+fn whisper_tail_echo_debug() -> bool {
+    std::env::var_os("OPENASR_WHISPER_DEBUG_TAIL_ECHO").is_some()
+}
+
+/// Does a candidate echo unit carry content: its decoded text bears at least
+/// one ASCII letter or digit. A punct-only unit ("." ".") is not an echo of
+/// speech and never splices.
+fn whisper_tail_echo_unit_has_content(
+    tokens: &[u32],
+    decode_unit_text: &dyn Fn(&[u32]) -> Option<String>,
+) -> bool {
+    decode_unit_text(tokens).is_some_and(|text| text.chars().any(|ch| ch.is_ascii_alphanumeric()))
+}
+
+/// The short unit echoed back-to-back at a clean decode's tail, as the
+/// inclusive index range of the SECOND (removable) copy, or `None`. The shape
+/// the tail-repeat collapse is too large to fold (its blocks run
+/// [`WHISPER_TAIL_REPEAT_MIN_BLOCK_TOKENS`]+ tokens) and the degenerate-repeat
+/// guard is too few copies to trip (a clean stop after two occurrences of one
+/// word; with advancing timestamps the cycle is not even exact). Two forms:
+///
+/// 1. Cross-run: the final two text runs are the same 1..=
+///    [`WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS`]-token unit, a pair of timestamp
+///    tokens separating the copies. The whole final run is the second copy.
+/// 2. Same-run: the final run's tail is the unit emitted twice, no timestamp
+///    between the copies (the no-`<|notimestamps|>` stream leaves the whole
+///    decode in one run, the echo the only structure in it). The shorter
+///    matching unit wins, so a longer exact loop sheds one copy per pass
+///    round rather than swallowing whole phrases.
+fn whisper_tail_echo_removal(
+    tokens: &[u32],
+    is_timestamp: &dyn Fn(u32) -> bool,
+    decode_unit_text: &dyn Fn(&[u32]) -> Option<String>,
+) -> Option<(usize, usize)> {
+    let runs = text_token_runs(tokens, is_timestamp);
+    let (lo, hi) = *runs.last()?;
+    if runs.len() >= 2 {
+        let (lo_prev, hi_prev) = runs[runs.len() - 2];
+        let m_last = hi.saturating_sub(lo).saturating_add(1);
+        let m_prev = hi_prev.saturating_sub(lo_prev).saturating_add(1);
+        if m_last == m_prev
+            && (1..=WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS).contains(&m_last)
+            && tokens[lo_prev..=hi_prev] == tokens[lo..=hi]
+            && whisper_tail_echo_unit_has_content(&tokens[lo..=hi], decode_unit_text)
+        {
+            return Some((lo, hi));
+        }
+    }
+    let run_len = hi.saturating_sub(lo).saturating_add(1);
+    for n in 1..=WHISPER_TAIL_ECHO_UNIT_MAX_TOKENS {
+        if run_len >= 2 * n
+            && tokens[lo + run_len - 2 * n..lo + run_len - n] == tokens[lo + run_len - n..=hi]
+            && whisper_tail_echo_unit_has_content(&tokens[lo + run_len - n..=hi], decode_unit_text)
+        {
+            return Some((lo + run_len - n, hi));
+        }
+    }
+    None
+}
+
+/// Splice an unvoiced short tail echo out of a clean-stop decode: the tokens,
+/// the parallel probabilities, and the cross-attention alignments drop the
+/// second copy's range, the text re-derives, and the copy's placed words are
+/// drained from `words`. Same splice mechanics as the degenerate-tail splice.
+///
+/// A decode can end by echoing the short unit it just emitted -- a closing
+/// name or exclamation duplicated back-to-back over the silence the window's
+/// tail holds ("...Booze. Luigi. Luigi."). No existing pass sees it: the
+/// degenerate-repeat guard needs a trip floor of many occurrences and the
+/// decode ends on an honest stop token, the tail-repeat collapse's repeated
+/// block is clause-scale, and the degenerate-tail splice's words fold onto
+/// one instant while this echo's two copies sit at separate placed instants.
+///
+/// Its signature needs all three layers, and all must agree before anything
+/// is dropped:
+/// (a) the decode's text tail is the short content-bearing unit emitted
+///     back-to-back ([`whisper_tail_echo_removal`]);
+/// (b1) the second copy's placed words sit over silence: no sustained speech
+///      run in the slice-local envelope under the removed words' windows plus
+///      their placement margin ([`whisper_degenerate_tail_region_silence`]);
+///      and
+/// (b2) the region is unvoiced in the dense-window sense: the region's
+///      loud quarter sits below the window's own loud quarter scaled by
+///      [`WHISPER_TAIL_ECHO_UNVOICED_FRACTION`]
+///      ([`whisper_tail_echo_region_unvoiced`]).
+///
+/// (b1) alone is not dense-window safe: it anchors "speech" to the window
+/// MEDIAN plus 5 dB, and in a window that is mostly speech the median is
+/// itself at speech level, so the anchor sits above a genuine utterance's
+/// peak and reads voiced speech as silence (a real fourth "I like beans!"
+/// measured below that anchor in a dense window). (b2) compares the region
+/// against the window's TYPICAL CONTENT level (its p75) instead: an unvoiced
+/// echo region rides far below it (measured ~0.18x), a genuine repeated word
+/// rides at it (measured ~0.77x), and the 0.5x floor sits in the gap. The
+/// conjunction is strictly more conservative than (b1) alone, so it can only
+/// keep words (b1) would have cut. Together the layers keep the genuine
+/// echo out on both flanks: a real "Luigi? Luigi?" call-out voices its
+/// second copy at speech level and both acoustic tests refuse to drop it; a
+/// non-repeated closing unit has no echo shape so the envelope is never even
+/// consulted.
+///
+/// Gated like the degenerate-tail splice on a clean STOP-token decode and run
+/// after word placement, since the acoustic layer reads the placed windows
+/// the echo stamped on the audio. Every other failure degrades to a no-op
+/// (fail-open): a missing or misaligned run-word pairing, an undecodable
+/// unit, words the unit's text does not account for, or an unverdictable
+/// region all keep the decode as decoded. The pass rounds up to
+/// [`WHISPER_TAIL_ECHO_MAX_ROUNDS`] so a multi-copy exact loop sheds one
+/// verified copy per round.
+fn whisper_splice_unvoiced_tail_echo(
+    tokenizer: &WhisperTokenizer,
+    decode: &mut WhisperGreedyDecodeResult,
+    token_alignments: &mut Vec<WhisperGeneratedTokenAlignment>,
+    words: &mut Vec<crate::WordTimestamp>,
+    run_word_ranges: &[(usize, usize)],
+    word_audio_rms_frames: Option<&[f32]>,
+    audio_duration_seconds: f32,
+) -> Result<bool, WhisperGgmlExecutorError> {
+    if !whisper_tail_echo_splice_enabled()
+        || !whisper_stop_reason_is_stop_token(&decode.stop_reason)
+        || decode.generated_tokens.is_empty()
+        || words.is_empty()
+    {
+        return Ok(false);
+    }
+    let decode_unit_text = |token_ids: &[u32]| tokenizer.decode_text_token_ids(token_ids).ok();
+    let mut spliced = false;
+    for _round in 0..WHISPER_TAIL_ECHO_MAX_ROUNDS {
+        // Runs are re-read from the CURRENT stream each round (an earlier
+        // round may have spliced it); the word ranges paired with it must
+        // still line up 1:1, since a shifted pairing is as off as it is
+        // untrustworthy.
+        let is_timestamp = |token_id: u32| {
+            tokenizer
+                .first_timestamp_token_id()
+                .is_some_and(|begin| token_id >= begin)
+        };
+        let runs = text_token_runs(&decode.generated_tokens, &is_timestamp);
+        if runs.is_empty() || run_word_ranges.len() != runs.len() {
+            break;
+        }
+        let Some((rem_lo, rem_hi)) =
+            whisper_tail_echo_removal(&decode.generated_tokens, &is_timestamp, &decode_unit_text)
+        else {
+            break;
+        };
+        let Some(&word_range) = run_word_ranges.last() else {
+            break;
+        };
+        let Some(run_words) = words.get(word_range.0..word_range.1) else {
+            break;
+        };
+        // The removed unit's placed words are the tail of the final run's
+        // words whose normalized text is the unit's own text: the whole run's
+        // words for the cross-run shape, a tail of them for the same-run one.
+        // A DTW run that aligned nothing holds no words to gate on, so the
+        // pass refuses rather than gate on the wrong range.
+        let Some(unit_text) = decode_unit_text(&decode.generated_tokens[rem_lo..=rem_hi]) else {
+            break;
+        };
+        let unit_units = crate::longform::normalize_words(&unit_text);
+        let words_len = word_range.1.saturating_sub(word_range.0);
+        let mut removed_span: Option<(usize, usize)> = None;
+        for k in 1..=words_len {
+            let tail = &run_words[words_len - k..];
+            let tail_units: Vec<String> = tail
+                .iter()
+                .flat_map(|word| crate::longform::normalize_words(&word.word))
+                .collect();
+            if tail_units == unit_units {
+                removed_span = Some((word_range.1 - k, word_range.1));
+                break;
+            }
+        }
+        let Some((word_lo, word_hi)) = removed_span else {
+            break;
+        };
+        let Some(removed_words) = words.get(word_lo..word_hi).filter(|w| !w.is_empty()) else {
+            break;
+        };
+        let region_start = f64::from(
+            removed_words
+                .iter()
+                .map(|word| word.start)
+                .fold(f32::INFINITY, f32::min),
+        ) - WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS;
+        let region_end = f64::from(
+            removed_words
+                .iter()
+                .map(|word| word.end)
+                // Placed ends are clamped to [0, duration] by the placement pass.
+                .fold(0.0_f32, f32::max),
+        ) + WHISPER_DEGENERATE_TAIL_REGION_PAD_SECONDS;
+        let region_silence = whisper_degenerate_tail_region_silence(
+            word_audio_rms_frames,
+            region_start,
+            region_end,
+            f64::from(audio_duration_seconds),
+        );
+        // The sibling test alone is not dense-window safe: its median+5 dB
+        // anchor sits above a genuine utterance's peak in a loud window and
+        // reads voiced speech as silence. The p75/p75 flank requires the
+        // region to sit far below the window's own content level, which real
+        // repeats do not. Both verdicts must agree to fire.
+        let region_unvoiced = whisper_tail_echo_region_unvoiced(
+            word_audio_rms_frames,
+            region_start,
+            region_end,
+            f64::from(audio_duration_seconds),
+        );
+        let fire = region_silence == Some(false) && region_unvoiced == Some(true);
+        if whisper_tail_echo_debug() {
+            eprintln!(
+                "openasr_whisper_ggml_executor stage=decode_loop event=tail_echo_probe tokens=[{}..{}] removed_words=[{}..{}] region=[{:.3}..{:.3}]s region_silence={region_silence:?} region_unvoiced={region_unvoiced:?} fire={fire}",
+                rem_lo, rem_hi, word_lo, word_hi, region_start, region_end
+            );
+        }
+        if !fire {
+            break;
+        }
+        let token_count = decode.generated_tokens.len();
+        // The parallel vectors are 1:1 with the tokens in the word-timestamp
+        // path; splice them at the same range only when their length matches.
+        if decode.generated_probabilities.len() == token_count {
+            splice_out_range(&mut decode.generated_probabilities, rem_lo, rem_hi + 1);
+        }
+        if token_alignments.len() == token_count {
+            splice_out_range(token_alignments, rem_lo, rem_hi + 1);
+        }
+        splice_out_range(&mut decode.generated_tokens, rem_lo, rem_hi + 1);
+        let text = tokenizer
+            .decode_text_token_ids(&decode.generated_tokens)
+            .map_err(
+                |error| WhisperGgmlExecutorError::DecoderInvalidTokenDecode {
+                    reason: format!("whisper tail-echo splice token decode failed: {error}"),
+                },
+            )?;
+        decode.text = text;
+        // The removed words are the tail of the word list (the final run's
+        // own tail, and runs and words share token order), so draining them
+        // leaves the surviving runs' words where the carry and the segment
+        // builder expect them.
+        let dropped_words = word_hi - word_lo;
+        words.drain(word_lo..word_hi);
+        spliced = true;
+        eprintln!(
+            "openasr_whisper_ggml_executor stage=decode_loop event=tail_echo_splice status=spliced dropped_tokens={} dropped_words={dropped_words} kept_tokens={}",
+            rem_hi - rem_lo + 1,
+            decode.generated_tokens.len()
+        );
+    }
+    Ok(spliced)
+}
+
 /// What one decode round produced, carried up for the fallback ladder to keep
 /// the winning candidate. `token_alignments` is the cross-attention word-align
 /// row captured during THIS round's decode (the word-timing path uses it), so
 /// the surviving candidate's alignments must come from the same round that
 /// won, not an earlier discarded one.
+#[derive(Clone)]
 struct WhisperDecodeCandidate {
     text_trimmed: String,
     token_alignments: Vec<WhisperGeneratedTokenAlignment>,
@@ -7378,6 +7712,29 @@ const WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS: f32 = 2.0;
 /// that adds no new audio never triggers the swap.
 const WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS: f32 = 0.5;
 
+/// How much untranscribed audio the ladder's winner may leave at the end of
+/// its window before the guard-cut round-1 stub may take the window back as
+/// its tail rescue. The stub's adoption re-stamps the WHOLE window onto text
+/// that ends at the guard's kept prefix, so it only pays behind a winner that
+/// is otherwise healthy and stopped just short (bibi: a ~2.5 s repeated
+/// phrase behind a clean 26.8 s transcript). Once the winner's own tail
+/// shortfall is 5+ s the winner is the broken side of the seam, and handing
+/// its window to a degenerate-repeat stub trades one wrong transcript for a
+/// shorter, worse-timed one (the ali/claire/gilbert/lobster/tequila shapes,
+/// where the stub's kept prefix dropped real words the clean winner held).
+const WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS: f32 = 5.0;
+
+/// How far short of the window end the stub's placed frontier must sit before
+/// the stub may claim the tail in the audible-tail coverage re-race. A stub
+/// cut mid-phrase shows the guard stopped the transcript short of real audio
+/// (bibi: 29.26 in a 29.35 s window) -- the shape the rescue exists for. A
+/// stub whose frontier lands ON the window end (to the frame) looped while
+/// its cross-attention tiled the whole window: its placements reach the end
+/// by attention drift, not by covering it, and its kept prefix has abandoned
+/// the very tail it would claim. 0.05 s clears a stamp's rounding without
+/// admitting a pinned frontier.
+const WHISPER_LADDER_TAIL_STUB_WINDOW_END_MARGIN_SECONDS: f32 = 0.05;
+
 /// How far below the decoded region the window's trailing envelope may sit
 /// (dB) and still count as speech the winner failed to transcribe. Mirrors
 /// [`WHISPER_CARRY_HEAD_SKIP_MAX_DEFICIT_DB`]: the same 6 dB tolerance the
@@ -7385,12 +7742,13 @@ const WHISPER_LADDER_TAIL_COVERAGE_MIN_PROGRESS_SECONDS: f32 = 0.5;
 const WHISPER_LADDER_TAIL_MAX_DEFICIT_DB: f32 = 6.0;
 
 /// Minimum count of salvaged (letters/digits-bearing) content tokens the
-/// ladder's incumbent must hold before the carry-less round may replace it.
-/// The subsequence check is only a content-preservation rule when the
-/// incumbent actually salvaged content: a two-word stub ("I. Rock." on
-/// music noise) survives as a subsequence of almost any longer decode, BPE
-/// fragmenting it into single tokens, so preserving it proves nothing and
-/// hands the window to whatever the carry-less round hallucinated.
+/// ladder's incumbent must hold before the carry-less round may replace it, and
+/// below which the stub re-race treats the incumbent as stub-shaped rather than
+/// a real transcript. A two-word stub ("I. Rock." on music noise) survives a
+/// subsequence check against almost any longer decode, BPE fragmenting it into
+/// single tokens, so a small incumbent's own count says nothing either way;
+/// the carry-less path reads that as a reason to refuse adoption, the stub
+/// re-race as a reason to let the recovery stand.
 const WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS: usize = 4;
 
 /// True when `kept` appears in `other` as an in-order (not necessarily
@@ -7404,6 +7762,71 @@ fn whisper_token_stream_is_subsequence(kept: &[u32], other: &[u32]) -> bool {
     let mut other = other.iter().copied();
     kept.iter()
         .all(|token| other.by_ref().any(|next| next == *token))
+}
+
+/// A guard-cut ladder round's salvaged content: its generated token stream with
+/// the timestamp stamps removed, a guard-cut round's kept loop cycle truncated
+/// to the pre-loop prefix (the kept cycle is the loop itself, not content), and
+/// its dominant short cycle stripped. Returns the surviving stream beside the
+/// count of its letters/digits-bearing tokens -- the same content notion the
+/// carry-less adoption's subsequence check uses.
+fn whisper_ladder_salvaged_stream(
+    tokenizer: &WhisperTokenizer,
+    result: &WhisperGreedyDecodeResult,
+) -> (Vec<u32>, usize) {
+    let stripped: Vec<u32> = result
+        .generated_tokens
+        .iter()
+        .copied()
+        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+        .collect();
+    let content = match result.guard_trip_ngram_len {
+        Some(cycle) => &stripped[..stripped.len().saturating_sub(cycle)],
+        None => &stripped[..],
+    };
+    let salvaged = whisper_stream_without_dominant_cycle(content);
+    let content_tokens = salvaged
+        .iter()
+        .filter(|token_id| {
+            tokenizer
+                .decode_text_token_ids(&[**token_id])
+                .is_ok_and(|text| text.chars().any(char::is_alphanumeric))
+        })
+        .count();
+    (salvaged, content_tokens)
+}
+
+/// Whether the stub re-race may hand a guard-tripped incumbent's window to a
+/// clean challenger, or the incumbent must keep it.
+///
+/// The re-race exists to recover speech a genuine loop stub left out, so it is
+/// refused only for the one shape where that recovery would cost real text: the
+/// incumbent is a full transcript and the challenger carries less than half as
+/// much content.
+///
+/// "Full transcript" is read off the guard's own cut rather than the text. A
+/// round that transcribed the window and only looped on its trailing silence
+/// lost a short tail to the repeat guard (bibi: 110 tokens kept of 120); a round
+/// that re-locked onto a loop lost the speech itself and kept a fraction of what
+/// it emitted (ploomet: 51 of 128). Stripping the dominant cycle cannot tell the
+/// two apart on its own, because a loop whose wording drifts ("...relax you." /
+/// "...relax you!") is not an exactly repeated cycle; the cut ratio can.
+///
+/// `pre_trip_tokens` is 0 when the round recorded no per-token rows, which leaves
+/// the ratio undefined; the veto then stands down and the re-race runs as before.
+fn whisper_ladder_stub_pool_may_replace(
+    incumbent_content_tokens: usize,
+    incumbent_kept_tokens: usize,
+    incumbent_pre_trip_tokens: usize,
+    challenger_content_tokens: usize,
+) -> bool {
+    let loop_was_only_a_tail = incumbent_pre_trip_tokens > 0
+        && incumbent_kept_tokens.saturating_mul(2) >= incumbent_pre_trip_tokens;
+    let incumbent_is_full_transcript = incumbent_content_tokens
+        >= WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS
+        && loop_was_only_a_tail;
+    !incumbent_is_full_transcript
+        || challenger_content_tokens.saturating_mul(2) >= incumbent_content_tokens
 }
 
 /// The token stream with its dominant short cycle removed: the period `n`
@@ -7491,6 +7914,89 @@ const WHISPER_CARRY_HEAD_SKIP_MIN_PROGRESS: f32 = 0.5;
 /// conservative head-only splice.
 const WHISPER_CARRY_HEAD_SKIP_DEGENERATE_WORD_WIDTH: f32 = 0.05;
 
+/// Two placed words this far apart or wider bound a hole the carry may have
+/// skipped: the model treated earlier carried words as already spoken and
+/// jumped the real speech BETWEEN them, leaving a mid-slice gap with no word
+/// stamps over ordinary audio (the same produced shape as the head skip, but
+/// interior). Everyday inter-clause pauses of this width are normal in every
+/// healthy decode, so the gap alone proves nothing -- [`WhisperCarryHole`] is
+/// only emitted when the gap also passes the acoustic gate.
+const WHISPER_CARRY_HOLE_MIN_GAP_SECONDS: f32 = 0.4;
+
+/// Interior-hole acoustic gate: the hole's peak RMS-envelope frame may sit at
+/// most this many dB under the placed words' frame percentile. The peak is the
+/// statistic that works where the mean fails: a real pause is silent across
+/// its whole width, while a skipped hole keeps sounding (a swallowed repeated
+/// word, a phrase the carry jumped) even when only a consonant onset or one
+/// loud frame stays under the gap, and a mean over the gap dilutes that onset
+/// into the pause floor. False triggers (an audible real pause) are cheap:
+/// the re-decode runs once per slice pool and a recovered word only enters the
+/// transcript if its own majority time credits it to the hole.
+const WHISPER_CARRY_HOLE_MAX_DEFICIT_DB: f32 = 6.0;
+
+/// A base re-decode word is credited to a hole when its majority time sits
+/// inside the hole window widened by this much on the START side. The re-decode
+/// places words on its own timing, and a swallowed repeated word commonly
+/// starts while the carried decode's preceding word is still being stretched
+/// over the gap; without the start margin its midpoint would sit just behind
+/// the hole's open edge and the recovery would drop the very word it exists
+/// for.
+const WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS: f32 = 0.5;
+
+/// The END-side widening of the hole window. Much smaller than the start
+/// margin because a re-decode word landing this far into the NEXT carried word
+/// is usually that word, not the hole's: swallowing happens at the hole's
+/// open edge. Stretched enough that a repeated word the recovery itself
+/// re-times against the carried decode's stretched right word still credits
+/// to its hole (its placement can trail the gap's end by ~a fifth of a
+/// second), with the duplicate gate + audio-support gate below catching
+/// whatever that slack admits wrong.
+const WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS: f32 = 0.25;
+
+/// Audio-support deficit for a grafted word's OWN span, tighter than the hole
+/// gate: a stamp placed over real speech (even a soft consonant onset DTW put
+/// a syllable early, 8 dB soft) still clears it, while a loop-filler word
+/// stamped into the hole's pause air sits 15-20 dB under the placed words.
+/// Between the worst real recovered word and the ghosts is where the line
+/// goes.
+const WHISPER_CARRY_HOLE_WORD_MAX_DEFICIT_DB: f32 = 12.0;
+
+/// A re-decode word wider than this is one of the re-decode's own stretched
+/// stamps (the same swallow shape the carried decode's wide words are, plated
+/// over a hole plus the following onset), not the narrow stamp of the lost
+/// word; grafted wide stamps duplicate the carried stretch and score as
+/// insertions. Real recovered speech across the suite grafts at <= 0.9 s.
+const WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS: f32 = 1.0;
+
+/// A re-decode word with mean token probability below this is loop filler
+/// ("Mhm.", "mmmm", a hallucinated lyric) rather than the missed speech,
+/// which decodes confidently even when the carry's repetition pressure broke
+/// its context.
+const WHISPER_CARRY_HOLE_MIN_GRAFT_WORD_CONFIDENCE: f32 = 0.55;
+
+/// A placed word wider than this is a STRETCH (the carry stretched the stamp
+/// over audio it actually skipped) rather than the narrow stamp of a single
+/// spoken word. The slot-conflict duplicate gate below only treats NARROW
+/// placed words as owning their time slot: a re-decode word stamped over a
+/// stretched, differently-worded placed word is exactly the recovery the hole
+/// exists for (the speech the stretch swallowed), while one stamped over a
+/// normal-width placed word with different text is a word-for-word misread of
+/// that word, not new speech to graft.
+const WHISPER_CARRY_HOLE_MAX_SLOT_CONFLICT_WIDTH_SECONDS: f32 = 0.5;
+
+/// A detected interior carry-skip hole: the gap between the placed words at
+/// `boundary` (+1) is at least [`WHISPER_CARRY_HOLE_MIN_GAP_SECONDS`] wide and
+/// still audible at the slice's placed-word level, so it plausibly holds
+/// speech the carry skipped. `lo`/`hi` are the slice-relative window bounds
+/// (the left word's end, the right word's start).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WhisperCarryHole {
+    /// Index of the left (earlier) of the two words that flank the hole.
+    boundary: usize,
+    lo: f32,
+    hi: f32,
+}
+
 /// One temperature-ladder round's decode, kept so the ladder's races can hand
 /// the whole set around without re-decoding. `round` is its 1-based rung (1 =
 /// the guard-tripped temperature-0 incumbent, `WHISPER_TEMPERATURE_LADDER.len()
@@ -7504,6 +8010,32 @@ struct WhisperLadderRound {
     candidate: WhisperDecodeCandidate,
     result: WhisperGreedyDecodeResult,
     evidence: Option<f32>,
+}
+
+/// Whether the guard-cut round-1 stub may enter the audible-tail coverage
+/// re-race when its placed frontier is `stub_frontier_seconds` in a window
+/// ending at `window_end_seconds` and the race winner leaves
+/// `tail_shortfall_seconds` of audible tail unclaimed.
+///
+/// Both bars keep the rescue pointed at the one shape it fixes. The
+/// shortfall cap: adopting the stub re-stamps the whole window onto text that
+/// ends at the guard's kept prefix, so the swap only pays behind a winner
+/// that is healthy but stopped just short. Past the cap the winner itself is
+/// the broken side of the seam and a degenerate-repeat stub's kept prefix
+/// cannot rescue it, only shorten it. The frontier margin: a stub cut
+/// mid-phrase shows the guard stopped the transcript short of real audio,
+/// while a stub whose frontier pins to the window end looped with its
+/// cross-attention tiling the window -- its placements reach the end by
+/// attention drift, its kept prefix abandoned the tail, and its tail claim
+/// is hollow.
+fn whisper_tail_stub_may_claim(
+    tail_shortfall_seconds: f32,
+    stub_frontier_seconds: f32,
+    window_end_seconds: f32,
+) -> bool {
+    tail_shortfall_seconds <= WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS
+        && stub_frontier_seconds + WHISPER_LADDER_TAIL_STUB_WINDOW_END_MARGIN_SECONDS
+            <= window_end_seconds
 }
 
 /// The pool position of the round that covers the most audio past the race
@@ -7646,6 +8178,368 @@ fn whisper_carry_head_skip_graft(
     } else {
         Some(WhisperCarryHeadSkipGraft::Splice { hole_words })
     }
+}
+
+/// Largest single RMS-envelope frame over the slice-relative seconds
+/// `[lo, hi)` -- the peaked counterpart to [`whisper_slice_envelope_level`],
+/// for gates that must catch a brief onset inside an otherwise quiet range (a
+/// mean over the range would dilute a 0.2 s consonant onset into the pause
+/// floor). Non-finite frames do not raise the peak. `None` when the range is
+/// empty, falls outside the measured envelope, or carries no signal.
+fn whisper_slice_envelope_peak(rms_frames: &[f32], lo: f32, hi: f32) -> Option<f32> {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    if rms_frames.len() < 2 || hi <= lo || lo < 0.0 {
+        return None;
+    }
+    let lo_frame = (lo as f64 / FRAME_SECONDS).floor() as usize;
+    let hi_frame = (hi as f64 / FRAME_SECONDS).floor() as usize;
+    let lo_frame = lo_frame.min(rms_frames.len());
+    let hi_frame = hi_frame.min(rms_frames.len());
+    if hi_frame <= lo_frame {
+        return None;
+    }
+    let peak = rms_frames[lo_frame..hi_frame]
+        .iter()
+        .copied()
+        .fold(0.0_f32, |peak, frame| {
+            if frame.is_finite() {
+                peak.max(frame)
+            } else {
+                peak
+            }
+        });
+    (peak > 0.0_f32).then_some(peak)
+}
+
+/// The RMS-envelope frames under every placed word, as the hole gate's
+/// reference sample (helper so the percentile and the gate share framing).
+fn whisper_carry_word_level_frames(rms_frames: &[f32], words: &[crate::WordTimestamp]) -> Vec<f32> {
+    const FRAME_SECONDS: f64 =
+        WHISPER_DTW_ENVELOPE_FRAME_COUNT as f64 / WHISPER_SAMPLE_RATE_HZ as f64;
+    words
+        .iter()
+        .filter(|word| word.end > word.start)
+        .filter_map(|word| {
+            let lo_frame = (word.start as f64 / FRAME_SECONDS).floor() as usize;
+            let hi_frame = (word.end as f64 / FRAME_SECONDS).floor() as usize;
+            let lo_frame = lo_frame.min(rms_frames.len());
+            let hi_frame = hi_frame.min(rms_frames.len());
+            (hi_frame > lo_frame).then(|| rms_frames[lo_frame..hi_frame].to_vec())
+        })
+        .flatten()
+        .collect()
+}
+
+/// Peaked reference level for the interior-hole gate: the 90th-percentile
+/// RMS-envelope frame under the slice's placed words themselves. Speech is
+/// quiet far more often than loud, so a percentile of the word frames sits
+/// well under a shout yet still far above a real pause's floor, which keeps
+/// the gate from admitting every wide inter-clause breath while the gap's own
+/// peak (even a lone soft onset frame) still clears it.
+fn whisper_carry_word_surface_level(
+    rms_frames: &[f32],
+    words: &[crate::WordTimestamp],
+) -> Option<f32> {
+    let mut frames = whisper_carry_word_level_frames(rms_frames, words);
+    if frames.is_empty() {
+        return None;
+    }
+    frames.sort_by(f32::total_cmp);
+    let index = frames.len().saturating_sub(1).saturating_mul(90) / 100;
+    frames
+        .get(index)
+        .copied()
+        .filter(|frame| frame.is_finite() && *frame > 0.0)
+}
+
+/// Interior carry-skip holes in a placed word list: consecutive word pairs
+/// whose gap is at least [`WHISPER_CARRY_HOLE_MIN_GAP_SECONDS`] wide AND still
+/// audible at the slice's placed-word level (deficit gate
+/// [`WHISPER_CARRY_HOLE_MAX_DEFICIT_DB`]), i.e. real speech the carried decode
+/// left unstamped between the words it did place. The head before the first
+/// word and the tail after the last word are deliberately not holes -- those
+/// carry shapes have their own recoveries (the head-skip graft and the
+/// ladder's audible-tail re-race), and re-covering them here would graft the
+/// same audio twice.
+fn whisper_carry_interior_holes(
+    words: &[crate::WordTimestamp],
+    rms_frames: Option<&[f32]>,
+) -> Vec<WhisperCarryHole> {
+    let Some(rms_frames) = rms_frames else {
+        return Vec::new();
+    };
+    let Some(surface) = whisper_carry_word_surface_level(rms_frames, words) else {
+        return Vec::new();
+    };
+    let trace_holes = whisper_ladder_debug_enabled();
+    if trace_holes {
+        eprintln!(
+            "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan words={} surface={surface:.5}",
+            words.len()
+        );
+    }
+    words
+        .windows(2)
+        .enumerate()
+        .filter_map(|(boundary, pair)| {
+            let (left, right) = (&pair[0], &pair[1]);
+            let (lo, hi) = (left.end, right.start);
+            if hi - lo < WHISPER_CARRY_HOLE_MIN_GAP_SECONDS {
+                return None;
+            }
+            let peak = whisper_slice_envelope_peak(rms_frames, lo, hi);
+            let hole = peak
+                .and_then(|peak| {
+                    let deficit = 20.0_f32 * (surface / peak).log10();
+                    (deficit.is_finite() && deficit <= WHISPER_CARRY_HOLE_MAX_DEFICIT_DB)
+                        .then_some(WhisperCarryHole { boundary, lo, hi })
+                });
+            if trace_holes {
+                match peak {
+                    None => eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan_gap boundary={boundary} gap={lo:.2}..{hi:.2} peak=none rejected=unmeasurable"
+                    ),
+                    Some(peak) => eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_scan_gap boundary={boundary} gap={lo:.2}..{hi:.2} peak={peak:.5} deficit={:.1} admitted={}",
+                        20.0_f32 * (surface / peak).log10(),
+                        hole.is_some()
+                    ),
+                }
+            }
+            hole
+        })
+        .collect()
+}
+
+/// Lowercased ASCII-alphanumeric word units of a display token ("heart...the"
+/// -> ["heart", "the"]), so the dedupe can say whether a placed word already
+/// COVERED a recovered word's content regardless of the merged/punctuated
+/// form DTW stitching reports it in.
+fn whisper_carry_normalized_word_units(word: &str) -> Vec<String> {
+    word.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|unit| !unit.is_empty())
+        .map(|unit| unit.chars().flat_map(|c| c.to_lowercase()).collect())
+        .collect()
+}
+
+/// Whether a re-decode word that credits to a hole is a DUPLICATE of content
+/// the carried decode already owns, in which case grafting it would emit a
+/// word the transcript already has (or a word-for-word misread of one).
+/// Returns the rejection reason, or `None` when the word is genuinely new
+/// speech for the hole. The re-decode runs on the SAME slice and re-stamps the
+/// words the carry placed, only on its own timing grid, so a grafted word that
+/// re-states an already-placed word is a duplicate, not a recovery. Pure so
+/// the unit tests pin each reject shape exactly as they pin the admissible
+/// recovery.
+fn whisper_carry_graft_duplicate_reason(
+    word: &crate::WordTimestamp,
+    majority: f32,
+    carried_words: &[crate::WordTimestamp],
+    right_boundary: Option<&crate::WordTimestamp>,
+) -> Option<&'static str> {
+    let word_units = whisper_carry_normalized_word_units(&word.word);
+    // Same-content re-stamp: a placed word with the same content whose span
+    // OVERLAPS the graft's span. The carry already stamped this word over this
+    // audio; the re-decode is just re-timing it. Subsumes the old stretch-cover
+    // case (a stretched same-content placed word spanning the graft's majority
+    // necessarily overlaps the graft's span). A same-content placed word that
+    // is only a NEIGHBOR (no span overlap) is a genuine repeat the speaker made
+    // twice -- the carry caught the first, the re-decode the second -- and
+    // stays.
+    for placed in carried_words {
+        if placed.start < word.end
+            && word.start < placed.end
+            && whisper_carry_normalized_word_units(&placed.word)
+                .iter()
+                .any(|unit| word_units.contains(unit))
+        {
+            return Some("duplicate_overlap");
+        }
+    }
+    // Right-boundary echo: the graft's content matches the word the carry
+    // placed right after the hole and the graft sits at or before that word --
+    // the re-decode re-timed the right-boundary word earlier into the gap
+    // instead of supplying the missing speech between the words. Only the RIGHT
+    // boundary is gated: a same-content left-boundary match with no overlap is
+    // a legitimate repeat after the boundary.
+    if let Some(right) = right_boundary
+        && majority <= right.start
+        && whisper_carry_normalized_word_units(&right.word)
+            .iter()
+            .any(|unit| word_units.contains(unit))
+    {
+        return Some("boundary_echo");
+    }
+    // Slot conflict over a normal word: a placed word of DIFFERENT content
+    // already owns the graft's majority time and is narrow (a normal stamp, not
+    // a stretch) -- the re-decode is misreading that word, not adding speech
+    // the carry skipped. New words recovered under a stretched placed word are
+    // the recovery, so only narrow placed words own their slot.
+    for placed in carried_words {
+        if placed.start <= majority
+            && majority <= placed.end
+            && placed.end - placed.start < WHISPER_CARRY_HOLE_MAX_SLOT_CONFLICT_WIDTH_SECONDS
+            && !whisper_carry_normalized_word_units(&placed.word)
+                .iter()
+                .any(|unit| word_units.contains(unit))
+        {
+            return Some("slot_conflict");
+        }
+    }
+    None
+}
+
+/// The interior-hole graft decision: the re-decode words to insert into the
+/// carried word list, each consumed by the hole its majority time credits it
+/// to, or `None` when the re-decode supplies nothing the carried decode
+/// lacks. Pure so the unit tests pin the credit window, the dedupe and the
+/// nothing-to-insert abort exactly as they pin the head-skip graft.
+fn whisper_carry_interior_hole_graft(
+    carried_words: &[crate::WordTimestamp],
+    recovered_words: &[crate::WordTimestamp],
+    holes: &[WhisperCarryHole],
+    rms_frames: Option<&[f32]>,
+) -> Option<Vec<crate::WordTimestamp>> {
+    let trace_graft =
+        whisper_ladder_debug_enabled() && !holes.is_empty() && !recovered_words.is_empty();
+    if trace_graft {
+        for (hole_index, hole) in holes.iter().enumerate() {
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_window hole={} window={:.2}..{:.2}",
+                hole_index,
+                hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS,
+                hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS
+            );
+        }
+    }
+    // Audio support for admitted words: a re-decode word is only the lost
+    // speech when the audio under ITS OWN span actually sounds like the speech
+    // the rest of the slice decodes at. The re-decode's DTW stamps live on
+    // their own time grid and can trail into a neighboring pause, and a
+    // pause-ghost word (loop filler stamped over silence) sounds orders of
+    // magnitude below the placed words, so measured under the placed words'
+    // surface level it fails the same deficit gate the hole itself passed.
+    let support_level =
+        rms_frames.and_then(|rms| whisper_carry_word_surface_level(rms, carried_words));
+    let mut hole_words: Vec<Vec<crate::WordTimestamp>> = vec![Vec::new(); holes.len()];
+    let mut used = vec![false; recovered_words.len()];
+    let mut grafted = 0usize;
+    for (hole_index, hole) in holes.iter().enumerate() {
+        let window_lo = hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS;
+        let window_hi = hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS;
+        for (index, word) in recovered_words.iter().enumerate() {
+            if used[index] {
+                continue;
+            }
+            // Content-bearing stamps only: a lone "." or a mojibake run is a
+            // DTW artifact, not the swallowed word a hole holds.
+            if !word.word.trim().chars().any(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            let majority = 0.5 * (word.start + word.end);
+            if majority < window_lo || majority > window_hi {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=outside_window",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // The re-decode's own stretched stamps and its low-probability
+            // fill are not the lost word; they are its copy of the SAME
+            // swallow/loop noise that stretched (or filled) this hole in the
+            // decode that came before, only re-timed onto its own grid. The
+            // lost word is narrow and confident.
+            if word.end - word.start >= WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS
+                || word.confidence.is_none_or(|confidence| {
+                    confidence < WHISPER_CARRY_HOLE_MIN_GRAFT_WORD_CONFIDENCE
+                })
+            {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=degrade",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // Skip the re-decode word when it duplicates content the carried
+            // decode already owns (a same-word re-stamp over this audio, a
+            // re-timing of the right-boundary word into the gap, or a
+            // word-for-word misread of a normal placed word) rather than
+            // supplying the speech the hole holds.
+            if let Some(reason) = whisper_carry_graft_duplicate_reason(
+                word,
+                majority,
+                carried_words,
+                carried_words.get(hole.boundary.saturating_add(1)),
+            ) {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected={reason}",
+                        hole_index, word.word, word.start, word.end
+                    );
+                }
+                continue;
+            }
+            // Audio support: skip a stamp whose own span sits on silence (a
+            // pause wrinkle word the loop emitted into the hole's air rather
+            // than the hole's lost speech).
+            if let Some(rms_frames) = rms_frames {
+                let supported = match (
+                    support_level,
+                    whisper_slice_envelope_peak(rms_frames, word.start, word.end),
+                ) {
+                    (Some(surface), Some(peak)) => {
+                        20.0_f32 * (surface / peak).log10()
+                            <= WHISPER_CARRY_HOLE_WORD_MAX_DEFICIT_DB
+                    }
+                    _ => false,
+                };
+                if !supported {
+                    if trace_graft {
+                        eprintln!(
+                            "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_candidate hole={} word={:?} span={:.2}..{:.2} majority={majority:.2} rejected=no_audio_support",
+                            hole_index, word.word, word.start, word.end
+                        );
+                    }
+                    continue;
+                }
+            }
+            used[index] = true;
+            grafted += 1;
+            if trace_graft {
+                eprintln!(
+                    "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_admitted hole={} word={:?} span={:.2}..{:.2} majority={majority:.2}",
+                    hole_index, word.word, word.start, word.end
+                );
+            }
+            hole_words[hole_index].push(word.clone());
+        }
+        hole_words[hole_index].sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    if grafted == 0 {
+        return None;
+    }
+    // Splice at the hole boundaries. Holes are emitted in boundary order (one
+    // hole per consecutive-word pair), so a single forward scan files every
+    // hole's recovered words between exactly the words that flank it.
+    let mut spliced = Vec::with_capacity(carried_words.len() + grafted);
+    let mut hole_front = 0usize;
+    for (index, word) in carried_words.iter().enumerate() {
+        spliced.push(word.clone());
+        while hole_front < holes.len() && holes[hole_front].boundary == index {
+            spliced.extend(std::mem::take(&mut hole_words[hole_front]));
+            hole_front += 1;
+        }
+    }
+    Some(spliced)
 }
 
 /// The tail mirror of [`whisper_slice_head_is_audible`], for the ladder's
@@ -8104,6 +8998,17 @@ fn run_whisper_decode_loop(
         // at, for the re-race logs and its temperature cap below.
         let mut best_round = 1usize;
         let mut best_temperature = 0.0_f32;
+        // The round-1 decode, preserved before the rounds below can replace
+        // it. The ladder only runs because it was guard-cut, and a guard cut
+        // can fall mid-phrase: the guard sees the token cycle, not the audio,
+        // so a genuine repeated run ("yeah" x 6) that the loop locked onto is
+        // cut the same way a silence loop is. The audible-tail coverage
+        // re-race below may hand the window back to this decode when no clean
+        // round covers the tail its pre-trip placements reach into -- a
+        // guard-cut slice is left to its own tail rescue, and the ladder is
+        // its only rescue.
+        let mut guard_cut_stub: Option<(WhisperDecodeCandidate, WhisperGreedyDecodeResult)> =
+            Some((best.0.clone(), best.1.clone()));
         if whisper_ladder_debug_enabled() {
             eprintln!(
                 "openasr_whisper_greedy_decode stage=temperature_ladder event=ladder_start initial_prompt_text={:?}",
@@ -8371,6 +9276,17 @@ fn run_whisper_decode_loop(
                 // cannot take over from any other round.
                 let cl_has_content =
                     cl_clean && cand.text_trimmed.chars().any(|c| c.is_alphanumeric());
+                // Strip timestamp stamps and the dominant short cycle from a
+                // round's generated stream: the content-preservation comparison
+                // shared by both adoption paths below.
+                let strip_stream = |stream: &[u32]| -> Vec<u32> {
+                    let stripped: Vec<u32> = stream
+                        .iter()
+                        .copied()
+                        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
+                        .collect();
+                    whisper_stream_without_dominant_cycle(&stripped)
+                };
                 if best.1.stop_reason == Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard {
                     let mut entrants = std::mem::take(&mut clean_rounds);
                     if cl_has_content {
@@ -8409,23 +9325,54 @@ fn run_whisper_decode_loop(
                             }
                         }
                         let winner = entrants.remove(winner_index);
-                        // Log before `best` takes ownership of the winner.
-                        eprintln!(
-                            "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={} temperature={} stop_reason={:?} evidence_secs={:?} text={:?}",
-                            winner.round,
-                            winner.temperature,
-                            winner.result.stop_reason,
-                            winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
-                            winner.candidate.text_trimmed
-                        );
-                        best_round = winner.round;
-                        best_temperature = winner.temperature;
-                        carry_less_round_won = winner.round == cl_round;
-                        best = (winner.candidate, winner.result);
-                        best_evidence = winner.evidence;
-                        // The rounds that lost this race stay in the pool for
-                        // the audible-tail coverage re-race below.
-                        clean_rounds = entrants;
+                        // A guard-tripped incumbent is not necessarily a stub:
+                        // a round that transcribed the window and only looped on
+                        // its trailing silence keeps the whole real transcript in
+                        // its pre-trip prefix. The re-race exists to recover
+                        // speech a loop stub left out, so it must not trade such
+                        // a transcript for a challenger carrying a fraction of
+                        // its content.
+                        let (_, incumbent_content_tokens) =
+                            whisper_ladder_salvaged_stream(tokenizer, &best.1);
+                        let (_, challenger_content_tokens) =
+                            whisper_ladder_salvaged_stream(tokenizer, &winner.result);
+                        if whisper_ladder_stub_pool_may_replace(
+                            incumbent_content_tokens,
+                            best.1.generated_tokens.len(),
+                            best.0.token_alignments.len(),
+                            challenger_content_tokens,
+                        ) {
+                            // Log before `best` takes ownership of the winner.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_won round={} temperature={} stop_reason={:?} evidence_secs={:?} text={:?}",
+                                winner.round,
+                                winner.temperature,
+                                winner.result.stop_reason,
+                                winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                                winner.candidate.text_trimmed
+                            );
+                            best_round = winner.round;
+                            best_temperature = winner.temperature;
+                            carry_less_round_won = winner.round == cl_round;
+                            best = (winner.candidate, winner.result);
+                            best_evidence = winner.evidence;
+                            // The rounds that lost this race stay in the pool
+                            // for the audible-tail coverage re-race below.
+                            clean_rounds = entrants;
+                        } else {
+                            // The incumbent's salvaged content would be lost:
+                            // keep its window and restore the pool (winner
+                            // included) for the tail-coverage re-race.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=stub_pool_kept_incumbent round={} temperature={} evidence_secs={:?} text={:?}",
+                                winner.round,
+                                winner.temperature,
+                                winner.evidence.map(|secs| (secs * 1000.0).round() / 1000.0),
+                                winner.candidate.text_trimmed
+                            );
+                            entrants.insert(winner_index, winner);
+                            clean_rounds = entrants;
+                        }
                     }
                 } else if cl_has_content {
                     let coverage_ok = match (best_evidence, cl_evidence) {
@@ -8435,14 +9382,6 @@ fn run_whisper_decode_loop(
                         }
                         _ => true,
                     };
-                    let strip_stream = |stream: &[u32]| -> Vec<u32> {
-                        let stripped: Vec<u32> = stream
-                            .iter()
-                            .copied()
-                            .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
-                            .collect();
-                        whisper_stream_without_dominant_cycle(&stripped)
-                    };
                     // The content the incumbent has actually salvaged. A
                     // guard-cut stub's kept loop cycle is the loop itself,
                     // not content: its salvaged content is the pre-loop
@@ -8450,33 +9389,11 @@ fn run_whisper_decode_loop(
                     // guard-cut stream (and a stamp the winning decode
                     // rendered under a different token id is a re-stamp, not
                     // a loss). Every other incumbent counts its whole stream.
-                    let stripped_best: Vec<u32> = best
-                        .1
-                        .generated_tokens
-                        .iter()
-                        .copied()
-                        .filter(|token_id| is_not_whisper_timestamp(tokenizer, *token_id))
-                        .collect();
-                    // The trip cycle counts raw tokens (a timestamp may ride
-                    // in it), so the trimmed tail may run a token longer than
-                    // the stripped cycle: saturate at the stream start, where
-                    // the stub's whole stripped stream is one kept cycle.
-                    let best_content = match best.1.guard_trip_ngram_len {
-                        Some(cycle) => &stripped_best[..stripped_best.len().saturating_sub(cycle)],
-                        None => &stripped_best[..],
-                    };
-                    let salvaged_stream = whisper_stream_without_dominant_cycle(best_content);
+                    let (salvaged_stream, salvaged_content_tokens) =
+                        whisper_ladder_salvaged_stream(tokenizer, &best.1);
                     // The saved tokens must themselves be salvage (see
                     // WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS): a tiny
                     // stub's subsequence test passes against nearly anything.
-                    let salvaged_content_tokens = salvaged_stream
-                        .iter()
-                        .filter(|token_id| {
-                            tokenizer
-                                .decode_text_token_ids(&[**token_id])
-                                .is_ok_and(|text| text.chars().any(char::is_alphanumeric))
-                        })
-                        .count();
                     let keeps_incumbent_content = salvaged_content_tokens
                         >= WHISPER_LADDER_CARRY_LESS_MIN_SALVAGED_TOKENS
                         && whisper_token_stream_is_subsequence(
@@ -8511,12 +9428,16 @@ fn run_whisper_decode_loop(
         // the resulting hole actually is -- where each round's placed words
         // END relative to the window -- and, when the winner leaves a
         // speech-level tail unclaimed, hand the window to the round that
-        // reaches furthest into it. Fail-open at every step: no word
-        // placements, no measurable tail, or no qualifying challenger leaves
-        // the ladder's own winner exactly as the race picked it.
-        if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
-            && !clean_rounds.is_empty()
-        {
+        // reaches furthest into it. The guard-cut round-1 stub is a pool
+        // member too: its word pass keeps the full pre-trip placements, so a
+        // cut that fell mid-phrase (the guard sees the token cycle, not the
+        // audio) still lets its transcript claim the tail no clean round
+        // transcribed -- while the audibility gate keeps a loop-over-silence
+        // stub out, its placements riding on audio nothing left behind.
+        // Fail-open at every step: no word placements, no measurable tail, or
+        // no qualifying challenger leaves the ladder's own winner exactly as
+        // the race picked it.
+        if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention {
             // The last placed word's end, in slice-relative seconds: where
             // this round's transcription of the window stops.
             let placed_frontier = |cand: &WhisperDecodeCandidate,
@@ -8530,49 +9451,107 @@ fn run_whisper_decode_loop(
                     word_audio_rms_frames,
                 )
             };
-            let window_end = audio_duration_seconds.max(0.0);
-            let winner_frontier = placed_frontier(&best.0, &best.1);
-            let tail_shortfall = winner_frontier
-                .filter(|frontier| {
-                    window_end - frontier >= WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS
-                })
-                .zip(word_audio_rms_frames)
-                .filter(|(frontier, rms_frames)| {
-                    whisper_slice_tail_is_audible(rms_frames, *frontier, window_end)
-                })
-                .map(|(frontier, _)| window_end - frontier);
-            if let Some(tail_shortfall) = tail_shortfall {
-                let winner_frontier = winner_frontier.expect("audible tail implies a frontier");
-                let pool_frontiers: Vec<(f32, Option<f32>, bool)> = clean_rounds
-                    .iter()
-                    .map(|round| {
-                        (
-                            round.temperature,
-                            placed_frontier(&round.candidate, &round.result),
-                            !round.evidence.is_some_and(|secs| {
+            // The round-1 stub joins the pool alongside the clean rounds when
+            // it is not already the winner: a guard cut falls where the token
+            // cycle did, not where the speech did, so while its text ends at
+            // the cut its word pass keeps the full pre-trip placements -- the
+            // only copies of a genuine repeated phrase the guard looped on
+            // that any clean round ever decoded here. The audible-tail gate
+            // below keeps it out of the loop-over-silence shape, where those
+            // placements ride on audio no one is leaving behind; the stub's
+            // own bars ([`whisper_tail_stub_may_claim`]) keep it out of the
+            // two shapes where re-stamping the whole window onto its kept
+            // prefix loses more than it recovers -- a 5+ s shortfall means
+            // the winner is the broken side, and a frontier pinned to the
+            // window end means the tail claim is attention drift. The same
+            // minimum-evidence refusal that marks a collapsed clean round
+            // applies.
+            let stub_frontier = if best.1.guard_trip_ngram_len.is_some() {
+                // The stub is the winner already: there is nothing to take
+                // the window back from it.
+                None
+            } else {
+                guard_cut_stub.as_ref().and_then(|(cand, result)| {
+                    placed_frontier(cand, result).filter(|_| {
+                        whisper_ladder_evidence_span_seconds(cand, audio_duration_seconds)
+                            .is_some_and(|secs| {
                                 secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
-                            }),
-                        )
+                            })
                     })
-                    .collect();
-                if let Some(index) = whisper_tail_coverage_challenger(
-                    &pool_frontiers,
-                    best_temperature,
-                    winner_frontier,
-                ) {
-                    eprintln!(
-                        "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_coverage_won round={} temperature={} replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} challenger_frontier_secs={:.2}",
-                        clean_rounds[index].round,
-                        clean_rounds[index].temperature,
-                        pool_frontiers[index].1.unwrap_or_default(),
-                    );
-                    let challenger = clean_rounds.swap_remove(index);
-                    best = (challenger.candidate, challenger.result);
-                    best_evidence = challenger.evidence;
-                    // Every pool member but the carry-less round decoded the
-                    // carry prompt, so a swap back onto one leaves the carry
-                    // head-skip recovery below free to run.
-                    carry_less_round_won = false;
+                })
+            };
+            if !clean_rounds.is_empty() || stub_frontier.is_some() {
+                let window_end = audio_duration_seconds.max(0.0);
+                let winner_frontier = placed_frontier(&best.0, &best.1);
+                let tail_shortfall = winner_frontier
+                    .filter(|frontier| {
+                        window_end - frontier >= WHISPER_LADDER_TAIL_COVERAGE_MIN_SECONDS
+                    })
+                    .zip(word_audio_rms_frames)
+                    .filter(|(frontier, rms_frames)| {
+                        whisper_slice_tail_is_audible(rms_frames, *frontier, window_end)
+                    })
+                    .map(|(frontier, _)| window_end - frontier);
+                if let Some(tail_shortfall) = tail_shortfall {
+                    let winner_frontier = winner_frontier.expect("audible tail implies a frontier");
+                    let mut pool_frontiers: Vec<(f32, Option<f32>, bool)> = clean_rounds
+                        .iter()
+                        .map(|round| {
+                            (
+                                round.temperature,
+                                placed_frontier(&round.candidate, &round.result),
+                                !round.evidence.is_some_and(|secs| {
+                                    secs >= WHISPER_LADDER_STUB_POOL_MIN_EVIDENCE_SECONDS
+                                }),
+                            )
+                        })
+                        .collect();
+                    let stub_index = stub_frontier
+                        .filter(|&frontier| {
+                            whisper_tail_stub_may_claim(tail_shortfall, frontier, window_end)
+                        })
+                        .map(|frontier| {
+                            pool_frontiers.push((0.0, Some(frontier), false));
+                            pool_frontiers.len().saturating_sub(1)
+                        });
+                    if let Some(index) = whisper_tail_coverage_challenger(
+                        &pool_frontiers,
+                        best_temperature,
+                        winner_frontier,
+                    ) {
+                        let challenger_frontier = pool_frontiers[index].1.unwrap_or_default();
+                        if Some(index) == stub_index {
+                            // Adopting the guard-cut round, which is how the
+                            // race-denial path already keeps a stub's window:
+                            // the transcript carries its pre-trip word
+                            // placements and its cut's stop reason, while its
+                            // text ends at the guard's kept prefix.
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_stub_won replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} stub_frontier_secs={challenger_frontier:.2}",
+                            );
+                            if let Some((stub_candidate, stub_decode)) = guard_cut_stub.take() {
+                                best_evidence = whisper_ladder_evidence_span_seconds(
+                                    &stub_candidate,
+                                    audio_duration_seconds,
+                                );
+                                best = (stub_candidate, stub_decode);
+                                carry_less_round_won = false;
+                            }
+                        } else {
+                            eprintln!(
+                                "openasr_whisper_greedy_decode stage=temperature_ladder event=tail_coverage_won round={} temperature={} replaced_round={best_round} winner_frontier_secs={winner_frontier:.2} window_end_secs={window_end:.2} tail_shortfall_secs={tail_shortfall:.2} challenger_frontier_secs={challenger_frontier:.2}",
+                                clean_rounds[index].round, clean_rounds[index].temperature,
+                            );
+                            let challenger = clean_rounds.swap_remove(index);
+                            best = (challenger.candidate, challenger.result);
+                            best_evidence = challenger.evidence;
+                            // Every pool member but the carry-less round
+                            // decoded the carry prompt, so a swap back onto
+                            // one leaves the carry head-skip recovery below
+                            // free to run.
+                            carry_less_round_won = false;
+                        }
+                    }
                 }
             }
         }
@@ -8689,7 +9668,22 @@ fn run_whisper_decode_loop(
             audio_duration_seconds,
         )
         .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
-        if spliced_degenerate_tail {
+        // Second splice over the same run/word pairing: a clean decode that
+        // ends on a short unit echoed back-to-back over the window's silent
+        // tail ("...Luigi. Luigi."), the shape the guard and the collapse
+        // above leave in. After a degenerate splice it re-reads the shifted
+        // stream and refuses on its parity check, so the two never overlap.
+        let spliced_tail_echo = whisper_splice_unvoiced_tail_echo(
+            tokenizer,
+            &mut decode,
+            &mut step_runner_token_alignments,
+            &mut words,
+            &degenerate_tail_run_word_ranges,
+            word_audio_rms_frames,
+            audio_duration_seconds,
+        )
+        .map_err(|e| decorate_decoder_boundary_error(e, &prelude_summary, &encoder_summary))?;
+        if spliced_degenerate_tail || spliced_tail_echo {
             text = decode.text.trim().to_string();
             if text.is_empty() {
                 eprintln!(
@@ -8708,27 +9702,32 @@ fn run_whisper_decode_loop(
             }
         }
     }
-    // Carry head-skip recovery (word splice): the longform carry seeds this
-    // slice's prompt with the previous slice's tail tokens in <startofprev>.
-    // Because the model has already "spoken" the carried words, it can treat
-    // them as the start of THIS window's content and begin emitting mid-
-    // slice, never generating words for the real speech at the slice head
-    // (the first cross-attention-placed word lands seconds into the slice
-    // while the audio ahead of it is at ordinary speech level). When that
-    // shape shows up, re-decode the SAME encoded slice with the base (carry-
-    // less) prompt and graft only the re-decode's hole words (majority time
-    // before the carried first word) in front of the carried words. The
-    // carried decode's tokens, text tail, carry and stop reason stay
-    // untouched, so every slice after this one is conditioned exactly as
-    // before and no downstream content changes. The rare case where the
-    // carried decode's own words are all degenerate zero-width tags (no real
-    // content after the skip at all) instead swaps in the re-decode's word
-    // list wholesale. Every healthy slice (first word inside the overlap
-    // re-read, or a quiet head) takes no action here and stays untouched.
+    // Carry recovery (word splice): the longform carry seeds this slice's
+    // prompt with the previous slice's tail tokens in <startofprev>. Because
+    // the model has already "spoken" the carried words, it can treat them as
+    // the start of THIS window's content in two ways: it may begin emitting
+    // mid-slice (never generating words for the real speech at the slice
+    // head; the first cross-attention-placed word lands seconds into the
+    // slice while the audio ahead of it is at ordinary speech level), or it
+    // may jump over interior audio and leave a mid-slice hole between two
+    // placed words whose gap sounds like ordinary speech. When either shape
+    // shows up, re-decode the SAME encoded slice once with the base (carry-
+    // less) prompt and graft the re-decode's words the carried decode
+    // lacked: head words (majority time before the carried first word) in
+    // front of the carried words, hole words (majority time credited to a
+    // detected hole) between the words that flank their hole. The carried
+    // decode's tokens, text tail, carry and stop reason stay untouched, so
+    // every slice after this one is conditioned exactly as before and no
+    // downstream content changes. The rare case where the carried decode's
+    // own words are all degenerate zero-width tags (no real content after
+    // the skip at all) instead swaps in the re-decode's word list wholesale.
+    // Every healthy slice (first word inside the overlap re-read, no audible
+    // holes, or quiet heads/pauses) takes no action here and stays
+    // untouched.
     if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
         // When the ladder's carry-less round already won, its decode IS the
         // base-prompt re-decode: running this recovery would re-decode the
-        // same slice and graft the same head words a second time.
+        // same slice and graft the same words a second time.
         && !carry_less_round_won
         && request_options.longform_prompt_carry_enabled()
         && request_options
@@ -8748,7 +9747,11 @@ fn run_whisper_decode_loop(
             } else {
                 None
             };
-        if let Some((rms_frames, carried_first_start)) = head_skip_candidate {
+        let interior_holes = whisper_carry_interior_holes(&words, word_audio_rms_frames);
+        if head_skip_candidate.is_some() || !interior_holes.is_empty() {
+            let carried_first_start = head_skip_candidate
+                .map(|(_, first)| first)
+                .unwrap_or_else(|| words.first().map(|word| word.start).unwrap_or(0.0));
             // Base (carry-less) prompt for the re-decode. It is shorter than
             // the carry prompt, so its generated-token budget is larger, but
             // prompt + generated still sums to `max_target_positions` -- the
@@ -8804,43 +9807,60 @@ fn run_whisper_decode_loop(
                                 &recovered_candidate.token_alignments,
                                 &recovered_decode.generated_probabilities,
                                 audio_duration_seconds,
-                                Some(rms_frames),
+                                word_audio_rms_frames,
                             )
                             .unwrap_or_default();
-                            match whisper_carry_head_skip_graft(
-                                &words,
-                                &recovered_words,
-                                carried_first_start,
-                            ) {
-                                None => {
-                                    if whisper_ladder_debug_enabled() {
-                                        let recovered_first = recovered_words
-                                            .first()
-                                            .map(|word| word.start)
-                                            .unwrap_or(f32::NAN);
-                                        eprintln!(
-                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=no_hole_words stop_reason={:?} recovered_words={} recovered_first_word={recovered_first:.2}s carried_first_word={carried_first_start:.2}s",
-                                            recovered_decode.stop_reason,
-                                            recovered_words.len(),
-                                        );
-                                    }
+                            let head_graft = head_skip_candidate.as_ref().map(|(_, head_first)| {
+                                whisper_carry_head_skip_graft(&words, &recovered_words, *head_first)
+                            });
+                            let head_graft_is_none = head_graft.is_none();
+                            if matches!(head_graft, Some(Some(WhisperCarryHeadSkipGraft::Swap))) {
+                                let recovered_text = recovered_decode.text.trim().to_string();
+                                if !recovered_text.is_empty()
+                                    && recovered_text.chars().any(|c| c.is_alphanumeric())
+                                {
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
+                                        recovered_words[0].start,
+                                        recovered_words.len(),
+                                        words.len()
+                                    );
+                                    text = recovered_text;
+                                    words = recovered_words;
                                 }
-                                Some(WhisperCarryHeadSkipGraft::Swap) => {
-                                    let recovered_text = recovered_decode.text.trim().to_string();
-                                    if !recovered_text.is_empty()
-                                        && recovered_text.chars().any(|c| c.is_alphanumeric())
-                                    {
-                                        eprintln!(
-                                            "openasr_whisper_greedy_decode stage=carry_head_skip event=word_swap carried_first_word={carried_first_start:.2}s recovered_first_word={:.2}s recovered_words={} carried_words={}",
-                                            recovered_words[0].start,
-                                            recovered_words.len(),
-                                            words.len()
-                                        );
-                                        text = recovered_text;
-                                        words = recovered_words;
-                                    }
+                            } else {
+                                // Interior hole splice first: a head splice
+                                // prepends words to the list, which would
+                                // shift every hole boundary index past its
+                                // own meaning, while the head graft was
+                                // already judged against the un-prepended
+                                // list.
+                                if let Some(hole_spliced) = whisper_carry_interior_hole_graft(
+                                    &words,
+                                    &recovered_words,
+                                    &interior_holes,
+                                    word_audio_rms_frames,
+                                ) {
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=words_spliced holes={} grafted_words={} carried_words={}",
+                                        interior_holes.len(),
+                                        hole_spliced.len() - words.len(),
+                                        words.len()
+                                    );
+                                    words = hole_spliced;
+                                    // The holes hold speech the decode never
+                                    // emitted, so its text disagrees with
+                                    // the spliced words; rebuild it from the
+                                    // placed word stamps so segment text and
+                                    // word stamps agree.
+                                    text = crate::transcript_text::join_segment_texts(
+                                        words.iter().map(|word| word.word.trim()),
+                                    );
                                 }
-                                Some(WhisperCarryHeadSkipGraft::Splice { hole_words }) => {
+                                if let Some(Some(WhisperCarryHeadSkipGraft::Splice {
+                                    hole_words,
+                                })) = head_graft
+                                {
                                     // Head-only splice: the grafted words precede the
                                     // carried first word, the rest of the carried
                                     // decode (and its token stream, which feeds the
@@ -8857,6 +9877,20 @@ fn run_whisper_decode_loop(
                                     spliced.extend_from_slice(&words);
                                     words = spliced;
                                     text = format!("{prefix} {text}");
+                                }
+                                if head_skip_candidate.is_some()
+                                    && head_graft_is_none
+                                    && whisper_ladder_debug_enabled()
+                                {
+                                    let recovered_first = recovered_words
+                                        .first()
+                                        .map(|word| word.start)
+                                        .unwrap_or(f32::NAN);
+                                    eprintln!(
+                                        "openasr_whisper_greedy_decode stage=carry_head_skip event=recovery_aborted reason=no_hole_words stop_reason={:?} recovered_words={} recovered_first_word={recovered_first:.2}s carried_first_word={carried_first_start:.2}s",
+                                        recovered_decode.stop_reason,
+                                        recovered_words.len(),
+                                    );
                                 }
                             }
                         }

@@ -1321,6 +1321,25 @@ fn cohere_refine_dtw_word_onsets_refuses_a_bed_level_front() {
 }
 
 #[test]
+fn cohere_refine_dtw_word_onsets_rescues_a_genuine_pause_front_below_peak_fraction() {
+    // A genuine pause front over a dense chunk: above the absolute quiet line
+    // (the median is the noise) yet below 16% of the chunk's own peak, so the
+    // front is trusted and the word advances to its own run at 3.8 s.
+    let mut envelope = vec![0.022f32; 750];
+    envelope[400] = 0.143; // peak 0.143; contrast 6.5x stays on the dense branch
+    for level in envelope[100..150].iter_mut() {
+        *level = 0.0185; // pause front
+    }
+    for level in envelope[190..200].iter_mut() {
+        *level = 0.143; // the word's own onset run at [3.8, 4.0)
+    }
+    let words = vec![word("a", 0.5, 0.6), word("b", 2.0, 4.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[1].start - 3.8).abs() < 0.05, "start={}", out[1].start);
+    assert!((out[1].end - 4.0).abs() < 1e-4);
+}
+
+#[test]
 fn cohere_refine_dtw_word_onsets_clamps_a_word_at_or_past_the_end() {
     // A word whose start maps past the last envelope frame (a longform chunk end)
     // must not overrun the array; it is clamped and left unrefined.
@@ -1384,6 +1403,83 @@ fn cohere_refine_dtw_word_offsets_refuses_a_music_floor_back() {
     let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
     assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
     assert!((out[1].start - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_rescues_a_genuine_pause_back_below_peak_fraction() {
+    // A genuine pause back over a dense chunk: above the absolute quiet line
+    // (the median is the noise) yet below 16% of the chunk's own peak, so the
+    // back is trusted and the word retreats to its run's offset at 2.6 s.
+    let mut envelope = vec![0.022f32; 750];
+    envelope[400] = 0.143; // peak 0.143; contrast 6.5x stays on the dense branch
+    for level in envelope[100..130].iter_mut() {
+        *level = 0.143; // the word's own run at [2.0, 2.6)
+    }
+    for level in envelope[130..200].iter_mut() {
+        *level = 0.016; // pause back
+    }
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 2.6).abs() < 0.05, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[2].end - 4.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_refuses_a_back_above_the_peak_quiet_gate() {
+    // A back that sits just above the peak-quiet gate (0.02 on a 0.143 peak
+    // is 0.14, above the 0.13 gate): a soft tail with the next word's
+    // lead-in, so the word keeps its fold end rather than being trimmed to
+    // the loud core.
+    let mut envelope = vec![0.022f32; 750];
+    envelope[400] = 0.143; // peak 0.143; contrast 6.5x stays on the dense branch
+    for level in envelope[100..130].iter_mut() {
+        *level = 0.143; // the word's own run at [2.0, 2.6)
+    }
+    for level in envelope[130..200].iter_mut() {
+        *level = 0.02; // soft-tail back, 0.14 of peak
+    }
+    let words = vec![
+        word("a", 0.5, 0.6),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[2].end - 4.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_offsets_never_lands_the_end_before_the_windows_own_audio() {
+    // A word whose own low-SNR body runs to the window edge has no tail to
+    // retreat to: the scan stops at the last run inside the window instead of
+    // falling back to the previous word's run out in the pre-lead.
+    let mut envelope = vec![0.04f32; 750];
+    envelope[400] = 0.17; // clip peak 0.17; median 0.04 -> contrast 4.25 (dense)
+    for level in envelope[80..100].iter_mut() {
+        *level = 0.06; // the previous word's audio in the pre-lead [1.6, 2.0)
+    }
+    for level in envelope[100..111].iter_mut() {
+        *level = 0.002; // real pause [2.0, 2.2)
+    }
+    for level in envelope[111..200].iter_mut() {
+        *level = 0.017; // the word's own low-SNR body [2.22, 4.0)
+    }
+    let words = vec![
+        word("a", 1.6, 2.0),
+        word("b", 2.0, 4.0),
+        word("c", 4.0, 4.5),
+    ];
+    let out = cohere_refine_dtw_word_offsets(words, Some(&envelope), 15.0);
+    assert!((out[1].end - 4.0).abs() < 1e-4, "end={}", out[1].end);
+    assert!((out[1].start - 2.0).abs() < 1e-4);
+    assert!((out[1].end - out[1].start) > 0.5, "window kept its audio");
+    assert!((out[2].end - 4.5).abs() < 1e-4);
 }
 
 #[test]
@@ -1635,6 +1731,68 @@ fn onset_head_fixture(head_span: std::ops::Range<usize>) -> Vec<f32> {
         *level = 0.002;
     }
     envelope
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_lands_a_brief_loud_two_frame_head_inside_the_core_floor() {
+    // Whisper's mikan "This" shape, mirrored: the fold window opens 0.12 s
+    // before a short word whose whole onset is a two-frame burst at 0.9x the
+    // core's own peak, 0.18 s in -- inside the core landing's 0.25 s floor. The
+    // two-frame sustain and the head-only push floor put the start on the burst
+    // (truth error 0.11 s at 39% truth coverage -> 0.01 s at full coverage).
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    // Ambience bleed above the near-floor head line, below the speech
+    // threshold, and below the first two frames (no window-start anchor).
+    for level in envelope[102..109].iter_mut() {
+        *level = 0.0012;
+    }
+    for level in envelope[109..111].iter_mut() {
+        *level = 0.045;
+    }
+    for level in envelope[115..131].iter_mut() {
+        *level = 0.05;
+    }
+    let words = vec![word("a", 2.0, 2.34), word("b", 2.5, 3.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 2.18).abs() < 0.01, "start={}", out[0].start);
+    assert!((out[1].start - 2.5).abs() < 1e-4);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_refuses_a_brief_weak_patch_as_a_head() {
+    // The protection the two-frame sustain leans on: the same two-frame patch at
+    // 0.3x the core's peak is breath or SFX, and the peak ratio still routes
+    // the push to the core.
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[102..109].iter_mut() {
+        *level = 0.0012;
+    }
+    for level in envelope[109..111].iter_mut() {
+        *level = 0.015;
+    }
+    for level in envelope[115..131].iter_mut() {
+        *level = 0.05;
+    }
+    let words = vec![word("a", 2.0, 2.34), word("b", 2.5, 3.0)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 2.30).abs() < 0.01, "start={}", out[0].start);
+}
+
+#[test]
+fn cohere_refine_dtw_word_onsets_keeps_the_core_push_floor_when_no_head_qualifies() {
+    // The head floor is a floor for head landings only: a core run 0.22 s in --
+    // inside the core landing's own 0.25 s calibration-error floor -- is still
+    // refused, so relaxing the head path did not widen the core path.
+    let mut envelope = vec![0.001f32; 750];
+    envelope[400] = 0.5;
+    for level in envelope[111..121].iter_mut() {
+        *level = 0.006;
+    }
+    let words = vec![word("a", 2.0, 2.5), word("b", 3.0, 3.5)];
+    let out = cohere_refine_dtw_word_onsets(words, Some(&envelope), 15.0);
+    assert!((out[0].start - 2.0).abs() < 1e-4, "start={}", out[0].start);
 }
 
 #[test]

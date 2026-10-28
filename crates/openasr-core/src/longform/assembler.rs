@@ -118,6 +118,30 @@ impl TimelineAudioLevels {
         Some(levels[index])
     }
 
+    /// Median level (dBFS) of the windows overlapping `[start, end]`;
+    /// `None` when fewer than `SEAM_ECHO_PROBE_MIN_WINDOWS` of them do.
+    ///
+    /// Word windows overlap their neighbors by the onset pad, so a
+    /// neighbor's onset routinely bleeds into the queried range and the
+    /// strongest window ([`Self::max_window_db`], the conservative read the
+    /// seam-hook veto takes) cannot answer "does this window hold an event?"
+    /// on its own. The median can: one bleeding edge is one window, while a
+    /// window that holds speech has most of its windows loud.
+    pub fn median_window_db(&self, start: f32, end: f32) -> Option<f32> {
+        self.overlap_fraction(start, end)?;
+        let mut levels = self.windows_overlapping(start, end);
+        if levels.len() < SEAM_ECHO_PROBE_MIN_WINDOWS {
+            return None;
+        }
+        levels.sort_by(|a, b| a.total_cmp(b));
+        let middle = levels.len() / 2;
+        Some(if levels.len() % 2 == 1 {
+            levels[middle]
+        } else {
+            0.5 * (levels[middle - 1] + levels[middle])
+        })
+    }
+
     fn windows_overlapping(&self, start: f32, end: f32) -> Vec<f32> {
         self.window_db
             .iter()
@@ -873,8 +897,10 @@ impl TranscriptAssembler {
     /// boundary), and the B-side seam phantom rule targets different-token
     /// heads only.
     ///
-    /// All signals must agree, or the word stays. The committed word was
-    /// decoded with certainty -- it owns the audio. The echo sits short-gap
+    /// All signals must agree, or the word stays. The committed word must own
+    /// the audio its echo shadows (see `committed_reading_owns_seam_audio`:
+    /// either it was decoded with certainty, or the cut landed on it and the
+    /// echo carries the evidence instead). The echo sits short-gap
     /// behind it (within the seam, not new speech) and wholly in the
     /// uncommitted region, so it cannot be a genuine straddling occurrence.
     /// It is a compressed echo, at most half the width of the committed
@@ -918,10 +944,7 @@ impl TranscriptAssembler {
         if !(0.0..=SEGMENT_STITCH_MAX_REGAP_SECONDS).contains(&gap_seconds) {
             return false;
         }
-        let Some(committed_confidence) = committed.confidence else {
-            return false;
-        };
-        if committed_confidence < SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE {
+        if !self.committed_reading_owns_seam_audio(previous, committed, reread) {
             return false;
         }
         if reread.end - reread.start
@@ -961,6 +984,73 @@ impl TranscriptAssembler {
         // pushed.
         true
     }
+
+    /// Does the committed tail word own the audio its seam re-read shadows?
+    ///
+    /// A certain reading owns its audio: a re-read is a second, weaker decode
+    /// of what the previous slice already committed, so the committed copy's
+    /// confidence is the ownership test (the premise the phantom and
+    /// trust-flip rules share).
+    ///
+    /// A word the cut landed on never earned that ownership. Its window runs
+    /// out to `previous.end` because the slice ended mid-word, so the decode
+    /// never heard that word end: the window is a placement artifact carrying
+    /// the score of a truncated token, not a certain reading of anything. Such
+    /// a committed copy cannot veto its echo, so the echo must carry the
+    /// evidence itself -- and both of its signals must agree, or the word
+    /// stays. A re-read of a word the cut truncated is decoded weakly (the
+    /// same weak/strong split the phantom rule uses on the seam), and its
+    /// window sits on the bed rather than on speech (the same level call the
+    /// seam-hook veto makes). A voiced echo window is a second utterance
+    /// whatever its score says, and stays.
+    fn committed_reading_owns_seam_audio(
+        &self,
+        previous: &Segment,
+        committed: &WordTimestamp,
+        reread: &WordTimestamp,
+    ) -> bool {
+        if committed
+            .confidence
+            .is_some_and(|confidence| confidence >= SEAM_PHANTOM_COMMITTED_MIN_CONFIDENCE)
+        {
+            return true;
+        }
+        // A word that finished clearly before the cut made room for new
+        // speech: its same-token successor across the boundary is a genuine
+        // back-to-back repeat, and the cut never truncated this word.
+        if previous.end - committed.end > SEGMENT_STITCH_SEAM_CLAMP_TOLERANCE_SECONDS {
+            return false;
+        }
+        if reread
+            .confidence
+            .is_some_and(|confidence| confidence > SEAM_PHANTOM_HEAD_MAX_CONFIDENCE)
+        {
+            return false;
+        }
+        self.seam_reread_window_is_unvoiced(reread)
+    }
+
+    /// Does the re-read's window sit on the local bed instead of on speech?
+    /// The median of the window's probe windows against the local bed, the
+    /// same verdict the seam-hook veto reaches with the strongest window: a
+    /// head copy that sits no more than [`HOOK_ECHO_UNVOICED_MARGIN_DB`]
+    /// above the bed carries no voiced event. Stands down (the re-read
+    /// stands) without the whole-recording level probe.
+    fn seam_reread_window_is_unvoiced(&self, reread: &WordTimestamp) -> bool {
+        let Some(levels) = self.audio_levels.as_ref() else {
+            return false;
+        };
+        let (Some(window_db), Some(bed_db)) = (
+            levels.median_window_db(reread.start, reread.end),
+            levels.bed_db(
+                reread.start - HOOK_ECHO_BED_BAND_SECONDS,
+                reread.end + HOOK_ECHO_BED_BAND_SECONDS,
+            ),
+        ) else {
+            return false;
+        };
+        window_db <= bed_db + HOOK_ECHO_UNVOICED_MARGIN_DB
+    }
 }
 
 /// How far inside the new slice a hook-equal head word may sit and still
@@ -982,6 +1072,11 @@ const HOOK_ECHO_MIN_BED_WINDOWS: usize = 8;
 /// the bed in every observed hook clip, and a quiet-but-real copy still
 /// clears this line.
 const HOOK_ECHO_UNVOICED_MARGIN_DB: f32 = 6.0;
+
+/// Fewest probe windows a seam-echo level call will read before it answers.
+/// Below this the median says nothing about the window as a whole, so the
+/// call abstains and the echo stands.
+const SEAM_ECHO_PROBE_MIN_WINDOWS: usize = 3;
 
 impl TranscriptAssembler {
     /// Deployment override for the seam-hook veto below: default on;
@@ -5901,8 +5996,10 @@ mod tests {
     fn assembler_keeps_same_token_head_without_committed_confidence() {
         // Confidence-presence gate: the seam copy is an isolated narrow
         // repeat of the committed tail a short seam behind it, but the
-        // committed word carries no confidence at all: without the committed
-        // certainty signal the echo verdict has no basis and the word stays.
+        // committed word carries no confidence at all and the seam copy
+        // decodes at 60%, above the weak-echo ceiling: neither echo-side
+        // signal is there, so the echo verdict has no basis and the word
+        // stays.
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
         assembler.push_slice_result(SliceTranscript {
@@ -5937,6 +6034,140 @@ mod tests {
             transcription
         );
         assert_eq!(transcription.segments[1].text, "and. Go.");
+    }
+
+    /// Cut-truncated re-read shape: slice 1 ends mid-word on 'Mario.' (its
+    /// window runs out to the cut at 56.70s because the slice ended inside
+    /// the token), the next slice re-emits the token as its head copy 0.24s
+    /// later and continues. Assembler over a bed recording whose voiced
+    /// content is given by `spikes`, so the echo window can sit on speech or
+    /// on the bed.
+    fn cut_word_reread_assembler(spikes: &[(f32, f32, f32)]) -> TranscriptAssembler {
+        let samples = bed_samples_with(-45.0, spikes, 70);
+        let levels = TimelineAudioLevels::from_samples(&samples, 16_000).unwrap();
+        TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+            .with_max_word_span_original_seconds(Some(1.6))
+            .with_audio_levels(Some(levels))
+    }
+
+    /// Slice 1 of the shape above: the cut lands inside 'Mario.', so its
+    /// window is pinned out to the slice end and the token decodes weakly.
+    fn push_cut_word_slice1(assembler: &mut TranscriptAssembler) {
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 16_000 * 57 - 4_800),
+            text: "Show us this Mario.".to_string(),
+            segments: vec![absolute_segment(
+                "Show us this Mario.",
+                54.5,
+                56.7,
+                vec![
+                    word_conf("Show", 54.544, 55.112, 0.936),
+                    word_conf("us", 55.012, 55.317, 0.994),
+                    word_conf("this", 55.217, 55.43, 0.967),
+                    word_conf("Mario.", 55.666, 56.7, 0.489),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+    }
+
+    /// Slice 2 of the shape above: the head echo of the cut word, then the
+    /// continuation.
+    fn push_cut_word_slice2(assembler: &mut TranscriptAssembler) {
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(16_000 * 56, 16_000 * 60),
+            text: "Mario, show us the light.".to_string(),
+            segments: vec![absolute_segment(
+                "Mario, show us the light.",
+                56.7,
+                57.72,
+                vec![
+                    word_conf("Mario,", 56.94, 57.144, 0.375),
+                    word_conf("show", 57.044, 57.315, 0.587),
+                    word_conf("us", 57.215, 57.424, 0.959),
+                    word_conf("the", 57.324, 57.562, 0.96),
+                    word_conf("light.", 57.462, 57.722, 0.766),
+                ],
+            )],
+            time_domain: SegmentTimeDomain::AbsoluteOriginal,
+        });
+    }
+
+    #[test]
+    fn assembler_drops_seam_reread_of_a_word_the_cut_truncated() {
+        // The committed 'Mario.' never earned ownership of its audio: the cut
+        // landed inside the token, so its window runs out to the slice end and
+        // carries the weak score of a truncated decode. The re-read starts
+        // 0.24s after the cut (past the stitch's past-previous-end tolerance,
+        // so the exact stitch never sees it) and its 0.2s window sits on the
+        // bed between the committed word and the continuation, carrying a
+        // weak score of its own. Both echo signals agree: drop the echo, keep
+        // the committed word.
+        let mut assembler =
+            cut_word_reread_assembler(&[(55.84, 56.46, -13.0), (57.12, 57.4, -13.0)]);
+        push_cut_word_slice1(&mut assembler);
+        push_cut_word_slice2(&mut assembler);
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 1,
+            "the unvoiced echo of a cut word must be dropped, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments.len(), 2);
+        assert_eq!(transcription.segments[0].text, "Show us this Mario.");
+        assert_eq!(
+            transcription.segments[1].text, "show us the light.",
+            "the echo head must be gone and the remainder kept, got {:?}",
+            transcription.segments[1].text
+        );
+        assert_eq!(
+            transcription.segments[1]
+                .words
+                .first()
+                .map(|word| word.word.as_str()),
+            Some("show"),
+            "the segment must resume at the first new word, got {:#?}",
+            transcription
+        );
+    }
+
+    #[test]
+    fn assembler_keeps_voiced_seam_reread_of_a_word_the_cut_truncated() {
+        // Same shape, but the echo window carries a voiced event 32dB above
+        // the bed: a second utterance of the token, however weak its score.
+        let mut assembler = cut_word_reread_assembler(&[
+            (55.84, 56.46, -13.0),
+            (56.94, 57.144, -13.0),
+            (57.12, 57.4, -13.0),
+        ]);
+        push_cut_word_slice1(&mut assembler);
+        push_cut_word_slice2(&mut assembler);
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "a voiced seam repeat must stay, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Mario, show us the light.");
+    }
+
+    #[test]
+    fn assembler_keeps_seam_reread_of_a_word_the_cut_truncated_without_level_probe() {
+        // Same shape with no level probe attached: without the acoustic
+        // evidence the echo has no basis against a cut word whose own
+        // certainty signal is absent, so both copies stand.
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default())
+                .with_max_word_span_original_seconds(Some(1.6));
+        push_cut_word_slice1(&mut assembler);
+        push_cut_word_slice2(&mut assembler);
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(
+            stats.duplicate_merge_count, 0,
+            "an unverifiable echo must stay, got {:#?}",
+            transcription
+        );
+        assert_eq!(transcription.segments[1].text, "Mario, show us the light.");
     }
 
     #[test]

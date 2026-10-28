@@ -3120,6 +3120,385 @@ fn splice_degenerate_tail_run_is_a_noop_when_the_alignments_misalign() {
     assert_eq!(words.len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// whisper_splice_unvoiced_tail_echo
+// ---------------------------------------------------------------------------
+
+/// Fictional unit decode for the pure shape tests: content tokens decode to
+/// word-like text, 9 to a bare period, anything else undecodable.
+fn tail_echo_unit_text(tokens: &[u32]) -> Option<String> {
+    let mut text = String::new();
+    for &token_id in tokens {
+        text.push_str(match token_id {
+            1 => "Luigi",
+            2 => "Booze",
+            3 => "Mario",
+            4 => "Boo",
+            7 => "hoo",
+            9 => ".",
+            _ => return None,
+        });
+    }
+    Some(text)
+}
+
+fn tail_echo_is_timestamp(token_id: u32) -> bool {
+    token_id >= 1000
+}
+
+/// The pure shape (a): a content unit of 1..=4 tokens emitted twice
+/// back-to-back at a clean decode's tail, with no timestamp between the
+/// copies -- the no-<|notimestamps|> stream leaves the whole decode in one
+/// run, the echo the only structure in it. The shorter matching unit wins, so
+/// a longer exact loop sheds one copy per round.
+#[test]
+fn tail_echo_removal_finds_a_same_run_unit_echo() {
+    // "...Booze Luigi Luigi": the second [Luigi] is the removable copy.
+    assert_eq!(
+        whisper_tail_echo_removal(&[2, 1, 1], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        Some((2, 2))
+    );
+    // A three-copy loop sheds its final copy this round.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 1, 1], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        Some((2, 2))
+    );
+    // A 4-token unit (the cap boundary) repeats: the whole unit's second copy.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1, 2, 3, 4, 1, 2, 3, 4],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((4, 7))
+    );
+}
+
+/// The pure shape (b): the final two text runs are the same short unit, a
+/// pair of timestamp tokens separating the copies. The whole final run is the
+/// second copy.
+#[test]
+fn tail_echo_removal_finds_a_cross_run_unit_echo() {
+    // [ts] [Luigi] [ts] [Luigi].
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 1, 1050, 1],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((3, 3))
+    );
+    // A 3-token unit across the timestamp pair.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 2, 1, 1050, 2, 1],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        Some((4, 5))
+    );
+}
+
+/// Everything the pass must not treat as an echo: a punct-only unit, a unit
+/// past the token cap, distinct tail words, and an undecodable unit.
+#[test]
+fn tail_echo_removal_refuses_shapes_that_are_not_echoes() {
+    // A punct-only tail repeats nothing that was spoken.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1000, 9, 1050, 9],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        None
+    );
+    // A 5-token unit is the tail-repeat collapse's terrain, never an echo.
+    assert_eq!(
+        whisper_tail_echo_removal(
+            &[1, 2, 3, 4, 7, 1, 2, 3, 4, 7],
+            &tail_echo_is_timestamp,
+            &tail_echo_unit_text
+        ),
+        None
+    );
+    // Distinct words at the tail: no repetition at all.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 2, 3], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        None
+    );
+    // The shape matches but the unit decodes to nothing: not speech.
+    assert_eq!(
+        whisper_tail_echo_removal(&[1, 5, 5], &tail_echo_is_timestamp, &tail_echo_unit_text),
+        None
+    );
+}
+
+/// The full pass over the quiet flank: a clean-stop decode whose final run
+/// verbatim re-emits the previous run's short unit. The window is mostly
+/// voiced speech, and the second copy sits in the window's quiet tail, so
+/// the echo's placed words are over silence far below the window's content
+/// level -- the splice removes the copy from the tokens, the probabilities,
+/// and the alignments, drains its placed words, and re-derives the text to
+/// the single copy.
+#[test]
+fn splice_unvoiced_tail_echo_splices_the_second_copy_over_silence() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // [ts(0)] [he] [ts(50)] [he]: the final run repeats the previous run's
+    // 2-token unit; both copies placed, the second over silence.
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 2.30, 2.50)];
+    // A 3.0 s window that is voiced speech (the first 2.0 s) over a quiet
+    // tail (the last 1.0 s): the second copy's region (2.15..2.65 s, the
+    // padded 2.30..2.50 word) sits wholly in the quiet tail, far below the
+    // window's own p75 content level.
+    let mut envelope = vec![0.05_f32; 100];
+    envelope.extend(std::iter::repeat_n(0.0005_f32, 50));
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&envelope),
+        3.0,
+    )
+    .expect("splice");
+    assert!(spliced, "an unvoiced second copy must be spliced");
+    assert_eq!(decode.generated_tokens, vec![ts, 1, 2, ts + 50]);
+    assert_eq!(decode.generated_probabilities.len(), 4);
+    assert_eq!(alignments.len(), 4);
+    assert_eq!(
+        alignments.iter().map(|a| a.token_id).collect::<Vec<_>>(),
+        decode.generated_tokens.as_slice()
+    );
+    let expected_text = tokenizer
+        .decode_text_token_ids(&[1, 2])
+        .expect("decode text");
+    assert_eq!(decode.text, expected_text);
+    assert_eq!(
+        words.len(),
+        1,
+        "the second copy's placed word must be drained"
+    );
+    assert_eq!(words[0].word, "he");
+}
+
+/// The acoustic layer: sustained speech under the second copy is a genuine
+/// call-out ("Luigi? Luigi?"), so the splice must refuse the identical shape.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_second_copy_is_real_speech() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    // Speech on the frames under the second copy's region (0.95..1.5 s).
+    let mut speech = vec![0.0005_f32; 75];
+    for sample in speech[50..60].iter_mut() {
+        *sample = 0.01_f32;
+    }
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&speech),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(
+        !spliced,
+        "sustained speech under the second copy is real audio"
+    );
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// The dense-window flank: an all-voiced window whose median+5 dB anchor sits
+/// above the region's peak, so the sibling silence test calls the region
+/// silent, yet the region rides at the window's own content level (p75 ==
+/// p75). A genuine repeated word, not an unvoiced echo: the unvoiced test
+/// must refuse the splice the median anchor alone would fire.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_region_carries_window_voice() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 2.30, 2.50)];
+    // A dense 3.0 s window, every frame at the same speech level; the
+    // second copy's region rides right at it.
+    let levels = vec![0.05_f32; 150];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&levels),
+        3.0,
+    )
+    .expect("no-op");
+    assert!(
+        !spliced,
+        "a region at the window's content level is voiced, not an echo"
+    );
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// The pure acoustic test: the region's p75 against the window's p75 at the
+/// 0.5x floor, with the fail-open refusals (no envelope, too-narrow region,
+/// zero content level).
+#[test]
+fn tail_echo_region_unvoiced_discriminates_the_quiet_region_from_content() {
+    // A 3.0 s window: voiced speech (0.05) for the first 2.0 s, a quiet
+    // tail (0.0005) for the last 1.0 s.
+    let mut levels: Vec<f32> = vec![0.05_f32; 100];
+    levels.extend(std::iter::repeat_n(0.0005_f32, 50));
+    // The quiet tail's region: p75 0.0005 < 0.025 (half the window p75).
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 2.20, 2.60, 3.0),
+        Some(true)
+    );
+    // A voiced region in the body: p75 0.05, not below 0.025.
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 0.30, 0.70, 3.0),
+        Some(false)
+    );
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(None, 0.30, 0.70, 3.0),
+        None
+    );
+    // The region clips down below the four-frame floor.
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&levels), 0.00, 0.06, 3.0),
+        None
+    );
+    let silent = vec![0.0_f32; 150];
+    assert_eq!(
+        whisper_tail_echo_region_unvoiced(Some(&silent), 0.30, 0.70, 3.0),
+        None
+    );
+}
+
+/// A guard-cut decode's tail is a retained loop prefix the next slice may
+/// continue: never splice it, whatever its shape.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_on_a_non_stop_reason() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(
+        tokens.clone(),
+        Seq2SeqGreedyDecodeStopReason::DegenerateRepeatGuard,
+    );
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let quiet = vec![0.0005_f32; 75];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        Some(&quiet),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "a guard-cut decode must not be spliced");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// A range list that no longer pairs 1:1 with the token stream's runs is
+/// untrustworthy: refuse rather than gate on a shifted word range.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_when_the_run_ranges_misalign() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    // Two runs in the tokens, one entry in the range list.
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let quiet = vec![0.0005_f32; 75];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 2)],
+        Some(&quiet),
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "misaligned ranges must refuse the splice");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
+/// No envelope means the silence cannot be confirmed: fail open and keep the
+/// decode even when the shape is a perfect echo.
+#[test]
+fn splice_unvoiced_tail_echo_is_a_noop_without_an_envelope() {
+    let (_, tokenizer) = whisper_execution_and_tokenizer_fixture();
+    let ts = tokenizer
+        .first_timestamp_token_id()
+        .expect("first timestamp id");
+    let tokens = vec![ts, 1, 2, ts + 50, 1, 2];
+    let mut alignments = tail_repeat_alignments(&tokens);
+    let mut decode = tail_repeat_decode(tokens.clone(), Seq2SeqGreedyDecodeStopReason::StopToken);
+    decode.text = tokenizer
+        .decode_text_token_ids(&tokens)
+        .expect("decode text");
+    let mut words = vec![word_ts("he", 0.30, 0.60), word_ts("he", 1.10, 1.50)];
+    let spliced = whisper_splice_unvoiced_tail_echo(
+        &tokenizer,
+        &mut decode,
+        &mut alignments,
+        &mut words,
+        &[(0, 1), (1, 2)],
+        None,
+        1.5,
+    )
+    .expect("no-op");
+    assert!(!spliced, "without an envelope the splice must refuse");
+    assert_eq!(decode.generated_tokens, tokens);
+    assert_eq!(words.len(), 2);
+}
+
 /// One alignment row whose cross-attention peaks at `frame` (0..1500).
 fn ladder_alignment_peaking_at(frame: usize) -> WhisperGeneratedTokenAlignment {
     WhisperGeneratedTokenAlignment {
@@ -3501,6 +3880,102 @@ fn tail_coverage_challenger_picks_the_round_reaching_furthest() {
 }
 
 #[test]
+fn tail_coverage_stub_admission_semantics() {
+    // The re-race pool appends the guard-cut round-1 stub as a T=0 entry after
+    // the clean rounds, and the challenger walk decides. Winner (a clean T=0
+    // carry-less round) stopped at 26.80 s; the clean rounds sit short of the
+    // tail while the stub's pre-trip placements run to 29.26 s -- the bibi
+    // shape, where only the stub transcribed the repeated phrase the guard
+    // cut. The stub's slot (last) must take the window.
+    let mut pool: Vec<(f32, Option<f32>, bool)> =
+        vec![(0.7_f32, Some(29.18_f32), false), (1.0, Some(28.9), false)];
+    let stub_frontier = 29.26_f32;
+    pool.push((0.0, Some(stub_frontier), false));
+    let stub_index = pool.len() - 1;
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        Some(stub_index),
+        "the stub's strict frontier lead must beat the hot clean rounds"
+    );
+
+    // A clean round that reaches further than the stub keeps the window: the
+    // stub only recovers a tail no clean round covered.
+    let mut pool = vec![(0.4_f32, Some(29.9_f32), false)];
+    pool.push((0.0, Some(stub_frontier), false));
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.4, 26.80),
+        Some(0)
+    );
+
+    // A tie keeps the clean round: the stub is appended after the clean pool,
+    // and the challenger walk only advances on a strict frontier win.
+    let mut pool = vec![(0.4_f32, Some(stub_frontier), false)];
+    pool.push((0.0, Some(stub_frontier), false));
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.4, 26.80),
+        Some(0)
+    );
+
+    // The stub within the progress margin of the winner covers no new audio.
+    let pool = [(0.0_f32, Some(27.1_f32), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        None
+    );
+
+    // A stub-only pool (every temperature round truncated) still challenges:
+    // the guard-cut slice is left to its own tail rescue, and the ladder is
+    // its only rescue.
+    let pool = [(0.0_f32, Some(stub_frontier), false)];
+    assert_eq!(
+        super::whisper_tail_coverage_challenger(&pool, 0.0, 26.80),
+        Some(0)
+    );
+}
+
+#[test]
+fn tail_stub_claim_gate_shapes() {
+    // bibi shape: a healthy winner leaves a small audible tail no clean
+    // round transcribed, and the stub was cut mid-window (29.26 in 29.35)
+    // holding the repeated phrase the guard looped on. The rescue exists for
+    // exactly this; it must be admitted.
+    assert!(super::whisper_tail_stub_may_claim(2.55, 29.26, 29.35));
+
+    // The shortfall cap is inclusive: a shortfall at the bound is still a
+    // small tail, not a broken winner.
+    assert!(super::whisper_tail_stub_may_claim(
+        super::WHISPER_LADDER_TAIL_STUB_MAX_SHORTFALL_SECONDS,
+        29.26,
+        29.35
+    ));
+
+    // Past the cap the winner is the broken side of the seam (claire 5.18,
+    // gilbert 5.26, ali 6.79, tequila-uvr 14.31 and 23.01, lobster 13.18):
+    // a degenerate-repeat stub's kept prefix cannot rescue that window, only
+    // shorten it.
+    for shortfall in [5.18_f32, 5.26, 6.79, 13.18, 14.31, 23.01] {
+        assert!(
+            !super::whisper_tail_stub_may_claim(shortfall, 29.26, 29.35),
+            "shortfall {shortfall} s must be refused"
+        );
+    }
+
+    // Frontier margin: 0.06 inside the window end is a real mid-phrase cut;
+    // 0.04 inside and a frontier exactly on the end are the loop's
+    // placements tiling to the slice end -- the tail claim is attention
+    // drift.
+    assert!(super::whisper_tail_stub_may_claim(2.55, 29.29, 29.35));
+    assert!(!super::whisper_tail_stub_may_claim(2.55, 29.31, 29.35));
+    assert!(!super::whisper_tail_stub_may_claim(2.55, 29.35, 29.35));
+
+    // The gates are independent: a small shortfall does not excuse a pinned
+    // frontier (ali/tequila shapes), and a stub cut mid-window does not
+    // excuse a broken winner (lobster).
+    assert!(!super::whisper_tail_stub_may_claim(0.01, 27.65, 27.65));
+    assert!(!super::whisper_tail_stub_may_claim(13.18, 25.87, 28.85));
+}
+
+#[test]
 fn token_stream_subsequence_shapes() {
     // In-order, non-contiguous: the longer stream carries everything the
     // shorter one says, in the same order, with more around it.
@@ -3536,6 +4011,41 @@ fn token_stream_subsequence_shapes() {
     // An empty kept stream is carried by anything.
     assert!(super::whisper_token_stream_is_subsequence(&[], &[1u32]));
     assert!(super::whisper_token_stream_is_subsequence(&[], &[]));
+}
+
+#[test]
+fn stub_pool_refuses_a_short_clean_stub_that_would_drop_a_real_transcription() {
+    // The bibi shape: the guard-tripped incumbent transcribed the whole window
+    // (it lost only a short trailing loop to the guard: 110 kept of 120) and the
+    // clean pool winner is a one-word stub, so adopting it drops real text.
+    assert!(
+        !super::whisper_ladder_stub_pool_may_replace(108, 110, 120, 2),
+        "a one-word stub must not replace a full-window transcript"
+    );
+
+    // The ploomet shape: the incumbent's guard cut took most of what it emitted
+    // (51 kept of 128), so it is a loop stub whatever lead-in it kept. No veto:
+    // the recovery stands even though the challenger is thin.
+    assert!(
+        super::whisper_ladder_stub_pool_may_replace(4, 51, 128, 2),
+        "a loop-dominated incumbent is a stub, not a transcript"
+    );
+
+    // A full transcript the challenger matches (or beats) on content still
+    // changes hands -- the oregon shape, where the clean round holds the phrase
+    // the guard-cut round lost.
+    assert!(super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 80));
+    assert!(super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 20));
+
+    // Half the incumbent's content is the tie point; under it is a collapse.
+    assert!(!super::whisper_ladder_stub_pool_may_replace(40, 60, 70, 19));
+
+    // A pure loop stub salvaged nothing at all.
+    assert!(super::whisper_ladder_stub_pool_may_replace(2, 30, 120, 0));
+
+    // No per-token rows leaves the cut ratio undefined: stand down rather than
+    // guess, so the re-race runs as it did before the veto.
+    assert!(super::whisper_ladder_stub_pool_may_replace(108, 110, 0, 2));
 }
 
 #[test]
@@ -3596,6 +4106,15 @@ fn head_skip_word(word: &str, start: f32, end: f32) -> crate::WordTimestamp {
         start,
         end,
         confidence: None,
+    }
+}
+
+fn hole_word(word: &str, start: f32, end: f32, confidence: f32) -> crate::WordTimestamp {
+    crate::WordTimestamp {
+        word: word.to_string(),
+        start,
+        end,
+        confidence: Some(confidence),
     }
 }
 
@@ -3688,6 +4207,329 @@ fn carry_head_skip_graft_swaps_only_degenerate_covered_heads() {
         whisper_carry_head_skip_graft(&tags, &late_onset, 14.08),
         Some(WhisperCarryHeadSkipGraft::Splice { .. })
     ));
+}
+
+fn rms_frames_for(levels: &[(usize, usize, f32)], frame_count: usize) -> Vec<f32> {
+    let mut frames = vec![0.0_f32; frame_count];
+    for (lo, hi, level) in levels {
+        frames[*lo..*hi]
+            .iter_mut()
+            .for_each(|frame| *frame = *level);
+    }
+    frames
+}
+
+#[test]
+fn carry_interior_holes_gate_on_width_and_audibility() {
+    // Words at an ordinary speech level with a 0.5 s audible gap, a 0.3 s
+    // too-narrow gap and a 0.9 s silent gap: only the first is a hole.
+    let words = vec![
+        head_skip_word("This", 0.00, 1.00),
+        head_skip_word("gap", 1.50, 2.00),
+        head_skip_word("too-narrow", 2.30, 3.00),
+        head_skip_word("silent", 3.90, 4.40),
+    ];
+    let frames = rms_frames_for(
+        &[
+            (0, 50, 0.5),
+            (75, 100, 0.5),
+            (115, 150, 0.5),
+            (195, 220, 0.5),
+            (50, 75, 0.45),
+        ],
+        220,
+    );
+    let holes = whisper_carry_interior_holes(&words, Some(&frames));
+    assert_eq!(
+        holes,
+        vec![WhisperCarryHole {
+            boundary: 0,
+            lo: 1.0,
+            hi: 1.5
+        }]
+    );
+    // No RMS envelope: no holes, fail closed.
+    assert!(whisper_carry_interior_holes(&words, None).is_empty());
+}
+
+#[test]
+fn carry_interior_hole_graft_credits_words_to_their_holes() {
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 4.00),
+        head_skip_word("more", 6.00, 7.00),
+    ];
+    let holes = vec![
+        WhisperCarryHole {
+            boundary: 0,
+            lo: 1.0,
+            hi: 3.0,
+        },
+        WhisperCarryHole {
+            boundary: 1,
+            lo: 4.0,
+            hi: 6.0,
+        },
+    ];
+    let recovered = vec![
+        hole_word("is", 1.10, 1.60, 0.9),
+        hole_word("like", 1.90, 2.40, 0.9),
+        hole_word(".", 2.00, 2.30, 0.9),
+        hole_word("a", 4.10, 4.40, 0.9),
+        hole_word("lot", 4.50, 4.90, 0.9),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &holes, None)
+        .expect("the hole words splice into the carried list");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    // Each recovered word lands between exactly the words that flank ITS
+    // hole, in start order; the punctuation stamp is dropped.
+    assert_eq!(
+        spliced_text,
+        vec!["Before.", "is", "like", "after", "a", "lot", "more"]
+    );
+    // A re-decode word whose majority time misses every hole window grafts
+    // nothing.
+    let unrelated = vec![hole_word("Nowhere", 8.00, 8.50, 0.9)];
+    assert!(whisper_carry_interior_hole_graft(&carried, &unrelated, &holes, None).is_none());
+    // Nothing at all: None means the caller keeps the carried decode.
+    assert!(whisper_carry_interior_hole_graft(&carried, &[], &holes, None).is_none());
+}
+
+#[test]
+fn carry_interior_hole_graft_skips_stretched_covered_words() {
+    // A carried word whose span stretches over the hole's side swallows the
+    // repeat run's text: when the re-decode reports that same text there,
+    // the carried decode did not lose it, it stretched it -- skip.
+    let carried = vec![
+        head_skip_word("and", 1.63, 2.71),
+        head_skip_word("narrow", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.63,
+        hi: 3.0,
+    };
+    // Majority 2.17 sits inside the stretched "and" ...
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &carried,
+            &[hole_word("and", 1.70, 2.30, 0.9)],
+            &[hole],
+            None,
+        )
+        .is_none()
+    );
+    // ... but a DIFFERENT word under the same stretch is the recovery the
+    // hole exists for: no text match means no cover.
+    let spliced = whisper_carry_interior_hole_graft(
+        &carried,
+        &[hole_word("stupidity", 1.80, 2.40, 0.98)],
+        &[hole],
+        None,
+    )
+    .expect("different content under a stretched word is the lost speech");
+    assert_eq!(spliced.len(), 3);
+    assert_eq!(spliced[1].word, "stupidity");
+    assert_eq!(spliced[2].word, "narrow");
+}
+
+#[test]
+fn carry_interior_hole_graft_rejects_duplicate_restates() {
+    // Same-content re-stamp: the re-decode re-times a word the carry already
+    // stamped, so its span overlaps the carried stamp (the mikan "Puff" shape).
+    // Width and confidence pass; the span overlap is what rejects it.
+    let mikan = vec![
+        head_skip_word("that?", 121.89, 122.13),
+        head_skip_word("Puff", 125.37, 125.57),
+    ];
+    let mikan_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 122.13,
+        hi: 125.37,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &mikan,
+            &[hole_word("Puff", 125.11, 125.48, 0.9)],
+            &[mikan_hole],
+            None,
+        )
+        .is_none()
+    );
+
+    // Right-boundary echo: the re-decode re-times the right-boundary word
+    // earlier into the gap (the malfina "Oh" at 335.42 ahead of the carried
+    // "Oh" at 336.88): same content as the right boundary, placed before it,
+    // no span overlap -- a re-stamp, not the speech the hole holds.
+    let malfina = vec![
+        head_skip_word("hurt.", 334.91, 335.83),
+        head_skip_word("Oh", 336.88, 337.10),
+    ];
+    let malfina_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 335.83,
+        hi: 336.88,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &malfina,
+            &[hole_word("Oh", 335.42, 335.54, 0.96)],
+            &[malfina_hole],
+            None,
+        )
+        .is_none()
+    );
+
+    // Slot conflict: the re-decode misreads a normal (narrow) placed word with
+    // different text (the rye "for" over the carried "four"); the graft's
+    // majority sits inside that narrow placed word, so the carry already owns
+    // the slot. A same-slot word under a STRETCHED placed word would be the
+    // recovery, so this is gated on the placed word being narrow.
+    let rye = vec![
+        head_skip_word("know,", 336.50, 336.72),
+        head_skip_word("four", 337.42, 337.71),
+        head_skip_word("hour", 337.61, 338.12),
+    ];
+    let rye_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 336.72,
+        hi: 337.42,
+    };
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &rye,
+            &[hole_word("for", 337.42, 337.69, 0.73)],
+            &[rye_hole],
+            None,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn carry_interior_hole_graft_keeps_genuine_repeats() {
+    // A same-content repeat that does NOT overlap the carried copy is the
+    // speaker saying the word twice (phoebe's second "Stupidity" after the
+    // carried "stupidity"): the carry caught the first, the re-decode the
+    // second -- the duplicate gate must not swallow it.
+    let phoebe = vec![
+        head_skip_word("stupidity", 112.95, 114.07),
+        head_skip_word("and", 115.63, 116.68),
+        head_skip_word("ignorance", 116.61, 117.08),
+    ];
+    let phoebe_hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 114.07,
+        hi: 115.63,
+    };
+    let spliced = whisper_carry_interior_hole_graft(
+        &phoebe,
+        &[hole_word("Stupidity", 115.56, 116.07, 0.97)],
+        &[phoebe_hole],
+        None,
+    )
+    .expect("a non-overlapping repeat is new speech, not a duplicate");
+    assert!(spliced.len() == 4);
+    assert_eq!(spliced[0].word, "stupidity");
+    assert_eq!(spliced[1].word, "Stupidity");
+    assert_eq!(spliced[2].word, "and");
+}
+
+#[test]
+fn carry_interior_hole_graft_demands_audio_support() {
+    // A recovered word stamped into the hole's PAUSE air (loop filler the
+    // re-decode itself produced) sits orders of magnitude below the placed
+    // words' surface level and is rejected, while a stamp over real speech
+    // clears the same deficit gate.
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.0,
+        hi: 3.0,
+    };
+    // Frames: words at 0.10 over [0, 3.5s) (50 frames/s), a loud first
+    // half of the gap and a near-silent pause around the ghost word.
+    let frames = rms_frames_for(
+        &[
+            (0, 50, 0.10),
+            (150, 175, 0.10),
+            (50, 110, 0.09),
+            (116, 130, 0.005),
+        ],
+        175,
+    );
+    let ghost = hole_word("It...", 2.30, 2.60, 0.9);
+    let real = hole_word("stupidity", 2.10, 2.40, 0.9);
+    assert!(
+        whisper_carry_interior_hole_graft(
+            &carried,
+            std::slice::from_ref(&ghost),
+            &[hole],
+            Some(&frames)
+        )
+        .is_none()
+    );
+    let spliced =
+        whisper_carry_interior_hole_graft(&carried, &[ghost.clone(), real], &[hole], Some(&frames))
+            .expect("the supported word survives the ghost's rejection");
+    assert_eq!(spliced.len(), 3);
+    assert_eq!(spliced[1].word, "stupidity");
+}
+
+#[test]
+fn carry_interior_hole_graft_rejects_stretched_and_unconfident_recoveries() {
+    // The re-decode's own stretched stamp over the hole is its copy of the
+    // carried decode's swallow (a wide "performed token", not the narrow
+    // lost word); its low-probability filler is loop noise. The lost word is
+    // narrow and confident.
+    let carried = vec![
+        head_skip_word("Before.", 0.00, 1.00),
+        head_skip_word("after", 3.00, 3.50),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.0,
+        hi: 3.0,
+    };
+    // A 1.6 s re-decode stamp centered in the window: rejected by width.
+    let stretched = hole_word("one.", 1.30, 2.90, 0.99);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[stretched], &[hole], None).is_none());
+    // A confident narrow word grafted where a fill would sit: width decides.
+    let recovered = vec![
+        hole_word("one.", 0.80, 2.40, 0.99),
+        hole_word("is", 2.10, 2.40, 0.90),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None)
+        .expect("the confident narrow stamp survives");
+    assert_eq!(
+        spliced.iter().map(|w| w.word.as_str()).collect::<Vec<_>>(),
+        vec!["Before.", "is", "after"]
+    );
+    // A narrow loop filler: rejected by confidence.
+    let filler = hole_word("Mhm.", 2.30, 2.60, 0.31);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[filler], &[hole], None).is_none());
+    // No confidence evidence at all fails the floor (withheld, not guessed).
+    let unprobable = head_skip_word("is", 2.10, 2.40);
+    assert!(whisper_carry_interior_hole_graft(&carried, &[unprobable], &[hole], None).is_none());
+}
+
+#[test]
+fn carry_normalized_word_units_split_merged_stamps() {
+    assert_eq!(
+        whisper_carry_normalized_word_units("heart...the"),
+        vec!["heart".to_string(), "the".to_string()]
+    );
+    assert_eq!(
+        whisper_carry_normalized_word_units("I,"),
+        vec!["i".to_string()]
+    );
+    assert!(whisper_carry_normalized_word_units("?!").is_empty());
 }
 
 #[test]
