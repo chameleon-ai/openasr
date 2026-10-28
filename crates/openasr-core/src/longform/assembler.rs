@@ -6,6 +6,8 @@ use super::timeline::TimelineMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentTimeDomain {
     RelativeToSliceContent,
+    /// Executor timestamps start at the full input, including context padding.
+    RelativeToSliceInput,
     AbsoluteOriginal,
 }
 
@@ -664,12 +666,14 @@ impl TranscriptAssembler {
         let sample_rate = 16_000.0_f32;
         let mut start = segment.start.max(0.0);
         let mut end = segment.end.max(start);
-        let mut content_offset = 0.0_f32;
-        if time_domain == SegmentTimeDomain::RelativeToSliceContent {
-            content_offset = slice.content_start_sample as f32 / sample_rate;
-            start += content_offset;
-            end += content_offset;
-        }
+        let relative_offset = match time_domain {
+            SegmentTimeDomain::RelativeToSliceContent => slice.content_start_sample,
+            SegmentTimeDomain::RelativeToSliceInput => slice.start_sample,
+            SegmentTimeDomain::AbsoluteOriginal => 0,
+        } as f32
+            / sample_rate;
+        start += relative_offset;
+        end += relative_offset;
         let original_start = self.timeline.map_processed_to_original_seconds(start);
         let original_end = self
             .timeline
@@ -681,7 +685,7 @@ impl TranscriptAssembler {
             .filter_map(|word| {
                 map_word_time_to_original(
                     word,
-                    content_offset,
+                    relative_offset,
                     time_domain,
                     &self.timeline,
                     original_start,
@@ -1819,7 +1823,7 @@ fn apply_suffix_prefix_stitch(
 
 fn map_word_time_to_original(
     word: &WordTimestamp,
-    content_offset: f32,
+    relative_offset: f32,
     time_domain: SegmentTimeDomain,
     timeline: &TimelineMap,
     segment_start: f32,
@@ -1832,9 +1836,9 @@ fn map_word_time_to_original(
     }
     let mut start = word.start.max(0.0);
     let mut end = word.end.max(start);
-    if time_domain == SegmentTimeDomain::RelativeToSliceContent {
-        start += content_offset;
-        end += content_offset;
+    if time_domain != SegmentTimeDomain::AbsoluteOriginal {
+        start += relative_offset;
+        end += relative_offset;
     }
     let mut original_start = timeline
         .map_processed_to_original_seconds(start)
