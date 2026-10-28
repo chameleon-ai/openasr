@@ -432,6 +432,14 @@ impl TranscriptAssembler {
         // slice trims against it (even if this slice is silent / emits nothing).
         let trim_boundary = self.committed_end_original;
         let previous_committed_end = self.committed_end_original;
+        let slice_start_original = self.timeline.map_processed_to_original_seconds(
+            transcript.slice.content_start_sample as f32 / 16_000.0,
+        );
+        // Matching text proves a re-read only when both decodes include the
+        // same audio. Adjacent windows and same-slice cues may contain genuine
+        // repeated speech, even when their text and estimated times match.
+        let overlaps_prior_audio =
+            trim_boundary.is_some_and(|boundary| slice_start_original < boundary);
         let slice_committed_end = self.slice_content_end_original(&transcript.slice);
         self.committed_end_original = Some(match previous_committed_end {
             Some(previous) => previous.max(slice_committed_end),
@@ -479,7 +487,7 @@ impl TranscriptAssembler {
             // words make a midpoint trim eat the textual re-read prefix and
             // would skip stitch if we required `words.is_empty()`. Same-slice
             // adjacent cues still skip stitch via `cross_slice_seam`.
-            if cross_slice_seam && self.try_stitch_seam_overlap(&mut mapped) {
+            if cross_slice_seam && self.try_stitch_seam_overlap(&mut mapped, overlaps_prior_audio) {
                 self.stats.duplicate_merge_count += 1;
                 if mapped.text.trim().is_empty() {
                     continue;
@@ -564,7 +572,11 @@ impl TranscriptAssembler {
             if cross_slice_seam && self.drop_seam_misdecoded_tail(&mapped) {
                 self.stats.duplicate_merge_count += 1;
             }
-            if self.try_drop_redundant_segment(&mapped) {
+            // Redundant drops prove a re-read by text alone; without an
+            // audio-overlap proxy they would erase genuine repeated speech
+            // between abutting windows.
+            if cross_slice_seam && overlaps_prior_audio && self.try_drop_redundant_segment(&mapped)
+            {
                 self.stats.duplicate_merge_count += 1;
                 continue;
             }
@@ -760,7 +772,11 @@ impl TranscriptAssembler {
     ///
     /// The stitch rewrites text only. `previous.end` is left alone so a
     /// later slice cannot swallow the earlier segment's boundary.
-    fn try_stitch_seam_overlap(&mut self, current: &mut Segment) -> bool {
+    fn try_stitch_seam_overlap(
+        &mut self,
+        current: &mut Segment,
+        overlaps_prior_audio: bool,
+    ) -> bool {
         let Some(previous) = self.segments.last_mut() else {
             return false;
         };
@@ -768,6 +784,16 @@ impl TranscriptAssembler {
         let time_overlaps = time_overlap > 1.0e-3;
         let gap_seconds = current.start - previous.end;
         if !time_overlaps && gap_seconds > self.merge_policy.max_gap_seconds {
+            return false;
+        }
+        // Stitching proves a re-read only when the decodes actually re-cover
+        // the same audio. When the slice head starts at or past the committed
+        // boundary, timestamps alone admit no shared audio, so only the
+        // narrow head-joined shape survives: the committed tail unit must
+        // re-appear at (or just past) the current head as a straddling word
+        // whose cut landed mid-unit. A full prefix match there is aligned
+        // genuine repeated speech, not a seam artifact.
+        if !overlaps_prior_audio && !rule_gated_head_reread_candidate(previous, current) {
             return false;
         }
         let min_units = if time_overlaps { 2 } else { 3 };
@@ -1486,6 +1512,25 @@ fn seam_a_side_trust_flip_should_drop(
         return false;
     }
     true
+}
+
+/// Head-joined re-read candidate for seams the timestamps cannot prove:
+/// the current slice's head starts at or past the committed boundary, so no
+/// audio is shared by construction. A seam stitch is then only plausible for
+/// the straddling-unit shape, where both slices decoded one unit that the
+/// cut split: the committed tail unit re-appears at, or within a few
+/// fragments of, the current head. Token equality here is only a gate --
+/// the stitch's own regap / seam-clamp vet still decides.
+fn rule_gated_head_reread_candidate(previous: &Segment, current: &Segment) -> bool {
+    let previous_units = overlap_units(&previous.text);
+    let current_units = overlap_units(&current.text);
+    let Some(tail) = previous_units.last() else {
+        return false;
+    };
+    current_units
+        .iter()
+        .take(3)
+        .any(|unit| unit.token == tail.token && !is_numeric_unit(&tail.token))
 }
 
 fn speakers_conflict(previous: &Segment, current: &Segment) -> bool {
@@ -2792,6 +2837,53 @@ mod tests {
         });
         let transcription = assembler.into_transcription();
         assert_eq!(transcription.segments.len(), 1);
+    }
+
+    #[test]
+    fn assembler_keeps_repeated_speech_in_nonoverlapping_slices() {
+        let text = "ask not what your country can do for you";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        for index in 0..3 {
+            assembler.push_slice_result(SliceTranscript {
+                slice: slice(index * 16_000, (index + 1) * 16_000),
+                text: text.to_string(),
+                segments: Vec::new(),
+                time_domain: SegmentTimeDomain::RelativeToSliceContent,
+            });
+        }
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 3);
+        assert_eq!(transcription.text.matches(text).count(), 3);
+        assert_eq!(stats.duplicate_merge_count, 0);
+    }
+
+    #[test]
+    fn assembler_keeps_repeated_cues_within_one_slice() {
+        let text = "ask not what your country can do for you";
+        let mut assembler =
+            TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
+        assembler.push_slice_result(SliceTranscript {
+            slice: slice(0, 48_000),
+            text: std::iter::repeat_n(text, 3).collect::<Vec<_>>().join(" "),
+            segments: (0..3)
+                .map(|index| Segment {
+                    start: index as f32,
+                    end: (index + 1) as f32,
+                    text: text.to_string(),
+                    speaker: None,
+                    speaker_label: None,
+                    speaker_person_id: None,
+                    speaker_snapshot_label: None,
+                    words: Vec::new(),
+                })
+                .collect(),
+            time_domain: SegmentTimeDomain::RelativeToSliceContent,
+        });
+        let (transcription, stats) = assembler.into_parts();
+        assert_eq!(transcription.segments.len(), 3);
+        assert_eq!(transcription.text.matches(text).count(), 3);
+        assert_eq!(stats.duplicate_merge_count, 0);
     }
 
     #[test]
@@ -4243,7 +4335,7 @@ mod tests {
                 )
                 .with_approximate_word_timestamps(true);
                 resumed.segments = out.segments.clone();
-                assert!(resumed.try_stitch_seam_overlap(&mut next));
+                assert!(resumed.try_stitch_seam_overlap(&mut next, true));
                 assert_eq!(resumed.segments[1].words[0].start, 25.5);
             } else {
                 let native_first = original_words
@@ -6620,7 +6712,7 @@ mod tests {
     #[test]
     fn assembler_keeps_short_abutting_repetition_without_time_overlap() {
         // Two-unit prefix shared by abutting complete slices must not stitch.
-        // Exact duplicates still drop via text-equality; this pair differs.
+        // Distinct audio must preserve both utterances.
         let mut assembler =
             TranscriptAssembler::new(TimelineMap::identity(), SegmentMergePolicy::default());
         assembler.push_slice_result(SliceTranscript {
