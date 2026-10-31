@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::BTreeMap,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::mpsc,
     time::Duration,
@@ -1631,13 +1632,19 @@ fn persist_catalog_cache(
     advance_epoch_floor: bool,
 ) {
     if let Err(error) = cache_catalog(home, cache_path, contents) {
-        eprintln!("openasr: warning: could not persist model catalog cache: {error}");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "openasr: warning: could not persist model catalog cache: {error}"
+        );
         return;
     }
     if let Err(error) =
         cache_catalog_security(home, manifest_contents, verified, advance_epoch_floor)
     {
-        eprintln!("openasr: warning: could not persist model catalog signature cache: {error}");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "openasr: warning: could not persist model catalog signature cache: {error}"
+        );
     }
 }
 
@@ -1770,7 +1777,7 @@ pub fn load_local_catalog_file_with_identity(
             );
             match &load.degraded_reason {
                 Some(reason) => {
-                    eprintln!("openasr: warning: {reason}");
+                    let _ = writeln!(std::io::stderr().lock(), "openasr: warning: {reason}");
                     catalog_security::record_catalog_degraded(home, "local", reason);
                 }
                 None => catalog_security::clear_catalog_degraded(home),
@@ -1811,7 +1818,7 @@ pub fn preview_local_catalog_file_with_identity(
     let home = openasr_home.as_ref();
     let load = read_and_verify_local_catalog_file(path, expected_catalog_url, home)?;
     if let Some(reason) = &load.degraded_reason {
-        eprintln!("openasr: warning: {reason}");
+        let _ = writeln!(std::io::stderr().lock(), "openasr: warning: {reason}");
     }
     Ok(load.catalog)
 }
@@ -1984,7 +1991,10 @@ pub fn parse_model_catalog(contents: &str, source: &str) -> Result<ModelCatalog,
             source_error,
         })?;
     for note in filter_forward_compatible_catalog(&mut catalog) {
-        eprintln!("openasr: {note}");
+        // Library consumers may have no stderr or a launcher-owned pipe whose
+        // reader has closed. A compatibility note must not turn an otherwise
+        // valid catalog load into a panic, including during GUI startup.
+        let _ = writeln!(std::io::stderr().lock(), "openasr: {note}");
     }
     validate_model_catalog(&catalog, source)?;
     Ok(catalog)
@@ -2887,7 +2897,7 @@ fn load_cached_signed_catalog(
                 "using the on-disk cached catalog at '{}' because the primary source failed: {error}",
                 cache_path.display()
             );
-            eprintln!("openasr: warning: {reason}");
+            let _ = writeln!(std::io::stderr().lock(), "openasr: warning: {reason}");
             catalog_security::record_catalog_degraded(home, "cache", &reason);
             Ok(catalog)
         }
@@ -2994,7 +3004,7 @@ fn load_embedded_signed_catalog_with_epoch(
                 "embedded catalog epoch {} is below the epoch floor {floor} recorded on this machine; using it anyway as a degraded boot candidate rather than refusing to start (see docs/CATALOG_COMPATIBILITY.md)",
                 verified.catalog_epoch
             );
-            eprintln!("openasr: warning: {reason}");
+            let _ = writeln!(std::io::stderr().lock(), "openasr: warning: {reason}");
             catalog_security::record_catalog_degraded(home, "embedded", &reason);
         }
         Err(error) => {
