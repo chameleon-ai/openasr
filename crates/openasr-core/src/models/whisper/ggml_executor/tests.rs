@@ -4439,6 +4439,113 @@ fn carry_interior_hole_graft_keeps_genuine_repeats() {
 }
 
 #[test]
+fn carry_interior_hole_graft_credits_across_and_replaces_the_swallow_chain() {
+    // The thanks "Two years ago" swallow: the gap opens in front of the
+    // stamps the carried decode stretched over the jumped audio, so the lost
+    // phrase sits UNDER the chain ("and", "wait"), not in the gap. The
+    // credit window reaches across the chain; a stamp the graft fully
+    // covers AND re-supplies (its content is again narrow, non-overlapping,
+    // via the "and" at 3.60) is replaced by the recovery, while the "wait"
+    // stamp that pokes past the graft's span stays.
+    let carried = vec![
+        head_skip_word("so.", 0.90, 1.20),
+        head_skip_word("and", 2.10, 3.20),
+        head_skip_word("wait", 3.30, 4.40),
+        head_skip_word("there", 4.60, 4.90),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.20,
+        hi: 2.10,
+    };
+    let recovered = vec![
+        hole_word("the", 1.30, 1.60, 0.9),
+        hole_word("crowd", 2.40, 2.80, 0.9),
+        hole_word("and", 3.60, 3.95, 0.9),
+        // The re-decode's own restamp of the stretched word it under-covers:
+        // same content overlapping the carried "wait" is a duplicate, not
+        // the speech the hole holds.
+        hole_word("wait", 3.95, 4.25, 0.9),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None)
+        .expect("the chain words credit to the hole");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        spliced_text,
+        vec!["so.", "the", "crowd", "and", "wait", "there"]
+    );
+    // The replaced stamp is the carried stretch; the recovered words carry
+    // its span at their own narrow placements.
+    assert_eq!(spliced[4].word, "wait");
+    assert_eq!(spliced[4].start, 3.30);
+    assert!((spliced[3].end - 3.95).abs() < 1.0e-4);
+}
+
+#[test]
+fn carry_interior_hole_graft_keeps_chain_stamps_the_graft_cannot_resupply() {
+    // Fail-open on content: a chain stamp fully inside the graft's span but
+    // whose text the graft does not supply stays -- deleting it would lose
+    // text the recovery does not own.
+    let carried = vec![
+        head_skip_word("so.", 0.90, 1.20),
+        head_skip_word("and", 2.10, 3.20),
+        head_skip_word("there", 4.60, 4.90),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.20,
+        hi: 2.10,
+    };
+    let recovered = vec![
+        hole_word("the", 1.30, 1.60, 0.9),
+        hole_word("a", 2.05, 2.25, 0.9),
+        hole_word("of", 2.30, 2.60, 0.9),
+        hole_word("this", 2.65, 3.25, 0.9),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None)
+        .expect("the covered-but-unsupplied stamp survives");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        spliced_text,
+        vec!["so.", "the", "a", "of", "this", "and", "there"]
+    );
+}
+
+#[test]
+fn carry_interior_hole_graft_keeps_chain_stamps_past_the_graft_span() {
+    // Fail-open on coverage: a chain stamp the graft's span does not reach
+    // stays, whatever its text.
+    let carried = vec![
+        head_skip_word("so.", 0.90, 1.20),
+        head_skip_word("and", 2.10, 3.20),
+        head_skip_word("there", 4.60, 4.90),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 1.20,
+        hi: 2.10,
+    };
+    let spliced = whisper_carry_interior_hole_graft(
+        &carried,
+        &[hole_word("the", 1.30, 1.60, 0.9)],
+        &[hole],
+        None,
+    )
+    .expect("the chain stamp outside the graft span survives");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(spliced_text, vec!["so.", "the", "and", "there"]);
+}
+
+#[test]
 fn carry_interior_hole_graft_demands_audio_support() {
     // A recovered word stamped into the hole's PAUSE air (loop filler the
     // re-decode itself produced) sits orders of magnitude below the placed

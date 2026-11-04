@@ -8390,11 +8390,41 @@ fn whisper_carry_graft_duplicate_reason(
     None
 }
 
+/// The carried decode's stretched stamps directly after a hole: the swallow
+/// chain the hole's credit window reaches across. A swallow leaves only a
+/// token gap in front of the first stretched stamp (the stamp whose DTW
+/// window the DTW stretched over the jumped audio), so the lost phrase sits
+/// under that stamp and any narrower stamp after it, and a re-decode word
+/// crediting under those spans is the phrase the gap alone cannot name. A
+/// stamp strictly WIDER than [`WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS`]
+/// is the chain's member: that is the bound the graft's own width gate runs
+/// for its re-decode stamps, so real single-word stamps -- at or under 1 s
+/// across the suite -- never chain, while the swallow's multi-word DTW
+/// stretches do. Pure so tests pin the chain exactly as they pin the graft.
+fn whisper_carry_hole_swallow_chain(
+    carried_words: &[crate::WordTimestamp],
+    hole: &WhisperCarryHole,
+) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut index = hole.boundary + 1;
+    while carried_words
+        .get(index)
+        .is_some_and(|stamp| stamp.end - stamp.start > WHISPER_CARRY_HOLE_MAX_GRAFT_WIDTH_SECONDS)
+    {
+        chain.push(index);
+        index += 1;
+    }
+    chain
+}
+
 /// The interior-hole graft decision: the re-decode words to insert into the
 /// carried word list, each consumed by the hole its majority time credits it
 /// to, or `None` when the re-decode supplies nothing the carried decode
-/// lacks. Pure so the unit tests pin the credit window, the dedupe and the
-/// nothing-to-insert abort exactly as they pin the head-skip graft.
+/// lacks. A hole whose right side is a stretch chain also credits and
+/// removes the stamps the chain covers (see
+/// [`whisper_carry_hole_swallow_chain`]). Pure so the unit tests pin the
+/// credit window, the dedupe and the nothing-to-insert abort exactly as they
+/// pin the head-skip graft.
 fn whisper_carry_interior_hole_graft(
     carried_words: &[crate::WordTimestamp],
     recovered_words: &[crate::WordTimestamp],
@@ -8403,16 +8433,6 @@ fn whisper_carry_interior_hole_graft(
 ) -> Option<Vec<crate::WordTimestamp>> {
     let trace_graft =
         whisper_ladder_debug_enabled() && !holes.is_empty() && !recovered_words.is_empty();
-    if trace_graft {
-        for (hole_index, hole) in holes.iter().enumerate() {
-            eprintln!(
-                "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_window hole={} window={:.2}..{:.2}",
-                hole_index,
-                hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS,
-                hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS
-            );
-        }
-    }
     // Audio support for admitted words: a re-decode word is only the lost
     // speech when the audio under ITS OWN span actually sounds like the speech
     // the rest of the slice decodes at. The re-decode's DTW stamps live on
@@ -8426,8 +8446,30 @@ fn whisper_carry_interior_hole_graft(
     let mut used = vec![false; recovered_words.len()];
     let mut grafted = 0usize;
     for (hole_index, hole) in holes.iter().enumerate() {
+        // Swallow reach: the credit window is the hole's own gap plus the
+        // stamps the carried decode stretched over the jumped audio (the
+        // swallow chain); a recovered word under those spans is the phrase
+        // the bare gap cannot name.
+        let swallow = whisper_carry_hole_swallow_chain(carried_words, hole);
+        let credit_hi = swallow
+            .last()
+            .and_then(|&index| carried_words.get(index))
+            .map_or(hole.hi, |stamp| stamp.end);
         let window_lo = hole.lo - WHISPER_CARRY_HOLE_WINDOW_MARGIN_BEFORE_SECONDS;
-        let window_hi = hole.hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS;
+        let window_hi = credit_hi + WHISPER_CARRY_HOLE_WINDOW_MARGIN_AFTER_SECONDS;
+        if trace_graft {
+            eprintln!(
+                "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_window hole={} window={:.2}..{:.2} swallow={}",
+                hole_index,
+                window_lo,
+                window_hi,
+                swallow
+                    .iter()
+                    .map(|index| index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         for (index, word) in recovered_words.iter().enumerate() {
             if used[index] {
                 continue;
@@ -8527,13 +8569,57 @@ fn whisper_carry_interior_hole_graft(
     if grafted == 0 {
         return None;
     }
+    // Swallow replacement: a stretched stamp the chain covers whose whole
+    // span sits inside the graft's span and whose text the graft re-supplies
+    // would otherwise sit under the recovered words forever -- a double
+    // stamp of the same audio (the stretched window the swallow left plus
+    // the narrow recovery). The graft owns that audio now, so the stamp is
+    // replaced; a stamp the graft cannot re-supply (different content) or
+    // that pokes past the graft's span stays, fail-open, keeping its text.
+    let mut replaced = Vec::new();
+    for (hole_index, hole) in holes.iter().enumerate() {
+        let [Some(first), Some(last)] = [
+            hole_words[hole_index].first(),
+            hole_words[hole_index].last(),
+        ] else {
+            continue;
+        };
+        let (graft_lo, graft_hi) = (first.start, last.end);
+        for index in whisper_carry_hole_swallow_chain(carried_words, hole) {
+            let stamp = &carried_words[index];
+            let units = whisper_carry_normalized_word_units(&stamp.word);
+            if stamp.start >= graft_lo
+                && stamp.end <= graft_hi
+                && hole_words[hole_index].iter().any(|graft| {
+                    whisper_carry_normalized_word_units(&graft.word)
+                        .iter()
+                        .any(|unit| units.contains(unit))
+                })
+            {
+                if trace_graft {
+                    eprintln!(
+                        "openasr_whisper_greedy_decode stage=carry_hole_skip event=hole_stretch_replaced hole={} word={:?} span={:.2}..{:.2}",
+                        hole_index, stamp.word, stamp.start, stamp.end
+                    );
+                }
+                replaced.push(index);
+            }
+        }
+    }
+    replaced.sort_unstable();
+    replaced.dedup();
     // Splice at the hole boundaries. Holes are emitted in boundary order (one
     // hole per consecutive-word pair), so a single forward scan files every
-    // hole's recovered words between exactly the words that flank it.
-    let mut spliced = Vec::with_capacity(carried_words.len() + grafted);
+    // hole's recovered words between exactly the words that flank it, and a
+    // stamp the graft replaced above is skipped in the same pass. A hole
+    // flushes at its boundary even when that index itself is in a previous
+    // hole's replaced set, so its grafts still land.
+    let mut spliced = Vec::with_capacity(carried_words.len() + grafted - replaced.len());
     let mut hole_front = 0usize;
     for (index, word) in carried_words.iter().enumerate() {
-        spliced.push(word.clone());
+        if !replaced.contains(&index) {
+            spliced.push(word.clone());
+        }
         while hole_front < holes.len() && holes[hole_front].boundary == index {
             spliced.extend(std::mem::take(&mut hole_words[hole_front]));
             hole_front += 1;
@@ -9715,15 +9801,17 @@ fn run_whisper_decode_loop(
     // less) prompt and graft the re-decode's words the carried decode
     // lacked: head words (majority time before the carried first word) in
     // front of the carried words, hole words (majority time credited to a
-    // detected hole) between the words that flank their hole. The carried
-    // decode's tokens, text tail, carry and stop reason stay untouched, so
-    // every slice after this one is conditioned exactly as before and no
-    // downstream content changes. The rare case where the carried decode's
-    // own words are all degenerate zero-width tags (no real content after
-    // the skip at all) instead swaps in the re-decode's word list wholesale.
-    // Every healthy slice (first word inside the overlap re-read, no audible
-    // holes, or quiet heads/pauses) takes no action here and stays
-    // untouched.
+    // detected hole) between the words that flank their hole. A hole whose
+    // right side is the swallow's stretch chain also credits and replaces
+    // the stamps the chain covers, whose span the graft re-supplies. The
+    // carried decode's tokens, text tail, carry and stop reason stay
+    // untouched, so every slice after this one is conditioned exactly as
+    // before and no downstream content changes. The rare case where the
+    // carried decode's own words are all degenerate zero-width tags (no real
+    // content after the skip at all) instead swaps in the re-decode's word
+    // list wholesale. Every healthy slice (first word inside the overlap
+    // re-read, no audible holes, or quiet heads/pauses) takes no action here
+    // and stays untouched.
     if word_timestamp_mode == WhisperWordTimestampMode::CrossAttention
         // When the ladder's carry-less round already won, its decode IS the
         // base-prompt re-decode: running this recovery would re-decode the
