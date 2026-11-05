@@ -4546,6 +4546,100 @@ fn carry_interior_hole_graft_keeps_chain_stamps_past_the_graft_span() {
 }
 
 #[test]
+fn carry_interior_hole_graft_declines_chain_reach_without_gap_credit() {
+    // The malfina "bi-mon"/"bisexual-mon" seam: the gap holds nothing the
+    // re-decode can recover (its only in-gap word is low-confidence fill),
+    // and the re-decode restamps the chain's wide words with the SAME
+    // content (duplicates) before adding a confident misreading ("mine")
+    // UNDER an already-stamped chain word. No gap credit, so no swallow
+    // reach: crediting under the chain would emit the stamped audio a
+    // second time, and the whole graft aborts, keeping the carried decode.
+    let carried = vec![
+        head_skip_word("bi-mon!", 17.25, 18.32),
+        head_skip_word("Happy", 19.07, 20.29),
+        head_skip_word("bisexual-mon!", 20.23, 21.49),
+        head_skip_word("*laughs*", 21.47, 23.07),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 18.32,
+        hi: 19.07,
+    };
+    let recovered = vec![
+        // The re-decode's only in-gap attempt is confidence-rejected fill;
+        // the wide chain words are restamped with their same content (the
+        // dedupe rejects them) ...
+        hole_word("mine", 17.93, 18.76, 0.40),
+        hole_word("happy", 19.11, 19.88, 0.90),
+        hole_word("bisexual", 19.78, 20.48, 0.90),
+        // ... so this confident word sitting UNDER the stamped
+        // "bisexual-mon!" is a re-reading of already-stamped audio, not the
+        // speech the hole holds.
+        hole_word("mine", 20.67, 21.34, 0.64),
+    ];
+    assert!(whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None).is_none());
+
+    // The SAME re-decode with a real gap recovery passes: the swallow is
+    // confirmed by the gap credit, the reach fires, and the "mine"
+    // re-reading is grafted fail-open like any other chain word.
+    let recovered = vec![
+        hole_word("month", 18.40, 18.90, 0.90),
+        hole_word("mine", 17.93, 18.76, 0.40),
+        hole_word("happy", 19.11, 19.88, 0.90),
+        hole_word("bisexual", 19.78, 20.48, 0.90),
+        hole_word("mine", 20.67, 21.34, 0.64),
+    ];
+    let spliced = whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None)
+        .expect("a gap credit confirms the swallow and opens the reach");
+    let spliced_text: Vec<&str> = spliced
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        spliced_text,
+        vec![
+            "bi-mon!",
+            "month",
+            "mine",
+            "Happy",
+            "bisexual-mon!",
+            "*laughs*"
+        ]
+    );
+}
+
+#[test]
+fn carry_interior_hole_graft_declines_unconfirmed_chain_with_empty_gap() {
+    // The lobster "Incluency Robin!" seam: sung wide words after the gap,
+    // none of which the re-decode restamps with the same content -- but the
+    // gap yields no recovery either (its lone attempt is low-confidence
+    // fill), so the wide words are just wide words, and the re-decode's
+    // "blue and sea" under them is a second reading of the same audio the
+    // carry already stamped.
+    let carried = vec![
+        head_skip_word("catfish!", 11.53, 12.43),
+        head_skip_word("Incluency", 13.21, 14.30),
+        head_skip_word("Robin!", 14.20, 15.37),
+        head_skip_word("Watch", 15.67, 16.46),
+    ];
+    let hole = WhisperCarryHole {
+        boundary: 0,
+        lo: 12.43,
+        hi: 13.21,
+    };
+    let recovered = vec![
+        // The gap's lone re-decode attempt fails the confidence floor ...
+        hole_word("He's", 13.09, 13.80, 0.50),
+        // ... and these narrow words sit under the wide stamped chain,
+        // which the re-decode never restamps with the same content.
+        hole_word("blue", 13.74, 13.97, 0.56),
+        hole_word("and", 13.87, 14.17, 0.91),
+        hole_word("sea", 14.07, 14.51, 0.98),
+    ];
+    assert!(whisper_carry_interior_hole_graft(&carried, &recovered, &[hole], None).is_none());
+}
+
+#[test]
 fn carry_interior_hole_graft_demands_audio_support() {
     // A recovered word stamped into the hole's PAUSE air (loop filler the
     // re-decode itself produced) sits orders of magnitude below the placed
