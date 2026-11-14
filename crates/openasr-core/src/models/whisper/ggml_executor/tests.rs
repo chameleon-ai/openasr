@@ -4793,6 +4793,29 @@ fn modal_word_bigram_counts_the_hook_phrase_case_insensitively() {
     );
 }
 
+#[test]
+fn placed_frontier_ignores_zero_width_tail_words() {
+    let words = vec![
+        head_skip_word("real", 10.0, 11.0),
+        head_skip_word("*Sigh*", 22.05, 22.05),
+        head_skip_word("*Sigh*", 22.05, 22.05),
+    ];
+    assert_eq!(
+        super::whisper_ladder_placed_frontier(&words),
+        Some(11.0),
+        "a loop that pinned zero-width words to the window end must not claim it"
+    );
+    let all_zero = vec![
+        head_skip_word("*Sigh*", 22.05, 22.05),
+        head_skip_word("*S*", 22.05, 22.05),
+    ];
+    assert_eq!(
+        super::whisper_ladder_placed_frontier(&all_zero),
+        None,
+        "a round whose placements all cover no audio reports no frontier"
+    );
+}
+
 fn guard_trip_repeat(first: &str, second: &str, count: usize) -> Option<((String, String), usize)> {
     Some(((first.to_string(), second.to_string()), count))
 }

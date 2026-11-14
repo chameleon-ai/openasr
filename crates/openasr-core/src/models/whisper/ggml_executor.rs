@@ -7604,6 +7604,14 @@ fn whisper_ladder_placed_frontier_seconds(
 /// this is what reaches the final transcript, not the trip-trimmed generated
 /// stream the guard's own counters describe. The repeat is `None` when no
 /// bigram occurs twice (a round that is not looping has no phrase to defend).
+///
+/// The frontier is the end of the last placed word that actually covers audio
+/// (`end > start`). A guard-cut stub's loop can pin zero-width words to the
+/// window end -- its cross-attention collapsed to the final frame -- and those
+/// cover nothing, so they must not make the stub "stand" at the window end and
+/// deny a challenger that recovered the audio the loop's placements skipped.
+/// A round whose words are all zero-width covers no audio at all, so it
+/// reports no frontier.
 fn whisper_ladder_placed_frontier_and_repeat(
     tokenizer: &WhisperTokenizer,
     candidate: &WhisperDecodeCandidate,
@@ -7621,8 +7629,22 @@ fn whisper_ladder_placed_frontier_and_repeat(
         Ok((words, _)) => words,
         Err(_) => return (None, None),
     };
-    let frontier = words.last().map(|word| word.end);
+    let frontier = whisper_ladder_placed_frontier(&words);
     (frontier, modal_normalized_word_bigram(&words))
+}
+
+/// The end of the last placed word that covers audio (`end > start`). A
+/// guard-cut stub's loop can pin zero-width words to the window end -- its
+/// cross-attention collapsed to the final frame -- and those cover nothing, so
+/// they must not make the stub "stand" at the window end and deny a challenger
+/// that recovered the audio the loop's placements skipped. A round whose words
+/// are all zero-width covers no audio at all, so it reports no frontier.
+fn whisper_ladder_placed_frontier(words: &[crate::api::backend::WordTimestamp]) -> Option<f32> {
+    words
+        .iter()
+        .rev()
+        .find(|word| word.end > word.start)
+        .map(|word| word.end)
 }
 
 /// The most frequent normalized word bigram over placed words and its count,
