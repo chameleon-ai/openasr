@@ -38,7 +38,6 @@ ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] 
 futures-util = "0.3"
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_LibraryLoader", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Registry"] }
-matrixmultiply = "0.3"
 memmap2 = "0.9"
 metal = "0.33"
 mime = "0.3"
@@ -76,7 +75,7 @@ rubato = "0.15"
 # libsqlite3-sys' build script) so the daemon history store needs no system
 # libsqlite3 -- matches the rest of this workspace's "vendor the native deps"
 # posture (see ggml git submodule in openasr-core).
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 rustls = "0.23.46"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -95,5 +94,4 @@ tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 toml = "1"
 tower = "0.5"
-unicode-general-category = "1.1"
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

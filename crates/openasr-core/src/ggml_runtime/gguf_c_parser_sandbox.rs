@@ -515,14 +515,30 @@ fn is_openasr_helper_exe(path: &Path) -> bool {
     {
         return false;
     }
-    // Accept the bundled sidecar name ("openasr") and any triple-suffixed /
-    // resource-dir variant ("openasr-aarch64-apple-darwin", "openasr-cli", ...)
-    // so Auto-mode engages the sandbox for every OpenASR helper, not just the
-    // exact "openasr" stem. The probe child runs the hidden subcommand on the
-    // direct-load path, so this does not recurse.
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem == "openasr" || stem.starts_with("openasr-"))
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    if stem == "openasr" {
+        // Accept the bundled sidecar name ("openasr") and any triple-suffixed /
+        // resource-dir variant ("openasr-aarch64-apple-darwin", "openasr-cli", ...)
+        // so Auto-mode engages the sandbox for every OpenASR helper, not just the
+        // exact "openasr" stem. The probe child runs the hidden subcommand on the
+        // direct-load path, so this does not recurse.
+        return true;
+    }
+    let Some(suffix) = stem.strip_prefix("openasr-") else {
+        return false;
+    };
+    // Cargo can also place bin-target unit-test harnesses under
+    // `target/<profile>/build/<pkg>/<hash>/out/openasr-<hash>` rather than
+    // `deps/`. A hex-only hash suffix inside a Cargo target tree is the tell
+    // that the executable is such a harness, not a shipped helper: it does not
+    // implement the hidden probe subcommand and would emit libtest output
+    // instead of the probe JSON.
+    let in_cargo_target = path
+        .components()
+        .any(|component| component.as_os_str() == "target");
+    !(in_cargo_target && suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn sandbox_timeout() -> Duration {
@@ -575,6 +591,12 @@ mod tests {
     fn helper_detection_excludes_cargo_test_harnesses_but_keeps_sidecars() {
         assert!(!is_openasr_helper_exe(Path::new(
             "/tmp/target/debug/deps/openasr-deadbeef"
+        )));
+        assert!(!is_openasr_helper_exe(Path::new(
+            "/tmp/target/debug/build/openasr-cli/7f9bb3194aa09a91/out/openasr-7f9bb3194aa09a91"
+        )));
+        assert!(is_openasr_helper_exe(Path::new(
+            "/usr/local/bin/openasr-deadbeef"
         )));
         assert!(is_openasr_helper_exe(Path::new("/usr/local/bin/openasr")));
         assert!(is_openasr_helper_exe(Path::new(

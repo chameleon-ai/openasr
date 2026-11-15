@@ -64,7 +64,6 @@ sha2.workspace = true
 libc.workspace = true
 libopus_sys.workspace = true
 memmap2.workspace = true
-matrixmultiply.workspace = true
 rayon.workspace = true
 realfft.workspace = true
 reqwest.workspace = true
@@ -74,7 +73,6 @@ symphonia.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-unicode-general-category.workspace = true
 zip.workspace = true
 # Optional, feature-gated (`ts-export`) real dependency: lets a downstream
 # crate's dev-dependency edge (with the feature turned on) see the TS impls

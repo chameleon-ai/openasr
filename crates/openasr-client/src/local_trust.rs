@@ -240,19 +240,20 @@ pub fn managed_daemon_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
+#[cfg(windows)]
+fn has_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn has_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn is_plain_regular_file(metadata: &std::fs::Metadata) -> bool {
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
+    metadata.is_file() && !metadata.file_type().is_symlink() && !has_windows_reparse_point(metadata)
 }
 
 #[cfg(unix)]

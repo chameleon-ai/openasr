@@ -175,7 +175,7 @@ fn test_history_busy_handler(_count: i32) -> bool {
 }
 
 #[cfg(test)]
-fn install_test_history_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+fn install_test_history_busy_handler(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_handler(Some(test_history_busy_handler))
 }
 
@@ -784,7 +784,7 @@ impl DaemonHistoryStore {
         let mut conn = self.connection()?;
         #[cfg(test)]
         if TEST_HISTORY_BUSY_HANDLER_ARMED.with(Cell::get) {
-            install_test_history_busy_handler(&conn).map_err(DaemonHistoryStoreError::Query)?;
+            install_test_history_busy_handler(&mut conn).map_err(DaemonHistoryStoreError::Query)?;
         }
         // Take the writer lock before classifying a failed conditional delete.
         // Otherwise another writer could change the row between the DELETE and
