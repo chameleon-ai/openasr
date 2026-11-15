@@ -632,11 +632,14 @@ impl Seq2SeqServeBatchFamily for WhisperFamily {
         let mut slot = WhisperBatchSlot::new(job)?;
         let prompt_len = slot.job.decode_config.initial_prompt_tokens.len();
         let mut logits = Vec::new();
-        for position in 0..prompt_len {
-            logits = runtime.compute_reused_step_logits(
-                slot.job.decode_config.initial_prompt_tokens[position],
-                position,
-            )?;
+        for (position, &token) in slot
+            .job
+            .decode_config
+            .initial_prompt_tokens
+            .iter()
+            .enumerate()
+        {
+            logits = runtime.compute_reused_step_logits(token, position)?;
         }
         slot.select_next_token_from_logits(logits)?;
 
