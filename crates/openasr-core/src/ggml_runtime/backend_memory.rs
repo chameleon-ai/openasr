@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::{ffi::c_void, marker::PhantomData, mem, ptr};
+use std::mem;
 
 use thiserror::Error;
 
@@ -94,9 +94,6 @@ impl BackendTerminalStatusClass {
             ffi::GGML_STATUS_FAILED => Self::Validation,
             ffi::GGML_STATUS_ALLOC_FAILED => Self::Capacity,
             ffi::GGML_STATUS_ABORTED => Self::Cancelled,
-            ffi::GGML_STATUS_EXECUTION_FAILED => Self::Execution,
-            ffi::GGML_STATUS_DEVICE_LOST => Self::DeviceLost,
-            ffi::GGML_STATUS_BACKEND_POISONED => Self::BackendPoisoned,
             status => Self::Unknown(status),
         }
     }
@@ -190,6 +187,8 @@ pub(crate) enum BackendMemoryAbiError {
     MixedPrimaryBackend,
     #[error("scheduler memory plan returned an item without a primary backend")]
     MissingPrimaryBackend,
+    #[error("backend memory quote token does not match its requests")]
+    QuoteMismatch,
 }
 
 impl BackendMemoryAbiError {
@@ -209,36 +208,177 @@ impl BackendMemoryAbiError {
     }
 }
 
-fn status(operation: &'static str, value: i32) -> Result<(), BackendMemoryAbiError> {
-    if value == ffi::GGML_STATUS_SUCCESS {
-        Ok(())
-    } else {
-        Err(BackendMemoryAbiError::Status {
-            operation,
-            status: value,
-        })
+// Stock ggml exposes exactly one device-wide free/total pair per device
+// (`ggml_backend_dev_memory`) and no native transaction machinery. The ABI
+// below preserves OpenASR's admission semantics (quote -> reserve -> reconcile)
+// on top of those facts:
+//
+// * domains are synthesized per device (one domain; host for CPU-class
+//   devices, device-local for GPU-class devices) keyed by a synthetic
+//   process-local identity, never a fabricated hardware UUID;
+// * quotes are conservative committed upper bounds: used-before from live
+//   stats plus the requested footprint, reconciled against fresh stats after
+//   the engine commits;
+// * reserve_private validates the quote token and re-issues the quote's own
+//   claims without touching native state -- the real allocation happens at
+//   graph/buffer commit time, and the post-allocation reconciliation is what
+//   binds the outcome to physical reality;
+// * stats are always available (never an ABI error): when the device query
+//   fails we report zeroed bytes with BUDGET_UNAVAILABLE so typed consumers
+//   see Unknown, i.e. fail-closed admission, rather than a silent total.
+static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Stats generation derived from the device's reported accounting tuple.
+/// Identical snapshots yield identical generations; any device-side movement
+/// (or a move between measured and unmeasurable) changes it. Deterministic
+/// reads (e.g. Linux CPU, which always reports free == total) keep one
+/// stable generation, which the admission layer requires between a quote and
+/// the stats sampled from it.
+fn stats_generation(free: u64, total: u64) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in [free, total, 1] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
+    hash | 1
+}
+
+fn next_request_id() -> u64 {
+    REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn monotonic_ns() -> u64 {
+    PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Synthetic process-local identity for one ggml registry device. This is
+/// deliberately not presented as a hardware UUID: bytes 0..8 are the device
+/// pointer, bytes 8..16 mix in the device name, and the result never leaves
+/// this process (the broker keys its domains on it).
+fn synthetic_device_uuid(device: ffi::GgmlBackendDevRaw) -> [u8; 16] {
+    let mut uuid = [0u8; 16];
+    let raw = device as u64;
+    uuid[..8].copy_from_slice(&raw.to_le_bytes());
+    let name_hash = if device.is_null() {
+        0x9e37_79b9_7f4a_7c15
+    } else {
+        let name = unsafe { ffi::ggml_backend_dev_name(device) };
+        if name.is_null() {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            let bytes = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+            fnv1a(bytes) | 1
+        }
+    };
+    uuid[8..].copy_from_slice(&name_hash.to_le_bytes());
+    if uuid.iter().all(|byte| *byte == 0) {
+        uuid[15] = 1;
+    }
+    uuid
+}
+
+fn domain_kind_for_device(device_kind: Option<super::GgmlBackendKind>) -> u32 {
+    match device_kind {
+        Some(super::GgmlBackendKind::Gpu | super::GgmlBackendKind::IntegratedGpu) => {
+            ffi::GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL
+        }
+        Some(super::GgmlBackendKind::Meta) => ffi::GGML_BACKEND_MEMORY_DOMAIN_UNIFIED,
+        // CPU and Accelerator (BLAS/AMX) domains are backed by host memory.
+        _ => ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE,
+    }
+}
+
+fn domain_id_for_device(
+    device_kind: Option<super::GgmlBackendKind>,
+    device: ffi::GgmlBackendDevRaw,
+) -> ffi::GgmlBackendMemoryDomainIdV1 {
+    let kind = domain_kind_for_device(device_kind);
+    ffi::GgmlBackendMemoryDomainIdV1 {
+        physical_device_uuid: if matches!(
+            kind,
+            ffi::GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL | ffi::GGML_BACKEND_MEMORY_DOMAIN_UNIFIED
+        ) {
+            synthetic_device_uuid(device)
+        } else {
+            [0; 16]
+        },
+        heap_index: 0,
+        kind,
+    }
+}
+
+fn device_name_lossy(device: ffi::GgmlBackendDevRaw) -> String {
+    if device.is_null() {
+        return "unknown-device".to_string();
+    }
+    let name = unsafe { ffi::ggml_backend_dev_name(device) };
+    if name.is_null() {
+        return "unknown-device".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendMemoryDomain {
+    pub(crate) id: ffi::GgmlBackendMemoryDomainIdV1,
+    #[allow(dead_code)]
+    pub(crate) name: String,
+}
+
+fn fingerprint_requests(requests: &[ffi::GgmlBackendMemoryRequestV1]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |value: u64| {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for request in requests {
+        mix(request.request_id);
+        mix(u64::from(request.kind));
+        mix(u64::from(request.flags));
+        mix(u64::from(request.usage));
+        mix(request.backend as usize as u64);
+        mix(request.peer_backend as usize as u64);
+        mix(request.buft as usize as u64);
+        mix(request.requested_bytes);
+        mix(request.currently_allocated_bytes);
+        mix(request.max_tensor_bytes);
+    }
+    hash
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct BackendMemoryAbi {
-    raw: &'static ffi::GgmlBackendMemoryApiV1,
     backend: ffi::GgmlBackendRaw,
     device: ffi::GgmlBackendDevRaw,
 }
 
-unsafe extern "C" {
-    fn ggml_backend_memory_api_for_device_v1(
-        device: ffi::GgmlBackendDevRaw,
-    ) -> *const ffi::GgmlBackendMemoryApiV1;
-}
-
 impl BackendMemoryAbi {
-    /// Resolves the optional v1 table from the concrete backend's registry.
-    ///
-    /// `backend` must remain a live ggml backend. Plugin registries are process
-    /// resident after loading, so the returned function table has static
-    /// lifetime even when the backend owner later drops.
+    /// A live ggml backend (or a registry device) is the only context the
+    /// stock memory model can speak about. The registry is process resident
+    /// after loading, so the returned ABI holds no native pointers beyond the
+    /// backend/device pair.
     pub(crate) unsafe fn from_backend(
         backend: ffi::GgmlBackendRaw,
     ) -> Result<Self, BackendMemoryAbiError> {
@@ -250,103 +390,42 @@ impl BackendMemoryAbi {
         if device.is_null() {
             return Err(BackendMemoryAbiError::Unavailable);
         }
-        // SAFETY: the shared ggml trampoline owns registry lookup and catches
-        // every provider exception before it can cross this Rust FFI seam.
-        let raw = unsafe { ffi::ggml_backend_memory_api_for_backend_v1(backend) };
-        let Some(raw) = (unsafe { raw.as_ref() }) else {
-            return Err(BackendMemoryAbiError::Unavailable);
-        };
-        if raw.struct_size < mem::size_of::<ffi::GgmlBackendMemoryApiV1>() as u32
-            || raw.abi_version != ffi::GGML_BACKEND_MEMORY_ABI_V1
-            || raw.get_domains.is_none()
-            || raw.quote.is_none()
-            || raw.reserve_private.is_none()
-            || raw.get_stats.is_none()
-        {
-            return Err(BackendMemoryAbiError::Incompatible);
-        }
-        Ok(Self {
-            raw,
-            backend,
-            device,
-        })
+        Ok(Self { backend, device })
     }
 
-    /// Resolves the optional v1 table from a registry device without constructing
-    /// a live backend context. Vulkan BUFFER quotes accept a null `backend` when
-    /// `buft` is set; AMD WDDM does not return the ~2.1 MiB host slab that
-    /// `ggml_backend_dev_init` leaves behind after `ggml_backend_free`.
-    ///
-    /// `device` must remain a live registry device. Plugin registries are
-    /// process resident after loading, so the returned function table has
-    /// static lifetime.
+    /// `device` must remain a live registry device.
     pub(crate) unsafe fn from_device(
         device: ffi::GgmlBackendDevRaw,
     ) -> Result<Self, BackendMemoryAbiError> {
         if device.is_null() {
             return Err(BackendMemoryAbiError::Unavailable);
         }
-        // SAFETY: the shared ggml trampoline owns registry lookup and catches
-        // every provider exception before it can cross this Rust FFI seam.
-        let raw = unsafe { ggml_backend_memory_api_for_device_v1(device) };
-        let Some(raw) = (unsafe { raw.as_ref() }) else {
-            return Err(BackendMemoryAbiError::Unavailable);
-        };
-        if raw.struct_size < mem::size_of::<ffi::GgmlBackendMemoryApiV1>() as u32
-            || raw.abi_version != ffi::GGML_BACKEND_MEMORY_ABI_V1
-            || raw.get_domains.is_none()
-            || raw.quote.is_none()
-            || raw.reserve_private.is_none()
-            || raw.get_stats.is_none()
-        {
-            return Err(BackendMemoryAbiError::Incompatible);
-        }
         Ok(Self {
-            raw,
-            backend: ptr::null_mut(),
+            backend: std::ptr::null_mut(),
             device,
         })
     }
 
-    pub(crate) fn domains(
-        &self,
-    ) -> Result<Vec<ffi::GgmlBackendMemoryDomainV1>, BackendMemoryAbiError> {
-        self.raw
-            .get_domains
-            .ok_or(BackendMemoryAbiError::Incompatible)?;
-        let mut count = 0_u32;
-        status("domains/count", unsafe {
-            ffi::ggml_backend_memory_api_get_domains_v1(
-                self.raw,
-                self.device,
-                ptr::null_mut(),
-                &mut count,
-            )
-        })?;
-        let mut domains: Vec<_> = (0..count)
-            .map(|_| ffi::GgmlBackendMemoryDomainV1 {
-                struct_size: mem::size_of::<ffi::GgmlBackendMemoryDomainV1>() as u32,
-                flags: 0,
-                id: ffi::GgmlBackendMemoryDomainIdV1::default(),
-                name: [0; 48],
-            })
-            .collect();
-        let mut capacity = count;
-        status("domains", unsafe {
-            ffi::ggml_backend_memory_api_get_domains_v1(
-                self.raw,
-                self.device,
-                domains.as_mut_ptr(),
-                &mut capacity,
-            )
-        })?;
-        if capacity > count {
-            return Err(BackendMemoryAbiError::UnstableCount {
-                operation: "domains",
+    pub(crate) fn domains(&self) -> Result<Vec<BackendMemoryDomain>, BackendMemoryAbiError> {
+        let device_kind = self.device_kind();
+        Ok(vec![BackendMemoryDomain {
+            id: domain_id_for_device(device_kind, self.device),
+            name: device_name_lossy(self.device),
+        }])
+    }
+
+    fn device_memory(&self) -> Result<(u64, u64), BackendMemoryAbiError> {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        // SAFETY: device is live; both pointers are writable.
+        unsafe { ffi::ggml_backend_dev_memory(self.device, &mut free, &mut total) };
+        if total == 0 {
+            return Err(BackendMemoryAbiError::Status {
+                operation: "device_memory",
+                status: ffi::GGML_STATUS_FAILED,
             });
         }
-        domains.truncate(capacity as usize);
-        Ok(domains)
+        Ok((free as u64, total as u64))
     }
 
     pub(crate) fn quote(
@@ -354,140 +433,108 @@ impl BackendMemoryAbi {
         requests: &[ffi::GgmlBackendMemoryRequestV1],
     ) -> Result<BackendMemoryQuote, BackendMemoryAbiError> {
         self.validate_primary_backends(requests)?;
-        self.raw.quote.ok_or(BackendMemoryAbiError::Incompatible)?;
-        let count = u32::try_from(requests.len())
-            .map_err(|_| BackendMemoryAbiError::UnstableCount { operation: "quote" })?;
-        let request_ptr = if requests.is_empty() {
-            ptr::null()
-        } else {
-            requests.as_ptr()
-        };
-        let mut raw = ffi::GgmlBackendMemoryQuoteV1 {
-            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
-            ..Default::default()
-        };
-        let mut claim_count = 0_u32;
-        // SAFETY: all pointers refer to initialized values for this call.
-        status("quote/count", unsafe {
-            ffi::ggml_backend_memory_api_quote_v1(
-                self.raw,
-                request_ptr,
-                count,
-                &mut raw,
-                ptr::null_mut(),
-                &mut claim_count,
-            )
-        })?;
-
-        let mut claims = initialized_claims(claim_count as usize);
-        let mut capacity = claim_count;
-        // SAFETY: `claims` has initialized writable elements and capacity.
-        status("quote", unsafe {
-            ffi::ggml_backend_memory_api_quote_v1(
-                self.raw,
-                request_ptr,
-                count,
-                &mut raw,
-                claims.as_mut_ptr(),
-                &mut capacity,
-            )
-        })?;
-        if capacity as usize > claims.len() {
-            return Err(BackendMemoryAbiError::UnstableCount { operation: "quote" });
+        let (free, total) = self.device_memory()?;
+        let used = total.saturating_sub(free);
+        let mut requested_upper: u64 = 0;
+        for request in requests {
+            requested_upper = requested_upper
+                .checked_add(request.requested_bytes)
+                .ok_or(BackendMemoryAbiError::UnstableCount { operation: "quote" })?;
         }
-        claims.truncate(capacity as usize);
+        let device_kind = self.device_kind();
+        let domain = domain_id_for_device(device_kind, self.device);
+        let generation = stats_generation(free, total);
+        let claims = requests
+            .iter()
+            .map(|request| ffi::GgmlBackendMemoryClaimV1 {
+                struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryClaimV1>() as u32,
+                // A committed upper bound: admission charges it, the
+                // post-allocation reconciliation refunds whatever the fresh
+                // device stats show was not used.
+                flags: ffi::GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER,
+                request_id: request.request_id,
+                domain,
+                payload_requested_bytes: request.requested_bytes,
+                committed_before_bytes: used,
+                committed_after_upper_bytes: used.saturating_add(requested_upper),
+                commit_peak_extra_upper_bytes: requested_upper,
+                resident_after_upper_bytes: request.requested_bytes,
+                retained_after_use_upper_bytes: request.requested_bytes,
+                releasable_after_use_upper_bytes: 0,
+            })
+            .collect();
+        let raw = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            flags: 0,
+            residual_flags: 0,
+            residual_request_count: 0,
+            provisional_requested_upper_bytes: requested_upper,
+            stats_generation: generation,
+            quote_token: next_request_id(),
+            request_fingerprint: fingerprint_requests(requests),
+        };
         Ok(BackendMemoryQuote { raw, claims })
     }
 
-    /// Performs backend-private transactional reservation against the exact
-    /// quote token. Engine-controlled buffers are committed separately by the
-    /// frozen scheduler plan, then callers fetch fresh stats for reconcile.
+    /// Stock ggml cannot pre-reserve backend-private memory; the allocation
+    /// happens at commit time and is reconciled against fresh stats. This
+    /// validates the quote token so a stale or mismatched quote cannot be
+    /// committed by accident, then re-issues the quote's own claims.
     pub(crate) fn reserve_private(
         &self,
         requests: &[ffi::GgmlBackendMemoryRequestV1],
         quote: &BackendMemoryQuote,
     ) -> Result<Vec<ffi::GgmlBackendMemoryClaimV1>, BackendMemoryAbiError> {
         self.validate_primary_backends(requests)?;
-        self.raw
-            .reserve_private
-            .ok_or(BackendMemoryAbiError::Incompatible)?;
-        let count =
-            u32::try_from(requests.len()).map_err(|_| BackendMemoryAbiError::UnstableCount {
-                operation: "reserve_private",
-            })?;
-        let request_ptr = if requests.is_empty() {
-            ptr::null()
-        } else {
-            requests.as_ptr()
-        };
-        let mut actual_count = 0_u32;
-        // First call is a sizing query and must not mutate backend state.
-        status("reserve_private/count", unsafe {
-            ffi::ggml_backend_memory_api_reserve_private_v1(
-                self.raw,
-                request_ptr,
-                count,
-                &quote.raw,
-                ptr::null_mut(),
-                &mut actual_count,
-            )
-        })?;
-        // A non-null pointer is intentional even for zero items: it
-        // distinguishes the commit call from the preceding sizing query.
-        let mut actual = initialized_claims(actual_count.max(1) as usize);
-        let mut capacity = actual_count;
-        status("reserve_private", unsafe {
-            ffi::ggml_backend_memory_api_reserve_private_v1(
-                self.raw,
-                request_ptr,
-                count,
-                &quote.raw,
-                actual.as_mut_ptr(),
-                &mut capacity,
-            )
-        })?;
-        if capacity > actual_count {
-            return Err(
-                BackendMemoryAbiError::ReservePrivatePostCommitCountMismatch {
-                    sized: actual_count,
-                    returned: capacity,
-                },
-            );
+        if fingerprint_requests(requests) != quote.raw.request_fingerprint {
+            return Err(BackendMemoryAbiError::QuoteMismatch);
         }
-        actual.truncate(capacity as usize);
-        Ok(actual)
+        Ok(quote.claims.clone())
     }
 
     pub(crate) fn stats(&self) -> Result<BackendMemoryStatsSnapshot, BackendMemoryAbiError> {
-        self.raw
-            .get_stats
-            .ok_or(BackendMemoryAbiError::Incompatible)?;
-        let mut count = 0_u32;
-        status("stats/count", unsafe {
-            ffi::ggml_backend_memory_api_get_stats_v1(
-                self.raw,
-                self.device,
-                self.backend,
-                ptr::null_mut(),
-                &mut count,
-            )
-        })?;
-        let mut domains = initialized_stats(count as usize);
-        let mut capacity = count;
-        status("stats", unsafe {
-            ffi::ggml_backend_memory_api_get_stats_v1(
-                self.raw,
-                self.device,
-                self.backend,
-                domains.as_mut_ptr(),
-                &mut capacity,
-            )
-        })?;
-        if capacity > count {
-            return Err(BackendMemoryAbiError::UnstableCount { operation: "stats" });
-        }
-        domains.truncate(capacity as usize);
-        Ok(BackendMemoryStatsSnapshot { domains })
+        let domain_kind = self.device_kind();
+        let domain = domain_id_for_device(domain_kind, self.device);
+        let base = ffi::GgmlBackendMemoryStatsV1 {
+            struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryStatsV1>() as u32,
+            flags: 0,
+            domain,
+            generation: 1,
+            timestamp_monotonic_ns: monotonic_ns(),
+            total_bytes: 0,
+            budget_bytes: 0,
+            device_used_bytes: 0,
+            device_free_bytes: 0,
+            backend_owned_live_bytes: 0,
+            backend_owned_cached_bytes: 0,
+            backend_owned_workspace_bytes: 0,
+            backend_owned_high_water_bytes: 0,
+            allocation_count: 0,
+            allocation_failure_count: 0,
+            health: ffi::GGML_BACKEND_MEMORY_HEALTHY,
+            last_ggml_status: ffi::GGML_STATUS_SUCCESS,
+            last_native_error: 0,
+            quarantine_generation: 0,
+        };
+        let stats = match self.device_memory() {
+            Ok((free, total)) => ffi::GgmlBackendMemoryStatsV1 {
+                flags: 0,
+                total_bytes: total,
+                budget_bytes: free,
+                device_used_bytes: total.saturating_sub(free),
+                device_free_bytes: free,
+                generation: stats_generation(free, total),
+                ..base
+            },
+            Err(_) => ffi::GgmlBackendMemoryStatsV1 {
+                flags: ffi::GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE,
+                health: ffi::GGML_BACKEND_MEMORY_DEGRADED,
+                ..base
+            },
+        };
+        Ok(BackendMemoryStatsSnapshot {
+            domains: vec![stats],
+        })
     }
 
     pub(crate) fn stats_at(
@@ -511,8 +558,7 @@ impl BackendMemoryAbi {
         if self.device.is_null() {
             return None;
         }
-        // SAFETY: ABI construction requires a live registry device; registry
-        // devices remain resident for the lifetime of the process.
+        // SAFETY: ABI construction requires a live registry device.
         let kind = unsafe { ffi::ggml_backend_dev_type(self.device) };
         Some(super::backend::backend_kind(kind))
     }
@@ -529,23 +575,12 @@ impl BackendMemoryAbi {
         ExecutionProvider::from_backend_name(name.as_ref())
     }
 
-    pub(crate) fn trim(&self, flags: u64) -> Result<(), BackendMemoryAbiError> {
-        self.raw.trim.ok_or(BackendMemoryAbiError::Incompatible)?;
-        status("trim", unsafe {
-            ffi::ggml_backend_memory_api_trim_v1(self.raw, self.backend, flags)
-        })
-    }
-
-    pub(crate) fn quarantine(
-        &self,
-        request: &ffi::GgmlBackendMemoryQuarantineV1,
-    ) -> Result<(), BackendMemoryAbiError> {
-        self.raw
-            .quarantine
-            .ok_or(BackendMemoryAbiError::Incompatible)?;
-        status("quarantine", unsafe {
-            ffi::ggml_backend_memory_api_quarantine_v1(self.raw, self.backend, request)
-        })
+    /// Stock ggml has no backend cache-trim hook. Scheduler buffer release
+    /// happens when the scheduler is dropped; this call keeps its existing
+    /// contract ("reclaim what can be reclaimed") without fabricating a
+    /// native operation.
+    pub(crate) fn trim(&self, _flags: u64) -> Result<(), BackendMemoryAbiError> {
+        Ok(())
     }
 
     fn validate_primary_backends(
@@ -560,24 +595,6 @@ impl BackendMemoryAbi {
         }
         Ok(())
     }
-}
-
-fn initialized_claims(count: usize) -> Vec<ffi::GgmlBackendMemoryClaimV1> {
-    (0..count)
-        .map(|_| ffi::GgmlBackendMemoryClaimV1 {
-            struct_size: mem::size_of::<ffi::GgmlBackendMemoryClaimV1>() as u32,
-            ..Default::default()
-        })
-        .collect()
-}
-
-fn initialized_stats(count: usize) -> Vec<ffi::GgmlBackendMemoryStatsV1> {
-    (0..count)
-        .map(|_| ffi::GgmlBackendMemoryStatsV1 {
-            struct_size: mem::size_of::<ffi::GgmlBackendMemoryStatsV1>() as u32,
-            ..Default::default()
-        })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -745,11 +762,20 @@ pub(crate) fn record_backend_memory_probe(
     }
 }
 
-/// RAII ownership of a frozen scheduler measurement. Dropping before commit
-/// restores the scheduler; successful commit consumes the plan handle.
-pub(crate) struct SchedulerMemoryPlan<'scheduler> {
-    raw: ffi::GgmlBackendSchedMemoryPlanRaw,
-    _scheduler: PhantomData<&'scheduler mut c_void>,
+/// Rust-side replacement for the fork's frozen scheduler memory plan. Stock
+/// ggml exposes `ggml_backend_sched_reserve_size`, which reports the exact
+/// buffer sizes a later `ggml_backend_sched_alloc_graph` will allocate, and
+/// `ggml_backend_sched_alloc_graph` to perform it. This plan is the pair of
+/// those calls plus the per-backend requests the admission broker quotes.
+///
+/// `ggml_backend_sched_reserve_size` internally calls
+/// `ggml_backend_sched_reset`, releasing any previously bound graph
+/// allocation before measuring. Callers must treat the scheduler as unbound
+/// after `create` returns.
+pub(crate) struct SchedulerMemoryPlan {
+    scheduler: ffi::GgmlBackendSchedRaw,
+    graph: ffi::GgmlCgraphRaw,
+    requests: Vec<ffi::GgmlBackendMemoryRequestV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,8 +969,10 @@ impl BackendTerminalOutcome {
     ) -> Self {
         let status = BackendTerminalStatusClass::from_raw(status);
         let device_health = evidence.device_health();
-        let mutation_flag = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
-        let release_flag = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN;
+        const MAY_HAVE_MUTATED: u32 = 1 << 0;
+        const RELEASE_PROVEN: u32 = 1 << 1;
+        let mutation_flag = MAY_HAVE_MUTATED;
+        let release_flag = RELEASE_PROVEN;
         let unknown_flags = flags & !(mutation_flag | release_flag);
         let may_have_mutated = flags & (mutation_flag | release_flag) != 0 || unknown_flags != 0;
         let mutation = if may_have_mutated {
@@ -1043,46 +1071,124 @@ impl super::backend_memory_admission::NativeOwnerAttachedCommitOutcome
     }
 }
 
-impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
+impl SchedulerMemoryPlan {
     /// `scheduler`, `graph`, and every tensor reachable from `graph` must stay
     /// live and immutable until this plan is committed or dropped.
+    /// `backends` is the scheduler's backend set in creation order; stock
+    /// ggml assigns one default buffer type per scheduler backend, so
+    /// `sizes[i]` is the footprint `sched_alloc_graph` will request from
+    /// `backends[i]`.
     pub(crate) unsafe fn create(
         scheduler: ffi::GgmlBackendSchedRaw,
         graph: ffi::GgmlCgraphRaw,
+        backends: &[ffi::GgmlBackendRaw],
     ) -> Result<Self, BackendMemoryAbiError> {
-        let mut raw = ptr::null_mut();
-        status("scheduler_plan/create", unsafe {
-            ffi::ggml_backend_sched_memory_plan_create_v1(scheduler, graph, &mut raw)
-        })?;
-        if raw.is_null() {
+        if scheduler.is_null() || graph.is_null() || backends.is_empty() {
             return Err(BackendMemoryAbiError::Status {
                 operation: "scheduler_plan/create",
                 status: ffi::GGML_STATUS_FAILED,
             });
         }
+        // Measure the footprint with a throwaway gallocr on the primary
+        // backend's buffer type. For the stock-ggml scheduler this is exact
+        // for the single-backend case and an upper bound for multi-backend
+        // (the pinned split is unreachable from outside the scheduler;
+        // a conservative node-byte sum stands in there). Crucially, this
+        // never reserves on the scheduler's own allocator: calling the stock
+        // `ggml_backend_sched_reserve_size` leaves `galloc->n_nodes` set with
+        // `buffers == NULL`, which makes the subsequent
+        // `ggml_backend_sched_alloc_graph` skip allocation and dereference a
+        // null buffer (SIGSEGV).
+        let mut sizes = vec![0_usize; backends.len()];
+        let primary_buft = unsafe {
+            let device = ffi::ggml_backend_get_device(backends[0]);
+            if device.is_null() {
+                return Err(BackendMemoryAbiError::Status {
+                    operation: "scheduler_plan/create",
+                    status: ffi::GGML_STATUS_FAILED,
+                });
+            }
+            ffi::ggml_backend_dev_buffer_type(device)
+        };
+        if primary_buft.is_null() {
+            return Err(BackendMemoryAbiError::Status {
+                operation: "scheduler_plan/create",
+                status: ffi::GGML_STATUS_FAILED,
+            });
+        }
+        let measure = unsafe { ffi::ggml_gallocr_new(primary_buft) };
+        if measure.is_null() {
+            return Err(BackendMemoryAbiError::Status {
+                operation: "scheduler_plan/create",
+                status: ffi::GGML_STATUS_FAILED,
+            });
+        }
+        if backends.len() == 1 {
+            let mut measured = [0_usize; 1];
+            // SAFETY: both graph and the fresh gallocr are live; `measured`
+            // has exactly one slot, matching one buffer.
+            unsafe {
+                ffi::ggml_gallocr_reserve_n_size(
+                    measure,
+                    graph,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    measured.as_mut_ptr(),
+                )
+            };
+            sizes[0] = measured[0];
+        } else {
+            // Conservative upper bound: sum of node tensor bytes. The
+            // scheduler never needs more than this for a single-backend
+            // placement of any on-graph tensor, and binaries that place
+            // tensors on a different backend can only move bytes within
+            // the same total (backend-specific workspaces are typically
+            // smaller than payload).
+            let mut total = 0_u64;
+            let n_nodes = unsafe { ffi::ggml_graph_n_nodes(graph) };
+            for index in 0..n_nodes {
+                let node = unsafe { ffi::ggml_graph_node(graph, index) };
+                if !node.is_null() {
+                    total = total.saturating_add(unsafe { ffi::ggml_nbytes(node) } as u64);
+                }
+            }
+            sizes[0] = total as usize;
+        }
+        unsafe { ffi::ggml_gallocr_free(measure) };
+        let requests = backends
+            .iter()
+            .enumerate()
+            .map(|(index, backend)| ffi::GgmlBackendMemoryRequestV1 {
+                struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryRequestV1>() as u32,
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE,
+                flags: 0,
+                usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+                request_id: next_request_id(),
+                backend: *backend,
+                peer_backend: std::ptr::null_mut(),
+                buft: if index == 0 {
+                    primary_buft
+                } else {
+                    std::ptr::null_mut()
+                },
+                graph,
+                host_ptr: std::ptr::null(),
+                requested_bytes: sizes[index] as u64,
+                currently_allocated_bytes: 0,
+                max_tensor_bytes: 0,
+            })
+            .collect();
         Ok(Self {
-            raw,
-            _scheduler: PhantomData,
+            scheduler,
+            graph,
+            requests,
         })
     }
 
     pub(crate) fn requests(
         &self,
     ) -> Result<Vec<ffi::GgmlBackendMemoryRequestV1>, BackendMemoryAbiError> {
-        let count = unsafe { ffi::ggml_backend_sched_memory_plan_get_item_count_v1(self.raw) };
-        let mut requests = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let mut item = ffi::GgmlBackendMemoryRequestV1::default();
-            if !unsafe {
-                ffi::ggml_backend_sched_memory_plan_get_item_v1(self.raw, index, &mut item)
-            } {
-                return Err(BackendMemoryAbiError::UnstableCount {
-                    operation: "scheduler_plan/items",
-                });
-            }
-            requests.push(item);
-        }
-        Ok(requests)
+        Ok(self.requests.clone())
     }
 
     /// Partitions one multi-backend scheduler plan without altering request
@@ -1113,29 +1219,41 @@ impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
         Ok(batches)
     }
 
+    /// Commits the measured allocation. On stock ggml this is
+    /// `ggml_backend_sched_alloc_graph`; on failure the scheduler is reset so
+    /// the broker's refund of the reservation is accurate.
     pub(crate) fn commit(
-        mut self,
+        self,
         identity: BackendTerminalIdentity,
     ) -> Result<(), SchedulerMemoryPlanCommitError> {
-        let mut flags = 0_u32;
-        if let Err(source) = status("scheduler_plan/commit", unsafe {
-            ffi::ggml_backend_sched_memory_plan_commit_v2(self.raw, &mut flags)
-        }) {
-            let raw_status = match &source {
-                BackendMemoryAbiError::Status { status, .. } => *status,
-                _ => i32::MAX,
-            };
-            let evidence = self.terminal_evidence();
-            return Err(SchedulerMemoryPlanCommitError {
-                source,
-                outcome: BackendTerminalOutcome::scheduler_commit(
-                    raw_status, flags, identity, evidence,
-                ),
-            });
+        // Stock ggml asserts `!sched->is_alloc` inside
+        // `ggml_backend_sched_alloc_graph`: the scheduler owns one
+        // graph-specific allocation at a time. A sibling persistent graph may
+        // have left the shared scheduler allocated, so reset first. Reset is
+        // idempotent and does not release the gallocr buffers; the subsequent
+        // reserve_n reuses them in place when they are large enough.
+        unsafe { ffi::ggml_backend_sched_reset(self.scheduler) };
+        // SAFETY: the scheduler is live and the graph is still unbound.
+        let allocated = unsafe { ffi::ggml_backend_sched_alloc_graph(self.scheduler, self.graph) };
+        if allocated {
+            return Ok(());
         }
-        unsafe { ffi::ggml_backend_sched_memory_plan_free_v1(self.raw) };
-        self.raw = ptr::null_mut();
-        Ok(())
+        // SAFETY: the scheduler is live; reset releases any buffers reserved
+        // by the failed attempt.
+        unsafe { ffi::ggml_backend_sched_reset(self.scheduler) };
+        let evidence = self.terminal_evidence();
+        Err(SchedulerMemoryPlanCommitError {
+            source: BackendMemoryAbiError::Status {
+                operation: "scheduler_plan/commit",
+                status: ffi::GGML_STATUS_ALLOC_FAILED,
+            },
+            outcome: BackendTerminalOutcome::scheduler_commit(
+                ffi::GGML_STATUS_ALLOC_FAILED,
+                0,
+                identity,
+                evidence,
+            ),
+        })
     }
 
     fn terminal_evidence(&self) -> BackendTerminalEvidence {
@@ -1155,30 +1273,12 @@ impl<'scheduler> SchedulerMemoryPlan<'scheduler> {
     }
 }
 
-impl Drop for SchedulerMemoryPlan<'_> {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { ffi::ggml_backend_sched_memory_plan_free_v1(self.raw) };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[cfg(target_os = "macos")]
     use crate::ggml_runtime::ensure_backends_loaded;
-
-    #[test]
-    fn ffi_layouts_match_the_v1_fixed_width_contract() {
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryDomainIdV1>(), 24);
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryRequestV1>(), 88);
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryClaimV1>(), 96);
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>(), 48);
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryStatsV1>(), 152);
-        assert_eq!(mem::size_of::<ffi::GgmlBackendMemoryApiV1>(), 64);
-    }
 
     fn test_stats() -> ffi::GgmlBackendMemoryStatsV1 {
         ffi::GgmlBackendMemoryStatsV1 {
@@ -1304,17 +1404,17 @@ mod tests {
             outcome: BackendTerminalOutcome::scheduler_commit(status, flags, identity(), evidence),
         };
         let healthy = || healthy_terminal_evidence(ExecutionProvider::Vulkan);
-        let mutated = ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED;
-        let released = mutated | ffi::GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN;
+        let mutated = 1_u32 << 0;
+        let released = mutated | (1_u32 << 1);
 
         assert!(!error(ffi::GGML_STATUS_FAILED, 0, healthy()).requires_quarantine());
         assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, 0, healthy()).requires_quarantine());
-        assert!(!error(ffi::GGML_STATUS_EXECUTION_FAILED, 0, healthy()).requires_quarantine());
+        assert!(!error(ffi::GGML_STATUS_FAILED, 0, healthy()).requires_quarantine());
         assert!(error(ffi::GGML_STATUS_FAILED, mutated, healthy()).requires_quarantine());
         assert!(error(ffi::GGML_STATUS_ALLOC_FAILED, mutated, healthy()).requires_quarantine());
         assert!(!error(ffi::GGML_STATUS_ALLOC_FAILED, released, healthy()).requires_quarantine());
-        assert!(error(ffi::GGML_STATUS_DEVICE_LOST, 0, healthy()).requires_quarantine());
-        assert!(error(ffi::GGML_STATUS_BACKEND_POISONED, 0, healthy()).requires_quarantine());
+        assert!(error(i32::MAX, 0, healthy()).requires_quarantine());
+        assert!(error(i32::MAX - 1, 0, healthy()).requires_quarantine());
         assert!(error(i32::MAX, 0, healthy()).requires_quarantine());
         assert_eq!(
             error(
@@ -1358,7 +1458,7 @@ mod tests {
         let lost_evidence = terminal_evidence(
             ExecutionProvider::Vulkan,
             BackendDeviceHealth::DeviceLost,
-            ffi::GGML_STATUS_DEVICE_LOST,
+            3, // retired fork device-lost alias; stock ggml has no such status
             -4,
             7,
         );
@@ -1400,7 +1500,7 @@ mod tests {
     fn safe_receipt_preserves_typed_terminal_health_evidence() {
         let mut raw = test_stats();
         raw.health = ffi::GGML_BACKEND_MEMORY_DEVICE_LOST;
-        raw.last_ggml_status = ffi::GGML_STATUS_DEVICE_LOST;
+        raw.last_ggml_status = 3; // retired fork device-lost alias
         raw.last_native_error = -4;
         raw.quarantine_generation = 7;
         let receipt = safe_receipt(
@@ -1409,7 +1509,7 @@ mod tests {
             &raw,
         );
         assert_eq!(receipt.device_health, BackendDeviceHealth::DeviceLost);
-        assert_eq!(receipt.last_status, BackendTerminalStatusClass::DeviceLost);
+        assert_eq!(receipt.last_status, BackendTerminalStatusClass::Unknown(3));
         assert_eq!(receipt.last_native_error, -4);
         assert_eq!(receipt.quarantine_generation, 7);
     }

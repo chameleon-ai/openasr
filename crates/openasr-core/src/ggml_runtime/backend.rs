@@ -370,7 +370,23 @@ pub(crate) fn device_supports_argmax_first(device: NonNull<c_void>) -> bool {
         let supported = if logits.is_null() {
             false
         } else {
-            let op = ffi::ggml_argmax_first(ctx, logits);
+            // Stock ggml has no native argmax-first op; the implementation is
+            // a GGML_OP_CUSTOM node whose callback lives in openasr itself, so
+            // any CPU-class backend supports it.
+            let mut args = [logits];
+            let op = ffi::ggml_custom_4d(
+                ctx,
+                ffi::GGML_TYPE_I32,
+                1,
+                1,
+                1,
+                1,
+                args.as_mut_ptr(),
+                1,
+                super::custom_ops::argmax_first_custom_op,
+                1,
+                std::ptr::null_mut(),
+            );
             !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
         };
         ffi::ggml_free(ctx);
@@ -397,7 +413,23 @@ pub(crate) fn device_supports_swoosh(device: NonNull<c_void>) -> bool {
         let supported = if input.is_null() {
             false
         } else {
-            let op = ffi::ggml_swoosh(ctx, input, 1.0, -0.08, 0.08);
+            // Stock ggml has no native swoosh kernel; the implementation is a
+            // GGML_OP_CUSTOM node whose callback lives in openasr itself, so
+            // any CPU-class backend supports it.
+            let mut args = [input];
+            let op = ffi::ggml_custom_4d(
+                ctx,
+                ffi::GGML_TYPE_F32,
+                N,
+                1,
+                1,
+                1,
+                args.as_mut_ptr(),
+                1,
+                super::custom_ops::swoosh_custom_op,
+                1,
+                std::ptr::null_mut(),
+            );
             !op.is_null() && ffi::ggml_backend_dev_supports_op(device.as_ptr(), op)
         };
         ffi::ggml_free(ctx);
@@ -907,24 +939,28 @@ fn validate_bundled_backend_manifest(manifest: &BundledBackendManifest) -> Resul
 fn load_best_bundled_backend(
     paths: &[CString],
     provider: &'static str,
-    host_abi_fingerprint: &str,
+    _host_abi_fingerprint: &str,
 ) -> Result<(), BackendPluginActivationError> {
-    let path_ptrs = paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
-    let abi = CString::new(host_abi_fingerprint).expect("backend ABI fingerprint is hexadecimal");
-    let provider_c = CString::new(provider).expect("provider is static ASCII");
-    let reg = unsafe {
-        ffi::ggml_backend_load_best_verified_utf8(
-            path_ptrs.as_ptr(),
-            path_ptrs.len(),
-            abi.as_ptr(),
-            provider_c.as_ptr(),
-        )
+    // Stock ggml: activation policy unchanged (signed file identity is
+    // verified by the caller), but the fork's in-plugin attestation symbols
+    // do not exist. The Rust-side verified loader enforces the same
+    // restricted search policy and registers the module itself.
+    let kind = match provider {
+        "cpu" => super::verified_load::ProviderKind::Cpu,
+        "cuda" => super::verified_load::ProviderKind::Cuda,
+        "hip" => super::verified_load::ProviderKind::Hip,
+        "vulkan" => super::verified_load::ProviderKind::Vulkan,
+        _ => {
+            return Err(BackendPluginActivationError::LoadFailed {
+                backend_id: format!("bundled-{provider}"),
+            });
+        }
     };
-    NonNull::new(reg)
-        .map(|_| ())
-        .ok_or_else(|| BackendPluginActivationError::LoadFailed {
-            backend_id: format!("bundled-{provider}"),
-        })
+    super::verified_load::load_best_verified(paths, kind).map_err(|error| {
+        BackendPluginActivationError::LoadFailed {
+            backend_id: format!("bundled-{provider}: {error}"),
+        }
+    })
 }
 
 fn path_to_utf8_cstring(
@@ -1552,215 +1588,63 @@ fn load_exact_backend_plugin(
     vendor: CatalogBackendVendor,
     plugin_path: &Path,
     dependency_dirs: &[PathBuf],
-    device_target: &str,
-    minimum_driver: Option<&str>,
+    _device_target: &str,
+    _minimum_driver: Option<&str>,
 ) -> Result<(), BackendPluginActivationError> {
-    let minimum_driver = live_backend_driver_floor(vendor, minimum_driver);
+    // Stock ggml cannot prove the plugin's PCI target or the machine's driver
+    // version at load time; the file identity and the persisted qualification
+    // binding are the activation authority (see verified_load.rs). The exact
+    // target and minimum-driver floor are validated by the activation flow
+    // before this call (signed catalog binding / persisted record), not here.
     let path = path_to_utf8_cstring(backend_id, plugin_path)?;
-    let abi = CString::new(BackendHostAbi::current().fingerprint)
-        .expect("backend ABI fingerprint is hexadecimal");
-    let provider_c = CString::new(backend_provider_label(vendor, backend_id)?)
-        .expect("provider is static ASCII");
-    let target_c = CString::new(device_target).map_err(|_| {
-        BackendPluginActivationError::ActivationState(
-            "backend device target contains an interior NUL".to_string(),
-        )
-    })?;
-    let minimum_driver_c = CString::new(minimum_driver.unwrap_or("")).map_err(|_| {
-        BackendPluginActivationError::ActivationState(
-            "backend minimum driver contains an interior NUL".to_string(),
-        )
-    })?;
-    let (dependency_dir_cstrings, dependency_dir_ptrs) =
-        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
-    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
-        std::ptr::null()
-    } else {
-        dependency_dir_ptrs.as_ptr()
-    };
-    let reg = unsafe {
-        ffi::ggml_backend_load_verified_v3_utf8(
-            path.as_ptr(),
-            dependency_dir_ptr,
-            dependency_dir_cstrings.len(),
-            abi.as_ptr(),
-            provider_c.as_ptr(),
-            target_c.as_ptr(),
-            minimum_driver_c.as_ptr(),
-        )
-    };
-    let Some(reg) = NonNull::new(reg) else {
-        return Err(BackendPluginActivationError::LoadFailed {
-            backend_id: backend_id.to_string(),
-        });
-    };
-    let name = unsafe { ffi::ggml_backend_reg_name(reg.as_ptr()) };
-    let actual = unsafe { cstr_lossy(name) };
-    let actual = if actual.is_empty() {
-        "<unknown>".to_string()
-    } else {
-        actual
-    };
-    let (expected, matches) = match vendor {
-        CatalogBackendVendor::Cpu => ("cpu", actual.to_ascii_lowercase().contains("cpu")),
-        CatalogBackendVendor::Cuda => ("cuda", actual.to_ascii_lowercase().contains("cuda")),
-        CatalogBackendVendor::Hip => {
-            let lower = actual.to_ascii_lowercase();
-            ("hip", lower.contains("hip") || lower.contains("rocm"))
+    let kind = match vendor {
+        CatalogBackendVendor::Cpu => super::verified_load::ProviderKind::Cpu,
+        CatalogBackendVendor::Cuda => super::verified_load::ProviderKind::Cuda,
+        CatalogBackendVendor::Hip => super::verified_load::ProviderKind::Hip,
+        CatalogBackendVendor::Vulkan => super::verified_load::ProviderKind::Vulkan,
+        CatalogBackendVendor::Unknown => {
+            return Err(BackendPluginActivationError::ProviderMismatch {
+                backend_id: backend_id.to_string(),
+                expected: "known backend",
+                actual: "unknown catalog vendor".to_string(),
+            });
         }
-        CatalogBackendVendor::Vulkan => ("vulkan", actual.to_ascii_lowercase().contains("vulkan")),
-        CatalogBackendVendor::Unknown => ("known backend", false),
     };
-    if !matches {
-        unsafe { ffi::ggml_backend_unload(reg.as_ptr()) };
-        return Err(BackendPluginActivationError::ProviderMismatch {
-            backend_id: backend_id.to_string(),
-            expected,
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn backend_provider_label(
-    vendor: CatalogBackendVendor,
-    backend_id: &str,
-) -> Result<&'static str, BackendPluginActivationError> {
-    match vendor {
-        CatalogBackendVendor::Cpu => Ok("cpu"),
-        CatalogBackendVendor::Cuda => Ok("cuda"),
-        CatalogBackendVendor::Hip => Ok("hip"),
-        CatalogBackendVendor::Vulkan => Ok("vulkan"),
-        CatalogBackendVendor::Unknown => Err(BackendPluginActivationError::ProviderMismatch {
-            backend_id: backend_id.to_string(),
-            expected: "known backend",
-            actual: "unknown catalog vendor".to_string(),
-        }),
-    }
+    let (dependency_dir_cstrings, _) = dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
+    super::verified_load::load_exact_verified(&path, kind, &dependency_dir_cstrings).map_err(
+        |error| BackendPluginActivationError::LoadFailed {
+            backend_id: format!("{backend_id}: {error}"),
+        },
+    )
 }
 
 fn probe_backend_plugin_identity_candidate(
     backend_id: &str,
-    vendor: CatalogBackendVendor,
-    plugin_path: &Path,
-    dependency_dirs: &[PathBuf],
-    provider_device_index: usize,
+    _vendor: CatalogBackendVendor,
+    _plugin_path: &Path,
+    _dependency_dirs: &[PathBuf],
+    _provider_device_index: usize,
 ) -> Result<(String, String), BackendPluginActivationError> {
-    let path = path_to_utf8_cstring(backend_id, plugin_path)?;
-    let abi = CString::new(BackendHostAbi::current().fingerprint)
-        .expect("backend ABI fingerprint is hexadecimal");
-    let provider = CString::new(backend_provider_label(vendor, backend_id)?)
-        .expect("provider is static ASCII");
-    let (dependency_dir_cstrings, dependency_dir_ptrs) =
-        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
-    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
-        std::ptr::null()
-    } else {
-        dependency_dir_ptrs.as_ptr()
-    };
-    let mut target = [0 as std::ffi::c_char; 128];
-    let mut driver = [0 as std::ffi::c_char; 64];
-    let ok = unsafe {
-        ffi::ggml_backend_probe_identity_verified_v1_utf8(
-            path.as_ptr(),
-            dependency_dir_ptr,
-            dependency_dir_cstrings.len(),
-            abi.as_ptr(),
-            provider.as_ptr(),
-            provider_device_index,
-            target.as_mut_ptr(),
-            target.len(),
-            driver.as_mut_ptr(),
-            driver.len(),
-        )
-    };
-    if !ok {
-        return Err(BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        });
-    }
-    let target = unsafe { CStr::from_ptr(target.as_ptr()) }
-        .to_str()
-        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        })?
-        .to_string();
-    let driver = unsafe { CStr::from_ptr(driver.as_ptr()) }
-        .to_str()
-        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        })?
-        .to_string();
-    if target.is_empty() || driver.is_empty() {
-        return Err(BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        });
-    }
-    Ok((target, driver))
+    // Stock ggml has no attestation symbol for physical target / driver;
+    // fabricating either would defeat the qualification binding. Fail closed.
+    Err(BackendPluginActivationError::LiveProbeFailed {
+        backend_id: backend_id.to_string(),
+    })
 }
 
 pub(crate) fn probe_exact_backend_plugin_candidate(
     backend_id: &str,
-    vendor: CatalogBackendVendor,
-    plugin_path: &Path,
-    dependency_dirs: &[PathBuf],
-    device_target: &str,
-    minimum_driver: Option<&str>,
+    _vendor: CatalogBackendVendor,
+    _plugin_path: &Path,
+    _dependency_dirs: &[PathBuf],
+    _device_target: &str,
+    _minimum_driver: Option<&str>,
 ) -> Result<String, BackendPluginActivationError> {
-    let minimum_driver = live_backend_driver_floor(vendor, minimum_driver);
-    let path = path_to_utf8_cstring(backend_id, plugin_path)?;
-    let abi = CString::new(BackendHostAbi::current().fingerprint)
-        .expect("backend ABI fingerprint is hexadecimal");
-    let provider = CString::new(backend_provider_label(vendor, backend_id)?)
-        .expect("provider is static ASCII");
-    let target = CString::new(device_target).map_err(|_| {
-        BackendPluginActivationError::ActivationState(
-            "backend device target contains an interior NUL".to_string(),
-        )
-    })?;
-    let minimum_driver = CString::new(minimum_driver.unwrap_or("")).map_err(|_| {
-        BackendPluginActivationError::ActivationState(
-            "backend minimum driver contains an interior NUL".to_string(),
-        )
-    })?;
-    let (dependency_dir_cstrings, dependency_dir_ptrs) =
-        dependency_dirs_to_ffi(backend_id, dependency_dirs)?;
-    let dependency_dir_ptr = if dependency_dir_ptrs.is_empty() {
-        std::ptr::null()
-    } else {
-        dependency_dir_ptrs.as_ptr()
-    };
-    let mut driver = [0 as std::ffi::c_char; 64];
-    let ok = unsafe {
-        ffi::ggml_backend_probe_verified_v3_utf8(
-            path.as_ptr(),
-            dependency_dir_ptr,
-            dependency_dir_cstrings.len(),
-            abi.as_ptr(),
-            provider.as_ptr(),
-            target.as_ptr(),
-            minimum_driver.as_ptr(),
-            driver.as_mut_ptr(),
-            driver.len(),
-        )
-    };
-    if !ok {
-        return Err(BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        });
-    }
-    let driver = unsafe { CStr::from_ptr(driver.as_ptr()) }
-        .to_str()
-        .map_err(|_| BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        })?
-        .to_string();
-    if driver.is_empty() {
-        return Err(BackendPluginActivationError::LiveProbeFailed {
-            backend_id: backend_id.to_string(),
-        });
-    }
-    Ok(driver)
+    // Stock ggml has no attestation symbol for the live target / driver;
+    // fabricating either would defeat the qualification binding. Fail closed.
+    Err(BackendPluginActivationError::LiveProbeFailed {
+        backend_id: backend_id.to_string(),
+    })
 }
 
 fn dependency_dirs_to_ffi(
@@ -1996,11 +1880,12 @@ pub fn ggml_available_devices() -> Vec<GgmlBackendDevice> {
     devices
 }
 
-/// Optional backend hardware fact queried through ggml's shared no-throw
-/// adapter. Older plugins remain ABI-safe and report zero/unknown.
-pub(crate) unsafe fn device_pci_vendor_id(device: NonNull<c_void>) -> Option<u32> {
-    let vendor_id = unsafe { ffi::ggml_backend_dev_pci_vendor_id(device.as_ptr()) };
-    (vendor_id != 0).then_some(vendor_id)
+/// Optional backend hardware fact. Stock ggml exposes no PCI vendor probe
+/// (it was a fork-only registry proc); the field stays `None` on every
+/// backend until an upstream-supported probe exists. Consumers must treat
+/// `None` as "unknown", never as a failure.
+pub(crate) unsafe fn device_pci_vendor_id(_device: NonNull<c_void>) -> Option<u32> {
+    None
 }
 
 impl GgmlCpuFeatures {

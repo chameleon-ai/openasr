@@ -81,6 +81,12 @@ Stages are independently skippable (`--skip-clone|--skip-build|--skip-download|-
 Everything lands under `tooling/nemotron-reference-dumper/work/` by default
 (git-ignored); override with `--repo-dir`, `--model-dir`, `--out-dir`.
 
+Local staging note (2026-11-16): `work/models/` already holds the full
+AtomicChat set — all three decoder tiers (`ad_q2_0_m`, `ad_iq4_nl`, `q8_0`),
+the shared `Encoder-F16`, and the `imatrix.gguf` calibration file — all
+sha256-verified against the pins above, 2026-11-16. Re-runs on any tier need
+no download.
+
 Outputs (in `--out-dir`):
 
 - `jfk.transcript.json` — verbatim transcript + word times.

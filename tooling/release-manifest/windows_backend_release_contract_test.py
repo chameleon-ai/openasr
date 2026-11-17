@@ -171,43 +171,12 @@ class WindowsBackendReleaseContractTests(unittest.TestCase):
         ):
             self.assertIn(symbol, self.workflow)
 
-    def test_provider_probe_driver_evidence_fails_closed_on_missing_or_truncated_output(self) -> None:
-        ggml = ROOT / "crates/openasr-core/third_party/openasr-ggml/src"
-        for source_path in (
-            ggml / "ggml-cuda/ggml-cuda.cu",
-            ggml / "ggml-vulkan/ggml-vulkan.cpp",
-        ):
-            source = source_path.read_text(encoding="utf-8")
-            self.assertIn(
-                "driver_out == nullptr || driver_out_capacity == 0", source
-            )
-            self.assertIn(
-                "static_cast<size_t>(driver_length) >= driver_out_capacity", source
-            )
-            self.assertIn("driver_out[0] = '\\0';", source)
-            self.assertIn("catch (...)", source)
-
-    def test_vulkan_exported_init_and_graph_compute_keep_exceptions_inside_status_boundaries(self) -> None:
-        source = (
-            ROOT
-            / "crates/openasr-core/third_party/openasr-ggml/src/ggml-vulkan/ggml-vulkan.cpp"
-        ).read_text(encoding="utf-8")
-        init = source.split("ggml_backend_t ggml_backend_vk_init", 1)[1].split(
-            "bool ggml_backend_is_vk", 1
-        )[0]
-        self.assertLess(init.index("try {"), init.index("VK_LOG_DEBUG"))
-        self.assertIn("catch (const vk::SystemError & error)", init)
-        self.assertIn("catch (...)", init)
-        self.assertIn("return nullptr;", init)
-
-        graph = source.split("static ggml_status ggml_backend_vk_graph_compute", 1)[
-            1
-        ].split("static void ggml_vk_graph_optimize", 1)[0]
-        self.assertIn("try {", graph)
-        self.assertIn("catch (const vk::SystemError & error)", graph)
-        self.assertIn("catch (const std::bad_alloc &)", graph)
-        self.assertIn("catch (...)", graph)
-        self.assertIn("GGML_STATUS_EXECUTION_FAILED", graph)
+    # Vendored-ggml probes: the fork's attestation protocol (openasr_ggml_*
+    # symbols inside CUDA/Vulkan plugin code) no longer exists in stock ggml
+    # 1.0.0. The optional accelerator-pack editions are blocked on an
+    # attestation redesign; release legs that produce signed GPU packs are
+    # similarly inapplicable until then. The assertions about the vendored
+    # fork's plugin-side probe were removed with the submodule switch.
 
     def test_windows_cuda_release_remains_compatible_with_cuda_12_drivers(self) -> None:
         sm86 = next(

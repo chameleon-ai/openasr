@@ -470,9 +470,9 @@ mod tests {
             "Q2_0 is a quantized type with no host transient"
         );
         assert_eq!(
-            ggml_is_quantized_checked(GGML_TYPE_COUNT - 1),
+            ggml_is_quantized_checked(GGML_TYPE_COUNT - 2),
             Ok(true),
-            "COUNT-1 must remain a live quantized slot in the vendored table"
+            "COUNT-2 must remain a live quantized slot in the vendored table (the last quantized type on stock ggml)"
         );
         assert!(
             checked_ggml_type(u32::MAX).is_err(),

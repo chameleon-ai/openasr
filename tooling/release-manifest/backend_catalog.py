@@ -341,7 +341,6 @@ def compile_entry(args: argparse.Namespace) -> dict[str, Any]:
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_SHARED_LIBS": "ON",
         "GGML_BACKEND_DL": "ON",
-        "OPENASR_VERIFIED_BACKEND_LOADING_ONLY": "ON",
         "GGML_NATIVE": "OFF",
     }.items():
         if str(cmake_entries.get(field, "")).upper() != expected.upper():

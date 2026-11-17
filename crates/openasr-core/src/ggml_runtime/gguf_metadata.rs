@@ -325,13 +325,11 @@ pub(crate) fn read_gguf_metadata_from_context(
 }
 
 pub(crate) fn bounded_gguf_parser_structural_bytes(n_kv: u64, n_tensors: u64) -> Option<u64> {
-    let mut bytes = 0_usize;
-    let ok = unsafe { ffi::gguf_bounded_parser_structural_bytes(n_kv, n_tensors, &mut bytes) };
-    ok.then(|| u64::try_from(bytes).ok()).flatten()
+    super::gguf_bounded_parser::structural_bytes(n_kv, n_tensors)
 }
 
 pub(crate) fn bounded_gguf_parser_payload_wire_multiplier() -> Option<u64> {
-    u64::try_from(unsafe { ffi::gguf_bounded_parser_payload_wire_multiplier() }).ok()
+    Some(super::gguf_bounded_parser::PAYLOAD_WIRE_MULTIPLIER)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,32 +345,19 @@ pub(crate) fn parse_bounded_gguf_context(
     #[cfg(test)]
     BOUNDED_PARSE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let mmap = runtime_source.backing_mmap();
-    let mut parse_error = ffi::GGUF_PARSE_ERROR_NONE;
+    // Structural prevalidation in Rust; only bytes that pass it are handed to
+    // the stock C parser. There is no host-side limit inside the C parser,
+    // so this gate is the bounded-memory contract.
+    super::gguf_bounded_parser::prevalidate_gguf_buffer(&mmap[..], limits)?;
     let context = unsafe {
         let params = ffi::GgufInitParams {
             no_alloc: true,
             ctx: ptr::null_mut(),
         };
-        let raw = ffi::gguf_init_from_buffer_with_limits(
-            mmap.as_ptr().cast(),
-            mmap.len(),
-            params,
-            limits,
-            &mut parse_error,
-        );
+        let raw = ffi::gguf_init_from_buffer(mmap.as_ptr().cast(), mmap.len(), params);
         GgufContextGuard::from_raw(raw)
     };
-    context.ok_or_else(|| {
-        if parse_error == ffi::GGUF_PARSE_ERROR_ALLOCATION {
-            GgufBoundedParseFailure::Allocation
-        } else {
-            debug_assert!(matches!(
-                parse_error,
-                ffi::GGUF_PARSE_ERROR_NONE | ffi::GGUF_PARSE_ERROR_INVALID_DATA
-            ));
-            GgufBoundedParseFailure::InvalidData
-        }
-    })
+    context.ok_or(GgufBoundedParseFailure::InvalidData)
 }
 
 #[cfg(test)]
@@ -501,24 +486,8 @@ mod tests {
     fn parse_raw_with_limits(
         bytes: &[u8],
         limits: super::ffi::GgufParseLimits,
-    ) -> (bool, std::os::raw::c_int) {
-        let mut error = super::ffi::GGUF_PARSE_ERROR_NONE;
-        let raw = unsafe {
-            super::ffi::gguf_init_from_buffer_with_limits(
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                super::ffi::GgufInitParams {
-                    no_alloc: true,
-                    ctx: std::ptr::null_mut(),
-                },
-                limits,
-                &mut error,
-            )
-        };
-        if !raw.is_null() {
-            unsafe { super::ffi::gguf_free(raw) };
-        }
-        (!raw.is_null(), error)
+    ) -> Result<(), super::GgufBoundedParseFailure> {
+        super::super::gguf_bounded_parser::prevalidate_gguf_buffer(bytes, limits)
     }
 
     fn empty_gguf_header(tensors: i64, kv: i64) -> Vec<u8> {
@@ -534,34 +503,40 @@ mod tests {
     fn bounded_parser_abi_enforces_every_header_resource_dimension() {
         let defaults = super::super::runtime_gguf_parse_limits();
         let valid = empty_gguf_header(0, 0);
-        assert_eq!(parse_raw_with_limits(&valid, defaults), (true, 0));
+        assert_eq!(parse_raw_with_limits(&valid, defaults), Ok(()));
 
-        let (_, tensor_error) = parse_raw_with_limits(
-            &empty_gguf_header(1, 0),
-            super::ffi::GgufParseLimits {
-                max_tensors: 0,
-                ..defaults
-            },
+        assert_eq!(
+            parse_raw_with_limits(
+                &empty_gguf_header(1, 0),
+                super::ffi::GgufParseLimits {
+                    max_tensors: 0,
+                    ..defaults
+                },
+            ),
+            Err(super::GgufBoundedParseFailure::InvalidData)
         );
-        assert_eq!(tensor_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
 
-        let (_, kv_error) = parse_raw_with_limits(
-            &empty_gguf_header(0, 1),
-            super::ffi::GgufParseLimits {
-                max_kv: 0,
-                ..defaults
-            },
+        assert_eq!(
+            parse_raw_with_limits(
+                &empty_gguf_header(0, 1),
+                super::ffi::GgufParseLimits {
+                    max_kv: 0,
+                    ..defaults
+                },
+            ),
+            Err(super::GgufBoundedParseFailure::InvalidData)
         );
-        assert_eq!(kv_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
 
-        let (_, header_error) = parse_raw_with_limits(
-            &valid,
-            super::ffi::GgufParseLimits {
-                max_header_bytes: u64::try_from(valid.len() - 1).expect("header length"),
-                ..defaults
-            },
+        assert_eq!(
+            parse_raw_with_limits(
+                &valid,
+                super::ffi::GgufParseLimits {
+                    max_header_bytes: u64::try_from(valid.len() - 1).expect("header length"),
+                    ..defaults
+                },
+            ),
+            Err(super::GgufBoundedParseFailure::InvalidData)
         );
-        assert_eq!(header_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
 
         let mut string_value = empty_gguf_header(0, 1);
         string_value.extend_from_slice(&4_u64.to_le_bytes());
@@ -569,14 +544,16 @@ mod tests {
         string_value.extend_from_slice(&super::ffi::GGUF_TYPE_STRING.to_le_bytes());
         string_value.extend_from_slice(&1_u64.to_le_bytes());
         string_value.extend_from_slice(b"x");
-        let (_, string_error) = parse_raw_with_limits(
-            &string_value,
-            super::ffi::GgufParseLimits {
-                max_string_bytes: 3,
-                ..defaults
-            },
+        assert_eq!(
+            parse_raw_with_limits(
+                &string_value,
+                super::ffi::GgufParseLimits {
+                    max_string_bytes: 3,
+                    ..defaults
+                },
+            ),
+            Err(super::GgufBoundedParseFailure::InvalidData)
         );
-        assert_eq!(string_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
 
         let mut array_value = empty_gguf_header(0, 1);
         array_value.extend_from_slice(&1_u64.to_le_bytes());
@@ -586,14 +563,16 @@ mod tests {
         array_value.extend_from_slice(&2_u64.to_le_bytes());
         array_value.extend_from_slice(&1_u32.to_le_bytes());
         array_value.extend_from_slice(&2_u32.to_le_bytes());
-        let (_, array_error) = parse_raw_with_limits(
-            &array_value,
-            super::ffi::GgufParseLimits {
-                max_array_elements: 1,
-                ..defaults
-            },
+        assert_eq!(
+            parse_raw_with_limits(
+                &array_value,
+                super::ffi::GgufParseLimits {
+                    max_array_elements: 1,
+                    ..defaults
+                },
+            ),
+            Err(super::GgufBoundedParseFailure::InvalidData)
         );
-        assert_eq!(array_error, super::ffi::GGUF_PARSE_ERROR_INVALID_DATA);
     }
 
     #[test]

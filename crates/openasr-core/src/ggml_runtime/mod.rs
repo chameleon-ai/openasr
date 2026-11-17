@@ -4,10 +4,12 @@ mod backend_graph_lifecycle;
 pub(crate) mod backend_memory;
 pub(crate) mod backend_memory_admission;
 mod cpu_graph;
+mod custom_ops;
 mod decode_conformance;
 mod env_flags;
 mod execution_telemetry;
 pub(crate) mod ffi;
+mod gguf_bounded_parser;
 mod gguf_c_parser_sandbox;
 pub mod gguf_header;
 mod gguf_metadata;
@@ -20,6 +22,7 @@ mod kv_element;
 mod package_probe;
 mod runtime_preflight;
 mod runtime_source;
+mod verified_load;
 
 /// Engine-wide GGUF header safety envelope. These are format/resource limits,
 /// not model-context limits; tensor payload bytes remain governed by the

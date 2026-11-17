@@ -1,5 +1,11 @@
 # ggml submodule sync
 
+> **Obsolete on `nemotron` (stock ggml 1.0.0 migration).** The submodule now
+> pins stock `ggml-org/ggml` v1.0.0; there is no fork patch stack to replay.
+> Keep this file for the historical record of the fork-based pin model. New
+> pins are plain upstream tags; do not run `sync.sh` against the stock pin.
+> See `docs/design/stock-ggml-1.0.0-migration.md`.
+
 The ggml backend is vendored as a git submodule at
 `crates/openasr-core/third_party/openasr-ggml` (a submodule of the
 `chameleon-ai/openasr-ggml` fork). `crates/openasr-core/build.rs` compiles it from

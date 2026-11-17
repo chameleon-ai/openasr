@@ -245,10 +245,6 @@ fn main() {
             ("CMAKE_BUILD_TYPE", "Release".to_owned()),
             ("BUILD_SHARED_LIBS", on_off(use_backend_dl)),
             ("GGML_BACKEND_DL", on_off(use_backend_dl)),
-            (
-                "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
-                on_off(use_backend_dl),
-            ),
             ("GGML_CPU_ALL_VARIANTS", on_off(ggml_cpu_all_variants)),
             ("GGML_BUILD_TESTS", "OFF".to_owned()),
             ("GGML_BUILD_EXAMPLES", "OFF".to_owned()),
@@ -258,10 +254,6 @@ fn main() {
             ("GGML_VULKAN", on_off(build_vulkan)),
             ("GGML_HIP", on_off(feat_hip)),
             ("GGML_SYCL", on_off(feat_sycl)),
-            (
-                "OPENASR_BACKEND_ABI_V1",
-                backend_host_abi_fingerprint.clone(),
-            ),
         ];
         if !reset_native_build_dir {
             let cache = build_dir.join("CMakeCache.txt");
@@ -307,10 +299,6 @@ fn main() {
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg(cmake_flag("BUILD_SHARED_LIBS", use_backend_dl))
         .arg(cmake_flag("GGML_BACKEND_DL", use_backend_dl))
-        .arg(cmake_flag(
-            "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
-            use_backend_dl,
-        ))
         .arg(cmake_flag("GGML_CPU_ALL_VARIANTS", ggml_cpu_all_variants))
         .arg("-DGGML_BUILD_TESTS=OFF")
         .arg("-DGGML_BUILD_EXAMPLES=OFF")
@@ -326,9 +314,6 @@ fn main() {
         .arg(cmake_flag("GGML_VULKAN", build_vulkan))
         .arg(cmake_flag("GGML_HIP", feat_hip))
         .arg(cmake_flag("GGML_SYCL", feat_sycl))
-        .arg(format!(
-            "-DOPENASR_BACKEND_ABI_V1={backend_host_abi_fingerprint}"
-        ))
         .arg(cmake_flag(
             "GGML_ACCELERATE",
             is_macos && !feat_cuda && !feat_vulkan,
@@ -1210,8 +1195,7 @@ fn emit_backend_host_abi(
         "OPENASR_BACKEND_TOOLCHAIN_CONTRACT must be a short ASCII contract token"
     );
     let compile_flags_contract = format!(
-        "build_shared_libs={}\nggml_backend_dl={}\nverified_backend_loading_only={}\nposition_independent_code=1\nopenasr_backend_abi_export=1\n",
-        u8::from(backend_dl),
+        "build_shared_libs={}\nggml_backend_dl={}\nposition_independent_code=1\n",
         u8::from(backend_dl),
         u8::from(backend_dl),
     );
@@ -1652,7 +1636,6 @@ fn windows_cmake_build_contract(
         "CMAKE_MSVC_RUNTIME_LIBRARY",
         "BUILD_SHARED_LIBS",
         "GGML_BACKEND_DL",
-        "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
         "GGML_CPU_ALL_VARIANTS",
         "GGML_NATIVE",
         "GGML_OPENMP",
@@ -1673,7 +1656,6 @@ fn windows_cmake_build_contract(
         "CMAKE_GENERATOR",
         "BUILD_SHARED_LIBS",
         "GGML_BACKEND_DL",
-        "OPENASR_VERIFIED_BACKEND_LOADING_ONLY",
         "GGML_CPU_ALL_VARIANTS",
         "GGML_NATIVE",
         "GGML_OPENMP",

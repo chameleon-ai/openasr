@@ -5,7 +5,6 @@ pub(crate) type GgmlBackendDevRaw = *mut c_void;
 pub(crate) type GgmlBackendBufferRaw = *mut c_void;
 pub(crate) type GgmlBackendBufferTypeRaw = *mut c_void;
 pub(crate) type GgmlBackendSchedRaw = *mut c_void;
-pub(crate) type GgmlBackendSchedMemoryPlanRaw = *mut c_void;
 pub(crate) type GgmlGallocrRaw = *mut c_void;
 pub(crate) type GgmlBackendRegRaw = *mut c_void;
 pub(crate) type GgmlContextRaw = *mut c_void;
@@ -13,7 +12,10 @@ pub(crate) type GgmlTensorRaw = *mut c_void;
 pub(crate) type GgmlCgraphRaw = *mut c_void;
 pub(crate) type GgufContextRaw = *mut c_void;
 pub(crate) const GGML_MAX_DIMS: usize = 4;
-pub(crate) const GGML_PREC_DEFAULT: c_int = 0;
+/// Mirrors `GGML_PREC_UNDEFINED` in ggml.h (`enum ggml_prec`, value 0). Used
+/// where an op carries no precision constraint; `GGML_PREC_F32` pins the
+/// accumulator to f32.
+pub(crate) const GGML_PREC_UNDEFINED: c_int = 0;
 pub(crate) const GGML_PREC_F32: c_int = 10;
 pub(crate) const GGML_OP_POOL_MAX: c_int = 0;
 
@@ -30,6 +32,26 @@ pub(crate) struct GgmlTensorLayoutPrefix {
 
 pub(crate) const GGML_MAX_SRC: usize = 10;
 pub(crate) const GGML_MAX_OP_PARAMS_I32: usize = 16;
+
+/// Mirrors the leading fields of `struct ggml_cgraph` (ggml-impl.h, vendored
+/// stock ggml) up to the nodes/leafs pointers. The scheduler hands out a
+/// shared gallocr whose buffers are reused across retained cgraphs, so the
+/// runtime must walk a cgraph to unbind the tensor bindings that reference a
+/// (possibly freed) buffer before another graph rebinds onto the same
+/// scheduler. `#[repr(C)]` reproduces the C layout; keep it in lockstep with
+/// the vendored ggml.c if the submodule pin changes cgraph fields ahead of
+/// `leafs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GgmlCgraphPrefix {
+    pub size: c_int,
+    pub n_nodes: c_int,
+    pub n_leafs: c_int,
+    pub nodes: *mut GgmlTensorRaw,
+    pub grads: *mut GgmlTensorRaw,
+    pub grad_accs: *mut GgmlTensorRaw,
+    pub leafs: *mut GgmlTensorRaw,
+}
 
 /// Mirrors `struct ggml_tensor` (ggml.h) far enough to reach the `view_src`
 /// and `data` fields the CPU step-buffer grow-to-fit reuse needs to inspect
@@ -73,7 +95,6 @@ pub(crate) struct GgufInitParams {
     pub ctx: *mut *mut c_void,
 }
 
-#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct GgufParseLimits {
     pub max_tensors: u64,
@@ -82,10 +103,6 @@ pub(crate) struct GgufParseLimits {
     pub max_array_elements: u64,
     pub max_header_bytes: u64,
 }
-
-pub(crate) const GGUF_PARSE_ERROR_NONE: c_int = 0;
-pub(crate) const GGUF_PARSE_ERROR_INVALID_DATA: c_int = 1;
-pub(crate) const GGUF_PARSE_ERROR_ALLOCATION: c_int = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -110,46 +127,23 @@ pub(crate) const GGML_STATUS_SUCCESS: c_int = 0;
 /// separate synchronize step is needed to observe a completion-phase failure.
 /// `GGML_STATUS_ABORTED` is the cooperative cancellation result; Rust maps it
 /// to the typed per-job cancellation path rather than a generic compute
-/// failure. All other non-success values below are terminal failures.
+/// failure. All other non-success values are terminal failures.
 pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
-pub(crate) const GGML_STATUS_EXECUTION_FAILED: c_int = 2;
-pub(crate) const GGML_STATUS_DEVICE_LOST: c_int = 3;
-pub(crate) const GGML_STATUS_BACKEND_POISONED: c_int = 4;
-pub(crate) const GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_MAY_HAVE_MUTATED: u32 = 1 << 0;
-pub(crate) const GGML_BACKEND_SCHED_MEMORY_PLAN_COMMIT_RELEASE_PROVEN: u32 = 1 << 1;
-pub(crate) const GGML_GALLOCR_MEASURE_COMMIT_MAY_HAVE_MUTATED: u32 = 1 << 0;
-pub(crate) const GGML_GALLOCR_MEASURE_COMMIT_RELEASE_UNPROVEN: u32 = 1 << 1;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_DISABLED: c_int = 0;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_NATIVE: c_int = 1;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_SEGMENTED: c_int = 2;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE: c_int = 0;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_SUBMISSION_CHECKPOINT: c_int = 1;
-pub(crate) const GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_GRAPH_COMPLETION: c_int = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GgmlBackendGraphCancelCapability {
-    pub mechanism: c_int,
-    pub observation_granularity: c_int,
-}
-
-impl Default for GgmlBackendGraphCancelCapability {
-    fn default() -> Self {
-        Self {
-            mechanism: GGML_BACKEND_GRAPH_CANCEL_DISABLED,
-            observation_granularity: GGML_BACKEND_GRAPH_CANCEL_OBSERVATION_NONE,
-        }
-    }
-}
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_COMPUTE: c_int = 2;
+// Only the graph-metadata tests read this; stock ggml itself propagates the
+// flag through view chains, which is what the regression gates assert.
+#[allow(dead_code)]
+pub(crate) const GGML_TENSOR_FLAG_OUTPUT: c_int = 2;
 
-pub(crate) const GGML_BACKEND_MEMORY_ABI_V1: u32 = 1;
-pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL: u32 = 1;
-pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE: u32 = 2;
-pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED: u32 = 3;
-pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_UNIFIED: u32 = 4;
-pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED: u32 = 5;
+// The stock-ggml memory model exposes exactly one device-wide free/total pair
+// via `ggml_backend_dev_memory`; there are no domains, heaps, or provider
+// failure taxonomy. The OpenASR broker keys synthetic GPU domains on a
+// process-local identity derived from the device pointer (see backend_memory.rs).
+
+// Scheduler measured reservations carry no backend-native provenance; the
+// broker treats them as committed upper bounds until the post-allocation
+// reconciliation against live device stats lands.
 pub(crate) const GGML_BACKEND_MEMORY_REQUEST_BUFFER: u32 = 1;
 pub(crate) const GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT: u32 = 2;
 pub(crate) const GGML_BACKEND_MEMORY_REQUEST_GRAPH_PRIVATE: u32 = 3;
@@ -158,52 +152,50 @@ pub(crate) const GGML_BACKEND_MEMORY_QUOTE_PROVISIONAL: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_QUOTE_HAS_RESIDUAL_UNCERTAINTY: u32 = 1 << 1;
 pub(crate) const GGML_BACKEND_MEMORY_QUOTE_OPAQUE_DRIVER_COSTS_REQUIRE_DOMAIN_HEADROOM: u32 =
     1 << 2;
-#[cfg(test)]
-pub(crate) const GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE: u32 = 1 << 0;
-pub(crate) const GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_EXACT: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER: u32 = 1 << 1;
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_DRIVER_ESTIMATE: u32 = 1 << 2;
+pub(crate) const GGML_BACKEND_MEMORY_CLAIM_PROVISIONAL: u32 = 1 << 6;
 #[cfg(test)]
 pub(crate) const GGML_BACKEND_MEMORY_CLAIM_FILE_BACKED: u32 = 1 << 5;
-pub(crate) const GGML_BACKEND_MEMORY_CLAIM_PROVISIONAL: u32 = 1 << 6;
+#[cfg(test)]
+pub(crate) const GGML_BACKEND_MEMORY_RESIDUAL_BACKEND_PRIVATE: u32 = 1 << 0;
 pub(crate) const GGML_BACKEND_MEMORY_HEALTHY: u32 = 0;
 pub(crate) const GGML_BACKEND_MEMORY_DEGRADED: u32 = 1;
 pub(crate) const GGML_BACKEND_MEMORY_QUARANTINED: u32 = 2;
 pub(crate) const GGML_BACKEND_MEMORY_DEVICE_LOST: u32 = 3;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(crate) struct GgmlBackendMemoryDomainIdV1 {
-    pub physical_device_uuid: [u8; 16],
-    pub heap_index: u32,
-    pub kind: u32,
-}
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_DEVICE_LOCAL: u32 = 1;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE: u32 = 2;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_HOST_PINNED: u32 = 3;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_UNIFIED: u32 = 4;
+pub(crate) const GGML_BACKEND_MEMORY_DOMAIN_FILE_BACKED: u32 = 5;
+pub(crate) const GGML_BACKEND_MEMORY_STATS_BUDGET_UNAVAILABLE: u32 = 1 << 0;
 
-#[repr(C)]
+/// One backend-specific memory request. This is the OpenASR-owned quoting
+/// currency, not an FFI layout; stock ggml has no equivalent struct.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GgmlBackendMemoryDomainV1 {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub id: GgmlBackendMemoryDomainIdV1,
-    pub name: [c_char; 48],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 pub(crate) struct GgmlBackendMemoryRequestV1 {
+    // Native-evidence parity fields: never read by the broker, retained so
+    // the struct remains self-describing for diagnostics and debugging.
+    #[allow(dead_code)]
     pub struct_size: u32,
     pub kind: u32,
     pub flags: u32,
     pub usage: u32,
     pub request_id: u64,
     pub backend: GgmlBackendRaw,
+    #[allow(dead_code)]
     pub peer_backend: GgmlBackendRaw,
+    #[allow(dead_code)]
     pub buft: GgmlBackendBufferTypeRaw,
+    #[allow(dead_code)]
     pub graph: GgmlCgraphRaw,
+    #[allow(dead_code)]
     pub host_ptr: *const c_void,
     pub requested_bytes: u64,
     pub currently_allocated_bytes: u64,
+    #[allow(dead_code)]
     pub max_tensor_bytes: u64,
 }
 
@@ -227,7 +219,17 @@ impl Default for GgmlBackendMemoryRequestV1 {
     }
 }
 
-#[repr(C)]
+/// Canonical identity of the domain a claim belongs to. `physical_device_uuid`
+/// is a synthetic process-local identity derived from the backend-device
+/// pointer for GPU domains (stock ggml exposes no hardware UUID), and all
+/// zeroes for host/system domains. Never fabricated across processes.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct GgmlBackendMemoryDomainIdV1 {
+    pub physical_device_uuid: [u8; 16],
+    pub heap_index: u32,
+    pub kind: u32,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct GgmlBackendMemoryClaimV1 {
     pub struct_size: u32,
@@ -236,33 +238,37 @@ pub(crate) struct GgmlBackendMemoryClaimV1 {
     pub domain: GgmlBackendMemoryDomainIdV1,
     pub payload_requested_bytes: u64,
     pub committed_before_bytes: u64,
+    #[allow(dead_code)]
     pub committed_after_upper_bytes: u64,
     pub commit_peak_extra_upper_bytes: u64,
+    #[allow(dead_code)]
     pub resident_after_upper_bytes: u64,
     pub retained_after_use_upper_bytes: u64,
+    #[allow(dead_code)]
     pub releasable_after_use_upper_bytes: u64,
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct GgmlBackendMemoryQuoteV1 {
+    #[allow(dead_code)]
     pub struct_size: u32,
     pub flags: u32,
     pub residual_flags: u32,
     pub residual_request_count: u32,
     pub provisional_requested_upper_bytes: u64,
     pub stats_generation: u64,
+    #[allow(dead_code)]
     pub quote_token: u64,
     pub request_fingerprint: u64,
 }
 
-#[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct GgmlBackendMemoryStatsV1 {
     pub struct_size: u32,
     pub flags: u32,
     pub domain: GgmlBackendMemoryDomainIdV1,
     pub generation: u64,
+    #[allow(dead_code)]
     pub timestamp_monotonic_ns: u64,
     pub total_bytes: u64,
     pub budget_bytes: u64,
@@ -272,98 +278,14 @@ pub(crate) struct GgmlBackendMemoryStatsV1 {
     pub backend_owned_cached_bytes: u64,
     pub backend_owned_workspace_bytes: u64,
     pub backend_owned_high_water_bytes: u64,
+    #[allow(dead_code)]
     pub allocation_count: u64,
+    #[allow(dead_code)]
     pub allocation_failure_count: u64,
     pub health: u32,
     pub last_ggml_status: i32,
     pub last_native_error: i64,
     pub quarantine_generation: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GgmlBackendMemoryQuarantineV1 {
-    pub struct_size: u32,
-    pub flags: u32,
-    pub reason: u32,
-    pub ggml_status: i32,
-    pub native_error: i64,
-    pub message: [c_char; 96],
-}
-
-pub(crate) type GgmlMemoryGetDomainsFn =
-    unsafe extern "C" fn(GgmlBackendDevRaw, *mut GgmlBackendMemoryDomainV1, *mut u32) -> c_int;
-pub(crate) type GgmlMemoryQuoteFn = unsafe extern "C" fn(
-    *const GgmlBackendMemoryRequestV1,
-    u32,
-    *mut GgmlBackendMemoryQuoteV1,
-    *mut GgmlBackendMemoryClaimV1,
-    *mut u32,
-) -> c_int;
-pub(crate) type GgmlMemoryReservePrivateFn = unsafe extern "C" fn(
-    *const GgmlBackendMemoryRequestV1,
-    u32,
-    *const GgmlBackendMemoryQuoteV1,
-    *mut GgmlBackendMemoryClaimV1,
-    *mut u32,
-) -> c_int;
-pub(crate) type GgmlMemoryGetStatsFn = unsafe extern "C" fn(
-    GgmlBackendDevRaw,
-    GgmlBackendRaw,
-    *mut GgmlBackendMemoryStatsV1,
-    *mut u32,
-) -> c_int;
-pub(crate) type GgmlMemoryTrimFn = unsafe extern "C" fn(GgmlBackendRaw, u64) -> c_int;
-pub(crate) type GgmlMemoryQuarantineFn =
-    unsafe extern "C" fn(GgmlBackendRaw, *const GgmlBackendMemoryQuarantineV1) -> c_int;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct GgmlBackendMemoryApiV1 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub capabilities: u64,
-    pub get_domains: Option<GgmlMemoryGetDomainsFn>,
-    pub quote: Option<GgmlMemoryQuoteFn>,
-    pub reserve_private: Option<GgmlMemoryReservePrivateFn>,
-    pub get_stats: Option<GgmlMemoryGetStatsFn>,
-    pub trim: Option<GgmlMemoryTrimFn>,
-    pub quarantine: Option<GgmlMemoryQuarantineFn>,
-}
-
-pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_ABI_V1: u32 = 1;
-pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_SUPPORTED_V1: u32 = 1 << 0;
-pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_CAPTURE_ENABLED_V1: u32 = 1 << 1;
-pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_EXECUTABLE_PRESENT_V1: u32 = 1 << 2;
-pub(crate) const GGML_BACKEND_GRAPH_LIFECYCLE_GRAPH_TRACKED_V1: u32 = 1 << 3;
-pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_NONE_V1: u32 = 0;
-pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_INSTANTIATED_V1: u32 = 1;
-pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_UPDATED_V1: u32 = 2;
-pub(crate) const GGML_BACKEND_GRAPH_EXECUTABLE_CHANGE_REPLACED_V1: u32 = 3;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GgmlBackendGraphLifecycleObservationV1 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub flags: u32,
-    pub last_executable_change: u32,
-    pub executable_generation: u64,
-}
-
-pub(crate) type GgmlBackendGraphLifecycleObserveV1Fn = unsafe extern "C" fn(
-    GgmlBackendRaw,
-    GgmlCgraphRaw,
-    *mut GgmlBackendGraphLifecycleObservationV1,
-) -> c_int;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct GgmlBackendGraphLifecycleApiV1 {
-    pub struct_size: u32,
-    pub abi_version: u32,
-    pub capabilities: u64,
-    pub observe: Option<GgmlBackendGraphLifecycleObserveV1Fn>,
 }
 
 /// ggml abort predicate: return true to abort the in-flight graph. Called from
@@ -382,7 +304,8 @@ pub(crate) const GGML_TYPE_I32: c_int = 26;
 pub(crate) const GGML_TYPE_Q2_0: c_int = 42;
 
 /// Exclusive upper bound of `enum ggml_type` in vendored
-/// `third_party/openasr-ggml/include/ggml.h` (`GGML_TYPE_COUNT = 43`).
+/// `third_party/openasr-ggml/include/ggml.h` (`GGML_TYPE_COUNT = 44`,
+/// `GGML_TYPE_F8_E4M3 = 43` added in v1.0.0).
 /// ggml indexes `type_traits[type]` without a range check, so ids outside
 /// `0..GGML_TYPE_COUNT` are an out-of-bounds read. Retired slots inside that
 /// range (removed Q4_2/Q4_3, Q4_0_*, IQ4_NL_*) keep `blck_size == 0`;
@@ -392,7 +315,10 @@ pub(crate) const GGML_TYPE_Q2_0: c_int = 42;
 /// ggml.h, add any new live type constants, and re-run
 /// `checked_ggml_type_matches_vendored_count` plus the retired-slot tests
 /// (type ids 4 and 31).
-pub(crate) const GGML_TYPE_COUNT: c_int = 43;
+/// Kept for pin documentation; stock ggml v1.0.0 adds GGML_TYPE_F8_E4M3.
+#[allow(dead_code)]
+pub(crate) const GGML_TYPE_F8_E4M3: c_int = 43;
+pub(crate) const GGML_TYPE_COUNT: c_int = 44;
 
 const _: () = assert!(GGML_TYPE_Q2_0 < GGML_TYPE_COUNT);
 
@@ -503,6 +429,7 @@ pub(crate) struct GgmlBackendDevCaps {
     pub host_buffer: bool,
     pub buffer_from_host_ptr: bool,
     pub events: bool,
+    pub mmap_support: bool,
 }
 
 #[repr(C)]
@@ -524,84 +451,44 @@ pub(crate) const GGUF_TYPE_STRING: c_int = 8;
 pub(crate) const GGUF_TYPE_ARRAY: c_int = 9;
 pub(crate) const GGUF_TYPE_UINT64: c_int = 10;
 
+/// Custom operator callback for stock ggml's `GGML_OP_CUSTOM`. Invoked from
+/// ggml's CPU threadpool with `ith`/`nth` task indices; openasr kernels set
+/// `n_tasks = 1`, so every callback runs once on the calling thread's ggml
+/// executor.
+pub(crate) type GgmlCustomOpFn =
+    unsafe extern "C" fn(dst: GgmlTensorRaw, ith: c_int, nth: c_int, userdata: *mut c_void);
+
 unsafe extern "C" {
     pub(crate) fn ggml_backend_name(backend: GgmlBackendRaw) -> *const c_char;
     pub(crate) fn ggml_backend_free(backend: GgmlBackendRaw);
-    pub(crate) fn ggml_backend_free_status(backend: GgmlBackendRaw) -> c_int;
+    pub(crate) fn ggml_backend_buffer_free(buffer: GgmlBackendBufferRaw);
     pub(crate) fn ggml_backend_init_best() -> GgmlBackendRaw;
     pub(crate) fn ggml_backend_init_by_type(
         dev_type: c_int,
         params: *const c_char,
     ) -> GgmlBackendRaw;
-    // GGML_BACKEND_DL: register backend plugin DLLs (ggml-<name>-*.dll / .so).
-    // Must run before any registry query under DL, where the static GGML_USE_*
-    // backend registration is compiled out (empty registry, init_best returns
-    // null, otherwise). The verified bundled loader scans only the explicit
-    // application directory and rejects modules before init when the OpenASR
-    // ABI attestation does not match. Optional packs use the exact verified
-    // path loader below; scanning every installed version is not a safe
-    // activation policy.
-    pub(crate) fn ggml_backend_load_verified_v3_utf8(
-        path_utf8: *const c_char,
-        dependency_dirs_utf8: *const *const c_char,
-        dependency_dir_count: usize,
-        expected_openasr_abi_v1: *const c_char,
-        expected_provider_v1: *const c_char,
-        expected_device_target: *const c_char,
-        minimum_driver_version: *const c_char,
-    ) -> GgmlBackendRegRaw;
-    pub(crate) fn ggml_backend_probe_verified_v3_utf8(
-        path_utf8: *const c_char,
-        dependency_dirs_utf8: *const *const c_char,
-        dependency_dir_count: usize,
-        expected_openasr_abi_v1: *const c_char,
-        expected_provider_v1: *const c_char,
-        expected_device_target: *const c_char,
-        minimum_driver_version: *const c_char,
-        driver_out: *mut c_char,
-        driver_out_capacity: usize,
-    ) -> bool;
-    pub(crate) fn ggml_backend_probe_identity_verified_v1_utf8(
-        path_utf8: *const c_char,
-        dependency_dirs_utf8: *const *const c_char,
-        dependency_dir_count: usize,
-        expected_openasr_abi_v1: *const c_char,
-        expected_provider_v1: *const c_char,
-        device_index: usize,
-        target_out: *mut c_char,
-        target_out_capacity: usize,
-        driver_out: *mut c_char,
-        driver_out_capacity: usize,
-    ) -> bool;
-    pub(crate) fn ggml_backend_load_best_verified_utf8(
-        paths_utf8: *const *const c_char,
-        path_count: usize,
-        expected_openasr_abi_v1: *const c_char,
-        expected_provider_v1: *const c_char,
-    ) -> GgmlBackendRegRaw;
-    pub(crate) fn ggml_backend_unload(reg: GgmlBackendRegRaw);
+    // Backend plugins are never loaded through the stock `ggml_backend_load*`
+    // family from openasr: every module activation goes through the Rust-side
+    // verified loader (ggml_runtime/verified_load.rs), which checks this
+    // host's signed file identity against the signed catalog/bundle before
+    // initialization and then registers the loaded module with the stock
+    // registry. Scanning an application directory for `ggml-*.dll` remains
+    // disabled: an unverified module must never activate.
+    pub(crate) fn ggml_backend_register(reg: GgmlBackendRegRaw);
+    pub(crate) fn ggml_backend_reg_get_proc_address(
+        reg: GgmlBackendRegRaw,
+        name: *const c_char,
+    ) -> *mut c_void;
     pub(crate) fn ggml_backend_reg_name(reg: GgmlBackendRegRaw) -> *const c_char;
-    pub(crate) fn ggml_backend_dev_pci_vendor_id(device: GgmlBackendDevRaw) -> u32;
-    pub(crate) fn ggml_backend_set_n_threads_if_supported(
-        backend: GgmlBackendRaw,
-        n_threads: c_int,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_buffer_free_status(buffer: GgmlBackendBufferRaw) -> c_int;
     pub(crate) fn ggml_backend_buffer_is_host(buffer: GgmlBackendBufferRaw) -> bool;
     pub(crate) fn ggml_backend_buffer_set_usage(buffer: GgmlBackendBufferRaw, usage: c_int);
+    pub(crate) fn ggml_backend_buffer_get_usage(buffer: GgmlBackendBufferRaw) -> c_int;
     // Keep raw graph execution inside ggml_runtime. Model families must use
     // GgmlCpuGraphRunner so request cancellation and typed terminal-status
     // mapping cannot be bypassed as new executors are added.
     pub(super) fn ggml_backend_graph_compute(
         backend: GgmlBackendRaw,
         cgraph: GgmlCgraphRaw,
-    ) -> c_int;
-    pub(super) fn ggml_backend_graph_compute_with_abort(
-        backend: GgmlBackendRaw,
-        cgraph: GgmlCgraphRaw,
-        abort_callback: GgmlAbortCallback,
-        abort_callback_data: *mut c_void,
-        cancel_capability: *mut GgmlBackendGraphCancelCapability,
     ) -> c_int;
     pub(crate) fn ggml_backend_sched_new(
         backends: *mut GgmlBackendRaw,
@@ -611,104 +498,32 @@ unsafe extern "C" {
         parallel: bool,
         op_offload: bool,
     ) -> GgmlBackendSchedRaw;
-    pub(crate) fn ggml_backend_sched_free_status(sched: GgmlBackendSchedRaw) -> c_int;
+    pub(crate) fn ggml_backend_sched_free(sched: GgmlBackendSchedRaw);
     pub(crate) fn ggml_backend_sched_reset(sched: GgmlBackendSchedRaw);
+    pub(crate) fn ggml_backend_sched_alloc_graph(
+        sched: GgmlBackendSchedRaw,
+        graph: GgmlCgraphRaw,
+    ) -> bool;
     pub(crate) fn ggml_backend_sched_get_tensor_backend(
         sched: GgmlBackendSchedRaw,
         node: GgmlTensorRaw,
     ) -> GgmlBackendRaw;
-    pub(crate) fn ggml_backend_sched_memory_plan_create_v1(
-        sched: GgmlBackendSchedRaw,
-        cgraph: GgmlCgraphRaw,
-        out_plan: *mut GgmlBackendSchedMemoryPlanRaw,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_sched_memory_plan_get_item_count_v1(
-        plan: GgmlBackendSchedMemoryPlanRaw,
-    ) -> u32;
-    pub(crate) fn ggml_backend_sched_memory_plan_get_item_v1(
-        plan: GgmlBackendSchedMemoryPlanRaw,
-        index: u32,
-        out_item: *mut GgmlBackendMemoryRequestV1,
-    ) -> bool;
-    pub(crate) fn ggml_backend_sched_memory_plan_commit_v2(
-        plan: GgmlBackendSchedMemoryPlanRaw,
-        out_flags: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_sched_memory_plan_free_v1(plan: GgmlBackendSchedMemoryPlanRaw);
-    pub(crate) fn ggml_backend_memory_api_for_backend_v1(
-        backend: GgmlBackendRaw,
-    ) -> *const GgmlBackendMemoryApiV1;
-    pub(crate) fn ggml_backend_graph_lifecycle_api_for_backend_v1(
-        backend: GgmlBackendRaw,
-    ) -> *const GgmlBackendGraphLifecycleApiV1;
-    pub(crate) fn ggml_backend_graph_lifecycle_api_observe_v1(
-        api: *const GgmlBackendGraphLifecycleApiV1,
-        backend: GgmlBackendRaw,
-        graph: GgmlCgraphRaw,
-        observation: *mut GgmlBackendGraphLifecycleObservationV1,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_get_domains_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        dev: GgmlBackendDevRaw,
-        domains: *mut GgmlBackendMemoryDomainV1,
-        inout_count: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_quote_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        requests: *const GgmlBackendMemoryRequestV1,
-        request_count: u32,
-        quote: *mut GgmlBackendMemoryQuoteV1,
-        claims: *mut GgmlBackendMemoryClaimV1,
-        inout_claim_count: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_reserve_private_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        requests: *const GgmlBackendMemoryRequestV1,
-        request_count: u32,
-        quote: *const GgmlBackendMemoryQuoteV1,
-        actual: *mut GgmlBackendMemoryClaimV1,
-        inout_actual_count: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_get_stats_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        dev: GgmlBackendDevRaw,
-        backend: GgmlBackendRaw,
-        stats: *mut GgmlBackendMemoryStatsV1,
-        inout_count: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_trim_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        backend: GgmlBackendRaw,
-        flags: u64,
-    ) -> c_int;
-    pub(crate) fn ggml_backend_memory_api_quarantine_v1(
-        api: *const GgmlBackendMemoryApiV1,
-        backend: GgmlBackendRaw,
-        request: *const GgmlBackendMemoryQuarantineV1,
-    ) -> c_int;
     pub(crate) fn ggml_backend_sched_graph_compute(
         sched: GgmlBackendSchedRaw,
         cgraph: GgmlCgraphRaw,
-    ) -> c_int;
-    pub(super) fn ggml_backend_sched_graph_compute_with_abort(
-        sched: GgmlBackendSchedRaw,
-        cgraph: GgmlCgraphRaw,
-        abort_callback: GgmlAbortCallback,
-        abort_callback_data: *mut c_void,
-        cancel_capability: *mut GgmlBackendGraphCancelCapability,
     ) -> c_int;
     pub(crate) fn ggml_backend_tensor_set(
         tensor: GgmlTensorRaw,
         data: *const c_void,
         offset: usize,
         size: usize,
-    ) -> c_int;
+    );
     pub(crate) fn ggml_backend_tensor_get(
         tensor: GgmlTensorRaw,
         data: *mut c_void,
         offset: usize,
         size: usize,
-    ) -> c_int;
+    );
     pub(crate) fn ggml_backend_tensor_alloc(
         buffer: GgmlBackendBufferRaw,
         tensor: GgmlTensorRaw,
@@ -734,29 +549,24 @@ unsafe extern "C" {
     ) -> GgmlBackendBufferRaw;
     pub(crate) fn ggml_backend_buffer_get_size(buffer: GgmlBackendBufferRaw) -> usize;
     pub(crate) fn ggml_gallocr_new(buft: GgmlBackendBufferTypeRaw) -> GgmlGallocrRaw;
-    pub(crate) fn ggml_gallocr_free_status(galloc: GgmlGallocrRaw) -> c_int;
-    pub(crate) fn ggml_gallocr_measure_n_v1(
+    pub(crate) fn ggml_gallocr_free(galloc: GgmlGallocrRaw);
+    // Pre-allocate buffers for a worst-case graph without mutating it. This is
+    // the stock-ggml measurement step: it computes the buffer sizes a later
+    // allocation would use.
+    pub(crate) fn ggml_gallocr_reserve_n(
         galloc: GgmlGallocrRaw,
         graph: GgmlCgraphRaw,
         node_buffer_ids: *const c_int,
         leaf_buffer_ids: *const c_int,
     ) -> bool;
-    pub(crate) fn ggml_gallocr_measure_get_chunk_count_v1(galloc: GgmlGallocrRaw) -> u32;
-    pub(crate) fn ggml_gallocr_measure_get_chunk_v1(
-        galloc: GgmlGallocrRaw,
-        index: u32,
-        buft: *mut GgmlBackendBufferTypeRaw,
-        requested_bytes: *mut u64,
-        currently_allocated_bytes: *mut u64,
-    ) -> bool;
-    pub(crate) fn ggml_gallocr_measure_commit_v2(
-        galloc: GgmlGallocrRaw,
-        out_flags: *mut u32,
-    ) -> c_int;
-    pub(crate) fn ggml_gallocr_alloc_graph_v2(
+    pub(crate) fn ggml_gallocr_reserve_n_size(
         galloc: GgmlGallocrRaw,
         graph: GgmlCgraphRaw,
-    ) -> c_int;
+        node_buffer_ids: *const c_int,
+        leaf_buffer_ids: *const c_int,
+        sizes: *mut usize,
+    );
+    pub(crate) fn ggml_gallocr_alloc_graph(galloc: GgmlGallocrRaw, graph: GgmlCgraphRaw) -> bool;
     // Tensor allocator (ggml-alloc.h): binds tensors into an already-allocated
     // buffer -- the primitive `ggml_backend_alloc_ctx_tensors` itself uses,
     // exposed here to bind the CPU step pool's *reused* buffer without
@@ -776,6 +586,7 @@ unsafe extern "C" {
         free: *mut usize,
         total: *mut usize,
     );
+    pub(crate) fn ggml_backend_dev_backend_reg(device: GgmlBackendDevRaw) -> GgmlBackendRegRaw;
     pub(crate) fn ggml_backend_dev_get_props(
         device: GgmlBackendDevRaw,
         props: *mut GgmlBackendDevProps,
@@ -807,8 +618,6 @@ unsafe extern "C" {
     pub(crate) fn ggml_backend_blas_init() -> GgmlBackendRaw;
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_blas_set_n_threads(backend: GgmlBackendRaw, n_threads: c_int);
-    #[cfg(all(target_os = "macos", test))]
-    pub(crate) fn openasr_ggml_metal_cached_device_count() -> usize;
     pub(crate) fn ggml_init(params: GgmlInitParams) -> GgmlContextRaw;
     pub(crate) fn ggml_reset(ctx: GgmlContextRaw);
     pub(crate) fn ggml_free(ctx: GgmlContextRaw);
@@ -894,7 +703,9 @@ unsafe extern "C" {
         a: GgmlTensorRaw,
         b: GgmlTensorRaw,
     ) -> GgmlTensorRaw;
-    pub(crate) fn ggml_mul_mat_set_prec(a: GgmlTensorRaw, prec: c_int);
+    // Sets the accumulator precision (op_params[0] for MUL_MAT, op_params[3] for
+    // FLASH_ATTN_EXT). Returns false for ops that carry no precision.
+    pub(crate) fn ggml_prec_set_acc(a: GgmlTensorRaw, prec: c_int) -> bool;
     pub(crate) fn ggml_get_rows(
         ctx: GgmlContextRaw,
         a: GgmlTensorRaw,
@@ -902,7 +713,23 @@ unsafe extern "C" {
     ) -> GgmlTensorRaw;
     #[allow(dead_code)] // last-max binding; unused until a native last-max lane is authorized
     pub(crate) fn ggml_argmax(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
-    pub(crate) fn ggml_argmax_first(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    // Custom operator support (stock ggml `GGML_OP_CUSTOM`). OpenASR's
+    // first-max argmax, Transformer-XL relative-position attention, LSTM scan,
+    // and swoosh activation are implemented as custom operators with Rust
+    // callbacks in `custom_ops.rs`; stock ggml has no native kernels for them.
+    pub(crate) fn ggml_custom_4d(
+        ctx: GgmlContextRaw,
+        type_: c_int,
+        ne0: i64,
+        ne1: i64,
+        ne2: i64,
+        ne3: i64,
+        args: *mut GgmlTensorRaw,
+        n_args: c_int,
+        fun: GgmlCustomOpFn,
+        n_tasks: c_int,
+        userdata: *mut c_void,
+    ) -> GgmlTensorRaw;
     #[cfg(test)]
     pub(crate) fn ggml_top_k(ctx: GgmlContextRaw, a: GgmlTensorRaw, k: c_int) -> GgmlTensorRaw;
     pub(crate) fn ggml_scale(ctx: GgmlContextRaw, a: GgmlTensorRaw, s: f32) -> GgmlTensorRaw;
@@ -961,34 +788,11 @@ unsafe extern "C" {
         max_bias: f32,
         logit_softcap: f32,
     ) -> GgmlTensorRaw;
-    pub(crate) fn ggml_flash_attn_ext_set_prec(a: GgmlTensorRaw, prec: c_int);
-    /// OpenASR-local CPU fused Transformer-XL relative-position attention.
-    /// Non-CPU backends do not implement this op.
-    pub(crate) fn ggml_flash_attn_rel_pos(
-        ctx: GgmlContextRaw,
-        q_u: GgmlTensorRaw,
-        q_v: GgmlTensorRaw,
-        k: GgmlTensorRaw,
-        r: GgmlTensorRaw,
-        v: GgmlTensorRaw,
-        mask: GgmlTensorRaw,
-        scale: f32,
-    ) -> GgmlTensorRaw;
     #[allow(dead_code)]
     pub(crate) fn ggml_ssm_conv(
         ctx: GgmlContextRaw,
         sx: GgmlTensorRaw,
         c: GgmlTensorRaw,
-    ) -> GgmlTensorRaw;
-    #[allow(dead_code)]
-    pub(crate) fn ggml_lstm_seq(
-        ctx: GgmlContextRaw,
-        x: GgmlTensorRaw,
-        w: GgmlTensorRaw,
-        r: GgmlTensorRaw,
-        b: GgmlTensorRaw,
-        gate_order: c_int,
-        reverse: bool,
     ) -> GgmlTensorRaw;
     pub(crate) fn ggml_can_repeat(a: GgmlTensorRaw, b: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_gelu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
@@ -997,13 +801,6 @@ unsafe extern "C" {
     pub(crate) fn ggml_relu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_sigmoid(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     pub(crate) fn ggml_softplus(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
-    pub(crate) fn ggml_swoosh(
-        ctx: GgmlContextRaw,
-        a: GgmlTensorRaw,
-        offset: f32,
-        shift: f32,
-        linear_scale: f32,
-    ) -> GgmlTensorRaw;
     pub(crate) fn ggml_exp(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
     #[allow(dead_code)]
     pub(crate) fn ggml_silu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
@@ -1184,19 +981,11 @@ unsafe extern "C" {
     // core. GgmlCpuFeatures::detect() reads CPU features via the Rust stdlib
     // instead (build-mode-agnostic).
 
-    pub(crate) fn gguf_init_from_buffer_with_limits(
+    pub(crate) fn gguf_init_from_buffer(
         data: *const c_void,
         size: usize,
         params: GgufInitParams,
-        limits: GgufParseLimits,
-        error: *mut c_int,
     ) -> GgufContextRaw;
-    pub(crate) fn gguf_bounded_parser_structural_bytes(
-        n_kv: u64,
-        n_tensors: u64,
-        result: *mut usize,
-    ) -> bool;
-    pub(crate) fn gguf_bounded_parser_payload_wire_multiplier() -> usize;
     pub(crate) fn gguf_free(ctx: GgufContextRaw);
     pub(crate) fn gguf_get_n_kv(ctx: *const c_void) -> i64;
     pub(crate) fn gguf_get_key(ctx: *const c_void, key_id: i64) -> *const c_char;
@@ -1253,6 +1042,12 @@ unsafe extern "C" {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn ggml_backend_metal_init() -> GgmlBackendRaw;
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ggml_backend_metal_set_abort_callback(
+        backend: GgmlBackendRaw,
+        abort_callback: GgmlAbortCallback,
+        abort_callback_data: *mut c_void,
+    );
 }
 
 #[cfg(test)]
