@@ -10871,11 +10871,15 @@ unsafe fn read_tensor_bytes(
 /// backend layer nor a cached backend retains the raw pointer after return.
 /// Stock ggml exposes cooperative cancellation through a per-backend abort
 /// hook (registry proc `ggml_backend_set_abort_callback`, or the Metal direct
-/// symbol on macOS), so the hook is installed on every scheduler backend,
-/// the plain compute is issued, and the hook is cleared again on the way out
-/// so a later unrelated compute on a shared cached backend never observes a
-/// dropped flag pointer. A backend that cannot observe aborts fails the
-/// compute closed rather than running an uncancellable decode.
+/// symbol on macOS), so the hook is installed on every scheduler backend that
+/// supports it, the plain compute is issued, and the hook is cleared again on
+/// the way out so a later unrelated compute on a shared cached backend never
+/// observes a dropped flag pointer. Backends without a native hook (stock
+/// CUDA/Vulkan/HIP) run in degraded mode: the graph runs to completion but
+/// cancel is still honored before the compute starts and after it returns,
+/// and hookable participants (e.g. the CPU fallback in a scheduler) keep
+/// node-level abort. A participant reporting a fatal lookup failure (no
+/// device or registry, not merely a missing hook) fails the compute closed.
 fn compute_graph_with_current_job_cancel(
     backend: NonNull<c_void>,
     scheduler: Option<NonNull<c_void>>,
@@ -10911,11 +10915,22 @@ fn compute_graph_with_current_job_cancel(
     } else {
         std::slice::from_ref(&backend)
     };
-    if !install_abort_callback(participants, callback, data) {
+    let install = install_abort_callback(participants, callback, data);
+    if install == AbortCallbackInstall::Failed {
+        // Unwind-safe: clear whatever was installed before returning so no
+        // participant keeps a dangling `data` pointer into this call's Arc.
+        let _ = install_abort_callback(participants, None, std::ptr::null_mut());
         return Err(GgmlCpuGraphError::GraphCancellationContractFailed {
             mechanism: 1,
             observation_granularity: 0,
         });
+    }
+    // Pre-start checkpoint: honor an already-requested cancel before any work
+    // enters the backend. CPU participants would observe it inside the first
+    // node anyway; this keeps the HIP/Vulkan/CUDA lanes honest too.
+    if flag.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = install_abort_callback(participants, None, std::ptr::null_mut());
+        return Ok(ffi::GGML_STATUS_ABORTED);
     }
     let status = unsafe {
         if let Some(scheduler) = scheduler {
@@ -10926,25 +10941,52 @@ fn compute_graph_with_current_job_cancel(
     };
     // Clear the hook before the flag Arc can be dropped by the caller.
     let _ = install_abort_callback(participants, None, std::ptr::null_mut());
+    // Post-compute checkpoint: a participant without a native abort hook ran
+    // to completion of the graph. The request may have been canceled while ot
+    // ran; report that as aborted so the caller stops before any readback.
+    if flag.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(ffi::GGML_STATUS_ABORTED);
+    }
     Ok(status)
 }
 
+/// How the participating backends responded to the per-job abort hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortCallbackInstall {
+    /// Every participating backend observed the hook.
+    Complete,
+    /// At least one participant registers no native abort hook (stock
+    /// CUDA/Vulkan/HIP register none). Those lanes run without intra-graph
+    /// cancellation, but any participant that did take the hook keeps
+    /// node-level abort, and the job still honors cancel before the compute
+    /// starts and after it returns.
+    Degraded,
+    /// A participant reported a fatal lookup failure (no device or no
+    /// registry), not merely an absent hook — something is wrong beyond
+    /// capability negotiation, so the compute is refused.
+    Failed,
+}
+
 /// Install or clear the per-backend abort hook on every participating
-/// backend. Returns false when any backend cannot observe aborts.
+/// backend. `Complete`/`Degraded` distinguish "no participant can observe
+/// aborts" (degraded, still runs) from "a participant is unusable"
+/// (`Failed`). Clearing is infallible for the same reason: participants
+/// without a hook silently accept the cleared state.
 fn install_abort_callback(
     backends: &[NonNull<c_void>],
     callback: ffi::GgmlAbortCallback,
     data: *mut c_void,
-) -> bool {
+) -> AbortCallbackInstall {
+    let mut degraded = false;
     for backend in backends {
         let backend = backend.as_ptr();
         let device = unsafe { ffi::ggml_backend_get_device(backend) };
         if device.is_null() {
-            return false;
+            return AbortCallbackInstall::Failed;
         }
         let reg = unsafe { ffi::ggml_backend_dev_backend_reg(device) };
         if reg.is_null() {
-            return false;
+            return AbortCallbackInstall::Failed;
         }
         #[cfg(target_os = "macos")]
         {
@@ -10963,7 +11005,8 @@ fn install_abort_callback(
         let proc_name = c"ggml_backend_set_abort_callback";
         let ptr = unsafe { ffi::ggml_backend_reg_get_proc_address(reg, proc_name.as_ptr()) };
         let Some(ptr) = NonNull::new(ptr) else {
-            return false;
+            degraded = true;
+            continue;
         };
         // SAFETY: `ggml_backend_set_abort_callback_t` is
         // `void (*)(ggml_backend_t, ggml_abort_callback, void *)`.
@@ -10971,7 +11014,11 @@ fn install_abort_callback(
             unsafe { std::mem::transmute(ptr) };
         unsafe { set(backend, callback, data) };
     }
-    true
+    if degraded {
+        AbortCallbackInstall::Degraded
+    } else {
+        AbortCallbackInstall::Complete
+    }
 }
 
 impl GgmlBackendGuard {
@@ -12992,18 +13039,19 @@ mod tests {
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities, GgmlContextGuard,
-        GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
-        GgmlCpuGraphError, GgmlCpuGraphOutputSpec, GgmlCpuGraphOutputValue, GgmlCpuGraphRunner,
-        GgmlCpuGraphThreadingWorkload, GgmlCpuTensor, GgmlGraphLifecycleState, GgmlLstmGateOrder,
-        GgmlMatmulPrecision, GgmlNativeGraphObservationPhase, GgmlPersistentGraphSession,
-        GgmlRopeExtParams, GgmlRunnerExecutionIdentity, GgmlStaticTensor,
-        GgmlWeightMaterialization, GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome,
-        GpuProbeState, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
-        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
-        gpu_probe_failed_log_message, gpu_probe_log_message, install_abort_callback,
-        install_test_graph_compute_status_override, install_test_tensor_readback_status_override,
-        memory_admission_failure, mul_mat_requires_f32_precision_to_preserve_rhs_range,
+        AbortCallbackInstall, AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities,
+        GgmlContextGuard, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig,
+        GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError, GgmlCpuGraphOutputSpec,
+        GgmlCpuGraphOutputValue, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlCpuTensor,
+        GgmlGraphLifecycleState, GgmlLstmGateOrder, GgmlMatmulPrecision,
+        GgmlNativeGraphObservationPhase, GgmlPersistentGraphSession, GgmlRopeExtParams,
+        GgmlRunnerExecutionIdentity, GgmlStaticTensor, GgmlWeightMaterialization,
+        GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
+        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
+        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
+        gpu_probe_log_message, install_abort_callback, install_test_graph_compute_status_override,
+        install_test_tensor_readback_status_override, memory_admission_failure,
+        mul_mat_requires_f32_precision_to_preserve_rhs_range,
         reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
         reset_test_tensor_readback_count, runtime_gpu_is_available,
         scheduler_allows_cpu_participants, test_compute_gate_attempt_count,
@@ -14469,7 +14517,7 @@ mod tests {
         node_count: usize,
         callback: ffi::GgmlAbortCallback,
         data: *mut std::ffi::c_void,
-    ) -> (i32, bool, Option<f32>) {
+    ) -> (i32, AbortCallbackInstall, Option<f32>) {
         let mut runner = GgmlCpuGraphRunner::new(config).expect("graph runner");
         let mut builder = runner.start_graph();
         let input = builder.new_tensor_1d_f32(1, "input").expect("input");
@@ -14559,7 +14607,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert!(installed, "CPU must register the abort hook");
+        assert_eq!(installed, AbortCallbackInstall::Complete);
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(4.0));
     }
@@ -14578,7 +14626,7 @@ mod tests {
             Some(abort_after_polls),
             (&probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert!(installed, "CPU must register the abort hook");
+        assert_eq!(installed, AbortCallbackInstall::Complete);
         assert_eq!(status, ffi::GGML_STATUS_ABORTED);
         assert_eq!(output, None);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 1);
@@ -14589,9 +14637,9 @@ mod tests {
     fn gpu_cancel_unsupported_graph_completes_and_reuses_backend() {
         use std::sync::atomic::Ordering;
 
-        // Stock ggml exports no abort hook on CUDA/Vulkan; the job-level
-        // compute path fails closed, so a direct FFI probe installs nothing
-        // and the graph runs to completion.
+        // Stock ggml exports no abort hook on CUDA/Vulkan/HIP; a direct FFI
+        // probe installs nothing (degraded) and the graph runs to completion.
+        // Callers still observe cancel at the job boundaries.
         let config = GgmlCpuGraphConfig {
             backend: GgmlCpuGraphBackend::Gpu,
             use_scheduler: false,
@@ -14607,7 +14655,7 @@ mod tests {
             Some(abort_after_polls),
             (&cancel_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert!(!installed, "stock GPU backends export no abort hook");
+        assert_eq!(installed, AbortCallbackInstall::Degraded);
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(96.0));
         assert_eq!(cancel_probe.polls.load(Ordering::SeqCst), 0);
@@ -14622,7 +14670,7 @@ mod tests {
             Some(abort_after_polls),
             (&reuse_probe as *const AbortAfterPolls).cast_mut().cast(),
         );
-        assert!(!installed);
+        assert_eq!(installed, AbortCallbackInstall::Degraded);
         assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
         assert_eq!(output, Some(96.0));
     }
@@ -14645,7 +14693,7 @@ mod tests {
                 Some(abort_after_polls),
                 (&probe as *const AbortAfterPolls).cast_mut().cast(),
             );
-            assert!(!installed, "stock GPU backends export no abort hook");
+            assert_eq!(installed, AbortCallbackInstall::Degraded);
             assert_eq!(status, ffi::GGML_STATUS_SUCCESS);
             assert_eq!(output, Some(96.0));
         }
@@ -14701,11 +14749,14 @@ mod tests {
             abort_after: 2,
         };
         let participants = [backend];
-        assert!(install_abort_callback(
-            &participants,
-            Some(abort_after_polls),
-            (&probe as *const AbortAfterPolls).cast_mut().cast(),
-        ));
+        assert_eq!(
+            install_abort_callback(
+                &participants,
+                Some(abort_after_polls),
+                (&probe as *const AbortAfterPolls).cast_mut().cast(),
+            ),
+            AbortCallbackInstall::Complete
+        );
         let status =
             unsafe { ffi::ggml_backend_graph_compute(backend.as_ptr(), graph_ptr.as_ptr()) };
         let _ = install_abort_callback(&participants, None, std::ptr::null_mut());

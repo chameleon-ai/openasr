@@ -77,12 +77,19 @@ Both were rebuilt in Rust:
   per-backend abort hook from the registry proc table
   (`ggml_backend_set_abort_callback`, or the Metal direct symbol on macOS).
   The job's cancel flag is installed on every participating scheduler backend
-  before each compute and cleared afterwards. A backend that cannot observe
-  aborts fails the compute closed (matching the fork's `GRAPH_CANCEL_NATIVE`
-  requirement) instead of running an uncancellable decode. CPU cancellation
-  is per-node; Metal cancellation works through the Metal hook; CUDA/Vulkan/HIP
-  have no hook in stock v1.0.0, so cooperative cancellation is unavailable on
-  those lanes (fail-closed, not silently uncancellable).
+  that supports it before each compute and cleared afterwards. Backends
+  without a native hook (stock CUDA/Vulkan/HIP register none) run in degraded
+  mode: the graph runs to completion, cancel is still honored before the
+  compute starts and after it returns (so no readback follows an aborted job),
+  and any participant that did take the hook (e.g. the CPU fallback in a
+  scheduler) keeps node-level abort. A participant reporting a fatal lookup
+  failure (no device or registry, not merely a missing hook) fails the compute
+  closed. CPU cancellation is per-node; Metal cancellation works through the
+  Metal hook; CUDA/Vulkan/HIP cancellation is job/boundary-scoped only (no
+  native hook exists in stock v1.0.0), matching llama.cpp's non-cooperative
+  GPU path — this replaces the earlier fail-closed-on-absent-hook behavior,
+  which broke every server-side GPU job carrying a cancellation flag (e.g.
+  whisper encoder prelude on HIP).
 
 ### Graph operators (stock GGML_OP_CUSTOM)
 
@@ -212,8 +219,11 @@ directly on a graph that may still hold gallocr-bound tensors.
 1. Optional downloadable GPU packs cannot be qualified or freshly activated
    (no live target/driver probe on stock ggml). Already-persisted exact
    activation records still work. Static GPU builds are unaffected.
-2. Cooperative cancellation is CPU and Metal only. CUDA/Vulkan/HIP compute
-   paths fail closed on cancel-carrying jobs.
+2. Cooperative cancellation is per-node on CPU, node-level via the Metal hook
+   on Metal, and job/boundary-scoped (pre/post-compute) only on CUDA/Vulkan/HIP.
+   The fork additionally polled at scheduler split boundaries (C-level), which
+   is not reimplemented on stock ggml; callers needing intra-decode cancel on
+   GPU lanes get it at job/boundary granularity only.
 3. The backend-private trim hook (`abi.trim`) is a no-op; scheduler working
    sets are released by dropping/recreating schedulers, not by a native trim.
 4. Backend-private accounting is reported as provider-unknown typed values;
