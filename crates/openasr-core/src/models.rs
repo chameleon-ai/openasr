@@ -44,6 +44,7 @@ pub(crate) mod mimo_asr;
 pub mod moonshine;
 pub(crate) mod moss_transcribe_diarize;
 pub mod native_execution_services;
+pub(crate) mod nemotron_transcribe;
 pub mod oasr_metadata;
 pub(crate) mod pack_import_surface;
 pub mod pack_quant;

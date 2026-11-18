@@ -557,6 +557,14 @@ QUANT_METADATA = {
     # tensor types (Q4_K, Q6_K, F32) and does not gain a new matmul type.
     "q4_k_m": QuantMetadata(cli_token="q4-k-m", suffix="q4km", label="Q4_K_M"),
     "q3_k": QuantMetadata(cli_token="q3-k", suffix="q3", label="q3_k"),
+    # Mixed "imatrix-weighted quantized experts + Q8_0 dense" AD profiles from
+    # the nemotron-3.5-transcribe-30b-a4b packs (a 30B-A4B MoE shipped with a
+    # shared F16 encoder sidecar). Catalog/pack metadata only: the runtime
+    # sees ordinary GGUF tensor types (Q2_0/IQ4_NL/Q8_0/BF16/F16), no new type.
+    # Suffix == the quant id itself, matching the published pack filenames
+    # (`...-ad_iq4_nl.oasr` / `...-ad_q2_0_m.oasr`).
+    "ad_iq4_nl": QuantMetadata(cli_token="ad_iq4_nl", suffix="ad_iq4_nl", label="AD-IQ4_NL"),
+    "ad_q2_0_m": QuantMetadata(cli_token="ad_q2_0_m", suffix="ad_q2_0_m", label="AD-Q2_0_M"),
 }
 # --- Recognition dialect codes + curated display labels ---------------------
 #
@@ -795,6 +803,7 @@ WORD_TIMESTAMP_SOURCE_BY_FAMILY = {
     "moss-transcribe-diarize": "forced_aligner",
     "funasr-nano": "forced_aligner",
     "granite-speech": "forced_aligner",
+    "nemotron-transcribe": "native",
 }
 
 

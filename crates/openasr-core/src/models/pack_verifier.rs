@@ -609,6 +609,11 @@ fn ggml_tensor_payload_size(ggml_type: u32, elements: u64) -> Result<u64, String
             .checked_mul(2)
             .ok_or_else(|| "f16/bf16 tensor size overflow".to_string()),
         2 => block_payload(elements, 32, 18),
+        // IQ4_NL (QK=32, 18-byte blocks) and Q2_0 (QK=64, 18-byte blocks).
+        // Both are used by the published nemotron-transcribe packs; see
+        // third_party/openasr-ggml/src/ggml-common.h static_asserts.
+        20 => block_payload(elements, 32, 18),
+        42 => block_payload(elements, 64, 18),
         8 => block_payload(elements, 32, 34),
         11 => block_payload(elements, 256, 110),
         12 => block_payload(elements, 256, 144),
@@ -769,5 +774,32 @@ mod tests {
             PackVerificationError::PackageContract { reason, .. }
                 if reason.contains("duplicate GGUF tensor name 'fixture.alpha'")
         ));
+    }
+}
+
+#[cfg(test)]
+mod payload_size_tests {
+    use super::ggml_tensor_payload_size;
+
+    #[test]
+    fn iq4_nl_and_q2_0_block_sizes_match_ggml() {
+        // IQ4_NL: QK=32, 18-byte blocks (2-byte half scale + 16 quants).
+        assert_eq!(ggml_tensor_payload_size(20, 32).expect("one block"), 18);
+        assert_eq!(
+            ggml_tensor_payload_size(20, 256).expect("eight blocks"),
+            144
+        );
+        // Q2_0: QK=64, 18-byte blocks (2-byte half scale + 16 quant bytes).
+        assert_eq!(ggml_tensor_payload_size(42, 64).expect("one block"), 18);
+        assert_eq!(
+            ggml_tensor_payload_size(42, 512).expect("eight blocks"),
+            144
+        );
+    }
+
+    #[test]
+    fn iq4_nl_and_q2_0_sizes_round_up_for_partial_blocks() {
+        assert_eq!(ggml_tensor_payload_size(20, 33).expect("two blocks"), 36);
+        assert_eq!(ggml_tensor_payload_size(42, 65).expect("two blocks"), 36);
     }
 }

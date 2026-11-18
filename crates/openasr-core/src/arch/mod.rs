@@ -32,10 +32,10 @@ use hparams::{
     COHERE_TRANSCRIBE_HPARAM_SCHEMA, DOLPHIN_HPARAM_SCHEMA, FIRERED_AED_HPARAM_SCHEMA,
     FIRERED_LLM_HPARAM_SCHEMA, FUNASR_NANO_HPARAM_SCHEMA, GRANITE_SPEECH_HPARAM_SCHEMA,
     MIMO_ASR_HPARAM_SCHEMA, MOONSHINE_HPARAM_SCHEMA, MOSS_TD_HPARAM_SCHEMA,
-    PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA, QWEN3_ARCHITECTURE_VALUE,
-    QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY, QWEN3_LLM_LAYERS_KEY,
-    SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA, WHISPER_HPARAM_SCHEMA,
-    XASR_ZIPFORMER_HPARAM_SCHEMA,
+    NEMOTRON_TRANSCRIBE_HPARAM_SCHEMA, PARAKEET_CTC_HPARAM_SCHEMA, PARAKEET_TDT_HPARAM_SCHEMA,
+    QWEN3_ARCHITECTURE_VALUE, QWEN3_ASR_HPARAM_SCHEMA, QWEN3_AUDIO_LAYERS_KEY,
+    QWEN3_LLM_LAYERS_KEY, SENSEVOICE_HPARAM_SCHEMA, WAV2VEC2_CTC_HPARAM_SCHEMA,
+    WHISPER_HPARAM_SCHEMA, XASR_ZIPFORMER_HPARAM_SCHEMA,
 };
 
 pub(crate) const GENERAL_ARCHITECTURE_KEY: &str = "general.architecture";
@@ -335,6 +335,29 @@ pub(crate) const GRANITE_SPEECH_DECODE_POLICY_ID: &str = "granite-speech.greedy.
 pub(crate) const GRANITE_SPEECH_RUNTIME_TENSOR_CONTRACT_ID: &str =
     "granite-speech.runtime-tensors.v0";
 pub(crate) const GRANITE_SPEECH_EXECUTOR_COMPONENT_ID: &str = "granite-speech.ggml-executor.v0";
+
+// nemotron-transcribe (NVIDIA/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B: a
+// Mamba-2/Transformer/MoE hybrid decoder (`nemotron_h_moe`, 53 blocks) + PE ASR
+// encoder + Sortformer speaker branch + CTC timestamp head, OpenMDW-1.1). Like
+// firered-llm/mimo-asr, none of these stages are composer block kinds, so this
+// stays on a hand-written dedicated executor (ArchitectureGraph). The published
+// packs are prebuilt externally and merged from a decoder GGUF and the shared
+// F16 sidecar (see tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py);
+// the family is currently STAGED behind a fail-closed not-yet-implemented
+// executor.
+pub(crate) const NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID: &str = "nemotron-transcribe-hybrid-moe";
+pub(crate) const NEMOTRON_TRANSCRIBE_GGML_ADAPTER_ID: &str =
+    "ggml-family-nemotron-transcribe-runtime-v1";
+pub(crate) const NEMOTRON_TRANSCRIBE_MODEL_FAMILY: &str = "nemotron-transcribe";
+pub(crate) const NEMOTRON_TRANSCRIBE_AUDIO_FRONTEND_ID: &str =
+    "nemotron-transcribe.mel128.16khz.mono.v0";
+pub(crate) const NEMOTRON_TRANSCRIBE_TOKENIZER_ID: &str = "nemotron-transcribe.bpe-131k.v1";
+pub(crate) const NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID: &str =
+    "nemotron-transcribe.greedy.seq2seq.v1";
+pub(crate) const NEMOTRON_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID: &str =
+    "nemotron-transcribe.runtime-tensors.v1";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXECUTOR_COMPONENT_ID: &str =
+    "nemotron-transcribe.ggml-executor.v0";
 
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.
@@ -723,6 +746,11 @@ const MOSS_RECOGNIZED_LANGUAGES: &[&str] = &[
     "de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "th", "tl", "tr", "ur", "vi", "zh",
 ];
 const GRANITE_SPEECH_RECOGNIZED_LANGUAGES: &[&str] = &["de", "en", "es", "fr", "ja", "pt"];
+const NEMOTRON_TRANSCRIBE_RECOGNIZED_LANGUAGES: &[&str] = &[
+    "ar", "bg", "bn", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hi", "hr", "hu",
+    "id", "it", "ja", "ko", "lt", "lv", "mr", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv",
+    "ta", "te", "th", "tl", "tr", "uk", "vi", "zh",
+];
 
 /// Identity facts for one native family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3368,6 +3396,122 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             skeleton_fixture: None,
         },
     },
+    OpenAsrArchitectureDescriptor {
+        resident_footprint: runtime_footprint::NEMOTRON_TRANSCRIBE_RESIDENT_FOOTPRINT,
+        identity: OpenAsrIdentityContract {
+            runtime_architecture_aliases: &[NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID],
+            model_family: NEMOTRON_TRANSCRIBE_MODEL_FAMILY,
+            model_architecture: NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            adapter_id: NEMOTRON_TRANSCRIBE_GGML_ADAPTER_ID,
+            // Language hinting works by appending a sentence to the prompt
+            // (the reference server adds "The speech is in <language>."), not by
+            // prompt tokens; without a hint the model works the language out
+            // from the speech itself. v1 ships no per-request hint plumbing.
+            catalog_family_id: "nemotron-transcribe",
+            module_slug: "nemotron_transcribe",
+            recognized_languages: NEMOTRON_TRANSCRIBE_RECOGNIZED_LANGUAGES,
+            language_family_hint: LanguageFamilyHint::SelectsViaPrompt {
+                default_language: "en",
+            },
+            dialect_capability: OpenAsrDialectCapability::NotAdvertised,
+        },
+        pack_contract: OpenAsrPackContract {
+            audio_frontend_id: NEMOTRON_TRANSCRIBE_AUDIO_FRONTEND_ID,
+            runtime_tensor_contract_id: NEMOTRON_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID,
+            tokenizer_id: NEMOTRON_TRANSCRIBE_TOKENIZER_ID,
+            pack_import: OpenAsrPackImportSurface::ExternalTooling {
+                relative_path: "tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py",
+            },
+            hparam_schema: NEMOTRON_TRANSCRIBE_HPARAM_SCHEMA,
+            runtime_validator:
+                crate::models::nemotron_transcribe::runtime_contract::validate_runtime_pack_contract,
+        },
+        execution_contract: OpenAsrExecutionContract {
+            dtw_word_times_buffer_sensitive: false,
+            preferred_longform_window_seconds: None,
+            executor_component_id: NEMOTRON_TRANSCRIBE_EXECUTOR_COMPONENT_ID,
+            runtime_factory:
+                crate::models::executor_component_registry::materialize_builtin_executor::<
+                    crate::models::nemotron_transcribe::NemotronTranscribeGgmlExecutor,
+                >,
+            execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
+            // NOTE: declared so the family may land executor work incrementally;
+            // this staged build cannot execute a single operator. The audit
+            // form must not claim any lane until the executor is real.
+            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
+            phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
+            // The upstream model CAN translate speech ("Translate the audio into
+            // English."); this staged build cannot run any of it, so the
+            // translation task surface stays closed.
+            supports_translation_task: false,
+            supports_source_language_hint: true,
+            adapter_binding: GgmlAdapterBindingStrategy::Unsupported,
+            prepared_runtime: OpenAsrPreparedRuntimeStrategy::FamilyOwned,
+            word_timestamps: OpenAsrWordTimestampStrategy::DecodeInvariant,
+            // ChatML utterance LLM: incomplete windows may legally decode
+            // empty; the SALM protocol itself refuses live audio outright.
+            streaming_partial_granularity: StreamingPartialGranularity::UtteranceComplete,
+            // Sortformer speaker branch lives inside the pack's PE encoder,
+            // emitting per-word speaker ids through the same CTC alignment pass.
+            speaker_segmentation: SpeakerSegmentationSource::InDecoder,
+            word_timestamp_source: WordTimestampSource::Native,
+            longform_slice_shape: OpenAsrLongformSliceShape::ScopedSlices {
+                // SALM can ingest up to an hour in one invocation, but this
+                // staged family has goldens only for short clips: every slice
+                // restarts in-decoder speaker numbering, so slicing at the
+                // GlobalQuadratic encoder ceiling is the conservative choice.
+                // Widen integral_seconds only with seam-level CER/DER evidence.
+                integral_seconds: 60.0,
+                target_seconds: 30.0,
+                max_seconds: 30.0,
+            },
+            invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 3600.0 },
+            // Transcriptions come out punctuated verbatim by default (see the
+            // SALM prompt table); the diarize mode is punctuation-free.
+            emits_punctuation: Some(true),
+            max_word_span_original_seconds: None,
+        },
+        topology_contract: OpenAsrTopologyContract {
+            // Attention blocks hold a causal KV over the transcript; the 23
+            // Mamba blocks carry fixed-size conv/SSM state that is not
+            // token-scaled and is deliberately not modelled by the shared
+            // capacity planner yet (the family fails closed before planning).
+            decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
+            decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
+                decode_policy_id: NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID,
+                reason: "nemotron-transcribe.greedy.seq2seq.v1 is not yet a shared policy component: the family is staged behind a fail-closed not-yet-implemented executor pending the greedy-AED decode onboarding (the loop must reuse run_seq2seq_greedy_decode_loop_v0 through run_builtin_seq2seq_decode_policy).",
+            },
+            block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
+                reason: "Mamba-2/Transformer/MoE hybrid decoder (53 blocks: 23 Mamba-2 blocks interleaved with 24 MoE blocks, 7 attention blocks incl. the blk.52 MTP head) + PE ASR encoder + 31-layer Sortformer speaker branch + CTC timestamp head; no stage is expressible by the shared block-stack composer.",
+            },
+        },
+        optimization_contract: OpenAsrOptimizationContract {
+            prefer_cpu_decoder_for_multichunk_metal: false,
+            auto_gpu_policy: AutoGpuPolicy::AllBackends,
+            // PE encoder is global self-attention per layer; same 30s safe
+            // ceiling as the other global-quadratic builtins until a measured
+            // activation coefficient exists.
+            encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+            },
+        },
+        quantization_contract: OpenAsrQuantizationContract {
+            tensor_classification: crate::models::nemotron_transcribe::package_import::TENSOR_QUANTIZATION_CONTRACT,
+        },
+        conformance_contract: OpenAsrConformanceContract {
+            profile_id: "nemotron-transcribe",
+            reference_dumper_source: Some("tooling/nemotron-reference-dumper/dump_golden.py"),
+            // Exempt from the runtime-ready skeleton gate on purpose: the
+            // executor is a fail-closed stub (the whole runtime has not
+            // landed), not merely an under-tested one. Remove this exemption
+            // in the same change that implements the executor and add a real
+            // SkeletonFixtureKind built from a tiny synthetic pack.
+            skeleton_exemption: Some(
+                "staged fail-closed not-yet-implemented executor; runtime and fixture must land together",
+            ),
+            skeleton_fixture: None,
+        },
+    },
 ];
 
 #[cfg(test)]
@@ -3638,6 +3782,7 @@ mod tests {
             (MIMO_ASR_GGML_ADAPTER_ID, false, false),
             (MOSS_TD_GGML_ADAPTER_ID, false, false),
             (GRANITE_SPEECH_GGML_ADAPTER_ID, false, false),
+            (NEMOTRON_TRANSCRIBE_GGML_ADAPTER_ID, false, true),
         ];
 
         for (adapter_id, supports_translation_task, supports_source_language_hint) in expected {
@@ -3753,6 +3898,11 @@ mod tests {
             (
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
                 SpeakerSegmentationSource::External,
+                Some(true),
+            ),
+            (
+                NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                SpeakerSegmentationSource::InDecoder,
                 Some(true),
             ),
         ];
@@ -3899,6 +4049,7 @@ mod tests {
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
                 Some(GRANITE_SPEECH_MAX_INVOCATION_SECONDS as f32),
             ),
+            (NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID, Some(3600.0)),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();
         for descriptor in registry.descriptors() {
@@ -3968,6 +4119,10 @@ mod tests {
             (MOSS_TD_GGML_ARCHITECTURE_ID, AutoGpuPolicy::AllBackends),
             (
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
+                AutoGpuPolicy::AllBackends,
+            ),
+            (
+                NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                 AutoGpuPolicy::AllBackends,
             ),
         ];
@@ -4193,6 +4348,12 @@ mod tests {
             (
                 GRANITE_SPEECH_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::LocalChunked,
+            ),
+            (
+                NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+                OpenAsrEncoderAttentionSpan::GlobalQuadratic {
+                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                },
             ),
         ];
         let registry = OpenAsrArchitectureRegistry::with_builtins();

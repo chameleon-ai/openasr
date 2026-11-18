@@ -2731,14 +2731,17 @@ mod tests {
     /// a tiny fixture can build.
     #[test]
     fn in_decoder_speaker_capability_is_family_level_not_pack_declared() {
-        // moss-transcribe-diarize is the only builtin family that carries
-        // speaker structure in its own decode today; every other family takes
-        // it from an external source (cohere's decoder has the mode but no
+        // moss-transcribe-diarize and nemotron-transcribe carry speaker
+        // structure in their own decode today; every other family takes it
+        // from an external source (cohere's decoder has the mode but no
         // publishable pack -- see its arch descriptor).
         let registry = crate::arch::OpenAsrArchitectureRegistry::with_builtins();
         for descriptor in registry.descriptors() {
-            let expected =
-                descriptor.identity.model_architecture == crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID;
+            let expected = matches!(
+                descriptor.identity.model_architecture,
+                crate::arch::MOSS_TD_GGML_ARCHITECTURE_ID
+                    | crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID
+            );
             assert_eq!(
                 descriptor
                     .execution_contract

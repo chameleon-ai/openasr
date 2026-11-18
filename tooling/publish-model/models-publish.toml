@@ -529,3 +529,20 @@ required_source_files = [
     "config.json", "tokenizer.json", "vocab.json", "merges.txt",
     "model.safetensors.index.json", "model*.safetensors",
 ]
+
+# nemotron-transcribe packs are prebuilt externally and were pushed to HF at
+# chameleon-ai/nemotron-3.5-transcribe-30b-a4b directly; the Rust family
+# importer does not exist yet, so no prep/convert command template is declared
+# here on purpose. To rebuild a pack from the AtomicChat GGUFs:
+#   python3 tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py \
+#       --decoder {src}/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-AD-Q2_0_M.gguf \
+#       --encoder {src}/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf \
+#       --out {out} --full-hash
+# (AD-IQ4_NL and Q8_0 follow the same shape; sha256s are pinned in the HF
+# model card and in tmp/publish/<id>/packs/*.result.json). Metadata/envelope
+# values are pinned in that script's OASR_KEYS.
+["nemotron-3.5-transcribe-30b-a4b"]
+upstream_repo = "AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF"
+source_revision = "dbd06c5cad7a2f33c8e06be2fb3ef814dbd9aa59"
+needs_license_flags = false
+required_source_files = ["NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf"]

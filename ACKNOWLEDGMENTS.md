@@ -65,6 +65,11 @@ credits the people who built the original.
   <https://huggingface.co/OpenASR/funasr-nano> (Mandarin + English; SAN-M/DFSMN
   encoder + adaptor + Qwen3-0.6B decoder; original weights:
   <https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512>).
+- Nemotron 3.5 Transcribe 30B-A4B (NVIDIA, OpenMDW-1.1) --
+  staged: published pack at chameleon-ai/nemotron-3.5-transcribe-30b-a4b, but
+  the OpenASR runtime for this family is not yet implemented (transcription
+  fails closed with a "not yet implemented" error). Original weights:
+  <https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B>.
 - Granite Speech 4.1 2B (IBM Granite, Apache-2.0) --
   <https://huggingface.co/OpenASR/granite-speech-4.1-2b> (English, French,
   German, Spanish, Portuguese, Japanese; Conformer encoder + Q-Former + 2B

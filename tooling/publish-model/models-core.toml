@@ -966,3 +966,47 @@ recommended_quant = "q8_0"
 upstream_release_date = "2025-05-01"
 min_core_version = "0.1.27"
 min_cli_version = "0.1.27"
+
+# NVIDIA Nemotron 3.5 Transcribe 30B-A4B (nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B):
+# Mamba-2/Transformer/MoE hybrid decoder (nemotron_h_moe, 53 blocks) + PE ASR
+# encoder + Sortformer speaker branch + CTC timestamp head. 40 languages, up to
+# 1-hour recordings, speaker attribution, speech translation, OpenMDW-1.1.
+# Its own runtime family/architecture (`nemotron-transcribe` in arch/mod.rs);
+# the runtime is NOT implemented yet -- this source row is staged
+# (release_public = false) and deliberately produces no catalog entry. Packs
+# are prebuilt externally (decoder + shared F16 encoder merged; tensor bytes
+# byte-identical to AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF
+# @ dbd06c5cad7a2f33c8e06be2fb3ef814dbd9aa59) and published at
+# chameleon-ai/nemotron-3.5-transcribe-30b-a4b; sha256/size verified against the
+# model card (2026-11-16). Encoded converter recipe:
+# tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py.
+#
+# Do NOT flip release_public until the family runtime lands, the release audit
+# form (docs/model-audits/nemotron-transcribe.md) passes validation, and
+# publish_catalog.sh re-signs the catalog at a bumped epoch. At that point
+# also set min_core_version / min_cli_version to the first release that ships
+# the nemotron-transcribe runtime (leaving them at the default 0.1.0 would
+# hand the pack to builds that cannot run it).
+["nemotron-3.5-transcribe-30b-a4b"]
+family = "nemotron-transcribe"
+hf_repo = "chameleon-ai/nemotron-3.5-transcribe-30b-a4b"
+# STAGED (release_public = false): produces no catalog entry. Flipping to
+# public requires: the family runtime to land, real OpenASR benchmarks in
+# tmp/publish/nemotron-3.5-transcribe-30b-a4b/metrics.json (the public-listing
+# gate fails closed without measured perf per quant), release_public = true,
+# and publish_catalog.sh re-signing the catalog at a bumped epoch.
+release_public = false
+size = "30b-a4b"
+registry_id = "nemotron-3.5-transcribe-30b-a4b"
+display_name = "Nemotron 3.5 Transcribe 30B-A4B"
+license_name = "OpenMDW License 1.1"
+license_source = "https://openmdw.ai/license/1-1/"
+license_class = "permissive"
+aliases = ["nemotron-transcribe", "nemotron-3.5-transcribe"]
+pull_alias = "nemotron-transcribe"
+# Explicit override, lockstep with NEMOTRON_TRANSCRIBE_RECOGNIZED_LANGUAGES in
+# arch/mod.rs (upstream card's language list).
+languages = ["ar", "bg", "bn", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hi", "hr", "hu", "id", "it", "ja", "ko", "lt", "lv", "mr", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "ta", "te", "th", "tl", "tr", "uk", "vi", "zh"]
+quants = ["q8_0", "ad_iq4_nl", "ad_q2_0_m"]
+recommended_quant = "ad_q2_0_m"
+upstream_release_date = "2026-11-16"

@@ -702,7 +702,7 @@ fn resident_footprint_inventory_is_complete() {
     let descriptors = registry.descriptors();
     assert_eq!(
         descriptors.len(),
-        16,
+        17,
         "the live ASR inventory must have one resident footprint row per architecture"
     );
 

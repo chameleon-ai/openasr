@@ -3553,16 +3553,18 @@ mod tests {
                 }
             }
         }
-        // Bookkeeping: exactly one family (granite-speech) is skeleton-exempt,
-        // and every descriptor was either covered or exempted.
+        // Bookkeeping: exactly two families are skeleton-exempt
+        // (granite-speech: EOT-id contract requires a huge vocab;
+        // nemotron-transcribe: staged fail-closed onboarding, the runtime
+        // must land with its fixture), and every descriptor was either
+        // covered or exempted.
+        let mut exempted_families: Vec<&'static str> =
+            exempted.iter().map(|(family, _)| *family).collect();
+        exempted_families.sort_unstable();
         assert_eq!(
-            exempted.len(),
-            1,
-            "exactly one family may be skeleton-exempt: {exempted:?}"
-        );
-        assert_eq!(
-            exempted[0].0, "granite-speech",
-            "only granite-speech is skeleton-exempt: {exempted:?}"
+            exempted_families,
+            ["granite-speech", "nemotron-transcribe"],
+            "only granite-speech and nemotron-transcribe are skeleton-exempt: {exempted:?}"
         );
         assert_eq!(covered + exempted.len(), descriptors.len());
     }

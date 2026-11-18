@@ -999,6 +999,8 @@ pub(crate) const MOSS_TD_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
     ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE, DECODER_STATE]);
 pub(crate) const GRANITE_SPEECH_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
     ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE, DECODER_STATE]);
+pub(crate) const NEMOTRON_TRANSCRIBE_RESIDENT_FOOTPRINT: ResidentFootprintFacet =
+    ResidentFootprintFacet::new(&[MODEL_BINDING, EXECUTION_STATE, DECODER_STATE]);
 
 const STREAM_VAD_EMBEDDED: ResidentComponentSpec = ResidentComponentSpec::new(
     "embedded-model",

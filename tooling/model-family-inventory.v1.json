@@ -1303,6 +1303,196 @@
       }
     },
     {
+      "catalog_family_id": "nemotron-transcribe",
+      "model_family": "nemotron-transcribe",
+      "model_architecture": "nemotron-transcribe-hybrid-moe",
+      "runtime_architecture_aliases": [
+        "nemotron-transcribe-hybrid-moe"
+      ],
+      "adapter_id": "ggml-family-nemotron-transcribe-runtime-v1",
+      "module_slug": "nemotron_transcribe",
+      "language": {
+        "policy": "selects-via-prompt",
+        "default_language": "en",
+        "reject_reason": null,
+        "languages": [
+          "ar",
+          "bg",
+          "bn",
+          "cs",
+          "da",
+          "de",
+          "el",
+          "en",
+          "es",
+          "et",
+          "fi",
+          "fr",
+          "he",
+          "hi",
+          "hr",
+          "hu",
+          "id",
+          "it",
+          "ja",
+          "ko",
+          "lt",
+          "lv",
+          "mr",
+          "mt",
+          "nl",
+          "pl",
+          "pt",
+          "ro",
+          "ru",
+          "sk",
+          "sl",
+          "sv",
+          "ta",
+          "te",
+          "th",
+          "tl",
+          "tr",
+          "uk",
+          "vi",
+          "zh"
+        ],
+        "dialect_mode": "not-advertised",
+        "selectable_dialect_codes": []
+      },
+      "pack": {
+        "audio_frontend_id": "nemotron-transcribe.mel128.16khz.mono.v0",
+        "decode_policy_id": "nemotron-transcribe.greedy.seq2seq.v1",
+        "runtime_tensor_contract_id": "nemotron-transcribe.runtime-tensors.v1",
+        "tokenizer_id": "nemotron-transcribe.bpe-131k.v1",
+        "hparam_schema": [
+          "nemotron_h_moe.block_count",
+          "nemotron_h_moe.embedding_length",
+          "nemotron_h_moe.vocab_size",
+          "nemotron_h_moe.context_length",
+          "nemotron_h_moe.expert_count",
+          "nemotron_h_moe.expert_used_count",
+          "nemotron_h_moe.expert_feed_forward_length",
+          "nemotron_h_moe.expert_shared_count",
+          "nemotron_h_moe.expert_shared_feed_forward_length",
+          "nemotron_h_moe.nextn_predict_layers",
+          "nemotron_h_moe.rope.dimension_count",
+          "nemotron_h_moe.ssm.conv_kernel",
+          "nemotron_h_moe.ssm.group_count",
+          "nemotron_h_moe.ssm.inner_size",
+          "nemotron_h_moe.ssm.state_size",
+          "nemotron_h_moe.ssm.time_step_rank",
+          "nemotron_h_moe.attention.head_count",
+          "nemotron_h_moe.attention.key_length",
+          "nemotron_h_moe.attention.value_length",
+          "pee.asr.n_layers",
+          "pee.asr.d_model",
+          "pee.asr.n_heads",
+          "pee.asr.feat_in",
+          "pee.asr.ff_hidden",
+          "pee.asr.rotary_dims",
+          "pee.asr.subsampling_factor",
+          "pee.diar.n_layers",
+          "pee.diar.d_model",
+          "pee.diar.tf_d_model",
+          "pee.diar.num_speakers",
+          "pee.fusion.proj_dim",
+          "pee.preprocessor.features",
+          "pee.preprocessor.sample_rate",
+          "pee.preprocessor.n_fft",
+          "ctc.vocab_size",
+          "ctc.d_model",
+          "ctc.n_layers"
+        ],
+        "importer": {
+          "kind": "external-tooling",
+          "symbol": null,
+          "relative_path": "tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py"
+        }
+      },
+      "execution": {
+        "executor_component_id": "nemotron-transcribe.ggml-executor.v0",
+        "executor": "dedicated-runtime-executor-v1",
+        "execution_capabilities": {
+          "cpu": true,
+          "providers": [
+            {
+              "provider": "cuda",
+              "full_device": true,
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
+            },
+            {
+              "provider": "hip",
+              "full_device": true,
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
+            },
+            {
+              "provider": "metal",
+              "full_device": true,
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "fresh_graph",
+                "capability_evidence_revision": 2
+              }
+            },
+            {
+              "provider": "vulkan",
+              "full_device": true,
+              "hybrid": false,
+              "decode_reuse_policy": {
+                "graph_mode": "reusable_graph",
+                "capability_evidence_revision": 2
+              }
+            }
+          ]
+        },
+        "streaming_partial_granularity": "utterance-complete",
+        "speaker_segmentation": "in-decoder",
+        "emits_punctuation": true,
+        "supports_phrase_bias": false,
+        "phrase_bias_strategy": "unsupported",
+        "phrase_bias_required_tensor": null,
+        "supports_translation_task": false,
+        "supports_source_language_hint": true,
+        "adapter_binding": "unsupported",
+        "prepared_runtime": "family-owned",
+        "word_timestamp_strategy": "decode-invariant",
+        "invocation_span": {
+          "policy": "bounded",
+          "max_seconds": 3600.0
+        }
+      },
+      "topology": {
+        "decode_driver": "dedicated",
+        "decode_driver_reason": "nemotron-transcribe.greedy.seq2seq.v1 is not yet a shared policy component: the family is staged behind a fail-closed not-yet-implemented executor pending the greedy-AED decode onboarding (the loop must reuse run_seq2seq_greedy_decode_loop_v0 through run_builtin_seq2seq_decode_policy).",
+        "block_stack": "architecture-graph",
+        "block_stack_reason": "Mamba-2/Transformer/MoE hybrid decoder (53 blocks: 23 Mamba-2 blocks interleaved with 24 MoE blocks, 7 attention blocks incl. the blk.52 MTP head) + PE ASR encoder + 31-layer Sortformer speaker branch + CTC timestamp head; no stage is expressible by the shared block-stack composer.",
+        "decoder_state": "causal-self-attention-kv"
+      },
+      "optimization": {
+        "prefer_cpu_decoder_for_multichunk_metal": false,
+        "auto_gpu_policy": "all-backends",
+        "encoder_attention_span": "global-quadratic",
+        "encoder_attention_max_safe_chunk_seconds": 30.0
+      },
+      "quantization": {
+        "tensor_classification": "semantic-roles-v1",
+        "quantized_axis": "first"
+      },
+      "conformance": {
+        "profile_id": "nemotron-transcribe",
+        "reference_dumper_source": "tooling/nemotron-reference-dumper/dump_golden.py"
+      }
+    },
+    {
       "catalog_family_id": "parakeet",
       "model_family": "parakeet-ctc",
       "model_architecture": "parakeet-fastconformer-ctc",

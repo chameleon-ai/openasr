@@ -471,3 +471,104 @@ pub(crate) static GRANITE_SPEECH_HPARAM_SCHEMA: &[&str] = &[
     "granite_speech.decoder.residual_multiplier",
     "granite_speech.decoder.logits_scaling",
 ];
+
+// ── Nemotron-Transcribe (nemotron-3.5-transcribe-30b-a4b) hparam keys ─────────
+
+/// GGUF `general.architecture` value retained by the merged pack (the decoder's
+/// value is authoritative; the encoder sidecar contributes non-conflicting keys).
+pub(crate) const NEMOTRON_TRANSCRIBE_ARCHITECTURE_ID: &str = "nemotron_h_moe";
+pub(crate) const NEMOTRON_TRANSCRIBE_BLOCK_COUNT_KEY: &str = "nemotron_h_moe.block_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_EMBEDDING_LENGTH_KEY: &str = "nemotron_h_moe.embedding_length";
+pub(crate) const NEMOTRON_TRANSCRIBE_VOCAB_SIZE_KEY: &str = "nemotron_h_moe.vocab_size";
+pub(crate) const NEMOTRON_TRANSCRIBE_CONTEXT_LENGTH_KEY: &str = "nemotron_h_moe.context_length";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXPERT_COUNT_KEY: &str = "nemotron_h_moe.expert_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXPERT_USED_COUNT_KEY: &str =
+    "nemotron_h_moe.expert_used_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXPERT_FEED_FORWARD_LENGTH_KEY: &str =
+    "nemotron_h_moe.expert_feed_forward_length";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXPERT_SHARED_COUNT_KEY: &str =
+    "nemotron_h_moe.expert_shared_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_EXPERT_SHARED_FEED_FORWARD_LENGTH_KEY: &str =
+    "nemotron_h_moe.expert_shared_feed_forward_length";
+pub(crate) const NEMOTRON_TRANSCRIBE_NEXTN_PREDICT_LAYERS_KEY: &str =
+    "nemotron_h_moe.nextn_predict_layers";
+pub(crate) const NEMOTRON_TRANSCRIBE_ROPE_DIMENSION_COUNT_KEY: &str =
+    "nemotron_h_moe.rope.dimension_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_SSM_CONV_KERNEL_KEY: &str = "nemotron_h_moe.ssm.conv_kernel";
+pub(crate) const NEMOTRON_TRANSCRIBE_SSM_GROUP_COUNT_KEY: &str = "nemotron_h_moe.ssm.group_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_SSM_INNER_SIZE_KEY: &str = "nemotron_h_moe.ssm.inner_size";
+pub(crate) const NEMOTRON_TRANSCRIBE_SSM_STATE_SIZE_KEY: &str = "nemotron_h_moe.ssm.state_size";
+pub(crate) const NEMOTRON_TRANSCRIBE_SSM_TIME_STEP_RANK_KEY: &str =
+    "nemotron_h_moe.ssm.time_step_rank";
+pub(crate) const NEMOTRON_TRANSCRIBE_ATTENTION_HEAD_COUNT_KEY: &str =
+    "nemotron_h_moe.attention.head_count";
+pub(crate) const NEMOTRON_TRANSCRIBE_ATTENTION_KEY_LENGTH_KEY: &str =
+    "nemotron_h_moe.attention.key_length";
+pub(crate) const NEMOTRON_TRANSCRIBE_ATTENTION_VALUE_LENGTH_KEY: &str =
+    "nemotron_h_moe.attention.value_length";
+
+// PE encoder sidecar keys (`pee.asr.*`).
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_N_LAYERS_KEY: &str = "pee.asr.n_layers";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_D_MODEL_KEY: &str = "pee.asr.d_model";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_N_HEADS_KEY: &str = "pee.asr.n_heads";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_FEAT_IN_KEY: &str = "pee.asr.feat_in";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_FF_HIDDEN_KEY: &str = "pee.asr.ff_hidden";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_ROTARY_DIMS_KEY: &str = "pee.asr.rotary_dims";
+pub(crate) const NEMOTRON_TRANSCRIBE_ASR_SUBSAMPLING_FACTOR_KEY: &str =
+    "pee.asr.subsampling_factor";
+
+// Sortformer speaker-branch keys (`pee.diar.*`).
+pub(crate) const NEMOTRON_TRANSCRIBE_DIAR_N_LAYERS_KEY: &str = "pee.diar.n_layers";
+pub(crate) const NEMOTRON_TRANSCRIBE_DIAR_D_MODEL_KEY: &str = "pee.diar.d_model";
+pub(crate) const NEMOTRON_TRANSCRIBE_DIAR_TF_D_MODEL_KEY: &str = "pee.diar.tf_d_model";
+pub(crate) const NEMOTRON_TRANSCRIBE_DIAR_NUM_SPEAKERS_KEY: &str = "pee.diar.num_speakers";
+
+// Fusion / preprocessor / CTC keys.
+pub(crate) const NEMOTRON_TRANSCRIBE_FUSION_PROJ_DIM_KEY: &str = "pee.fusion.proj_dim";
+pub(crate) const NEMOTRON_TRANSCRIBE_PREPROCESSOR_FEATURES_KEY: &str = "pee.preprocessor.features";
+pub(crate) const NEMOTRON_TRANSCRIBE_PREPROCESSOR_SAMPLE_RATE_KEY: &str =
+    "pee.preprocessor.sample_rate";
+pub(crate) const NEMOTRON_TRANSCRIBE_PREPROCESSOR_N_FFT_KEY: &str = "pee.preprocessor.n_fft";
+pub(crate) const NEMOTRON_TRANSCRIBE_CTC_VOCAB_SIZE_KEY: &str = "ctc.vocab_size";
+pub(crate) const NEMOTRON_TRANSCRIBE_CTC_D_MODEL_KEY: &str = "ctc.d_model";
+pub(crate) const NEMOTRON_TRANSCRIBE_CTC_N_LAYERS_KEY: &str = "ctc.n_layers";
+
+pub(crate) static NEMOTRON_TRANSCRIBE_HPARAM_SCHEMA: &[&str] = &[
+    NEMOTRON_TRANSCRIBE_BLOCK_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_EMBEDDING_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_VOCAB_SIZE_KEY,
+    NEMOTRON_TRANSCRIBE_CONTEXT_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_EXPERT_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_EXPERT_USED_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_EXPERT_FEED_FORWARD_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_EXPERT_SHARED_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_EXPERT_SHARED_FEED_FORWARD_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_NEXTN_PREDICT_LAYERS_KEY,
+    NEMOTRON_TRANSCRIBE_ROPE_DIMENSION_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_SSM_CONV_KERNEL_KEY,
+    NEMOTRON_TRANSCRIBE_SSM_GROUP_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_SSM_INNER_SIZE_KEY,
+    NEMOTRON_TRANSCRIBE_SSM_STATE_SIZE_KEY,
+    NEMOTRON_TRANSCRIBE_SSM_TIME_STEP_RANK_KEY,
+    NEMOTRON_TRANSCRIBE_ATTENTION_HEAD_COUNT_KEY,
+    NEMOTRON_TRANSCRIBE_ATTENTION_KEY_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_ATTENTION_VALUE_LENGTH_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_N_LAYERS_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_D_MODEL_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_N_HEADS_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_FEAT_IN_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_FF_HIDDEN_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_ROTARY_DIMS_KEY,
+    NEMOTRON_TRANSCRIBE_ASR_SUBSAMPLING_FACTOR_KEY,
+    NEMOTRON_TRANSCRIBE_DIAR_N_LAYERS_KEY,
+    NEMOTRON_TRANSCRIBE_DIAR_D_MODEL_KEY,
+    NEMOTRON_TRANSCRIBE_DIAR_TF_D_MODEL_KEY,
+    NEMOTRON_TRANSCRIBE_DIAR_NUM_SPEAKERS_KEY,
+    NEMOTRON_TRANSCRIBE_FUSION_PROJ_DIM_KEY,
+    NEMOTRON_TRANSCRIBE_PREPROCESSOR_FEATURES_KEY,
+    NEMOTRON_TRANSCRIBE_PREPROCESSOR_SAMPLE_RATE_KEY,
+    NEMOTRON_TRANSCRIBE_PREPROCESSOR_N_FFT_KEY,
+    NEMOTRON_TRANSCRIBE_CTC_VOCAB_SIZE_KEY,
+    NEMOTRON_TRANSCRIBE_CTC_D_MODEL_KEY,
+    NEMOTRON_TRANSCRIBE_CTC_N_LAYERS_KEY,
+];
