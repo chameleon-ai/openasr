@@ -12,16 +12,22 @@
 //! `tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py`) and
 //! already carry the full `openasr.*` envelope.
 //!
-//! STAGED, fail-closed: this module exists so the family's packs can pass the
-//! production `PackVerifier` and so the release pipeline can proceed. The
-//! decoder/encoder/speaker-branch/CTC runtime itself has NOT landed: the
-//! executor fails closed with a "not yet implemented" error, and the family
-//! must not be treated as runnable until the executor, the streaming session
-//! driver, and the golden-parity gate are real. See
-//! `docs/model-audits/nemotron-transcribe.md`.
+//! Bring-up state: the offline execution path (frontend -> PE encoder ->
+//! nemotron_h_moe trunk -> shared greedy driver -> verbatim transcript) is
+//! implemented; streaming is the shared snapshot driver (registration
+//! completeness, not a streaming-tuned latency claim). In-decoder speaker
+//! ids, the CTC timestamp head, word timestamps, and the translation task
+//! remain unimplemented; the audit form stays honest about that.
 
+pub(crate) mod capacity;
+pub(crate) mod decode_executor;
+pub(crate) mod decoder_graph;
+pub(crate) mod encoder_graph;
 pub(crate) mod executor;
+pub(crate) mod frontend;
 pub(crate) mod package_import;
+pub(crate) mod prompt;
 pub(crate) mod runtime_contract;
+pub(crate) mod tokenizer;
 
 pub(crate) use executor::NemotronTranscribeGgmlExecutor;

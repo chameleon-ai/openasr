@@ -299,6 +299,29 @@ pub(crate) const MOSS_TD_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDe
         ctc_blank_token_id: None,
     };
 
+pub(crate) const NEMOTRON_TRANSCRIBE_DECODE_POLICY_COMPONENT:
+    BuiltinDecodePolicyComponentDescriptor = BuiltinDecodePolicyComponentDescriptor {
+    // Source of truth is `crate::arch` (same staging precedent as
+    // mimo-asr above): nemotron-transcribe has no crate-root re-export.
+    decode_policy_id: crate::arch::NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID,
+    execution_kind: BuiltinDecodePolicyExecutionKind::Seq2SeqGreedyV0,
+    // The stop token (`<|im_end|>`, id 11) is supplied per-request via
+    // `BuiltinSeq2SeqDecodePolicyConfigInput.eot_token_id`; the audio row
+    // positions are spliced in by the executor before decode starts and
+    // are never emitted by the trunk itself, so there is nothing to
+    // strip -- Identity postprocess, same shape as firered-llm.
+    seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
+    seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
+    seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
+    seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+    // The executor assembles the audio splice ONCE (the whole PE-projected
+    // utterance goes into a single prompt) and decodes it in one pass;
+    // it emits no carry context. Disabled, same as firered-llm.
+    longform_prompt_carry_mode: BuiltinDecodePolicyLongformPromptCarryMode::Disabled,
+    longform_profile: BuiltinDecodePolicyLongformProfile::Default,
+    ctc_blank_token_id: None,
+};
+
 pub(crate) const GRANITE_SPEECH_DECODE_POLICY_COMPONENT: BuiltinDecodePolicyComponentDescriptor =
     BuiltinDecodePolicyComponentDescriptor {
         // Source of truth is `crate::arch` (same staging precedent as

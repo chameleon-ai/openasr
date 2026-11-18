@@ -1471,8 +1471,8 @@
         }
       },
       "topology": {
-        "decode_driver": "dedicated",
-        "decode_driver_reason": "nemotron-transcribe.greedy.seq2seq.v1 is not yet a shared policy component: the family is staged behind a fail-closed not-yet-implemented executor pending the greedy-AED decode onboarding (the loop must reuse run_seq2seq_greedy_decode_loop_v0 through run_builtin_seq2seq_decode_policy).",
+        "decode_driver": "shared-seq2seq-greedy",
+        "decode_driver_reason": null,
         "block_stack": "architecture-graph",
         "block_stack_reason": "Mamba-2/Transformer/MoE hybrid decoder (53 blocks: 23 Mamba-2 blocks interleaved with 24 MoE blocks, 7 attention blocks incl. the blk.52 MTP head) + PE ASR encoder + 31-layer Sortformer speaker branch + CTC timestamp head; no stage is expressible by the shared block-stack composer.",
         "decoder_state": "causal-self-attention-kv"

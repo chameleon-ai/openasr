@@ -12,10 +12,10 @@
 //! - the tensor index: exactly 1303 tensors, with the mandatory scopes and
 //!   the small set of load-bearing shapes pinned.
 //!
-//! It deliberately does NOT claim anything about execution: the family is
-//! staged as not-yet-implemented and no graph is built from this contract
-//! yet. When the real executor lands, this file evolves into the executor's
-//! own typed metadata instead of being loosened.
+//! It deliberately does NOT claim anything about execution: this validator
+//! pins the pack's structure and hparams only. The executor
+//! (`models/nemotron_transcribe/`) is built against these same pinned
+//! identities; keep the two in sync rather than loosening either.
 
 use thiserror::Error;
 

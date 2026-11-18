@@ -2517,7 +2517,13 @@ impl GgmlStaticTensorArenaUsage {
     const fn backend_buffer_usage(self) -> c_int {
         match self {
             Self::Weights => ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
-            Self::State => ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE,
+            // Session-resident state (KV/SSM/conv arenas) must not look like
+            // scheduler-owned compute scratch: `detach_scheduler_graph_bindings`
+            // unbinds COMPUTE-usage tensors between graphs, which would null
+            // these tensors' buffer/data and trip the view-init assert in the
+            // next graph's bind. ANY keeps them resident for the session while
+            // remaining legal for the HIP backend.
+            Self::State => ffi::GGML_BACKEND_BUFFER_USAGE_ANY,
         }
     }
 }
@@ -5754,6 +5760,79 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.new_tensor_checked(raw, "ggml_rms_norm")
     }
 
+    /// `x > 0 ? 1 : 0` elementwise (ggml's `step`).
+    pub(crate) fn step(
+        &self,
+        input: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_step")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_step input")?;
+        let raw = unsafe { ffi::ggml_step(self.context.as_ptr(), input.raw.as_ptr()) };
+        self.new_tensor_checked(raw, "ggml_step")
+    }
+
+    /// `min(max(x, lo), hi)` elementwise (ggml's `clamp`).
+    pub(crate) fn clamp(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        min: f32,
+        max: f32,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_clamp")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_clamp input")?;
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_clamp requires finite min <= max",
+            });
+        }
+        let raw = unsafe { ffi::ggml_clamp(self.context.as_ptr(), input.raw.as_ptr(), min, max) };
+        self.new_tensor_checked(raw, "ggml_clamp")
+    }
+
+    /// `silu(a) * b` elementwise with the gate on the left (ggml's
+    /// `swiglu_split`; the Mamba z-gate).
+    pub(crate) fn swiglu_split(
+        &self,
+        a: GgmlCpuTensor<'a>,
+        b: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_swiglu_split")?;
+        self.ensure_tensor_type(a, ffi::GGML_TYPE_F32, "ggml_swiglu_split a")?;
+        self.ensure_tensor_type(b, ffi::GGML_TYPE_F32, "ggml_swiglu_split b")?;
+        self.ensure_tensor_contiguous(a, "ggml_swiglu_split a")?;
+        self.ensure_tensor_contiguous(b, "ggml_swiglu_split b")?;
+        let a_shape = self.tensor_shape_4d(a)?;
+        let b_shape = self.tensor_shape_4d(b)?;
+        if a_shape != b_shape {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_swiglu_split requires a and b to have the same shape",
+            });
+        }
+        let raw = unsafe {
+            ffi::ggml_swiglu_split(self.context.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr())
+        };
+        self.new_tensor_checked(raw, "ggml_swiglu_split")
+    }
+
+    /// `x * s + b` elementwise (ggml's `scale_bias`).
+    pub(crate) fn scale_bias(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        scale: f32,
+        bias: f32,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_scale_bias")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_scale_bias input")?;
+        if !scale.is_finite() || !bias.is_finite() {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_scale_bias scale and bias must be finite",
+            });
+        }
+        let raw =
+            unsafe { ffi::ggml_scale_bias(self.context.as_ptr(), input.raw.as_ptr(), scale, bias) };
+        self.new_tensor_checked(raw, "ggml_scale_bias")
+    }
+
     #[allow(dead_code)]
     pub(crate) fn repeat(
         &self,
@@ -6986,6 +7065,119 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
             )
         };
         self.new_tensor_checked(raw, "ggml_ssm_conv")
+    }
+
+    /// Builds ggml's Mamba-2 associative scan. `state` is the recurrent state
+    /// `[d_state, head_dim, n_head, slots]`, `ids` selects the slot per sequence
+    /// (one i32 per sequence; `-1` reads the zero state). The output is the
+    /// concatenated scan output followed by the updated states.
+    pub(crate) fn ssm_scan(
+        &self,
+        state: GgmlCpuTensor<'a>,
+        x: GgmlCpuTensor<'a>,
+        dt: GgmlCpuTensor<'a>,
+        a: GgmlCpuTensor<'a>,
+        b: GgmlCpuTensor<'a>,
+        c: GgmlCpuTensor<'a>,
+        ids: GgmlCpuTensor<'a>,
+        k: usize,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_ssm_scan")?;
+        self.ensure_tensor_type(state, ffi::GGML_TYPE_F32, "ggml_ssm_scan state")?;
+        self.ensure_tensor_type(x, ffi::GGML_TYPE_F32, "ggml_ssm_scan x")?;
+        self.ensure_tensor_type(dt, ffi::GGML_TYPE_F32, "ggml_ssm_scan dt")?;
+        self.ensure_tensor_type(a, ffi::GGML_TYPE_F32, "ggml_ssm_scan A")?;
+        self.ensure_tensor_type(b, ffi::GGML_TYPE_F32, "ggml_ssm_scan B")?;
+        self.ensure_tensor_type(c, ffi::GGML_TYPE_F32, "ggml_ssm_scan C")?;
+        self.ensure_tensor_type(ids, ffi::GGML_TYPE_I32, "ggml_ssm_scan ids")?;
+        self.ensure_tensor_contiguous(state, "ggml_ssm_scan state")?;
+        self.ensure_tensor_contiguous(dt, "ggml_ssm_scan dt")?;
+        self.ensure_tensor_contiguous(a, "ggml_ssm_scan A")?;
+        let k_i64 = i64::try_from(k).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "ggml_ssm_scan K exceeds i64",
+        })?;
+        let raw = unsafe {
+            ffi::ggml_ssm_scan(
+                self.context.as_ptr(),
+                state.raw.as_ptr(),
+                x.raw.as_ptr(),
+                dt.raw.as_ptr(),
+                a.raw.as_ptr(),
+                b.raw.as_ptr(),
+                c.raw.as_ptr(),
+                ids.raw.as_ptr(),
+                k_i64,
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_ssm_scan")
+    }
+
+    /// Descending top-k over the first axis: returns the k largest indices per
+    /// row as an i32 tensor shaped like the input's ne1..ne3 axes.
+    pub(crate) fn argsort_top_k(
+        &self,
+        input: GgmlCpuTensor<'a>,
+        k: usize,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_argsort_top_k")?;
+        self.ensure_tensor_type(input, ffi::GGML_TYPE_F32, "ggml_argsort_top_k input")?;
+        let shape = self.tensor_shape_4d(input)?;
+        if k == 0 || k > shape[0] {
+            return Err(GgmlCpuGraphError::UnsupportedInputs {
+                reason: "ggml_argsort_top_k requires 0 < k <= input.ne0",
+            });
+        }
+        let k_i32 = i32::try_from(k).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
+            reason: "ggml_argsort_top_k k exceeds i32",
+        })?;
+        let raw =
+            unsafe { ffi::ggml_argsort_top_k(self.context.as_ptr(), input.raw.as_ptr(), k_i32) };
+        self.new_tensor_checked(raw, "ggml_argsort_top_k")
+    }
+
+    /// Per-row expert selection matmul. `experts` is `[n_embd, n_ff, n_expert]`
+    /// (one expert matrix per trailing plane), `input` is
+    /// `[n_embd, n_expert_used, n_tokens]`, `ids` is `[n_expert_used, n_tokens]`
+    /// i32. Result is `[n_ff, n_expert_used, n_tokens]`.
+    pub(crate) fn mul_mat_id(
+        &self,
+        experts: GgmlCpuTensor<'a>,
+        input: GgmlCpuTensor<'a>,
+        ids: GgmlCpuTensor<'a>,
+    ) -> Result<GgmlCpuTensor<'a>, GgmlCpuGraphError> {
+        self.ensure_can_extend_graph("ggml_mul_mat_id")?;
+        self.ensure_tensor_type_in(
+            experts,
+            &[
+                ffi::GGML_TYPE_F16,
+                ffi::GGML_TYPE_F32,
+                ffi::GGML_TYPE_Q4_0,
+                ffi::GGML_TYPE_Q8_0,
+                ffi::GGML_TYPE_Q2_0,
+                ffi::GGML_TYPE_IQ4_NL,
+                ffi::GGML_TYPE_Q3_K,
+                ffi::GGML_TYPE_Q4_K,
+                ffi::GGML_TYPE_Q5_K,
+                ffi::GGML_TYPE_Q6_K,
+            ],
+            "ggml_mul_mat_id experts",
+        )?;
+        self.ensure_tensor_type_in(
+            input,
+            &[ffi::GGML_TYPE_F16, ffi::GGML_TYPE_F32],
+            "ggml_mul_mat_id input",
+        )?;
+        self.ensure_tensor_type(ids, ffi::GGML_TYPE_I32, "ggml_mul_mat_id ids")?;
+        self.ensure_tensor_contiguous(ids, "ggml_mul_mat_id ids")?;
+        let raw = unsafe {
+            ffi::ggml_mul_mat_id(
+                self.context.as_ptr(),
+                experts.raw.as_ptr(),
+                input.raw.as_ptr(),
+                ids.raw.as_ptr(),
+            )
+        };
+        self.new_tensor_checked(raw, "ggml_mul_mat_id")
     }
 
     /// Builds ggml's fused LSTM sequence op. The native constructor creates
@@ -17991,7 +18183,7 @@ mod tests {
         );
         assert_eq!(
             super::GgmlStaticTensorArenaUsage::State.backend_buffer_usage(),
-            ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE
+            ffi::GGML_BACKEND_BUFFER_USAGE_ANY
         );
 
         let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::conservative_default())

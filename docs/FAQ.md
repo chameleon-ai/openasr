@@ -20,10 +20,11 @@ FireRedASR2-LLM (Mandarin + English bilingual; Encoder-Adapter-LLM),
 Fun-ASR-Nano (zh/en; SAN-M encoder + Qwen3 decoder), Granite Speech 4.1
 (en/fr/de/es/pt/ja; Conformer + Q-Former + 2B decoder),
 MOSS-Transcribe-Diarize (zh/en meeting transcription with in-decoder speaker
-segmentation), Nemotron 3.5 Transcribe 30B-A4B (staged: pack published at
-chameleon-ai/nemotron-3.5-transcribe-30b-a4b, but the OpenASR runtime is not
-yet implemented -- transcription fails closed with a "not yet implemented"
-error), and X-ASR (Zipformer). They run local offline transcription on CPU and Metal
+segmentation), Nemotron 3.5 Transcribe 30B-A4B (pack published at
+chameleon-ai/nemotron-3.5-transcribe-30b-a4b; the offline runtime is
+implemented -- transcription works from a local .oasr pack on GPU --
+but the family is not in the pull catalog yet and has no measured bench), and
+X-ASR (Zipformer). They run local offline transcription on CPU and Metal
 lanes. See [Known Limitations](KNOWN_LIMITATIONS.md) for per-family
 streaming and word-timestamp support, and the per-model cards under
 [`model-registry/models/`](../model-registry/models/) for quant tiers.

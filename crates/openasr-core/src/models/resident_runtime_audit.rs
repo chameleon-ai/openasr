@@ -521,6 +521,10 @@ fn resident_inventory_set() -> BTreeSet<(String, String, String)> {
             "models/moss_transcribe_diarize/executor.rs",
             "MossTdUnifiedRuntimePool",
         ),
+        (
+            "models/nemotron_transcribe/executor.rs",
+            "NemotronTranscribeUnifiedRuntimePool",
+        ),
         ("models/parakeet_ctc/executor.rs", "ParakeetCtcRuntimePool"),
         ("models/parakeet_tdt/executor.rs", "ParakeetTdtRuntimePool"),
         (

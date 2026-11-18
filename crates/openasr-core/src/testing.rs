@@ -3555,8 +3555,9 @@ mod tests {
         }
         // Bookkeeping: exactly two families are skeleton-exempt
         // (granite-speech: EOT-id contract requires a huge vocab;
-        // nemotron-transcribe: staged fail-closed onboarding, the runtime
-        // must land with its fixture), and every descriptor was either
+        // nemotron-transcribe: runtime landed 2026-11-18 (offline JFK golden
+        // on HIP) but no synthetic skeleton fixture exists yet, so the
+        // exemption still carries the load), and every descriptor was either
         // covered or exempted.
         let mut exempted_families: Vec<&'static str> =
             exempted.iter().map(|(family, _)| *family).collect();

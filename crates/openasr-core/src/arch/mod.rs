@@ -3475,11 +3475,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             // Attention blocks hold a causal KV over the transcript; the 23
             // Mamba blocks carry fixed-size conv/SSM state that is not
             // token-scaled and is deliberately not modelled by the shared
-            // capacity planner yet (the family fails closed before planning).
+            // capacity planner (the family-owned runtime owns it).
             decoder_state_topology: OpenAsrDecoderStateTopology::CausalSelfAttentionKv,
-            decode_driver: OpenAsrDecodeDriverStrategy::Dedicated {
-                decode_policy_id: NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID,
-                reason: "nemotron-transcribe.greedy.seq2seq.v1 is not yet a shared policy component: the family is staged behind a fail-closed not-yet-implemented executor pending the greedy-AED decode onboarding (the loop must reuse run_seq2seq_greedy_decode_loop_v0 through run_builtin_seq2seq_decode_policy).",
+            decode_driver: OpenAsrDecodeDriverStrategy::SharedSeq2SeqGreedy {
+                policy: crate::models::decode_policy_component_registry::NEMOTRON_TRANSCRIBE_DECODE_POLICY_COMPONENT,
             },
             block_stack: OpenAsrBlockStackStrategy::ArchitectureGraph {
                 reason: "Mamba-2/Transformer/MoE hybrid decoder (53 blocks: 23 Mamba-2 blocks interleaved with 24 MoE blocks, 7 attention blocks incl. the blk.52 MTP head) + PE ASR encoder + 31-layer Sortformer speaker branch + CTC timestamp head; no stage is expressible by the shared block-stack composer.",

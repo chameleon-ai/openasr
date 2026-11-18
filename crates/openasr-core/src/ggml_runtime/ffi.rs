@@ -129,6 +129,7 @@ pub(crate) const GGML_STATUS_SUCCESS: c_int = 0;
 /// to the typed per-job cancellation path rather than a generic compute
 /// failure. All other non-success values are terminal failures.
 pub(crate) const GGML_STATUS_ABORTED: c_int = 1;
+pub(crate) const GGML_BACKEND_BUFFER_USAGE_ANY: c_int = 0;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_WEIGHTS: c_int = 1;
 pub(crate) const GGML_BACKEND_BUFFER_USAGE_COMPUTE: c_int = 2;
 // Only the graph-metadata tests read this; stock ggml itself propagates the
@@ -302,6 +303,10 @@ pub(crate) const GGML_TYPE_Q5_K: c_int = 13;
 pub(crate) const GGML_TYPE_Q6_K: c_int = 14;
 pub(crate) const GGML_TYPE_I32: c_int = 26;
 pub(crate) const GGML_TYPE_Q2_0: c_int = 42;
+/// IQ4_NL (type 20): used by the nemotron-transcribe AD tiers' routed experts.
+/// Not in the shared mul_mat allowlist yet; bound only where a family's graph
+/// declares it.
+pub(crate) const GGML_TYPE_IQ4_NL: c_int = 20;
 
 /// Exclusive upper bound of `enum ggml_type` in vendored
 /// `third_party/openasr-ggml/include/ggml.h` (`GGML_TYPE_COUNT = 44`,
@@ -755,6 +760,24 @@ unsafe extern "C" {
     ) -> GgmlTensorRaw;
     #[allow(dead_code)]
     pub(crate) fn ggml_rms_norm(ctx: GgmlContextRaw, a: GgmlTensorRaw, eps: f32) -> GgmlTensorRaw;
+    pub(crate) fn ggml_step(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
+    pub(crate) fn ggml_scale_bias(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        s: f32,
+        b: f32,
+    ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_clamp(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        min: f32,
+        max: f32,
+    ) -> GgmlTensorRaw;
+    pub(crate) fn ggml_swiglu_split(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+    ) -> GgmlTensorRaw;
     #[allow(dead_code)]
     pub(crate) fn ggml_repeat(
         ctx: GgmlContextRaw,
@@ -793,6 +816,36 @@ unsafe extern "C" {
         ctx: GgmlContextRaw,
         sx: GgmlTensorRaw,
         c: GgmlTensorRaw,
+    ) -> GgmlTensorRaw;
+    // Mamba-2 associative scan. `s` is the recurrent state
+    // [d_state, head_dim, n_head, slots], `ids` selects the slot per sequence
+    // (one i32 per sequence); the result is the concatenated output followed by
+    // K state snapshots (see `ggml_ssm_scan` in ggml.c).
+    pub(crate) fn ggml_ssm_scan(
+        ctx: GgmlContextRaw,
+        s: GgmlTensorRaw,
+        x: GgmlTensorRaw,
+        dt: GgmlTensorRaw,
+        a: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+        c: GgmlTensorRaw,
+        ids: GgmlTensorRaw,
+        k: i64,
+    ) -> GgmlTensorRaw;
+    // Descending top-k over ne0: returns the k largest indices per row (i32).
+    pub(crate) fn ggml_argsort_top_k(
+        ctx: GgmlContextRaw,
+        a: GgmlTensorRaw,
+        k: c_int,
+    ) -> GgmlTensorRaw;
+    // Per-row expert selection matmul: `as` is [k, rows, n_expert], `b` is
+    // [k, n_expert_used, n_tokens], `ids` is [n_expert_used, n_tokens] i32.
+    // An id of -1 zeroes that slot's output.
+    pub(crate) fn ggml_mul_mat_id(
+        ctx: GgmlContextRaw,
+        r#as: GgmlTensorRaw,
+        b: GgmlTensorRaw,
+        ids: GgmlTensorRaw,
     ) -> GgmlTensorRaw;
     pub(crate) fn ggml_can_repeat(a: GgmlTensorRaw, b: GgmlTensorRaw) -> bool;
     pub(crate) fn ggml_gelu(ctx: GgmlContextRaw, a: GgmlTensorRaw) -> GgmlTensorRaw;
