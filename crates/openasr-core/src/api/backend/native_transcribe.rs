@@ -7479,7 +7479,12 @@ fn quant_tag_for_log(requested_model_id: &str, runtime_pack_path: &Path) -> Stri
         .flatten()
     {
         let canonical = crate::canonical_quant_tag(candidate);
-        if matches!(canonical, "f32" | "fp16" | "q8_0" | "q4_k" | "q3_k") {
+        // The nemotron-transcribe family's `ad_*` tags are exact, unaliased
+        // canonical tags (see its model card: ad_q2_0_m / ad_iq4_nl / q8_0).
+        if matches!(
+            canonical,
+            "f32" | "fp16" | "q8_0" | "q4_k" | "q3_k" | "ad_q2_0_m" | "ad_iq4_nl"
+        ) {
             return canonical.to_string();
         }
     }
@@ -7711,6 +7716,27 @@ mod tests {
                 Path::new("/arbitrary/not-a-quant/model.oasr")
             ),
             "unknown"
+        );
+    }
+
+    #[test]
+    fn request_context_quant_recognizes_nemotron_ad_quant_tags() {
+        // Regression guard: nemotron-transcribe's exact `ad_*` tags must
+        // surface in the request-context line, not degrade to `unknown`.
+        let object = Path::new(
+            "/models/objects/sha256/0044546efb95d4d08e85f5574da2b042a5a4fb2490678c666b65404f1ac94c04/content",
+        );
+        assert_eq!(
+            quant_tag_for_log("nemotron-3.5-transcribe-30b-a4b:ad_q2_0_m", object),
+            "ad_q2_0_m"
+        );
+        assert_eq!(
+            quant_tag_for_log("nemotron-3.5-transcribe-30b-a4b:ad_iq4_nl", object),
+            "ad_iq4_nl"
+        );
+        assert_eq!(
+            quant_tag_for_log("nemotron-3.5-transcribe-30b-a4b:q8_0", object),
+            "q8_0"
         );
     }
 
