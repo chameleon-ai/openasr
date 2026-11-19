@@ -6,9 +6,9 @@
 //!
 //! Faithful port of the reference (`src/speechlm/pee/pee_model.cpp`,
 //! `pee_rope_transformer.{h,cpp}` in NeMo-Speech.cpp), B=1, single utterance.
-//! The CTC timestamp head is *not* built here (word timestamps are out of
-//! scope for this cut); the ASR expert's post-`final_norm` states are
-//! returned so a later pass can bolt the head on.
+//! The ASR expert's post-`final_norm` states (and the 10 ms Sortformer
+//! probabilities) are tapped in the output so the CTC timestamp head and
+//! host aligner in `ctc_head`/`ctc_align` can bolt on after decode.
 //!
 //! Feature stacking (`feat_in=128`, `subsampling=8`) is a pure reshape of the
 //! zero-padded mel, not a conv; the ASR expert's per-utterance per-feature
@@ -58,7 +58,7 @@ pub(crate) struct RopeTransformerConfig {
 }
 
 impl RopeTransformerConfig {
-    fn validate(&self, name: &str) -> Result<(), NemotronTranscribeEncoderError> {
+    pub(crate) fn validate(&self, name: &str) -> Result<(), NemotronTranscribeEncoderError> {
         if !self.d_model.is_multiple_of(self.n_heads) {
             return Err(NemotronTranscribeEncoderError::Shape {
                 reason: format!(
@@ -108,13 +108,13 @@ pub(crate) const NEMOTRON_TRANSCRIBE_TF_D_MODEL: usize = 192;
 const NEMOTRON_TRANSCRIBE_UPSAMPLE_FACTOR: usize = 8;
 const NEMOTRON_TRANSCRIBE_SUBSAMPLING_FACTOR: usize = 8;
 const NEMOTRON_TRANSCRIBE_FEAT_IN: usize = 128;
-const LAYERNORM_EPS: f32 = 1e-5;
+pub(crate) const LAYERNORM_EPS: f32 = 1e-5;
 
 fn rope_positions(t: usize) -> Vec<i32> {
     (0..t as i32).collect()
 }
 
-fn add_norm_weight<'a>(
+pub(crate) fn add_norm_weight<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
     weight: GgmlCpuTensor<'a>,
@@ -136,7 +136,7 @@ fn add_norm_weight<'a>(
     )
 }
 
-fn linear_no_bias<'a>(
+pub(crate) fn linear_no_bias<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     weight: GgmlCpuTensor<'a>,
     input: GgmlCpuTensor<'a>,
@@ -145,7 +145,7 @@ fn linear_no_bias<'a>(
     graph.mul_mat(weight, input).map_err(ggml_err(stage))
 }
 
-fn linear_with_bias<'a>(
+pub(crate) fn linear_with_bias<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     weight: GgmlCpuTensor<'a>,
     input: GgmlCpuTensor<'a>,
@@ -158,7 +158,7 @@ fn linear_with_bias<'a>(
 
 /// Per-head LayerNorm over `d_k` with its own gain/bias (the ASR expert's
 /// `qk_norm`). Applied BEFORE rope.
-fn head_norm<'a>(
+pub(crate) fn head_norm<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
     weight: GgmlCpuTensor<'a>,
@@ -170,7 +170,7 @@ fn head_norm<'a>(
 
 /// One pre-LN RoPE transformer block for the ASR/diar experts.
 #[allow(clippy::too_many_arguments)]
-fn rope_transformer_block<'a>(
+pub(crate) fn rope_transformer_block<'a>(
     graph: &mut GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
     positions: GgmlCpuTensor<'a>,
@@ -304,22 +304,22 @@ fn rope_transformer_block<'a>(
     graph.add(x1, ff).map_err(map)
 }
 
-struct EncoderBlockWeights<'a> {
-    norm1_w: GgmlCpuTensor<'a>,
-    norm1_b: GgmlCpuTensor<'a>,
-    qkv_w: GgmlCpuTensor<'a>,
-    out_proj_w: GgmlCpuTensor<'a>,
-    out_proj_b: GgmlCpuTensor<'a>,
-    q_norm_w: GgmlCpuTensor<'a>,
-    q_norm_b: GgmlCpuTensor<'a>,
-    k_norm_w: GgmlCpuTensor<'a>,
-    k_norm_b: GgmlCpuTensor<'a>,
-    norm2_w: GgmlCpuTensor<'a>,
-    norm2_b: GgmlCpuTensor<'a>,
-    ffn_up_w: GgmlCpuTensor<'a>,
-    ffn_up_b: GgmlCpuTensor<'a>,
-    ffn_down_w: GgmlCpuTensor<'a>,
-    ffn_down_b: GgmlCpuTensor<'a>,
+pub(crate) struct EncoderBlockWeights<'a> {
+    pub(crate) norm1_w: GgmlCpuTensor<'a>,
+    pub(crate) norm1_b: GgmlCpuTensor<'a>,
+    pub(crate) qkv_w: GgmlCpuTensor<'a>,
+    pub(crate) out_proj_w: GgmlCpuTensor<'a>,
+    pub(crate) out_proj_b: GgmlCpuTensor<'a>,
+    pub(crate) q_norm_w: GgmlCpuTensor<'a>,
+    pub(crate) q_norm_b: GgmlCpuTensor<'a>,
+    pub(crate) k_norm_w: GgmlCpuTensor<'a>,
+    pub(crate) k_norm_b: GgmlCpuTensor<'a>,
+    pub(crate) norm2_w: GgmlCpuTensor<'a>,
+    pub(crate) norm2_b: GgmlCpuTensor<'a>,
+    pub(crate) ffn_up_w: GgmlCpuTensor<'a>,
+    pub(crate) ffn_up_b: GgmlCpuTensor<'a>,
+    pub(crate) ffn_down_w: GgmlCpuTensor<'a>,
+    pub(crate) ffn_down_b: GgmlCpuTensor<'a>,
 }
 
 struct RopeTransformerWeights<'a> {
@@ -492,6 +492,12 @@ pub(crate) struct NemotronTranscribeEncoderOutput {
     pub projections: Vec<f32>,
     /// `frames * 8` f32 80 ms speaker probabilities.
     pub speaker_probs: Vec<f32>,
+    /// `frames * 1280` f32 ASR expert post-`final_norm` states (80 ms grid),
+    /// tapped for the CTC timestamp head.
+    pub asr_states: Vec<f32>,
+    /// `8 * frames * 8` f32 Sortformer probabilities on the 10 ms grid,
+    /// frame-major (`[t * 8 + speaker]`), tapped for diarization refinement.
+    pub speaker_probs10: Vec<f32>,
 }
 
 /// PE encoder runtime: a resident runner + loaded weight context. The graph
@@ -739,11 +745,22 @@ impl NemotronTranscribeEncoderRuntime {
         let taps: Vec<(GgmlCpuTensor<'_>, usize)> = vec![
             (proj, t_out * NEMOTRON_TRANSCRIBE_FUSION_PROJ_DIM),
             (p80, t_out * NEMOTRON_TRANSCRIBE_NUM_SPEAKERS),
+            (asr_out, t_out * NEMOTRON_TRANSCRIBE_ASR_CONFIG.d_model),
+            (
+                probs,
+                t_out * NEMOTRON_TRANSCRIBE_UPSAMPLE_FACTOR * NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
+            ),
         ];
         graph
             .set_output(proj)
             .map_err(ggml_err("set_output(proj)"))?;
         graph.set_output(p80).map_err(ggml_err("set_output(p80)"))?;
+        graph
+            .set_output(asr_out)
+            .map_err(ggml_err("set_output(asr_out)"))?;
+        graph
+            .set_output(probs)
+            .map_err(ggml_err("set_output(probs10)"))?;
         graph
             .set_f32_slice(asr_mel_t, asr_mel, "pe_asr_mel")
             .map_err(ggml_err("upload_asr_mel"))?;
@@ -760,10 +777,14 @@ impl NemotronTranscribeEncoderRuntime {
         let mut outputs = outputs;
         let projections = outputs.remove(0);
         let speaker_probs = outputs.remove(0);
+        let asr_states = outputs.remove(0);
+        let speaker_probs10 = outputs.remove(0);
         Ok(NemotronTranscribeEncoderOutput {
             frames: t_out,
             projections,
             speaker_probs,
+            asr_states,
+            speaker_probs10,
         })
     }
 

@@ -16,10 +16,15 @@
 //! nemotron_h_moe trunk -> shared greedy driver -> verbatim transcript) is
 //! implemented; streaming is the shared snapshot driver (registration
 //! completeness, not a streaming-tuned latency claim). In-decoder speaker
-//! ids, the CTC timestamp head, word timestamps, and the translation task
-//! remain unimplemented; the audit form stays honest about that.
+//! ids and the translation task remain unimplemented; the CTC timestamp head
+//! and word timestamps are implemented (verified against the oracle); the
+//! audit form stays honest about the rest.
 
 pub(crate) mod capacity;
+pub(crate) mod ctc_align;
+pub(crate) mod ctc_head;
+pub(crate) mod ctc_spm;
+pub(crate) mod ctc_unit_tables;
 pub(crate) mod decode_executor;
 pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;

@@ -10,8 +10,11 @@
 //!   verbatim transcript. The speaker branch runs as part of the fused PE
 //!   encoder (single-window path); the decode-mode diarize prompt is wired
 //!   but the transcript keeps the raw `<spk:N>` tags.
-//! - in-decoder speaker ids, word timestamps, and the CTC head are NOT
-//!   implemented yet (audit form stays Deferred/No until they land).
+//! - word timestamps: the ASR expert's post-`final_norm` states are tapped,
+//!   the CTC head (`ctc_head`) runs them on the 40 ms grid, and the ported
+//!   host aligner (`ctc_align` + `ctc_spm`) produces `Segment.words` when
+//!   `request_options.word_timestamps` is set.
+//! - in-decoder speaker ids remain unverified.
 //! - streaming: the shared snapshot streaming driver re-runs this same
 //!   offline pass over the growing buffer (registration completeness; no
 //!   streaming-tuned latency claim).
@@ -21,6 +24,12 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use super::ctc_align::{
+    AlignmentConfig, AlignmentInputs, align_record, alignment_targets, clean_sot_transcript,
+    public_words,
+};
+use super::ctc_head::{CTC_BLANK_ID, CTC_UPSAMPLING, CTC_VOCAB_SIZE, CtcHeadRuntime, bf16_round};
+use super::ctc_spm::CtcSpm;
 use super::decode_executor::NemotronTranscribeDecodeSession;
 use super::decode_executor::NemotronTranscribeResidentAudioDecodeStepExecutor;
 use super::decoder_graph::NemotronTranscribeDecoderRuntime;
@@ -126,6 +135,8 @@ pub(crate) enum NemotronTranscribeGgmlExecutorError {
     CapacityFailed { reason: String },
     #[error("nemotron-transcribe prepared runtime owner failed: {reason}")]
     RuntimeOwnershipFailed { reason: String },
+    #[error("nemotron-transcribe CTC word timestamps failed: {reason}")]
+    WordTimestampsFailed { reason: String },
 }
 
 fn map_registry_error(
@@ -165,6 +176,14 @@ impl From<super::encoder_graph::NemotronTranscribeEncoderError>
 {
     fn from(error: super::encoder_graph::NemotronTranscribeEncoderError) -> Self {
         Self::EncoderFailed {
+            reason: error.to_string(),
+        }
+    }
+}
+
+impl From<super::ctc_head::CtcHeadError> for NemotronTranscribeGgmlExecutorError {
+    fn from(error: super::ctc_head::CtcHeadError) -> Self {
+        Self::WordTimestampsFailed {
             reason: error.to_string(),
         }
     }
@@ -220,6 +239,10 @@ struct NemotronTranscribePreparedRuntime {
     embed_table: MappedTokenEmbeddingTable,
     encoder: NemotronTranscribeEncoderRuntime,
     decoder: NemotronTranscribeDecodeSession,
+    /// CTC timestamp head (runs on the ASR expert's tapped states).
+    ctc_head: CtcHeadRuntime,
+    /// CTC aligner's SentencePiece tokenizer.
+    ctc_spm: CtcSpm,
 }
 
 impl NemotronTranscribePreparedRuntime {
@@ -254,11 +277,32 @@ impl NemotronTranscribePreparedRuntime {
         let encoder = NemotronTranscribeEncoderRuntime::new_from_preflight(preflight, backend)?;
         let decoder =
             NemotronTranscribeDecoderRuntime::new_from_preflight(preflight, decoder_span, backend)?;
+        // The CTC head and its aligner tokenizer ship in every pack. Fail
+        // closed if the SPM metadata or its vocabulary is missing/invalid.
+        const CTC_SPM_KEY: &str = "ctc.tokenizer.spm_model";
+        let spm_b64 = metadata.get_string(CTC_SPM_KEY).ok_or_else(|| {
+            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                reason: format!("pack metadata '{CTC_SPM_KEY}' is missing"),
+            }
+        })?;
+        let spm_bytes = super::ctc_spm::decode_base64(spm_b64).map_err(|error| {
+            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let ctc_spm = CtcSpm::parse(&spm_bytes, CTC_VOCAB_SIZE - 1).map_err(|error| {
+            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                reason: error.to_string(),
+            }
+        })?;
+        let ctc_head = CtcHeadRuntime::new_from_preflight(preflight, backend)?;
         Ok(Self {
             tokenizer,
             embed_table,
             encoder,
             decoder: NemotronTranscribeDecodeSession::new(decoder),
+            ctc_head,
+            ctc_spm,
         })
     }
 }
@@ -465,6 +509,7 @@ impl NemotronTranscribeGgmlExecutor {
             .cloned();
         let in_decoder_speakers = request.request_options.in_decoder_speakers;
         let language = request.request_options.language.clone();
+        let word_timestamps = request.request_options.word_timestamps;
 
         actor
             .call_mut_fallible(move |runtime| -> Result<GgmlAsrExecutionResult, NemotronTranscribeGgmlExecutorError> {
@@ -548,6 +593,98 @@ impl NemotronTranscribeGgmlExecutor {
                     })?
                 };
                 let text = result.text.trim().to_string();
+
+                // --- CTC word timestamps (transcript-independent head + host aligner) ---
+                let words = if word_timestamps {
+                    let transcript = clean_sot_transcript(&text, &[]);
+                    if transcript.is_empty() {
+                        Vec::new()
+                    } else {
+                        // The encoder returns speaker probabilities speaker-major
+                        // ([speaker * frames + t]); the aligner expects frame-major
+                        // ([t * speakers + speaker]).
+                        let enc_frames = encoder_output.frames;
+                        let speakers = super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS;
+                        let mut speaker_probs =
+                            vec![0.0f32; enc_frames * speakers];
+                        for t in 0..enc_frames {
+                            for spk in 0..speakers {
+                                speaker_probs[t * speakers + spk] =
+                                    encoder_output.speaker_probs[spk * enc_frames + t];
+                            }
+                        }
+                        let ctc_frames = encoder_output.frames * CTC_UPSAMPLING;
+                        let targets = alignment_targets(
+                            &prepared.ctc_spm,
+                            &transcript,
+                            CTC_BLANK_ID,
+                            ctc_frames,
+                        )
+                        .map_err(|reason| {
+                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                                reason: format!("CTC alignment targets: {reason}"),
+                            }
+                        })?;
+                        let logits = prepared.ctc_head.logits(
+                            &encoder_output.asr_states,
+                            encoder_output.frames,
+                            &targets.columns,
+                        )
+                        .map_err(|error| {
+                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                                reason: error.to_string(),
+                            }
+                        })?;
+                        prepared.ctc_head.release_transient_compute_memory().map_err(|error| {
+                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                                reason: error.to_string(),
+                            }
+                        })?;
+                        let emissions: Vec<f32> = logits.iter().map(|&v| bf16_round(v)).collect();
+                        let config = AlignmentConfig {
+                            max_word_frames: 12 * CTC_UPSAMPLING,
+                            ..Default::default()
+                        };
+                        let inputs = AlignmentInputs {
+                            log_probs: &emissions,
+                            frames: ctc_frames,
+                            speaker_probs: Some(&speaker_probs),
+                            speaker_frames: encoder_output.frames,
+                            speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
+                            activity10: Some(&encoder_output.speaker_probs10),
+                            label_frames: frames
+                                .min(8 * encoder_output.frames),
+                            label_speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
+                            label_seconds: 0.01,
+                            duration: f64::from(audio_duration_seconds),
+                            time_offset: 0.0,
+                        };
+                        let aligned = align_record(&targets, &inputs, &config).map_err(|reason| {
+                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                                reason: format!("CTC alignment: {reason}"),
+                            }
+                        })?;
+                        public_words(&aligned.words)
+                            .into_iter()
+                            .map(|row| {
+                                let unit = &targets.words[row.word];
+                                crate::api::backend::WordTimestamp {
+                                    word: if unit.display.is_empty() {
+                                        unit.word.clone()
+                                    } else {
+                                        unit.display.clone()
+                                    },
+                                    start: row.start as f32,
+                                    end: row.end as f32,
+                                    confidence: None,
+                                }
+                            })
+                            .collect()
+                    }
+                } else {
+                    Vec::new()
+                };
+
                 Ok(GgmlAsrExecutionResult {
                     transcription: Transcription {
                         truncated_decodes: Vec::new(),
@@ -561,7 +698,7 @@ impl NemotronTranscribeGgmlExecutor {
                             speaker_label: None,
                             speaker_person_id: None,
                             speaker_snapshot_label: None,
-                            words: Vec::new(),
+                            words,
                         }],
                         longform: None,
                         language: None,

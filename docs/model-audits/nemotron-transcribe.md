@@ -76,7 +76,7 @@ pass it today.
 | --- | --- | --- |
 | Greedy logits shortcuts (argmax path skips needless softmax/sort work) | Supported | Decode goes through the shared `run_builtin_seq2seq_decode_policy` with the registered shared policy `nemotron-transcribe.greedy.seq2seq.v1` (`NEMOTRON_TRANSCRIBE_DECODE_POLICY_COMPONENT`, decode_policy_component_registry.rs); the inventory row is `SharedSeq2SeqGreedy` and `shared_decode_topologies_call_their_declared_driver` enforces it. No separate softmax-skip shortcut is implemented (the shared loop owns the argmax path). |
 | Speculative decode: per-family verdict recorded (do it, defer it, or dead) | Deferred | Verdict: **defer**. The pack's single nextn/MTP layer (blk.52) is inert without speculative-decode runtime work that does not exist anywhere in OpenASR; revisit with the MTP milestone. |
-| CTC blank-skip fast path (CTC families; otherwise Not applicable) | Not applicable | The CTC head is a timestamp/diarize-auxiliary branch, not the decode driver. Unlock: if a word-time path is built on the CTC branch, revisit. |
+| CTC blank-skip fast path (CTC families; otherwise Not applicable) | Not applicable | The CTC head is a timestamp/diarize-auxiliary branch, not the decode driver. A word-time path now exists (`ctc_head`/`ctc_align`) but only projects the compact alignment columns, never full-vocabulary decode. Unlock: if the CTC head ever becomes the decode driver, revisit. |
 | Decode guards are zero-cost on the hot path (degenerate-loop guard etc.) | Supported | The degenerate-loop guard and the stop-token accounting come from the shared driver (`run_seq2seq_greedy_decode_loop_v0`); the family-specific executor supplies only `Seq2SeqGreedyDecodeStepExecutor` + prompt plan credentials. |
 
 ## 5. Frontend & IO
