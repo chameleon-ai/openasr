@@ -520,7 +520,15 @@ impl BackendMemoryAbi {
             Ok((free, total)) => ffi::GgmlBackendMemoryStatsV1 {
                 flags: 0,
                 total_bytes: total,
-                budget_bytes: free,
+                // Stock ggml exposes no working-set budget, so report none.
+                // Deriving one from `free` is self-defeating: `free` already
+                // excludes this process's own committed weights, so the
+                // admission ceiling (95% of budget) would drop below the
+                // ledger's committed bytes and every post-weight-import
+                // reservation would fail on a full-GPU placement. Budget "0"
+                // is the contract's "no budget" sentinel: admission falls
+                // back to the device total.
+                budget_bytes: 0,
                 device_used_bytes: total.saturating_sub(free),
                 device_free_bytes: free,
                 generation: stats_generation(free, total),
