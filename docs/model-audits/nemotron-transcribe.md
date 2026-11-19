@@ -6,18 +6,20 @@
 > release flow: `tooling/publish-model/scripts/_manifest.py --public` fails
 > closed on a missing or half-filled form.
 
-**STATUS: RUNTIME IMPLEMENTED, NOT READY FOR RELEASE.** The nemotron-transcribe
-family's offline execution path (frontend -> PE ASR+Sortformer encoder ->
-nemotron_h_moe trunk -> shared greedy driver) is implemented and, on HIP
-(AMD gfx1030, `ad_q2_0_m`), produces the verbatim JFK fixture transcript
-byte-identical to the NeMo-Speech.cpp oracle
-(`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`).
-**No benchmark has been measured by OpenASR, the AMI diarization fixtures are
-unverified through this runtime, streaming is the shared snapshot driver
-(completeness, not latency-tuned), and the CPU/Metal/CUDA/Vulkan lanes are
-unmeasured or unverified.** Do not flip `release_public = true`, run
-`publish_catalog.sh`, or treat any cell as evidence of more than the offline
-HIP lane until benchmark and cross-backend evidence exist.
+**STATUS: RUNTIME IMPLEMENTED, BENCH COMPLETE, NOT READY FOR RELEASE.** The
+nemotron-transcribe family's offline execution path (frontend -> PE
+ASR+Sortformer encoder -> nemotron_h_moe trunk -> shared greedy driver) is
+implemented and verified verbatim against the NeMo-Speech.cpp oracle golden
+(`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`) on both
+lanes: **CPU** (best-of-3 per quant, all three quants, sha-bound to the
+published packs) and **HIP** (full-residency runs on a gfx1151 Strix Halo,
+112 GiB unified GTT; all three quants verbatim). Peak RSS per quant measured.
+**Remaining release blockers:** min_core_version / min_cli_version must name
+the first release shipping this family; the GPU verdict on <=16 GB discrete
+cards is not supported (see the backend matrix); the AMI diarization fixtures
+are unverified through this runtime; streaming is the shared snapshot
+driver. **Do not flip `release_public = true`, run `publish_catalog.sh`, or
+treat any cell as evidence beyond the listed lanes until those are closed.**
 
 | Field | Value |
 | --- | --- |
@@ -25,7 +27,7 @@ HIP lane until benchmark and cross-backend evidence exist.
 | Models covered | nemotron-3.5-transcribe-30b-a4b (q8_0, ad_iq4_nl, ad_q2_0_m; packs published at chameleon-ai/nemotron-3.5-transcribe-30b-a4b, hf_revision 4aefd4391c57bb5cf18ffcabac635f526c636142) |
 | Auditor / date | OpenASR onboarding, 2026-11-18 |
 | Core version + commit audited | workspace 0.2.1, `nemotron` branch (uncommitted working tree at audit time) |
-| Bench hardware | AMD Radeon RX 6800 XT (gfx1030, 16 GB), ROCm/HIP; no other lane benched |
+| Bench hardware | AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, 112 GiB unified GTT), Arch 2026-11-18 (CPU + HIP best-of-3); AMD RX 6800 XT (gfx1030, 16 GB) HIP bring-up, AMD ROCm/HIP; no Mac/Metal host benched |
 
 **How to fill.** Status is exactly one of:
 
@@ -66,7 +68,7 @@ pass it today.
 | mmap weight loading | Supported | Weights are bound from the verified pack through the shared preflight reader (`load_gguf_weight_context_from_preflight`): Q2_0/IQ4_NL/Q8_0 tensors are bound in place (no host-side dequantization pass), activations flow F32. Evidence: executor weight binding + `audit-quant` clean on all three packs. |
 | Resident pool reuse across requests (weights stay resident) | Supported | `NemotronTranscribeGgmlExecutor` owns an `AdmittedPinnedRuntimeActorCheckoutPool` keyed by `(pack content, ExecutionLaneKey, required_span)` with limits 4 idle entries / 2 instances per key; the unified runtime (tokenizer, mmap'd embedding table, encoder+decoder sessions, KV/SSM/conv arenas) is leased per request and returned to the pool; the actor worker thread keeps every native context. `evict_prepared_runtime_content_id` evicts idle actors per pack; `unload_idle_state` drops them all. K2/K3 audit gates pass; `resident_runtime_audit` green. KV/SSM/conv arena reuse within a request AND across requests both exercised. |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Graphs are built with explicit `cont` calls at layout boundaries (e.g. SSM `zxBCdt` slicing, KV row writes, debug-free tap-free outputs); no audit pass has recorded the reasons per node. Unlock: graph review enumerating every `cont` and why the input could not be consumed strided. |
-| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Deferred | Unmeasured. Weights alone: q8_0 36.7 GB / ad_iq4_nl 21.3 GB / ad_q2_0_m 15.2 GB (card). One HIP run on gfx1030 16 GB completed for ad_q2_0_m, but no peak RSS/VRAM was sampled (the pack exceeds VRAM, so page-cache flow dominates). Unlock: quiet-host measurement per quant on the release-bench host. |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Supported (CPU); not applicable (HIP) | Measured on the Strix Halo bench host (2026-11-18, quiet, sha-bound to the published packs): ad_q2_0_m peak RSS 18.3 GB / HIP 15.1 GB; ad_iq4_nl 24.0 / 20.4; q8_0 38.2 / 34.7. Weights alone match (card: 15.2 / 21.3 / 36.7 GB); no excess observed. Catalog RAM requirement should cite these peaks at flip time. HIP VRAM not separately attributed (unified GTT). |
 
 ## 4. Decode algorithms
 
@@ -90,7 +92,7 @@ pass it today.
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
 | Metal command batching + wired memory budget respected | Deferred | No OpenASR Metal lane (this family has only been run on HIP and CPU-build); Vulkan-class smoke on the upstream SALM server (see `tooling/nemotron-reference-dumper/README.md`, validated ad_q2_0_m on gfx1031/RADV 16 GB on 2026-11-16) is NOT evidence about OpenASR Metal. Unlock: OpenASR Metal smoke on reference quants. |
-| CPU thread pool sized for P/E cores | Deferred | CPU build was verified to run the fixture (output not correctness-checked); threadpool not audited. Unlock: CPU bring-up + threadpool audit. |
+| CPU thread pool sized for P/E cores | Deferred | The CPU lane is correctness-verified and benched: JFK fixture transcribes verbatim on ad_q2_0_m (best-of-3, RTF 0.627, peak RSS ~19.5 GB on a 62 GB x86-64 host; load 96.3 s / compute 6.9 s, 2026-11-18); threadpool still not audited. Unlock: CPU threadpool audit + full per-quant CPU bench on the release host (ad_iq4_nl / q8_0 do not fit a 62 GB host under the residency regime). |
 | Accelerate/BLAS used where it wins | Deferred | CPU lane not profiled. Unlock: CPU bring-up + BLAS comparison. |
 
 ## 7. Backend coverage matrix
@@ -103,11 +105,11 @@ placement gate (or equivalent) proved the compute actually runs there.
 
 | Backend | Supported? | Golden-verified? | Utilization measured? | Justification + unlock plan if unsupported |
 | --- | --- | --- | --- | --- |
-| CPU | Yes | No | No | The executor runs to completion on CPU (offline JFK fixture, default build); transcript correctness not verified there. Unlock: golden fixture (`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`) asserted green on CPU. |
+| CPU | Yes | Yes | N/A | All three quants bench on CPU (best-of-3, Ryzen AI MAX+ 395, 2026-11-18, sha-bound to the published packs, JFK verbatim): ad_q2_0_m RTF 0.234 / peak RSS 18.3 GB; ad_iq4_nl RTF 0.242 / 24.0 GB; q8_0 RTF 0.251 / 38.2 GB. Utilization: N/A on CPU. |
 | Metal | No | No | No | See CPU. Unlock: same gate, on the Apple-Silicon bench host with the Metal backend. |
 | CUDA | No | No | No | See CPU. Unlock: executor on CUDA + gpu-weight-placement gate with one-shot `GGML_SCHED_DEBUG=2`. |
 | Vulkan | No | No | No | See CPU; note upstream `nemo-speech vulkan-server` smoke (ad_q2_0_m, gfx1031/RADV, validated 2026-11-16) is oracle evidence, not OpenASR evidence. Unlock: same gate on the Vulkan bench host. |
-| HIP | Yes | Yes | No | Runs on AMD RX 6800 XT (gfx1030, 16 GB, ROCm/HIP); JFK fixture transcribes verbatim, byte-identical to the NeMo-Speech.cpp oracle golden. Utilization (weight-placement gate) not measured. Unlock: `GGML_SCHED_DEBUG=2` one-shot on the release bench host + measurement. |
+| HIP | Yes | Yes | No | All three quants run and transcribe verbatim on ROCm/HIP (best-of-3, Radeon 8060S / gfx1151 / 112 GiB unified GTT, 2026-11-18, sha-bound packs): ad_q2_0_m RTF 0.090 / peak 15.1 GB; ad_iq4_nl RTF 0.092 / 20.4 GB; q8_0 RTF 0.105 / 34.7 GB. Utilization not measured. Caveat: a <=16 GB discrete card cannot hold the packs + encoder buffer fully resident (see KNOWN_LIMITATIONS); a 16 GB lane fails closed at `upload_asr_mel`/weight-context. Unlock: `GGML_SCHED_DEBUG=2` utilization on the release host + a <=16 GB card verdict (residency split or no-go). |
 
 ## 8. Correctness & quality
 

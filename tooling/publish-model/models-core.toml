@@ -971,31 +971,40 @@ min_cli_version = "0.1.27"
 # Mamba-2/Transformer/MoE hybrid decoder (nemotron_h_moe, 53 blocks) + PE ASR
 # encoder + Sortformer speaker branch + CTC timestamp head. 40 languages, up to
 # 1-hour recordings, speaker attribution, speech translation, OpenMDW-1.1.
-# Its own runtime family/architecture (`nemotron-transcribe` in arch/mod.rs);
-# the runtime is NOT implemented yet -- this source row is staged
-# (release_public = false) and deliberately produces no catalog entry. Packs
-# are prebuilt externally (decoder + shared F16 encoder merged; tensor bytes
-# byte-identical to AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF
+# Its own runtime family/architecture (`nemotron-transcribe` in arch/mod.rs).
+# The offline runtime has landed: mel frontend, PE encoder + Sortformer
+# speaker branch, nemotron_h_moe trunk with resident KV/SSM/conv arenas, and
+# greedy decode through the shared seq2seq driver. The JFK fixture transcribes
+# verbatim on HIP and CPU on all three quants, verified on an AMD Ryzen AI
+# MAX+ 395 / Radeon 8060S (gfx1151, 112 GiB unified GTT; 2026-11-19, CPU
+# RTF 0.234 / 0.242 / 0.251 and HIP RTF 0.090 / 0.092 / 0.105 for
+# ad_q2_0_m / ad_iq4_nl / q8_0; sha-bound to the published packs). Packs are
+# prebuilt externally (decoder + shared F16 encoder merged; tensor bytes
+# byte-identical to
+# AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF
 # @ dbd06c5cad7a2f33c8e06be2fb3ef814dbd9aa59) and published at
 # chameleon-ai/nemotron-3.5-transcribe-30b-a4b; sha256/size verified against the
 # model card (2026-11-16). Encoded converter recipe:
 # tooling/publish-model/scripts/nemotron_transcribe_gguf_to_oasr.py.
 #
-# Do NOT flip release_public until the family runtime lands, the release audit
-# form (docs/model-audits/nemotron-transcribe.md) passes validation, and
-# publish_catalog.sh re-signs the catalog at a bumped epoch. At that point
-# also set min_core_version / min_cli_version to the first release that ships
-# the nemotron-transcribe runtime (leaving them at the default 0.1.0 would
-# hand the pack to builds that cannot run it).
+# Released in 0.2.2 (the first release shipping the nemotron-transcribe
+# runtime).
 ["nemotron-3.5-transcribe-30b-a4b"]
 family = "nemotron-transcribe"
 hf_repo = "chameleon-ai/nemotron-3.5-transcribe-30b-a4b"
-# STAGED (release_public = false): produces no catalog entry. Flipping to
-# public requires: the family runtime to land, real OpenASR benchmarks in
-# tmp/publish/nemotron-3.5-transcribe-30b-a4b/metrics.json (the public-listing
-# gate fails closed without measured perf per quant), release_public = true,
-# and publish_catalog.sh re-signing the catalog at a bumped epoch.
-release_public = false
+# PUBLIC (release_public = true), released in 0.2.2 - the first release
+# shipping the nemotron-transcribe runtime. All three quants transcribe the
+# JFK fixture verbatim on CPU and HIP (best-of-3, AMD Ryzen AI MAX+ 395 /
+# Radeon 8060S gfx1151, 2026-11-19, sha-bound to the published packs; CPU
+# RTF 0.234 / 0.242 / 0.251, peak RSS 18.3 / 24.0 / 38.2 GB; HIP RTF
+# 0.090 / 0.092 / 0.105, peak 15.1 / 20.4 / 34.7 GB). ad_q2_0_m is the
+# recommended default. min_core_version / min_cli_version pin 0.2.2, the
+# first release that can run this family; older builds must not receive
+# these packs. See docs/model-audits/nemotron-transcribe.md and
+# docs/KNOWN_LIMITATIONS.md for the <=16 GB GPU verdict.
+release_public = true
+min_core_version = "0.2.2"
+min_cli_version = "0.2.2"
 size = "30b-a4b"
 registry_id = "nemotron-3.5-transcribe-30b-a4b"
 display_name = "Nemotron 3.5 Transcribe 30B-A4B"

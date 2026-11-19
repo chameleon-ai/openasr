@@ -2,8 +2,8 @@
 # from the upstream HF model card (chameleon-ai/nemotron-3.5-transcribe-30b-a4b,
 # the packs' own README) and the base model card (nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B).
 # Upstream license = OpenMDW License 1.1. Keep every factual claim to what those
-# sources state; this family is staged (release_public = false) and its runtime
-# is NOT implemented yet.
+# sources state; the OpenASR runtime for this family has landed (offline
+# inference from the .oasr pack; JFK fixture verified verbatim on HIP and CPU).
 
 tagline = "NVIDIA Nemotron 3.5 Transcribe — a 30B MoE speech LLM for long-form, multilingual transcription with speaker attribution"
 
@@ -11,7 +11,7 @@ highlights = [
   "🗣️ **40 languages** — long-form recordings up to 1 hour, verbatim punctuated output",
   "👥 **Speaker attribution** — Sortformer branch and CTC timestamp head ship inside every pack",
   "📦 **Three quant tiers** — ad_q2_0_m (default) / ad_iq4_nl / q8_0 in OpenASR's native .oasr format",
-  "⚠️ **Staged, not yet runnable** — packs are structurally verified; the OpenASR runtime for this family has not landed, so transcription fails closed with a 'not yet implemented' error",
+  "✅ **Runs offline in OpenASR** — the native runtime executes the full pipeline (PE encoder + hybrid Mamba-2/MoE decoder + speaker branch) from one .oasr pack; the JFK fixture transcribes verbatim on GPU (HIP) and CPU",
 ]
 
 intro = """
@@ -20,10 +20,11 @@ Its Mamba-2/Transformer/MoE decoder (nemotron_h_moe, 53 blocks) reads a
 32-layer PE ASR encoder, with a 31-layer Sortformer branch for speaker
 attribution and a CTC head for word timestamps — all in one merged `.oasr`
 pack. OpenASR distributes the three published quantization tiers (q8_0,
-ad_iq4_nl, ad_q2_0_m) in the native `.oasr` format. The runtime for this
-family is staged and not yet implemented: packs are structurally verified
-(layout invariants, byte-identical tensor data, metadata content) but cannot
-yet be executed by OpenASR.
+ad_iq4_nl, ad_q2_0_m) in the native `.oasr` format, and the OpenASR native
+runtime executes the full offline pipeline (mel frontend, PE encoder, hybrid
+Mamba-2/Transformer/MoE decoder, speaker branch) from a single pack. Verified
+verbatim on the JFK fixture on GPU (ROCm/HIP) and CPU; long-form and
+multi-speaker validation is ongoing.
 """
 
 acknowledgement = """
@@ -46,7 +47,7 @@ highlights = [
   "🗣️ **40 种语言** — 最长 1 小时录音，逐字带标点输出",
   "👥 **说话人归属** — 每个 pack 内置 Sortformer 分支与 CTC 时间戳头",
   "📦 **三档量化** — ad_q2_0_m（默认）/ ad_iq4_nl / q8_0，OpenASR 原生 .oasr 格式",
-  "⚠️ **预览阶段，暂不可运行** — packs 已通过结构校验；该家族的 OpenASR 运行时尚未落地，转写会以“尚未实现”报错",
+  "✅ **OpenASR 离线运行** — 原生运行时从单个 .oasr pack 执行完整流水线（PE 编码器 + 混合 Mamba-2/MoE 解码器 + 说话人分支）；JFK 测试样例在 GPU (HIP) 与 CPU 上逐字验证通过",
 ]
 
-source_sha256 = "556ba4bfbf05e03dc8b698cbf3c66b9df781a196ebee215c584425d103a0d643"
+source_sha256 = "b844b223bab87717639f89924bf2e9989e3c079df48b15ee76be6d85cad7a48d"

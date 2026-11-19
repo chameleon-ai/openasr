@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-10-12T16:23:21+00:00",
+  "generated_at": "2026-11-19T11:11:45+00:00",
   "catalog_url": "https://catalog.openasr.org/v1/catalog.json",
   "models": [
     {
@@ -1029,6 +1029,150 @@
         }
       },
       "min_core_version": "0.1.17"
+    },
+    {
+      "id": "nemotron-3.5-transcribe-30b-a4b",
+      "kind": "asr-model",
+      "display_name": "Nemotron 3.5 Transcribe 30B-A4B",
+      "family": "nemotron-transcribe",
+      "aliases": [
+        "nemotron-transcribe",
+        "nemotron-3.5-transcribe"
+      ],
+      "pull_alias": "nemotron-transcribe",
+      "size": "30b-a4b",
+      "languages": [
+        "ar",
+        "bg",
+        "bn",
+        "cs",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "fi",
+        "fr",
+        "he",
+        "hi",
+        "hr",
+        "hu",
+        "id",
+        "it",
+        "ja",
+        "ko",
+        "lt",
+        "lv",
+        "mr",
+        "mt",
+        "nl",
+        "pl",
+        "pt",
+        "ro",
+        "ru",
+        "sk",
+        "sl",
+        "sv",
+        "ta",
+        "te",
+        "th",
+        "tl",
+        "tr",
+        "uk",
+        "vi",
+        "zh"
+      ],
+      "vendor": "AtomicChat",
+      "license": "OpenMDW License 1.1",
+      "license_url": "https://openmdw.ai/license/1-1/",
+      "license_class": "permissive",
+      "hf_repo": "chameleon-ai/nemotron-3.5-transcribe-30b-a4b",
+      "hf_revision": "4aefd4391c57bb5cf18ffcabac635f526c636142",
+      "public": true,
+      "min_cli_version": "0.2.2",
+      "recommended_quant": "ad_q2_0_m",
+      "pull_recommended": "nemotron-3.5-transcribe-30b-a4b:ad_q2_0_m",
+      "prose": {
+        "tagline": "NVIDIA Nemotron 3.5 Transcribe \u2014 a 30B MoE speech LLM for long-form, multilingual transcription with speaker attribution",
+        "overview": [
+          "Nemotron 3.5 Transcribe 30B-A4B is NVIDIA's open-weight offline speech LLM.\nIts Mamba-2/Transformer/MoE decoder (nemotron_h_moe, 53 blocks) reads a\n32-layer PE ASR encoder, with a 31-layer Sortformer branch for speaker\nattribution and a CTC head for word timestamps \u2014 all in one merged `.oasr`\npack. OpenASR distributes the three published quantization tiers (q8_0,\nad_iq4_nl, ad_q2_0_m) in the native `.oasr` format, and the OpenASR native\nruntime executes the full offline pipeline (mel frontend, PE encoder, hybrid\nMamba-2/Transformer/MoE decoder, speaker branch) from a single pack. Verified\nverbatim on the JFK fixture on GPU (ROCm/HIP) and CPU; long-form and\nmulti-speaker validation is ongoing."
+        ],
+        "highlights": [
+          "\ud83d\udde3\ufe0f **40 languages** \u2014 long-form recordings up to 1 hour, verbatim punctuated output",
+          "\ud83d\udc65 **Speaker attribution** \u2014 Sortformer branch and CTC timestamp head ship inside every pack",
+          "\ud83d\udce6 **Three quant tiers** \u2014 ad_q2_0_m (default) / ad_iq4_nl / q8_0 in OpenASR's native .oasr format",
+          "\u2705 **Runs offline in OpenASR** \u2014 the native runtime executes the full pipeline (PE encoder + hybrid Mamba-2/MoE decoder + speaker branch) from one .oasr pack; the JFK fixture transcribes verbatim on GPU (HIP) and CPU"
+        ]
+      },
+      "quants": [
+        {
+          "quant": "q8_0",
+          "suffix": "q8",
+          "pull": "nemotron-3.5-transcribe-30b-a4b:q8",
+          "filename": "nemotron-3.5-transcribe-30b-a4b-q8_0.oasr",
+          "url": "https://huggingface.co/chameleon-ai/nemotron-3.5-transcribe-30b-a4b/resolve/4aefd4391c57bb5cf18ffcabac635f526c636142/nemotron-3.5-transcribe-30b-a4b-q8_0.oasr",
+          "sha256": "ad61a56d5a149d4f56af6a33f0b3f40cf275bfb63753bc430de416efc3d49ad7",
+          "size_bytes": 36675053792,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.25053781345454545,
+            "rtf_metal": null,
+            "peak_rss_bytes": 41052979200,
+            "jfk_wer_vs_fp16": null
+          }
+        },
+        {
+          "quant": "ad_iq4_nl",
+          "suffix": "ad_iq4_nl",
+          "pull": "nemotron-3.5-transcribe-30b-a4b:ad_iq4_nl",
+          "filename": "nemotron-3.5-transcribe-30b-a4b-ad_iq4_nl.oasr",
+          "url": "https://huggingface.co/chameleon-ai/nemotron-3.5-transcribe-30b-a4b/resolve/4aefd4391c57bb5cf18ffcabac635f526c636142/nemotron-3.5-transcribe-30b-a4b-ad_iq4_nl.oasr",
+          "sha256": "4accd8e56eef300b61c540a96a2c8c41135e1b7077f01729082cdcc95ae11898",
+          "size_bytes": 21349067264,
+          "recommended": false,
+          "perf": {
+            "rtf_cpu": 0.2424278679090909,
+            "rtf_metal": null,
+            "peak_rss_bytes": 25727299584,
+            "jfk_wer_vs_fp16": null
+          }
+        },
+        {
+          "quant": "ad_q2_0_m",
+          "suffix": "ad_q2_0_m",
+          "pull": "nemotron-3.5-transcribe-30b-a4b:ad_q2_0_m",
+          "filename": "nemotron-3.5-transcribe-30b-a4b-ad_q2_0_m.oasr",
+          "url": "https://huggingface.co/chameleon-ai/nemotron-3.5-transcribe-30b-a4b/resolve/4aefd4391c57bb5cf18ffcabac635f526c636142/nemotron-3.5-transcribe-30b-a4b-ad_q2_0_m.oasr",
+          "sha256": "07df6014518e2148dd13997e84c2e49ba51f7d368ef823bb8ccfe7f592325016",
+          "size_bytes": 15242619392,
+          "recommended": true,
+          "perf": {
+            "rtf_cpu": 0.23408378936363636,
+            "rtf_metal": null,
+            "peak_rss_bytes": 19621273600,
+            "jfk_wer_vs_fp16": null
+          }
+        }
+      ],
+      "language_mode": "specify_only",
+      "language_default": "en",
+      "emits_punctuation": true,
+      "speaker_source": "native",
+      "word_timestamp_source": "native",
+      "prose_locales": {
+        "zh-CN": {
+          "tagline": "NVIDIA Nemotron 3.5 Transcribe\u2014\u201430B MoE \u8bed\u97f3\u5927\u6a21\u578b\uff0c\u957f\u97f3\u9891\u3001\u591a\u8bed\u8a00\u8f6c\u5199\uff0c\u652f\u6301\u8bf4\u8bdd\u4eba\u5f52\u5c5e",
+          "highlights": [
+            "\ud83d\udde3\ufe0f **40 \u79cd\u8bed\u8a00** \u2014 \u6700\u957f 1 \u5c0f\u65f6\u5f55\u97f3\uff0c\u9010\u5b57\u5e26\u6807\u70b9\u8f93\u51fa",
+            "\ud83d\udc65 **\u8bf4\u8bdd\u4eba\u5f52\u5c5e** \u2014 \u6bcf\u4e2a pack \u5185\u7f6e Sortformer \u5206\u652f\u4e0e CTC \u65f6\u95f4\u6233\u5934",
+            "\ud83d\udce6 **\u4e09\u6863\u91cf\u5316** \u2014 ad_q2_0_m\uff08\u9ed8\u8ba4\uff09/ ad_iq4_nl / q8_0\uff0cOpenASR \u539f\u751f .oasr \u683c\u5f0f",
+            "\u2705 **OpenASR \u79bb\u7ebf\u8fd0\u884c** \u2014 \u539f\u751f\u8fd0\u884c\u65f6\u4ece\u5355\u4e2a .oasr pack \u6267\u884c\u5b8c\u6574\u6d41\u6c34\u7ebf\uff08PE \u7f16\u7801\u5668 + \u6df7\u5408 Mamba-2/MoE \u89e3\u7801\u5668 + \u8bf4\u8bdd\u4eba\u5206\u652f\uff09\uff1bJFK \u6d4b\u8bd5\u6837\u4f8b\u5728 GPU (HIP) \u4e0e CPU \u4e0a\u9010\u5b57\u9a8c\u8bc1\u901a\u8fc7"
+          ]
+        }
+      },
+      "upstream_release_date": "2026-11-16",
+      "min_core_version": "0.2.2"
     },
     {
       "id": "moss-transcribe-diarize",

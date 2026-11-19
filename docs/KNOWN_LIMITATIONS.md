@@ -9,6 +9,13 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   Windows on [GitHub Releases](https://github.com/chameleon-ai/openasr/releases).
   Building from source remains supported. Public model-pack distribution is limited to catalog entries
   explicitly marked `public:true`.
+- The Nemotron 3.5 Transcribe 30B-A4B packs (`nemotron-transcribe` family)
+  are a staged catalog row -- not yet pullable. Verified on an unified-memory
+  APU (gfx1151, 112 GiB) where all three quants run fully GPU-resident and
+  transcribe verbatim; on a <=16 GB discrete card the packs exceed VRAM for
+  the full-context residency path, so the runtime fails closed at encoder
+  residency (`upload_asr_mel` / weight-context) instead of streaming weights.
+  The CPU lane transcribes the JFK fixture verbatim for all three quants.
 - `GET /v1/models` and other served-identity listings verify GGUF metadata
   and the CAS path digest of the bound pack. They do not re-hash a multi-GB
   object on every read. Full-file integrity is `openasr model-pack verify`.

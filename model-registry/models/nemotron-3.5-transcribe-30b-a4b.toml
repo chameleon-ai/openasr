@@ -1,0 +1,10 @@
+id = "nemotron-3.5-transcribe-30b-a4b"
+default_variant = "published"
+display_name = "Nemotron 3.5 Transcribe 30B-A4B (OpenASR pack)"
+languages = ["ar", "bg", "bn", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hi", "hr", "hu", "id", "it", "ja", "ko", "lt", "lv", "mr", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "ta", "te", "th", "tl", "tr", "uk", "vi", "zh"]
+size = "30b-a4b"
+license = "OpenMDW License 1.1"
+source = "Published OpenASR packs: https://huggingface.co/chameleon-ai/nemotron-3.5-transcribe-30b-a4b"
+
+[variant]
+quantization = "ad_q2_0_m"
