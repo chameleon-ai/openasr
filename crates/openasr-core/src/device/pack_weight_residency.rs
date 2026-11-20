@@ -275,6 +275,25 @@ impl DeviceMemoryBrokerSet {
                 });
             }
             inner.record_receipt_reuse();
+            // This attempt opened its own mapping envelope before weight
+            // materialization discovered the existing residency. Consume and
+            // immediately release it: otherwise its pack-sized pending hold
+            // stays on the shared longform reservation for the whole request
+            // and crowds out later per-slice graph-buffer admissions.
+            if key.domain == MemoryDomainKey::SystemMemory
+                && let Some(envelope) = self.try_consume_mapping_envelope(
+                    key.mapping_identity,
+                    bytes,
+                    cohort_id,
+                    format!(
+                        "pack-weight-residency-reuse:{}:{:#x}",
+                        key.domain,
+                        key.mapping_identity.as_raw()
+                    ),
+                )?
+            {
+                drop(envelope);
+            }
             return Ok((
                 PackWeightResidencyHandle {
                     inner,

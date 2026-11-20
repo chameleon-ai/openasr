@@ -382,13 +382,15 @@ pub(crate) const NEMOTRON_TRANSCRIBE_EXECUTOR_COMPONENT_ID: &str =
 /// (sysfs, including ~1 GB device baseline) with backend=gpu. The in-crate
 /// probe harness resolves `Auto` to CPU and measured ~17.6 GB RSS at 12 s
 /// and ~43.2 GB RSS at 62 s; those are host-lane numbers, not VRAM.
-/// Probe result (gfx1030, 16 GB): no value from 30 s to 1200 s lets clips
-/// longer than ~94 s transcribe. Long segments fail on a single oversized
-/// graph-buffer request; short segments fail after system-memory admission
-/// accumulates a pack-sized pending allocation plus ~46-61 GB committed.
-/// Restored to 300 s; the long-clip failure is a memory-retention issue in
-/// the longform path, not a slice-length setting.
-pub(crate) const NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS: u32 = 300;
+/// The ggml graph buffer for one slice sums every activation tensor in the
+/// graph context; on a 16 GB card a ~94 s slice already needs ~33 GB, so the
+/// old 300 s value could never be admitted. Capped at 90 s to stay inside
+/// the measured graph-memory envelope. This is a device-specific bound, not
+/// a quality or safety claim; it is paired with the stable-envelope runtime
+/// key that makes all slices of a longform request share one actor.
+/// Re-tested at 1200 s after those fixes on a 997 s clip: still fail-closed,
+/// requesting 110.6 GB for the single graph buffer against 33.2 GB available.
+pub(crate) const NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS: u32 = 90;
 
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.

@@ -129,12 +129,18 @@ fn plan_nemotron_transcribe_decoder_state_with_components(
 ) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
     let family = "nemotron-transcribe";
     let _ = metadata;
-    let seconds =
-        input.invocation.samples() as f32 / input.invocation.sample_rate_hz().get() as f32;
+    // Size the topology from the envelope's maximum invocation, not the exact
+    // slice. The topology feeds both the logical and the reserve demand, and
+    // the family runtime pool keys its resident actor on the reserve span:
+    // deriving it from each slice's sample count drifts the key with slice
+    // length and builds a new actor (with new graph buffers) per slice.
+    // The envelope is the longform window ceiling, so it covers every slice.
+    let envelope = input.envelope.maximum_invocation();
+    let seconds = envelope.samples() as f32 / envelope.sample_rate_hz().get() as f32;
     let budget = output_budget_for_seconds(seconds);
     let prompt_positions = packed_prompt_position_estimate(
-        input.invocation.sample_rate_hz().get(),
-        input.invocation.samples(),
+        envelope.sample_rate_hz().get(),
+        envelope.samples(),
         prefix_positions,
     )
     .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })?;

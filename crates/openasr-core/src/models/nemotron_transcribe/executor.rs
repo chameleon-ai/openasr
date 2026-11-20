@@ -80,9 +80,11 @@ const NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS: usize = 640;
 const NEMOTRON_TRANSCRIBE_RUNTIME_ACTOR_MAX_IDLE_ENTRIES: usize = 4;
 const NEMOTRON_TRANSCRIBE_RUNTIME_ACTOR_MAX_INSTANCES_PER_KEY: usize = 2;
 
-/// Resident-runtime identity. The span is part of the key because the
-/// resident KV arena is sized from the packed prompt; a longer clip can
-/// never reuse a span that is too small.
+/// Resident-runtime identity. The span comes from the stable invocation
+/// envelope, not the exact slice: longform slices of different lengths must
+/// share one resident runtime, otherwise every distinct span builds a new
+/// actor with its own pack residency and graph buffers. The envelope is
+/// sized from the longform window ceiling, so it always covers a slice.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NemotronTranscribeUnifiedRuntimeCacheKey {
     content: PackContentKey,
@@ -370,7 +372,11 @@ impl NemotronTranscribeGgmlExecutor {
                 .allocations()
                 .iter()
                 .find(|allocation| allocation.logical.id == crate::models::nemotron_transcribe::capacity::NEMOTRON_TRANSCRIBE_SELF_KV_STATE_ID)
-                .map(|allocation| allocation.logical.positions)
+                // Use the envelope's reserve span, not the exact slice's
+                // logical span: all slices of a longform request then share
+                // one actor instead of allocating a new ~15 GB pack residency
+                // for every distinct slice length.
+                .map(|allocation| allocation.reserve.positions)
                 .ok_or_else(|| NemotronTranscribeGgmlExecutorError::CapacityFailed {
                     reason: "decoder-state plan is missing the nemotron self-KV stream"
                         .to_string(),
