@@ -208,7 +208,33 @@ fn migrate_model_store_once() {
     }
 }
 
+/// Opt-in peak VRAM report for `OPENASR_MEASURE_VRAM=1` (HIP builds only).
+/// Reports on normal return; error paths that call `process::exit` skip Drop.
+struct VramReport(Option<openasr_core::VramPeakSampler>);
+
+impl VramReport {
+    fn start_if_requested() -> Self {
+        if std::env::var_os("OPENASR_MEASURE_VRAM").is_none() {
+            return Self(None);
+        }
+        Self(Some(openasr_core::VramPeakSampler::start(
+            std::time::Duration::from_millis(50),
+        )))
+    }
+}
+
+impl Drop for VramReport {
+    fn drop(&mut self) {
+        if let Some(sampler) = self.0.take()
+            && let Some(peak) = sampler.stop()
+        {
+            eprintln!("OPENASR_VRAM_PEAK_BYTES={peak}");
+        }
+    }
+}
+
 async fn run() -> Result<()> {
+    let _vram_report = VramReport::start_if_requested();
     let command = match Cli::parse().command {
         Command::MemoryPressureHelper {
             parent_pid,

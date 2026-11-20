@@ -10388,6 +10388,53 @@ mod tests {
         resolution.options.validate().expect("resolved options");
     }
 
+    /// nemotron-transcribe is the first family whose window is one named
+    /// constant rather than inline literals. Raising the constant in one
+    /// place must move every value asserted here with it; changing only one
+    /// of the four declaration sites fails this test.
+    #[test]
+    fn nemotron_scoped_slices_resolve_the_single_named_window() {
+        let slice = crate::arch::NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32;
+        let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
+            integral_seconds,
+            target_seconds,
+            max_seconds,
+        } = crate::arch::longform_slice_shape_for_model_architecture(
+            crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+        )
+        else {
+            panic!("nemotron-transcribe must declare ScopedSlices");
+        };
+        assert_eq!(
+            (integral_seconds, target_seconds, max_seconds),
+            (slice, slice, slice)
+        );
+
+        // Just past the window: slicing takes over with exactly the declared
+        // window, and the encoder memory cap must not re-narrow it.
+        let resolution = resolve_native_longform_policy_for_backend(
+            None,
+            slice + 1.0,
+            crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(resolution.options.mode, LongFormMode::Energy);
+        assert_eq!(resolution.options.chunk_seconds, slice);
+        assert_eq!(resolution.options.max_chunk_seconds, slice);
+        assert_eq!(resolution.options.padding_seconds, 0.0);
+        assert!(!resolution.options.carry_prompt_across_slices);
+        resolution.options.validate().expect("resolved options");
+
+        // At the window itself the recording still decodes whole.
+        let whole = resolve_native_longform_policy_for_backend(
+            None,
+            slice,
+            crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            GgmlCpuGraphBackend::Cpu,
+        );
+        assert_eq!(whole.options.mode, LongFormMode::Off);
+    }
+
     /// Deterministic stand-in for a far-field meeting recording where most of
     /// the speech sits *below* the pipeline's absolute silence floor
     /// (`energy_silence_threshold_db`, -38 dBFS): a loud talker near the mic
@@ -11014,14 +11061,15 @@ mod tests {
     /// (issue #68): a `GlobalQuadratic` encoder must never be handed a
     /// longform chunk longer than its declared safe ceiling, while
     /// encoder-memory cap. An independent semantic invocation span may still
-    /// narrow the window (notably Whisper's 30s frontend). All nine
+    /// narrow the window (notably Whisper's 30s frontend). The
     /// `GlobalQuadratic` builtins (including firered-aed/cohere-transcribe/
     /// moonshine, which also carry the decode-side `ConservativeSeq2SeqV1`
-    /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, so this asserts
-    /// exact equality, not just an upper bound: the two caps stacked on the
-    /// conservative-seq2seq trio must resolve to the same 30s default, not
-    /// silently over-tighten to something smaller than either cap alone
-    /// intends.
+    /// cap) declare `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`, except
+    /// nemotron-transcribe, whose cited onboarding override is pinned to its
+    /// own named constant below. This asserts exact equality, not just an
+    /// upper bound: the two caps stacked on the conservative-seq2seq trio
+    /// must resolve to the same 30s default, not silently over-tighten to
+    /// something smaller than either cap alone intends.
     #[test]
     fn encoder_attention_span_caps_every_builtin_architecture_on_the_production_path() {
         for descriptor in OpenAsrArchitectureRegistry::with_builtins().descriptors() {
@@ -11029,16 +11077,30 @@ mod tests {
             // slicing policy actually runs for `ScopedSlices` families too --
             // a shorter recording legitimately resolves to longform off for
             // them, which would say nothing about the encoder caps under test.
+            // Keep the fixture long enough to get past every family's
+            // integral window even when a cited override widens the slice
+            // window beyond the old 600s test clip.
+            let safe_cap = descriptor.longform_max_safe_chunk_seconds().unwrap_or(0.0);
             let resolution = resolve_native_longform_policy_for_backend(
                 None,
-                600.0,
+                600.0_f32.max(safe_cap + 1.0),
                 descriptor.identity.model_architecture,
                 GgmlCpuGraphBackend::Cpu,
             );
             match descriptor.longform_max_safe_chunk_seconds() {
                 Some(max_safe_chunk_seconds) => {
+                    let expected = match descriptor.identity.model_architecture {
+                        // Cited override: onboarding-branch plumbing for the
+                        // first family that can slice past the conservative
+                        // default; see the constant's doc for the evidence
+                        // owed before it may move again.
+                        crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
+                            crate::arch::NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32
+                        }
+                        _ => DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                    };
                     assert_eq!(
-                        max_safe_chunk_seconds, DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                        max_safe_chunk_seconds, expected,
                         "'{}' GlobalQuadratic ceiling must be the shared default absent a cited \
                          upstream override",
                         descriptor.identity.model_architecture

@@ -210,8 +210,9 @@ pub use ggml_runtime::{
     run_diagnostic_layer2_exact_route_probe,
 };
 pub use metrics::{
-    ProcessMemorySnapshot, WerCounts, cer_counts, current_rss_bytes, normalize_text,
-    peak_rss_bytes, process_memory_snapshot, wer, wer_counts, word_prefix_error_rate,
+    ProcessMemorySnapshot, VramPeakSampler, WerCounts, cer_counts, current_rss_bytes,
+    hip_vram_used_bytes, normalize_text, peak_rss_bytes, process_memory_snapshot, wer, wer_counts,
+    word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use qualification_manifest::{

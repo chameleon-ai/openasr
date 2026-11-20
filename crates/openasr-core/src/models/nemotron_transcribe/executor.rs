@@ -803,3 +803,212 @@ impl crate::models::ggml_asr_executor::GgmlAsrStreamingExecutor for NemotronTran
         self.unified_runtimes.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use crate::arch::builtin_adapter_descriptor;
+    use crate::ggml_runtime::install_request_backend_override;
+    use crate::models::ggml_asr_executor::{
+        GgmlAsrBackendPreference, GgmlAsrDecoderState, GgmlAsrDecoderStatePlanningInput,
+        GgmlAsrPreparedAudioView,
+    };
+
+    use super::*;
+
+    /// Real pack for the opt-in scaling probe; never committed (a 15-37 GB
+    /// weight-bearing fixture). Same skip-if-absent convention as the other
+    /// families' dev-pack tests.
+    fn dev_pack_path() -> Option<PathBuf> {
+        match crate::testing::external_test_fixture_path(
+            "OPENASR_NEMOTRON_TRANSCRIBE_PACK",
+            "nemotron-transcribe .oasr pack",
+        ) {
+            Ok(path) => Some(path),
+            Err(skip) => {
+                eprintln!("skipping: {skip}");
+                None
+            }
+        }
+    }
+
+    fn jfk_samples() -> Vec<f32> {
+        crate::api::audio_io::load_wav_16khz_mono_f32_v0(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/jfk.wav"),
+            "nemotron slice scaling probe",
+            "nemotron slice scaling probe",
+        )
+        .expect("load jfk.wav fixture")
+    }
+
+    /// Speech-like filler: loop the JFK fixture so the clip clears both the
+    /// near-digital-silence gate and the no-voice speaker-activity gate,
+    /// otherwise the executor would short-circuit before the encoder runs.
+    fn looped_samples(seconds: f32, base: &[f32]) -> Vec<f32> {
+        let target = (seconds * 16_000.0).ceil() as usize;
+        let mut samples = Vec::with_capacity(target);
+        while samples.len() < target {
+            samples
+                .extend_from_slice(&base[..target.saturating_sub(samples.len()).min(base.len())]);
+        }
+        samples
+    }
+
+    fn plan_test_request_decoder_state(
+        executor: &NemotronTranscribeGgmlExecutor,
+        request: &mut GgmlAsrExecutionViewRequest<'_>,
+    ) {
+        let decoder_state = {
+            let planning_input = GgmlAsrDecoderStatePlanningInput::for_offline_view_request(
+                request.runtime_source_preflight(),
+                &request.prepared_audio,
+                &request.request_options,
+                request.resolved_runtime.backend(),
+            )
+            .expect("build nemotron decoder-state planning input");
+            executor
+                .decoder_state_contract(&request.selected_family)
+                .expect("load nemotron decoder-state contract")
+                .plan(&planning_input)
+                .expect("plan nemotron decoder state")
+        };
+        request.decoder_state = decoder_state;
+    }
+
+    /// One direct invocation of the given length; the longform slicer is
+    /// deliberately bypassed so the measurement is the cost of one slice,
+    /// which is exactly the window `NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS`
+    /// is meant to bound.
+    fn transcribe_single_pass(
+        executor: &NemotronTranscribeGgmlExecutor,
+        samples: Vec<f32>,
+        pack_path: &Path,
+    ) -> Option<(String, std::time::Duration, f32)> {
+        let runtime_source_preflight =
+            crate::models::runtime_preflight::load_runtime_source_metadata_and_tensor_index(
+                pack_path,
+            )
+            .expect("nemotron runtime must pass preflight");
+        // `Accelerated` would try a 14.5 GiB device allocation here: the bare
+        // harness lacks the production exact-route lane that shares one weight
+        // context between encoder and decoder, so it OOMs. Keep `Auto` and
+        // report the resolved backend so a CPU-lane run cannot be mistaken for
+        // a VRAM measurement. For the real GPU number use the CLI with
+        // OPENASR_MEASURE_VRAM=1.
+        let backend_preference = GgmlAsrBackendPreference::Auto;
+        // A direct execute_view bypasses dispatch, so the backend preference
+        // must be installed here for the thread-local readers (same as the
+        // other families' real-pack dev tests).
+        let _backend_override_guard =
+            install_request_backend_override(backend_preference.request_backend_override());
+        let resolved_runtime = crate::ggml_runtime::ResolvedFamilyRuntimeInput::resolve(
+            backend_preference.request_backend_override(),
+            crate::arch::family_auto_gpu_policy_for_model_architecture(
+                crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            ),
+        );
+        eprintln!(
+            "nemotron slice probe: resolved_backend={:?}",
+            resolved_runtime.backend()
+        );
+        let audio_duration_seconds = samples.len() as f32 / 16_000.0;
+        let mut request = GgmlAsrExecutionViewRequest {
+            execution_services:
+                crate::models::native_execution_services::test_native_execution_services(),
+            decoder_state: GgmlAsrDecoderState::NoPersistentState,
+            verified_pack: crate::models::runtime_preflight::verified_pack_from_preflight_for_test(
+                runtime_source_preflight,
+                crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            ),
+            selected_family: builtin_adapter_descriptor(
+                crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
+            ),
+            prepared_audio: GgmlAsrPreparedAudioView::mono_16khz(samples),
+            request_options: Default::default(),
+            backend_preference,
+            resolved_runtime,
+            execution_context: std::sync::Arc::new(crate::RequestExecutionContext::uncancellable(
+                "nemotron slice scaling probe",
+            )),
+        };
+        plan_test_request_decoder_state(executor, &mut request);
+
+        let started_at = Instant::now();
+        let result = executor
+            .execute_view(&request)
+            .expect("nemotron transcribe");
+        Some((
+            result.transcription.text,
+            started_at.elapsed(),
+            audio_duration_seconds,
+        ))
+    }
+
+    /// Slice-length scaling probe: reports a single-pass transcription's RTF,
+    /// peak RSS and sampled peak VRAM at each candidate window. This is the
+    /// evidence owed by `NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS` (a
+    /// measured per-family peak-activation coefficient); the assertions only
+    /// check the call completed (an empty transcript is reported, not failed,
+    /// since the gates can legitimately produce one). Peak RSS is a process
+    /// high-water mark (run one candidate per
+    /// process for an isolated reading); VRAM is sampled per call and is
+    /// device-wide, so it is only attributable to this process on an idle
+    /// GPU. VRAM reading requires building the test with `--features hip`.
+    /// `OPENASR_NEMOTRON_SLICE_PROBE_WINDOWS` overrides the comma-separated
+    /// candidate windows (seconds) for a quick smoke run.
+    #[test]
+    #[ignore = "host-local: needs OPENASR_NEMOTRON_TRANSCRIBE_PACK + fixtures/jfk.wav; \
+                measures per-slice activation headroom to pin \
+                NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS; run via --run-ignored on the target class"]
+    fn longform_slice_scaling_probe() {
+        let Some(pack_path) = dev_pack_path() else {
+            return;
+        };
+        let base = jfk_samples();
+        let executor = NemotronTranscribeGgmlExecutor::default();
+        let windows: Vec<f32> = match std::env::var("OPENASR_NEMOTRON_SLICE_PROBE_WINDOWS") {
+            Ok(value) => value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<f32>().ok())
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .collect(),
+            Err(_) => vec![120.0, 300.0, 600.0, 1200.0],
+        };
+        if windows.is_empty() {
+            eprintln!("skipping: no positive windows in OPENASR_NEMOTRON_SLICE_PROBE_WINDOWS");
+            return;
+        }
+        for window_seconds in windows {
+            let samples = looped_samples(window_seconds + 1.0, &base);
+            // VRAM can fall between windows (unlike the RSS high-water mark),
+            // so each candidate gets its own per-call sampled peak.
+            let vram_sampler = crate::metrics::VramPeakSampler::start(Duration::from_millis(50));
+            let outcome = transcribe_single_pass(&executor, samples, &pack_path);
+            let peak_vram_bytes = vram_sampler.stop();
+            let Some((text, elapsed, audio_duration_seconds)) = outcome else {
+                return;
+            };
+            // An empty transcript is a legitimate outcome (silence / no-voice
+            // gate) and does not invalidate the memory measurement.
+            if text.trim().is_empty() {
+                eprintln!(
+                    "nemotron slice probe: window={window_seconds:.0}s produced no transcript"
+                );
+            }
+            let rtf = elapsed.as_secs_f32() / audio_duration_seconds.max(0.001);
+            let peak_rss_mb = crate::metrics::peak_rss_bytes()
+                .map(|bytes| bytes as f64 / 1.0e6)
+                .unwrap_or(0.0);
+            let peak_vram_mb = peak_vram_bytes
+                .map(|bytes| bytes as f64 / 1.0e6)
+                .unwrap_or(0.0);
+            eprintln!(
+                "nemotron slice probe: window={window_seconds:.0}s \
+                 audio={audio_duration_seconds:.2}s elapsed={elapsed:?} \
+                 RTF={rtf:.3} peak_rss={peak_rss_mb:.0}MB peak_vram={peak_vram_mb:.0}MB"
+            );
+        }
+    }
+}

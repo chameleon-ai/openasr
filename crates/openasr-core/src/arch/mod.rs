@@ -359,6 +359,37 @@ pub(crate) const NEMOTRON_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID: &str =
 pub(crate) const NEMOTRON_TRANSCRIBE_EXECUTOR_COMPONENT_ID: &str =
     "nemotron-transcribe.ggml-executor.v0";
 
+/// Largest recording (in seconds) the nemotron-transcribe runtime is
+/// currently cleared to encode + decode in a single pass.
+///
+/// EXPERIMENTAL (onboarding branch): the first family whose invocation
+/// envelope (3600 s span, 73,728-position cap) admits slices far beyond
+/// the shared conservative `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30 s).
+/// The PE encoder is `GlobalQuadratic`, so a value here is legitimate
+/// only with a measured per-family peak-activation coefficient (see that
+/// constant's doc, which names exactly this evidence) plus the seam CER/DER
+/// evidence `ScopedSlices` demands. The ignored
+/// `longform_slice_scaling_probe` test in
+/// `models::nemotron_transcribe::executor` produces the measurement.
+///
+/// One constant drives four declaration sites (integral/target/max slice
+/// window + the encoder memory cap) so the plumbing cannot drift
+/// internally. Split into target/max constants only when the
+/// measurement yields two different numbers.
+///
+/// Observations on gfx1030 16 GB / ad_q2_0_m (not a safety coefficient):
+/// the release CLI transcribe of jfk.wav peaks at ~15.4 GiB device VRAM
+/// (sysfs, including ~1 GB device baseline) with backend=gpu. The in-crate
+/// probe harness resolves `Auto` to CPU and measured ~17.6 GB RSS at 12 s
+/// and ~43.2 GB RSS at 62 s; those are host-lane numbers, not VRAM.
+/// Probe result (gfx1030, 16 GB): no value from 30 s to 1200 s lets clips
+/// longer than ~94 s transcribe. Long segments fail on a single oversized
+/// graph-buffer request; short segments fail after system-memory admission
+/// accumulates a pack-sized pending allocation plus ~46-61 GB committed.
+/// Restored to 300 s; the long-clip failure is a memory-retention issue in
+/// the longform path, not a slice-length setting.
+pub(crate) const NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS: u32 = 300;
+
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.
 ///
@@ -3456,14 +3487,13 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
             speaker_segmentation: SpeakerSegmentationSource::InDecoder,
             word_timestamp_source: WordTimestampSource::Native,
             longform_slice_shape: OpenAsrLongformSliceShape::ScopedSlices {
-                // SALM can ingest up to an hour in one invocation, but this
-                // staged family has goldens only for short clips: every slice
-                // restarts in-decoder speaker numbering, so slicing at the
-                // GlobalQuadratic encoder ceiling is the conservative choice.
-                // Widen integral_seconds only with seam-level CER/DER evidence.
-                integral_seconds: 60.0,
-                target_seconds: 30.0,
-                max_seconds: 30.0,
+                // Onboarding plumbing: one named constant drives the whole
+                // window; see NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS for
+                // the measured activation coefficient and seam CER/DER
+                // evidence owed before this value may move again.
+                integral_seconds: NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32,
+                target_seconds: NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32,
+                max_seconds: NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32,
             },
             invocation_span: OpenAsrInvocationSpan::Bounded { max_seconds: 3600.0 },
             // Transcriptions come out punctuated verbatim by default (see the
@@ -3487,11 +3517,12 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
         optimization_contract: OpenAsrOptimizationContract {
             prefer_cpu_decoder_for_multichunk_metal: false,
             auto_gpu_policy: AutoGpuPolicy::AllBackends,
-            // PE encoder is global self-attention per layer; same 30s safe
-            // ceiling as the other global-quadratic builtins until a measured
-            // activation coefficient exists.
+            // Cited override of `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`: first
+            // GlobalQuadratic family cleared for slices past the conservative
+            // default; experimental onboarding placeholder, see
+            // NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS for the evidence owed.
             encoder_attention_span: OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                max_safe_chunk_seconds: NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32,
             },
         },
         quantization_contract: OpenAsrQuantizationContract {
@@ -4253,10 +4284,11 @@ mod tests {
     /// consults to cap chunk length for quadratic-attention encoders (issue
     /// #68). Whisper's fixed 30s window and zipformer's local/chunked
     /// streaming encoder need no additional cap; every other builtin
-    /// architecture's encoder is full self-attention over the whole chunk,
-    /// so all nine are `GlobalQuadratic` at `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`
-    /// (none of the nine has an upstream-recommended value that overrides
-    /// the shared default; see that constant's doc for the survey).
+    /// architecture's encoder is full self-attention over the whole chunk.
+    /// Eight of the nine are `GlobalQuadratic` at
+    /// `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS`; nemotron-transcribe carries the
+    /// cited onboarding override below (see
+    /// `NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS` for the evidence owed).
     #[test]
     fn builtin_architectures_declare_encoder_attention_span() {
         let expected: &[(&str, OpenAsrEncoderAttentionSpan)] = &[
@@ -4351,7 +4383,7 @@ mod tests {
             (
                 NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
                 OpenAsrEncoderAttentionSpan::GlobalQuadratic {
-                    max_safe_chunk_seconds: DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
+                    max_safe_chunk_seconds: NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32,
                 },
             ),
         ];
