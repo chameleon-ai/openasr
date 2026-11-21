@@ -33,6 +33,11 @@ pub(crate) const NEMOTRON_TRANSCRIBE_TRANSCRIBE_PROMPT: &str = "Produce a verbat
 /// Diarize prompt (in-decoder speaker tags). Served only when the request
 /// asks for speaker diarization.
 pub(crate) const NEMOTRON_TRANSCRIBE_DIARIZE_PROMPT: &str = "Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. Use no punctuation and no capitalization. Start every speaker turn with a speaker tag such as <spk:0>, <spk:1>, <spk:2>, etc.; assign one stable tag per speaker and keep speaker identities consistent. Output only the speaker-tagged transcript. <|audio|>";
+/// Empty-transcript fallback (reference `kFallbackPrompt`, verbatim): when the
+/// served transcription prompt decodes to nothing (the model takes its stop
+/// token at step 0), the same encoder output is re-decoded once with this
+/// prompt, which is tuned to pull speech out of music and background noise.
+pub(crate) const NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT: &str = "Transcribe the following. Write all numbers in words. Ignore any music or background sounds: <|audio|>";
 
 pub(crate) const NEMOTRON_TRANSCRIBE_MAX_OUTPUT_TOKENS: usize = 21664;
 pub(crate) const NEMOTRON_TRANSCRIBE_MIN_OUTPUT_TOKENS: usize = 24;
@@ -291,6 +296,20 @@ mod tests {
         // The chat wrapper is applied by build_prompt_plan, not here.
         assert!(!text.contains(NEMOTRON_TRANSCRIBE_CHAT_PREFIX));
         assert!(!text.contains(NEMOTRON_TRANSCRIBE_CHAT_SUFFIX));
+    }
+
+    /// The fallback prompt is a reference byte contract (reference
+    /// `kFallbackPrompt`): it fires from the same request only when the
+    /// served prompt decoded to nothing, so its text must not drift.
+    #[test]
+    fn fallback_prompt_is_the_reference_prompt_with_a_valid_locator() {
+        let text = build_served_instruction(NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT, None)
+            .expect("fallback prompt locator layout");
+        assert_eq!(
+            text,
+            "Transcribe the following. Write all numbers in words. \
+             Ignore any music or background sounds: <|audio|>"
+        );
     }
 
     #[test]

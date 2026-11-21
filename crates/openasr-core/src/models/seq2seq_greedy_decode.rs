@@ -136,6 +136,13 @@ pub(crate) enum Seq2SeqGreedyDecodeStopReason {
     /// its result with this reason, so "we kept a partial" stays visible rather
     /// than being laundered into a normal completion.
     BudgetExhausted,
+    /// The model emitted its stop token as the very first token, so no content
+    /// token was kept: the transcript is empty and the decode described none
+    /// of the audio it was given. The model stopped itself (unlike a guard or
+    /// budget cut), but it did so before transcribing anything, so a family
+    /// that keeps the empty result must report it as a truncation, not as a
+    /// clean [`Self::StopToken`] completion.
+    StopTokenBeforeContent,
 }
 
 impl Seq2SeqGreedyDecodeStopReason {
@@ -161,6 +168,7 @@ impl Seq2SeqGreedyDecodeStopReason {
     ) -> Option<DecodeTruncation> {
         let reason = match self {
             Self::StopToken => return None,
+            Self::StopTokenBeforeContent => DecodeTruncationReason::StopTokenBeforeContent,
             Self::DegenerateRepeatGuard => DecodeTruncationReason::DegenerateRepeatGuard,
             Self::BudgetExhausted => DecodeTruncationReason::BudgetExhausted,
         };
@@ -407,7 +415,15 @@ pub(crate) fn run_seq2seq_greedy_decode_loop_v0(
             observer.report(step_index + 1, config.max_generated_tokens);
         }
         if selection.reached_eot {
-            stop_reason = Some(Seq2SeqGreedyDecodeStopReason::StopToken);
+            // A stop token with no content behind it is not a completed
+            // transcript: `generated` is empty exactly when the first selected
+            // token already stopped the decode, so keep that distinct from a
+            // clean stop instead of labeling an empty decode `StopToken`.
+            stop_reason = if generated.is_empty() {
+                Some(Seq2SeqGreedyDecodeStopReason::StopTokenBeforeContent)
+            } else {
+                Some(Seq2SeqGreedyDecodeStopReason::StopToken)
+            };
             break;
         }
         generated.push(selection.token_id);
@@ -916,6 +932,69 @@ mod tests {
         // The kept tail is the trip's single cycle; its length is the only
         // way a caller can identify the attractor in the truncated stream.
         assert_eq!(output.guard_trip_ngram_len, Some(1));
+    }
+
+    /// A stop token at step zero is not a completed transcript: the decode
+    /// kept no tokens, so it must surface as a stop-token-before-content
+    /// truncation, never as a clean stop. The shared driver owns the
+    /// distinction so no family can launder a step-zero stop back into a
+    /// `StopToken` success.
+    #[test]
+    fn a_stop_token_before_any_content_reports_truncation_not_a_stop_token() {
+        let mut step_executor = SyntheticStepExecutor {
+            vocab_size: 16,
+            // The first (and only) selection is the stop token itself.
+            sequence: vec![7],
+            logits_calls: 0,
+        };
+        let token_decoder = SyntheticTokenDecoder {
+            table: BTreeMap::new(),
+        };
+        let config = Seq2SeqGreedyDecodeConfig {
+            initial_prompt_tokens: vec![42],
+            eot_token_id: 7,
+            stop_token_ids: Vec::new(),
+            vocab_size: 16,
+            max_generated_tokens: 8,
+            suppress_first_step_token_ids: Vec::new(),
+            suppress_token_ids: Vec::new(),
+            phrase_biases: Vec::new(),
+        };
+        let mut no_token_trace = |_: usize, _: u32, _: bool| {};
+        let mut no_topk_trace = |_: usize, _: &[f32]| {};
+
+        let output = run_seq2seq_greedy_decode_loop_v0(
+            &config,
+            &mut step_executor,
+            &token_decoder,
+            &mut no_token_trace,
+            &mut no_topk_trace,
+            &std::sync::Arc::new(crate::api::backend::TranscriptionControl::new()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(output.generated_tokens.is_empty());
+        assert_eq!(output.text, "");
+        assert_eq!(
+            output.stop_reason,
+            Seq2SeqGreedyDecodeStopReason::StopTokenBeforeContent
+        );
+        assert!(output.stop_reason.is_truncated());
+        // Presence of the truncation is the load-bearing signal: it is what
+        // puts a `truncated` entry on the transcript and keeps the quality
+        // label off a decode that described none of its audio.
+        let truncation = output
+            .stop_reason
+            .into_decode_truncation(None)
+            .expect("a stop before content must surface as a truncation");
+        assert_eq!(
+            truncation.reason,
+            crate::api::backend::DecodeTruncationReason::StopTokenBeforeContent
+        );
+        assert_eq!(truncation.reason.as_str(), "stop-token-before-content");
+        assert!(truncation.transcript_covers_up_to_seconds.is_none());
     }
 
     #[test]

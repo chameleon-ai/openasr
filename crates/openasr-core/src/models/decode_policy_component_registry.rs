@@ -63,6 +63,13 @@ pub(crate) enum BuiltinDecodePolicySeq2SeqStopTokenKind {
 pub(crate) enum BuiltinDecodePolicySeq2SeqSuppressionKind {
     None,
     WhisperDefaultV0,
+    /// Suppress only the family's EOT token on the first step. The stop token
+    /// stays a legal choice from step one on. For families whose only honest
+    /// "no transcript" exits run BEFORE the LLM (near-digital-silence and
+    /// no-voice gates): once the decoder runs, a step-zero stop token is a
+    /// false negative on the knife-edge first-token decision, not a refusal,
+    /// and an empty decode must never be the model's way out.
+    EotFirstStepV0,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +320,13 @@ pub(crate) const NEMOTRON_TRANSCRIBE_DECODE_POLICY_COMPONENT:
     seq2seq_text_postprocess_kind: BuiltinDecodePolicySeq2SeqTextPostprocessKind::Identity,
     seq2seq_trace_kind: BuiltinDecodePolicySeq2SeqTraceKind::RuntimeJsonlV1,
     seq2seq_stop_token_kind: BuiltinDecodePolicySeq2SeqStopTokenKind::None,
-    seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::None,
+    // Once the LLM runs, a step-zero EOT is a false negative: the executor's
+    // near-digital silence and no-voice gates already end honest silence
+    // before the decoder, and the reference's own empty-transcript fallback
+    // can still lose this knife-edge decision on low quants. Mask EOT on
+    // step zero only (the shared driver's first-step suppression), leaving
+    // it a legal stop token from step one on.
+    seq2seq_suppression_kind: BuiltinDecodePolicySeq2SeqSuppressionKind::EotFirstStepV0,
     // The executor assembles the audio splice ONCE (the whole PE-projected
     // utterance goes into a single prompt) and decodes it in one pass;
     // it emits no carry context. Disabled, same as firered-llm.
@@ -621,6 +634,13 @@ pub(crate) fn build_builtin_seq2seq_decode_policy_config(
     let (suppress_first_step_token_ids, suppress_token_ids) =
         match descriptor.seq2seq_suppression_kind {
             BuiltinDecodePolicySeq2SeqSuppressionKind::None => (Vec::new(), Vec::new()),
+            BuiltinDecodePolicySeq2SeqSuppressionKind::EotFirstStepV0 => {
+                // See the kind's doc: the honest empty-transcript exits run
+                // before the LLM, so on the first step the stop token is kept
+                // out of the candidate set and the decode starts from the
+                // model's best content token instead of stalling at step zero.
+                (vec![input.eot_token_id], Vec::new())
+            }
             BuiltinDecodePolicySeq2SeqSuppressionKind::WhisperDefaultV0 => {
                 let mut suppress_token_ids = Vec::new();
                 for token_id in [
@@ -1448,6 +1468,32 @@ mod tests {
 
         assert_eq!(config.suppress_first_step_token_ids, vec![7, 9]);
         assert_eq!(config.suppress_token_ids, vec![3, 4, 5, 6, 8]);
+    }
+
+    #[test]
+    fn nemotron_seq2seq_config_suppresses_only_eot_on_the_first_step() {
+        let descriptor =
+            resolve_builtin_decode_policy(crate::arch::NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID)
+                .expect("nemotron descriptor");
+        let config = build_builtin_seq2seq_decode_policy_config(
+            descriptor,
+            &BuiltinSeq2SeqDecodePolicyConfigInput {
+                initial_prompt_tokens: vec![1, 2],
+                eot_token_id: 11,
+                vocab_size: 32,
+                max_generated_tokens: 16,
+            },
+            &(),
+            None,
+        )
+        .expect("nemotron config");
+
+        // The only honest empty-transcript exits run before the LLM, so a
+        // step-zero stop token must not be a legal first choice here. No
+        // other suppression: the stop token stays legal from step one on.
+        assert_eq!(config.suppress_first_step_token_ids, vec![11]);
+        assert!(config.suppress_token_ids.is_empty());
+        assert!(config.stop_token_ids.is_empty());
     }
 
     #[test]

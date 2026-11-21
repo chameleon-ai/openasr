@@ -792,6 +792,11 @@ pub enum DecodeTruncationReason {
     /// The generation budget ran out before the model emitted a stop token.
     /// The family kept the generated prefix instead of failing the request.
     BudgetExhausted,
+    /// The model's stop token arrived as the first token, so the transcript is
+    /// empty: none of the decode's audio was described. A consumer must not
+    /// read the empty text as "no speech" - the decode stopped itself at step
+    /// zero, which on a voiced clip is a false negative, not a completion.
+    StopTokenBeforeContent,
 }
 
 impl DecodeTruncationReason {
@@ -801,6 +806,7 @@ impl DecodeTruncationReason {
         match self {
             Self::DegenerateRepeatGuard => "degenerate-repeat-guard",
             Self::BudgetExhausted => "budget-exhausted",
+            Self::StopTokenBeforeContent => "stop-token-before-content",
         }
     }
 }

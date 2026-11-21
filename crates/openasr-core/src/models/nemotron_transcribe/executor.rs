@@ -72,7 +72,6 @@ pub(crate) const NEMOTRON_TRANSCRIBE_EOT_TOKEN_ID: u32 = 11;
 /// treated as silence (the LLM never runs).
 pub(crate) const NEMOTRON_TRANSCRIBE_SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.5;
 
-const NEMOTRON_TRANSCRIBE_MAX_GENERATED_TOKENS: usize = 21664;
 const NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS: usize = 640;
 /// Resident unified-runtime pool limits: a few idle (pack, lane, span)
 /// buckets; two actors per bucket. Native ownership is bound at build time,
@@ -551,14 +550,6 @@ impl NemotronTranscribeGgmlExecutor {
                     language.as_deref(),
                 )?;
                 let audio_rows = encoder_output.frames;
-                let prompt_token_ids = plan.prompt_token_ids(audio_rows);
-                let prompt_len = prompt_token_ids.len();
-                let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
-                    initial_prompt_tokens: prompt_token_ids,
-                    eot_token_id: NEMOTRON_TRANSCRIBE_EOT_TOKEN_ID,
-                    vocab_size: 131_072,
-                    max_generated_tokens: NEMOTRON_TRANSCRIBE_MAX_GENERATED_TOKENS,
-                };
                 let decode_text_token_ids =
                     |token_ids: &[u32]| -> Result<String, Seq2SeqGreedyDecodeError> {
                         prepared
@@ -568,19 +559,42 @@ impl NemotronTranscribeGgmlExecutor {
                                 reason: error.to_string(),
                             })
                     };
-                let result = {
+                // One decode pass over the audio-spliced prompt. Each pass
+                // prefills the resident session from scratch (it resets its
+                // arenas at prefill), so a second pass re-decodes the SAME
+                // encoder output under a different prompt: the reference's
+                // one-shot empty-transcript fallback.
+                let projections = encoder_output.projections;
+                let mut decode_pass = |plan: &prompt::NemotronTranscribePromptPlan,
+                                       projections: &[f32]|
+                    -> Result<crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeResult,
+                              NemotronTranscribeGgmlExecutorError> {
+                    let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
+                        initial_prompt_tokens: plan.prompt_token_ids(audio_rows),
+                        eot_token_id: NEMOTRON_TRANSCRIBE_EOT_TOKEN_ID,
+                        vocab_size: 131_072,
+                        // Match the KV topology's duration-scaled budget: the
+                        // resident self-KV span is planned from
+                        // `output_budget_for_seconds` for the envelope, so a
+                        // larger driver cap would let a long decode walk off
+                        // the end of the allocated KV positions.
+                        max_generated_tokens: prompt::output_budget_for_seconds(
+                            audio_duration_seconds,
+                        ),
+                    };
+                    let prompt_len = decode_config.initial_prompt_tokens.len();
                     // The resident session resets its arenas itself at prefill.
                     let session = &mut prepared.decoder;
                     let mut step_executor = NemotronTranscribeResidentAudioDecodeStepExecutor::new(
                         session,
                         &prepared.embed_table,
-                        plan.prefix_ids,
-                        plan.suffix_ids,
-                        encoder_output.projections,
+                        plan.prefix_ids.clone(),
+                        plan.suffix_ids.clone(),
+                        projections.to_vec(),
                         2688,
                         prompt_len,
                     );
-                    run_builtin_seq2seq_decode_policy(
+                    let decoded = run_builtin_seq2seq_decode_policy(
                         crate::arch::NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID,
                         &decode_config,
                         &(),
@@ -593,102 +607,164 @@ impl NemotronTranscribeGgmlExecutor {
                         &control,
                         decode_work_progress.as_ref(),
                         unstable_decode_text.as_ref(),
-                    )
-                    .map_err(|error| NemotronTranscribeGgmlExecutorError::DecodeFailed {
-                        reason: error.to_string(),
-                    })?
+                    );
+                    match decoded {
+                        Ok(result) => Ok(result),
+                        Err(Seq2SeqGreedyDecodeError::EotNotReachedBeforeMaxTokens {
+                            generated_tokens,
+                            generated_probabilities,
+                            ..
+                        }) => {
+                            // Reaching the budget is a degraded decode, not a
+                            // failed request: keep the generated prefix and
+                            // report the shortfall as a budget truncation (the
+                            // same salvage the other seq2seq families use).
+                            let text = decode_text_token_ids(&generated_tokens).map_err(|error| {
+                                NemotronTranscribeGgmlExecutorError::DecodeFailed {
+                                    reason: error.to_string(),
+                                }
+                            })?;
+                            Ok(crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeResult {
+                                generated_tokens,
+                                generated_probabilities,
+                                text,
+                                stop_reason:
+                                    crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeStopReason::BudgetExhausted,
+                                guard_trip_ngram_len: None,
+                            })
+                        }
+                        Err(error) => Err(NemotronTranscribeGgmlExecutorError::DecodeFailed {
+                            reason: error.to_string(),
+                        }),
+                    }
                 };
-                let text = result.text.trim().to_string();
+                let mut result = decode_pass(&plan, &projections)?;
+                let mut text = result.text.trim().to_string();
+                if text.is_empty() && !in_decoder_speakers {
+                    // The reference's one-shot empty-transcript fallback: the
+                    // served transcription prompt decoded to nothing (the
+                    // model took its stop token at step zero), so re-decode
+                    // the same encoder output once under the
+                    // music/noise-tolerant prompt. Served transcription
+                    // prompts only - the diarize prompt is a different task
+                    // contract - and at most once: if this also comes back
+                    // empty the result stands, now reported as a
+                    // stop-token-before-content truncation by the driver.
+                    eprintln!(
+                        "openasr_nemotron_transcribe stage=decode event=empty_transcript_fallback status=fired"
+                    );
+                    let fallback_plan = prompt::build_served_prompt(
+                        &prepared.tokenizer,
+                        prompt::NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT,
+                        language.as_deref(),
+                    )?;
+                    let fallback_result = decode_pass(&fallback_plan, &projections)?;
+                    let fallback_text = fallback_result.text.trim().to_string();
+                    if !fallback_text.is_empty() {
+                        result = fallback_result;
+                        text = fallback_text;
+                    }
+                }
 
                 // --- CTC word timestamps (transcript-independent head + host aligner) ---
-                let words = if word_timestamps {
+                // Alignment is a best-effort enhancement: the reference returns
+                // the transcript with timestamps unavailable when the head or
+                // the aligner fails (a long/recovering decode can outgrow the
+                // CTC grid), so a failure here must never fail the transcription.
+                let aligned_words = (|| -> Result<
+                    Vec<crate::api::backend::WordTimestamp>,
+                    NemotronTranscribeGgmlExecutorError,
+                > {
+                    if !word_timestamps {
+                        return Ok(Vec::new());
+                    }
                     let transcript = clean_sot_transcript(&text, &[]);
                     if transcript.is_empty() {
-                        Vec::new()
-                    } else {
-                        // The encoder returns speaker probabilities speaker-major
-                        // ([speaker * frames + t]); the aligner expects frame-major
-                        // ([t * speakers + speaker]).
-                        let enc_frames = encoder_output.frames;
-                        let speakers = super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS;
-                        let mut speaker_probs =
-                            vec![0.0f32; enc_frames * speakers];
-                        for t in 0..enc_frames {
-                            for spk in 0..speakers {
-                                speaker_probs[t * speakers + spk] =
-                                    encoder_output.speaker_probs[spk * enc_frames + t];
-                            }
-                        }
-                        let ctc_frames = encoder_output.frames * CTC_UPSAMPLING;
-                        let targets = alignment_targets(
-                            &prepared.ctc_spm,
-                            &transcript,
-                            CTC_BLANK_ID,
-                            ctc_frames,
-                        )
-                        .map_err(|reason| {
-                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
-                                reason: format!("CTC alignment targets: {reason}"),
-                            }
-                        })?;
-                        let logits = prepared.ctc_head.logits(
-                            &encoder_output.asr_states,
-                            encoder_output.frames,
-                            &targets.columns,
-                        )
-                        .map_err(|error| {
-                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
-                                reason: error.to_string(),
-                            }
-                        })?;
-                        prepared.ctc_head.release_transient_compute_memory().map_err(|error| {
-                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
-                                reason: error.to_string(),
-                            }
-                        })?;
-                        let emissions: Vec<f32> = logits.iter().map(|&v| bf16_round(v)).collect();
-                        let config = AlignmentConfig {
-                            max_word_frames: 12 * CTC_UPSAMPLING,
-                            ..Default::default()
-                        };
-                        let inputs = AlignmentInputs {
-                            log_probs: &emissions,
-                            frames: ctc_frames,
-                            speaker_probs: Some(&speaker_probs),
-                            speaker_frames: encoder_output.frames,
-                            speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
-                            activity10: Some(&encoder_output.speaker_probs10),
-                            label_frames: frames
-                                .min(8 * encoder_output.frames),
-                            label_speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
-                            label_seconds: 0.01,
-                            duration: f64::from(audio_duration_seconds),
-                            time_offset: 0.0,
-                        };
-                        let aligned = align_record(&targets, &inputs, &config).map_err(|reason| {
-                            NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
-                                reason: format!("CTC alignment: {reason}"),
-                            }
-                        })?;
-                        public_words(&aligned.words)
-                            .into_iter()
-                            .map(|row| {
-                                let unit = &targets.words[row.word];
-                                crate::api::backend::WordTimestamp {
-                                    word: if unit.display.is_empty() {
-                                        unit.word.clone()
-                                    } else {
-                                        unit.display.clone()
-                                    },
-                                    start: row.start as f32,
-                                    end: row.end as f32,
-                                    confidence: None,
-                                }
-                            })
-                            .collect()
+                        return Ok(Vec::new());
                     }
-                } else {
-                    Vec::new()
+                    // The encoder returns speaker probabilities speaker-major
+                    // ([speaker * frames + t]); the aligner expects frame-major
+                    // ([t * speakers + speaker]).
+                    let enc_frames = encoder_output.frames;
+                    let speakers = super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS;
+                    let mut speaker_probs = vec![0.0f32; enc_frames * speakers];
+                    for t in 0..enc_frames {
+                        for spk in 0..speakers {
+                            speaker_probs[t * speakers + spk] =
+                                encoder_output.speaker_probs[spk * enc_frames + t];
+                        }
+                    }
+                    let ctc_frames = encoder_output.frames * CTC_UPSAMPLING;
+                    let targets = alignment_targets(
+                        &prepared.ctc_spm,
+                        &transcript,
+                        CTC_BLANK_ID,
+                        ctc_frames,
+                    )
+                    .map_err(|reason| NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                        reason: format!("CTC alignment targets: {reason}"),
+                    })?;
+                    let logits = prepared.ctc_head.logits(
+                        &encoder_output.asr_states,
+                        encoder_output.frames,
+                        &targets.columns,
+                    )
+                    .map_err(|error| NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                        reason: error.to_string(),
+                    })?;
+                    prepared.ctc_head.release_transient_compute_memory().map_err(|error| {
+                        NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    let emissions: Vec<f32> = logits.iter().map(|&v| bf16_round(v)).collect();
+                    let config = AlignmentConfig {
+                        max_word_frames: 12 * CTC_UPSAMPLING,
+                        ..Default::default()
+                    };
+                    let inputs = AlignmentInputs {
+                        log_probs: &emissions,
+                        frames: ctc_frames,
+                        speaker_probs: Some(&speaker_probs),
+                        speaker_frames: encoder_output.frames,
+                        speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
+                        activity10: Some(&encoder_output.speaker_probs10),
+                        label_frames: frames.min(8 * encoder_output.frames),
+                        label_speakers: super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS,
+                        label_seconds: 0.01,
+                        duration: f64::from(audio_duration_seconds),
+                        time_offset: 0.0,
+                    };
+                    let aligned = align_record(&targets, &inputs, &config).map_err(|reason| {
+                        NemotronTranscribeGgmlExecutorError::WordTimestampsFailed {
+                            reason: format!("CTC alignment: {reason}"),
+                        }
+                    })?;
+                    Ok(public_words(&aligned.words)
+                        .into_iter()
+                        .map(|row| {
+                            let unit = &targets.words[row.word];
+                            crate::api::backend::WordTimestamp {
+                                word: if unit.display.is_empty() {
+                                    unit.word.clone()
+                                } else {
+                                    unit.display.clone()
+                                },
+                                start: row.start as f32,
+                                end: row.end as f32,
+                                confidence: None,
+                            }
+                        })
+                        .collect())
+                })();
+                let words = match aligned_words {
+                    Ok(words) => words,
+                    Err(error) => {
+                        eprintln!(
+                            "openasr_nemotron_transcribe stage=word_timestamps event=alignment_unavailable status=degraded reason={error}"
+                        );
+                        Vec::new()
+                    }
                 };
 
                 Ok(GgmlAsrExecutionResult {

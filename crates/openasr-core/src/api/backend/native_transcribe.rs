@@ -1382,6 +1382,24 @@ fn run_native_transcription_fallible_with_input(
     } else {
         crate::subtitle::TimelineQuality::NativeApproximate
     };
+    // An empty transcript has no word timeline that could be reliable. When
+    // the decode itself flagged it (a stop token before any content: the
+    // model stopped at step zero without transcribing anything), the vacuous
+    // "nothing to align" reliability of the anchor validation would label a
+    // failed decode as a clean success - exactly the claim an empty decode
+    // cannot make - so keep the label on the approximate tier.
+    if align_decision.native_reliable
+        && transcription
+            .segments
+            .iter()
+            .all(|segment| segment.words.is_empty())
+        && transcription.truncated_decodes.iter().any(|truncated| {
+            truncated.truncation.reason
+                == crate::api::backend::DecodeTruncationReason::StopTokenBeforeContent
+        })
+    {
+        timeline_quality = crate::subtitle::TimelineQuality::NativeApproximate;
+    }
     let transcription = if align_decision.need_align {
         // Forced alignment is a separate heavyweight model phase. Unload idle
         // primary ASR caches so the aligner can quote its graph against free

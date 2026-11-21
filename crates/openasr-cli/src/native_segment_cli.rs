@@ -1663,6 +1663,9 @@ fn warn_about_truncated_decodes(transcription: &openasr_core::Transcription) {
             openasr_core::DecodeTruncationReason::BudgetExhausted => {
                 "the decode ran out of its token budget before the model finished"
             }
+            openasr_core::DecodeTruncationReason::StopTokenBeforeContent => {
+                "the model stopped before transcribing anything"
+            }
         };
         eprintln!("warning: the transcript is incomplete for {where_}: {cause}.{covered}");
     }

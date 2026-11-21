@@ -67,6 +67,7 @@ pub(crate) fn packed_prompt_position_estimate(
     sample_rate_hz: u32,
     samples: usize,
     prompt_prefix_positions: usize,
+    prompt_suffix_positions: usize,
 ) -> Result<usize, TopologyError> {
     let seconds = samples as f32 / sample_rate_hz as f32;
     if !seconds.is_finite() {
@@ -75,8 +76,12 @@ pub(crate) fn packed_prompt_position_estimate(
         });
     }
     let audio_rows = (seconds * 12.5).ceil().max(1.0) as usize;
+    // The executable prompt is `[prefix][audio rows][suffix]`: omitting the
+    // suffix here under-sizes the resident KV span by its token length and a
+    // full budget decode walks off the end of the allocation.
     prompt_prefix_positions
         .checked_add(audio_rows)
+        .and_then(|positions| positions.checked_add(prompt_suffix_positions))
         .ok_or(TopologyError::ArithmeticOverflow {
             operation: "nemotron prompt positions",
         })
@@ -125,7 +130,7 @@ fn plan_nemotron_transcribe_decoder_state_with_components(
     input: &GgmlAsrDecoderStatePlanningInput<'_>,
     metadata: super::runtime_contract::NemotronTranscribeExecutionMetadata,
     prefix_positions: usize,
-    _suffix_positions: usize,
+    suffix_positions: usize,
 ) -> Result<crate::capacity::topology::DecoderStatePlan, GgmlAsrDecoderStatePlanningError> {
     let family = "nemotron-transcribe";
     let _ = metadata;
@@ -142,6 +147,7 @@ fn plan_nemotron_transcribe_decoder_state_with_components(
         envelope.sample_rate_hz().get(),
         envelope.samples(),
         prefix_positions,
+        suffix_positions,
     )
     .map_err(|source| GgmlAsrDecoderStatePlanningError::Topology { family, source })?;
     let topology = NemotronTranscribeDecoderStateTopology::new(prompt_positions, budget);
