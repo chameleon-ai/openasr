@@ -275,9 +275,30 @@ impl NemotronTranscribePreparedRuntime {
                 reason: error.to_string(),
             },
         )?;
-        let encoder = NemotronTranscribeEncoderRuntime::new_from_preflight(preflight, backend)?;
-        let decoder =
-            NemotronTranscribeDecoderRuntime::new_from_preflight(preflight, decoder_span, backend)?;
+        // Only the scheduler-backed Hybrid placement can split weight
+        // residency (its CPU fallback hosts the offloaded tensors). Ask the
+        // VRAM-derived policy which MoE experts must leave the device and
+        // hand the same spec to every runner: encoder, decoder, and CTC head
+        // coalesce onto one pack-wide weight owner, so three distinct specs
+        // would alias or double the residency.
+        let host_offload =
+            match crate::models::native_execution_services::current_execution_placement() {
+                Some(crate::device::execution_policy::ExecutionPlacement::Hybrid) => {
+                    super::offload::compute_host_offload_spec(backend, &preflight.tensor_index)
+                }
+                _ => None,
+            };
+        let encoder = NemotronTranscribeEncoderRuntime::new_from_preflight(
+            preflight,
+            backend,
+            host_offload.clone(),
+        )?;
+        let decoder = NemotronTranscribeDecoderRuntime::new_from_preflight(
+            preflight,
+            decoder_span,
+            backend,
+            host_offload.clone(),
+        )?;
         // The CTC head and its aligner tokenizer ship in every pack. Fail
         // closed if the SPM metadata or its vocabulary is missing/invalid.
         const CTC_SPM_KEY: &str = "ctc.tokenizer.spm_model";
@@ -296,7 +317,7 @@ impl NemotronTranscribePreparedRuntime {
                 reason: error.to_string(),
             }
         })?;
-        let ctc_head = CtcHeadRuntime::new_from_preflight(preflight, backend)?;
+        let ctc_head = CtcHeadRuntime::new_from_preflight(preflight, backend, host_offload)?;
         Ok(Self {
             tokenizer,
             embed_table,

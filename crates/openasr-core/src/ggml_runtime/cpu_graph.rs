@@ -2029,6 +2029,11 @@ pub struct GgmlCpuGraphRunner {
     graph_size: usize,
     _scheduler_accel_backends: Vec<GgmlBackendGuard>,
     _scheduler_cpu_fallback: Option<GgmlBackendGuard>,
+    /// Optional host-weight offload the owning family requested for the next
+    /// weight load: bind `candidate_tensors` (in order, up to `budget_bytes`)
+    /// into a host-resident WEIGHTS buffer. Only effective on a scheduler-backed
+    /// (hybrid) GPU lane, which supplies the CPU fallback buffer.
+    host_offload: Option<HostWeightOffloadSpec>,
     scheduler: Option<GgmlBackendSchedulerGuard>,
     /// Grow-to-fit backend buffer reused across `start_graph()` calls for the
     /// CPU, no-scheduler per-token decode path (see `GgmlCpuStepBufferPool`).
@@ -2529,6 +2534,64 @@ impl GgmlStaticTensorArenaUsage {
 }
 
 #[allow(dead_code)]
+/// Generic, model-agnostic host-weight offload request.
+///
+/// The owning family decides *which* tensors may leave the device and in what
+/// order (`candidate_tensors`) and *how many device bytes* must be freed
+/// (`budget_bytes`), deriving both from the detected device memory. This layer
+/// only performs the split: it walks `candidate_tensors` in order and binds
+/// them into a host-resident WEIGHTS buffer until the cumulative freed bytes
+/// reach `budget_bytes`, leaving every other tensor (including tensors the
+/// family never listed) in the device buffer. Offloading a whole named tensor
+/// (never a partial one) keeps the graph's 3-D expert layout intact.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct HostWeightOffloadSpec {
+    budget_bytes: u64,
+    candidate_tensors: Vec<String>,
+}
+
+impl HostWeightOffloadSpec {
+    pub(crate) fn new(budget_bytes: u64, candidate_tensors: Vec<String>) -> Self {
+        Self {
+            budget_bytes,
+            candidate_tensors,
+        }
+    }
+
+    /// Stable fingerprint for the coalescing key: two runtimes with the same
+    /// budget and candidate ordering share one physical split, a different
+    /// offload count must not alias a cached materialization.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.budget_bytes.hash(&mut hasher);
+        self.candidate_tensors.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Resolves the ordered candidate names to the tensors that will actually
+    /// leave the device: walk in order, accumulating payload bytes, and stop
+    /// once `budget_bytes` is covered. Returns the exact names to bind host-side.
+    pub(crate) fn resolve(&self, bytes_for: &dyn Fn(&str) -> Option<u64>) -> Vec<String> {
+        let mut chosen = Vec::new();
+        if self.budget_bytes == 0 {
+            return chosen;
+        }
+        let mut freed = 0u64;
+        for name in &self.candidate_tensors {
+            let Some(bytes) = bytes_for(name) else {
+                continue;
+            };
+            chosen.push(name.clone());
+            freed = freed.saturating_add(bytes);
+            if freed >= self.budget_bytes {
+                break;
+            }
+        }
+        chosen
+    }
+}
+
 enum GgmlWeightMaterialization {
     HostImported {
         source_identity: super::StrongFileIdentity,
@@ -2540,6 +2603,14 @@ enum GgmlWeightMaterialization {
         lane: crate::models::native_execution_services::ExecutionLaneKey,
         _buffer: GgmlBackendBufferGuard,
     },
+    /// Device-copy with a host-resident split: the non-offloaded tensors live in
+    /// `_device_buffer` (WEIGHTS, on the selected GPU backend) and the offloaded
+    /// tensors live in `_host_buffer` (WEIGHTS, CPU buffer type).
+    DeviceCopiedSplit {
+        lane: crate::models::native_execution_services::ExecutionLaneKey,
+        _device_buffer: GgmlBackendBufferGuard,
+        _host_buffer: GgmlBackendBufferGuard,
+    },
 }
 
 #[allow(dead_code)]
@@ -2547,6 +2618,7 @@ enum GgmlWeightMaterialization {
 enum GgmlWeightMaterializationKind {
     HostImported,
     DeviceCopied,
+    DeviceCopiedSplit,
 }
 
 #[allow(dead_code)]
@@ -2555,6 +2627,7 @@ impl GgmlWeightMaterialization {
         match self {
             Self::HostImported { .. } => GgmlWeightMaterializationKind::HostImported,
             Self::DeviceCopied { .. } => GgmlWeightMaterializationKind::DeviceCopied,
+            Self::DeviceCopiedSplit { .. } => GgmlWeightMaterializationKind::DeviceCopiedSplit,
         }
     }
 
@@ -2567,7 +2640,8 @@ impl GgmlWeightMaterialization {
                 Some(ResidentHostImportCapability { source_identity })
             }
             (GgmlWeightMaterializationKind::HostImported, None)
-            | (GgmlWeightMaterializationKind::DeviceCopied, _) => None,
+            | (GgmlWeightMaterializationKind::DeviceCopied, _)
+            | (GgmlWeightMaterializationKind::DeviceCopiedSplit, _) => None,
         }
     }
 
@@ -2576,20 +2650,30 @@ impl GgmlWeightMaterialization {
             Self::HostImported {
                 source_identity, ..
             } => Self::host_import_capability_for_kind(self.kind(), Some(*source_identity)),
-            Self::DeviceCopied { .. } => Self::host_import_capability_for_kind(self.kind(), None),
+            Self::DeviceCopied { .. } | Self::DeviceCopiedSplit { .. } => {
+                Self::host_import_capability_for_kind(self.kind(), None)
+            }
         }
     }
 
+    /// The device-resident (GPU) weight buffer. For a split materialization this
+    /// is the non-offloaded portion; the host portion is reached through the
+    /// variant directly.
     fn buffer(&self) -> &GgmlBackendBufferGuard {
         match self {
-            Self::HostImported { _buffer, .. } | Self::DeviceCopied { _buffer, .. } => _buffer,
+            Self::HostImported { _buffer, .. }
+            | Self::DeviceCopied { _buffer, .. }
+            | Self::DeviceCopiedSplit {
+                _device_buffer: _buffer,
+                ..
+            } => _buffer,
         }
     }
 
     fn mmap(&self) -> Option<&std::sync::Arc<Mmap>> {
         match self {
             Self::HostImported { _mmap, .. } => Some(_mmap),
-            Self::DeviceCopied { .. } => None,
+            Self::DeviceCopied { .. } | Self::DeviceCopiedSplit { .. } => None,
         }
     }
 }
@@ -2635,7 +2719,8 @@ impl GgmlLoadedWeightContext {
     pub(crate) fn resident_device_copy_capability(&self) -> Option<ResidentDeviceCopyCapability> {
         match &self.inner.materialization {
             GgmlWeightMaterialization::HostImported { .. } => None,
-            GgmlWeightMaterialization::DeviceCopied { lane, .. } => {
+            GgmlWeightMaterialization::DeviceCopied { lane, .. }
+            | GgmlWeightMaterialization::DeviceCopiedSplit { lane, .. } => {
                 Some(ResidentDeviceCopyCapability { lane: lane.clone() })
             }
         }
@@ -2693,6 +2778,10 @@ struct LoadedWeightOwnerKey {
     mapping_identity: usize,
     kind: GgmlWeightMaterializationKind,
     lane: crate::models::native_execution_services::ExecutionLaneKey,
+    /// Fingerprint of the active host-offload spec (0 when none). A split with a
+    /// different offload count is a second physical owner and must not alias a
+    /// cached one, so the count is part of identity.
+    offload_fingerprint: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2735,6 +2824,7 @@ impl LoadedWeightOwnerCache {
         source: &GgmlRuntimeSource,
         kind: GgmlWeightMaterializationKind,
         backend_kind: GgmlCpuGraphBackend,
+        offload_fingerprint: u64,
     ) -> LoadedWeightOwnerKey {
         let lane =
             crate::models::native_execution_services::current_execution_lane_key(backend_kind);
@@ -2753,9 +2843,11 @@ impl LoadedWeightOwnerCache {
             mapping_identity: match kind {
                 GgmlWeightMaterializationKind::HostImported => source.backing_mmap_identity(),
                 GgmlWeightMaterializationKind::DeviceCopied => 0,
+                GgmlWeightMaterializationKind::DeviceCopiedSplit => 0,
             },
             kind,
             lane,
+            offload_fingerprint,
         }
     }
 
@@ -3319,6 +3411,7 @@ impl GgmlCpuGraphRunner {
             graph_size: config.graph_size,
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
+            host_offload: None,
             scheduler,
             cpu_step_buffer_pool: GgmlCpuStepBufferPool::new(),
             last_transient_graph_generation: None,
@@ -3401,6 +3494,17 @@ impl GgmlCpuGraphRunner {
         self.scheduler.is_some()
     }
 
+    /// Request host-weight offloading for the next weight load. The owning
+    /// family computes `spec` (candidate tensor ordering + VRAM-derived byte
+    /// budget); the split is performed at load time. Must be called before the
+    /// first `load_gguf_weight_context*` on this runner. Only takes effect on a
+    /// scheduler-backed GPU lane (which owns the CPU fallback buffer the
+    /// offloaded tensors bind into); on any other lane the load fails closed
+    /// rather than silently leaving weights device-resident.
+    pub(crate) fn set_host_weight_offload(&mut self, spec: HostWeightOffloadSpec) {
+        self.host_offload = Some(spec);
+    }
+
     pub(crate) fn loaded_weight_binding_identity(
         &self,
         loaded: &GgmlLoadedWeightContext,
@@ -3453,14 +3557,45 @@ impl GgmlCpuGraphRunner {
     ) -> Result<GgmlLoadedWeightContext, GgmlCpuGraphError> {
         let require_direct_backend_matmul_support =
             self.backend_kind.is_gpu_class() && self.scheduler.is_none();
-        let preferred_kind = if backend_supports_host_import_weight_buffer(self.backend.raw) {
-            GgmlWeightMaterializationKind::HostImported
-        } else {
-            GgmlWeightMaterializationKind::DeviceCopied
+        // Host offload needs the CPU fallback backend from a scheduler-backed
+        // (hybrid) lane. If a family requested it on any other lane, fail closed
+        // instead of silently leaving the requested tensors device-resident.
+        let (offload, host_backend) = match self.host_offload.as_ref() {
+            Some(spec) => match self.scheduler_cpu_fallback_backend() {
+                Some(backend) => (Some(spec), Some(backend)),
+                None => {
+                    return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                        reason: "host weight offload was requested but this lane has no CPU \
+                                  fallback buffer to host the offloaded tensors in"
+                            .to_string(),
+                    });
+                }
+            },
+            None => (None, None),
+        };
+        let (preferred_kind, offload_fingerprint) = match (offload, host_backend) {
+            (Some(spec), Some(_)) => (
+                GgmlWeightMaterializationKind::DeviceCopiedSplit,
+                spec.fingerprint(),
+            ),
+            (None, None) => (
+                if backend_supports_host_import_weight_buffer(self.backend.raw) {
+                    GgmlWeightMaterializationKind::HostImported
+                } else {
+                    GgmlWeightMaterializationKind::DeviceCopied
+                },
+                0,
+            ),
+            _ => unreachable!("offload and host backend are set together"),
         };
         let owners = crate::models::native_execution_services::current_loaded_weight_owners();
         if let Some(owners) = owners.as_ref() {
-            let key = LoadedWeightOwnerCache::key(source, preferred_kind, self.backend_kind);
+            let key = LoadedWeightOwnerCache::key(
+                source,
+                preferred_kind,
+                self.backend_kind,
+                offload_fingerprint,
+            );
             if let Some(inner) = owners.lookup(&key) {
                 if require_direct_backend_matmul_support {
                     validate_direct_backend_matmul_weight_support(
@@ -3482,16 +3617,27 @@ impl GgmlCpuGraphRunner {
             self.backend.raw,
             self.backend_kind,
             require_direct_backend_matmul_support,
+            offload,
+            host_backend,
         )?;
         if let Some(owners) = owners {
             let key = LoadedWeightOwnerCache::key(
                 source,
                 loaded.inner.materialization.kind(),
                 self.backend_kind,
+                offload_fingerprint,
             );
             owners.publish(key, &loaded.inner);
         }
         Ok(loaded)
+    }
+
+    /// The scheduler CPU-fallback backend, the host side of a hybrid lane: the
+    /// buffer type its offloaded weights bind into and the memory domain the
+    /// host-resident portion is admitted against. Present only on a
+    /// scheduler-backed (hybrid) GPU lane.
+    fn scheduler_cpu_fallback_backend(&self) -> Option<NonNull<c_void>> {
+        Some(self._scheduler_cpu_fallback.as_ref()?.raw)
     }
 
     fn park_idle_runner_graph_context(&mut self) {
@@ -3967,6 +4113,14 @@ impl GgmlLoadedWeightContext {
             GgmlWeightMaterialization::DeviceCopied { _buffer, .. } => {
                 _buffer.record_receipt_reuse();
             }
+            GgmlWeightMaterialization::DeviceCopiedSplit {
+                _device_buffer,
+                _host_buffer,
+                ..
+            } => {
+                _device_buffer.record_receipt_reuse();
+                _host_buffer.record_receipt_reuse();
+            }
         }
     }
 
@@ -3986,6 +4140,8 @@ impl GgmlLoadedWeightContext {
         backend: NonNull<c_void>,
         backend_kind: GgmlCpuGraphBackend,
         require_direct_backend_matmul_support: bool,
+        offload: Option<&HostWeightOffloadSpec>,
+        host_backend: Option<NonNull<c_void>>,
     ) -> Result<Self, GgmlCpuGraphError> {
         let path = source.path();
         let mmap = source.backing_mmap();
@@ -4042,19 +4198,73 @@ impl GgmlLoadedWeightContext {
         if require_direct_backend_matmul_support {
             validate_direct_backend_matmul_weight_support(context.raw, backend, path)?;
         }
-        let materialization = match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
-            Some((buffer, mmap, residency)) => GgmlWeightMaterialization::HostImported {
-                source_identity: source.strong_file_identity(),
-                _buffer: buffer,
-                _mmap: mmap,
-                _pack_weight_residency: residency,
-            },
-            None => GgmlWeightMaterialization::DeviceCopied {
+        let materialization = if let (Some(offload), Some(host_backend)) = (offload, host_backend) {
+            // VRAM-derived host split: bind the offloaded tensors into a
+            // host-resident WEIGHTS buffer, then device-copy the rest. The device
+            // allocation (below) skips the already-bound tensors, so the two
+            // buffers together cover the whole pack exactly once.
+            let offload_names = offload.resolve(&|name| {
+                reader
+                    .tensor_index()
+                    .get(name)
+                    .map(|metadata| metadata.size_bytes)
+            });
+            let offload_set: std::collections::HashSet<&str> =
+                offload_names.iter().map(String::as_str).collect();
+            let mut offload_raw: Vec<NonNull<c_void>> = Vec::with_capacity(offload_names.len());
+            let mut cursor = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
+            while let Some(raw) = NonNull::new(cursor) {
+                let name = unsafe { cstr_lossy(ffi::ggml_get_name(raw.as_ptr())) };
+                if offload_set.contains(name.as_str()) {
+                    offload_raw.push(raw);
+                }
+                cursor = unsafe { ffi::ggml_get_next_tensor(context.raw.as_ptr(), raw.as_ptr()) };
+            }
+            if offload_raw.len() != offload_names.len() {
+                return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                    reason: format!(
+                        "host offload spec referenced {} tensors but only {} were present in {}",
+                        offload_names.len(),
+                        offload_raw.len(),
+                        path.display()
+                    ),
+                });
+            }
+            let host_buft = NonNull::new(unsafe {
+                ffi::ggml_backend_get_default_buffer_type(host_backend.as_ptr())
+            })
+            .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                operation: "host-offload-buffer/describe",
+                reason: "CPU fallback backend returned no buffer type".to_owned(),
+            })?;
+            let host_buffer = GgmlBackendBufferGuard::allocate_host_offload_buffer(
+                host_buft,
+                host_backend,
+                &offload_raw,
+            )?;
+            let device_buffer = GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?;
+            GgmlWeightMaterialization::DeviceCopiedSplit {
                 lane: crate::models::native_execution_services::current_execution_lane_key(
                     backend_kind,
                 ),
-                _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
-            },
+                _device_buffer: device_buffer,
+                _host_buffer: host_buffer,
+            }
+        } else {
+            match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
+                Some((buffer, mmap, residency)) => GgmlWeightMaterialization::HostImported {
+                    source_identity: source.strong_file_identity(),
+                    _buffer: buffer,
+                    _mmap: mmap,
+                    _pack_weight_residency: residency,
+                },
+                None => GgmlWeightMaterialization::DeviceCopied {
+                    lane: crate::models::native_execution_services::current_execution_lane_key(
+                        backend_kind,
+                    ),
+                    _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
+                },
+            }
         };
         let mut tensors = HashMap::new();
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
@@ -12282,6 +12492,7 @@ impl GgmlBackendSchedulerGuard {
         backends: &mut [ffi::GgmlBackendRaw],
         backend_private_leases: BTreeMap<usize, GgmlBackendPrivateLeaseOwner>,
         graph_size: usize,
+        op_offload: bool,
     ) -> Result<Self, GgmlCpuGraphError> {
         let n_backends =
             c_int::try_from(backends.len()).map_err(|_| GgmlCpuGraphError::UnsupportedInputs {
@@ -12294,7 +12505,7 @@ impl GgmlBackendSchedulerGuard {
                 n_backends,
                 graph_size,
                 false,
-                true,
+                op_offload,
             )
         };
         NonNull::new(raw)
@@ -12363,7 +12574,22 @@ fn build_graph_scheduler(
             Rc::clone(&cpu.private_memory_leases),
         );
     }
-    GgmlBackendSchedulerGuard::new(&mut backends, backend_private_leases, graph_size)
+    // GPU hybrid schedulers disable ggml's op_offload heuristic: it pulls ops
+    // whose weights live in the CPU fallback backend's buffer back onto the
+    // accelerator (staging the full weight tensor) whenever the op's batch is
+    // large enough. That erases exactly the VRAM a host weight split frees, at
+    // the moment the context buffer is largest (prefill). For every existing
+    // materialization all weights live in device buffers (HostImported buffers
+    // are device buffers over host pointers; DeviceCopied is copied up front),
+    // so no op qualifies and this is a no-op; it only changes placement for
+    // the host portion of a split materialization, where it is required.
+    let op_offload = !backend_kind.is_gpu_class();
+    GgmlBackendSchedulerGuard::new(
+        &mut backends,
+        backend_private_leases,
+        graph_size,
+        op_offload,
+    )
 }
 
 impl GgmlBackendSchedulerGuard {
@@ -12859,6 +13085,86 @@ impl GgmlBackendBufferGuard {
             requests,
             request_semantics,
             semantics,
+            true,
+            native_allocate,
+        )
+    }
+
+    /// Admits and allocates a host-resident (CPU buffer type) WEIGHTS buffer that
+    /// binds exactly `tensors` (in the given order) via `ggml_backend_buft_alloc_buffer_n`.
+    /// This is the host half of the split weight materialization: it moves a named
+    /// subset of a pack's tensors to system RAM while the rest stays device-resident.
+    /// The tensors are bound into the buffer as part of the native allocation, so
+    /// the caller must pass the exact raw tensor pointers to offload.
+    fn allocate_host_offload_buffer(
+        buft: NonNull<c_void>,
+        backend: NonNull<c_void>,
+        tensors: &[NonNull<c_void>],
+    ) -> Result<Self, GgmlCpuGraphError> {
+        if tensors.is_empty() {
+            return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                reason: "host offload buffer requested with no tensors".to_string(),
+            });
+        }
+        let alignment = unsafe { ffi::ggml_backend_buft_get_alignment(buft.as_ptr()) };
+        let mut size: usize = 0;
+        for tensor in tensors {
+            let alloc_size =
+                unsafe { openasr_ggml_backend_buft_get_alloc_size(buft.as_ptr(), tensor.as_ptr()) };
+            let padded = (alloc_size.saturating_add(alignment - 1)) / alignment * alignment;
+            size = size
+                .checked_add(padded)
+                .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "host-offload-buffer/describe",
+                    reason: "host offload buffer bytes overflowed".to_string(),
+                })?;
+        }
+        let requested_bytes =
+            u64::try_from(size).map_err(|_| GgmlCpuGraphError::MemoryAdmission {
+                operation: "host-offload-buffer/describe",
+                reason: "host offload buffer bytes exceed u64".to_string(),
+            })?;
+        let mut tensor_array: Vec<ffi::GgmlTensorRaw> =
+            tensors.iter().map(|t| t.as_ptr()).collect();
+        let native_allocate = move || {
+            let raw = unsafe {
+                ffi::ggml_backend_buft_alloc_buffer_n(
+                    buft.as_ptr(),
+                    tensor_array.as_mut_ptr(),
+                    tensor_array.len() as c_int,
+                )
+            };
+            let raw = NonNull::new(raw)
+                .ok_or_else(|| backend_buffer_allocation_failure("pack-host-offload-buffer"))?;
+            unsafe {
+                ffi::ggml_backend_buffer_set_usage(
+                    raw.as_ptr(),
+                    ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+                )
+            };
+            Ok(GgmlRawBackendBufferGuard {
+                raw,
+                released: false,
+            })
+        };
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+            request_id: 1,
+            backend: backend.as_ptr(),
+            buft: buft.as_ptr(),
+            requested_bytes,
+            ..Default::default()
+        };
+        allocate_native_buffer_with_admission(
+            "pack-host-offload-buffer",
+            backend,
+            request,
+            NativeMemoryClaimSemantics {
+                resource_id: "pack-host-offload-buffer".to_owned(),
+                lifetime: AllocationLifetime::PackShared,
+                phases: PhaseSet::ALL,
+            },
             true,
             native_allocate,
         )

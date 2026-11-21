@@ -702,9 +702,13 @@ impl NemotronTranscribeDecoderRuntime {
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         max_positions: usize,
         backend: GgmlCpuGraphBackend,
+        host_offload: Option<crate::ggml_runtime::HostWeightOffloadSpec>,
     ) -> Result<Self, NemotronTranscribeDecoderError> {
         let graph_config = decoder_graph_config(backend);
-        let runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
+        let mut runner = GgmlCpuGraphRunner::new(graph_config).map_err(ggml_err("runner_init"))?;
+        if let Some(spec) = host_offload {
+            runner.set_host_weight_offload(spec);
+        }
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_gguf_weight_context"))?;

@@ -152,9 +152,13 @@ impl CtcHeadRuntime {
     pub(crate) fn new_from_preflight(
         preflight: &crate::ggml_runtime::GgufRuntimeSourcePreflight,
         backend: GgmlCpuGraphBackend,
+        host_offload: Option<crate::ggml_runtime::HostWeightOffloadSpec>,
     ) -> Result<Self, CtcHeadError> {
-        let runner =
+        let mut runner =
             GgmlCpuGraphRunner::new(graph_config(backend)).map_err(ggml_err("runner_init"))?;
+        if let Some(spec) = host_offload {
+            runner.set_host_weight_offload(spec);
+        }
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_weights"))?;

@@ -552,6 +552,15 @@ unsafe extern "C" {
         buft: GgmlBackendBufferTypeRaw,
         size: usize,
     ) -> GgmlBackendBufferRaw;
+    // Allocates buffer(s) sized for exactly `tensors` and binds each into them
+    // (via the same tensor allocator `ggml_backend_alloc_ctx_tensors` uses), so
+    // a caller can pre-place a named subset of a no_alloc context's tensors into
+    // one buffer and leave the rest unallocated for a second pass.
+    pub(crate) fn ggml_backend_buft_alloc_buffer_n(
+        buft: GgmlBackendBufferTypeRaw,
+        tensors: *mut GgmlTensorRaw,
+        n_tensors: c_int,
+    ) -> GgmlBackendBufferRaw;
     pub(crate) fn ggml_backend_buffer_get_size(buffer: GgmlBackendBufferRaw) -> usize;
     pub(crate) fn ggml_gallocr_new(buft: GgmlBackendBufferTypeRaw) -> GgmlGallocrRaw;
     pub(crate) fn ggml_gallocr_free(galloc: GgmlGallocrRaw);

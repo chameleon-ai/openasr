@@ -30,6 +30,7 @@ pub(crate) mod decoder_graph;
 pub(crate) mod encoder_graph;
 pub(crate) mod executor;
 pub(crate) mod frontend;
+pub(crate) mod offload;
 pub(crate) mod package_import;
 pub(crate) mod prompt;
 pub(crate) mod runtime_contract;

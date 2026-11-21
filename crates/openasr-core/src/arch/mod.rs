@@ -102,6 +102,38 @@ const DOLPHIN_EXECUTION_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilit
         AcceleratedPlacementCapabilities::FULL_DEVICE_AND_HYBRID,
     );
 
+/// nemotron-transcribe: the 30B MoE trunk is ~14 GiB, so on a 16 GB-class card
+/// the whole pack plus the context buffer sits at the edge of physical VRAM.
+/// HIP declares the scheduler-backed Hybrid placement (not FullDevice): the
+/// family computes how many MoE expert tensors must move to system RAM from
+/// the detected device memory at runtime preparation (0 when the pack fits,
+/// growing as headroom shrinks) and splits the weight residency accordingly -
+/// the count is a function of measured VRAM, never a fixed knob. FullDevice is
+/// deliberately not a HIP candidate: it is admitted on weight bytes alone
+/// (W < policy ceiling) and would always win the candidate walk, leaving the
+/// context buffer with no headroom exactly when it is needed; with 0
+/// offloaded tensors the Hybrid lane behaves the same as FullDevice anyway.
+/// Other providers keep the all-device placement because the offload path is
+/// validated on HIP only.
+const NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES: ExecutionCapabilities =
+    ExecutionCapabilities::new(true)
+        .with_provider(
+            ExecutionProvider::Metal,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Cuda,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        )
+        .with_provider(
+            ExecutionProvider::Hip,
+            AcceleratedPlacementCapabilities::HYBRID,
+        )
+        .with_provider(
+            ExecutionProvider::Vulkan,
+            AcceleratedPlacementCapabilities::FULL_DEVICE,
+        );
+
 const FIRERED_LLM_EXECUTION_CAPABILITIES: ExecutionCapabilities = CPU_AND_FULL_DEVICE_EXECUTION;
 
 pub(crate) fn firered_llm_unified_runtime_enabled(
@@ -3468,10 +3500,10 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                     crate::models::nemotron_transcribe::NemotronTranscribeGgmlExecutor,
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
-            // NOTE: declared so the family may land executor work incrementally;
-            // this staged build cannot execute a single operator. The audit
-            // form must not claim any lane until the executor is real.
-            execution_capabilities: CPU_AND_FULL_DEVICE_EXECUTION,
+            // The 30B MoE trunk sits at the edge of 16 GB-class VRAM, so HIP
+            // runs the VRAM-derived Hybrid split; other providers keep the
+            // all-device placement. See the constant's doc for the reasoning.
+            execution_capabilities: NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             // The upstream model CAN translate speech ("Translate the audio into
             // English."); this staged build cannot run any of it, so the
@@ -3618,9 +3650,12 @@ mod tests {
                 ExecutionProvider::Hip,
                 ExecutionProvider::Vulkan,
             ] {
-                let hybrid_only = descriptor.identity.model_architecture
+                let hybrid_only = (descriptor.identity.model_architecture
                     == MOONSHINE_GGML_ARCHITECTURE_ID
-                    && provider == ExecutionProvider::Vulkan;
+                    && provider == ExecutionProvider::Vulkan)
+                    || (descriptor.identity.model_architecture
+                        == NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID
+                        && provider == ExecutionProvider::Hip);
                 let qualified_fallback = descriptor.identity.model_architecture
                     == DOLPHIN_GGML_ARCHITECTURE_ID
                     && provider == ExecutionProvider::Vulkan;

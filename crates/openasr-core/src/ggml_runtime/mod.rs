@@ -81,8 +81,8 @@ pub(crate) use cpu_graph::{
     GgmlFlashAttentionPrecision, GgmlGraphShapeKey, GgmlLoadedTensor,
     GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlMatmulPrecision,
     GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
-    GgmlSameShapePersistentGraph, GgmlStaticTensor, GgmlStaticTensorArena, LoadedWeightOwnerCache,
-    ResidentDeviceCopyCapability, ResidentHostImportCapability,
+    GgmlSameShapePersistentGraph, GgmlStaticTensor, GgmlStaticTensorArena, HostWeightOffloadSpec,
+    LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
     encoder_same_shape_reuse_is_enabled, exact_discrete_gpu_unified_owner_is_proven,
     proven_discrete_gpu_provider,
 };
