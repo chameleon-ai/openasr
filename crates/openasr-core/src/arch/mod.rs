@@ -391,38 +391,28 @@ pub(crate) const NEMOTRON_TRANSCRIBE_RUNTIME_TENSOR_CONTRACT_ID: &str =
 pub(crate) const NEMOTRON_TRANSCRIBE_EXECUTOR_COMPONENT_ID: &str =
     "nemotron-transcribe.ggml-executor.v0";
 
-/// Largest recording (in seconds) the nemotron-transcribe runtime is
-/// currently cleared to encode + decode in a single pass.
+/// Model-level hard ceiling (seconds) for one nemotron-transcribe slice,
+/// derived from the family's engine context budget (~one hour at the 80 ms
+/// grid), not from any device's VRAM.
 ///
-/// EXPERIMENTAL (onboarding branch): the first family whose invocation
-/// envelope (3600 s span, 73,728-position cap) admits slices far beyond
-/// the shared conservative `DEFAULT_ENCODER_SAFE_CHUNK_SECONDS` (30 s).
-/// The PE encoder is `GlobalQuadratic`, so a value here is legitimate
-/// only with a measured per-family peak-activation coefficient (see that
-/// constant's doc, which names exactly this evidence) plus the seam CER/DER
-/// evidence `ScopedSlices` demands. The ignored
-/// `longform_slice_scaling_probe` test in
-/// `models::nemotron_transcribe::executor` produces the measurement.
+/// This is the descriptor's static ceiling only. The *operative* slice length
+/// is derived at runtime from detected memory in
+/// `models::nemotron_transcribe::slice::runtime_slice_seconds`: more memory
+/// yields longer slices, less memory yields shorter ones, and every backend
+/// (discrete GPU, APU, CPU) stays in inference instead of falling back. The
+/// runtime value is always clamped to this ceiling, so the four descriptor
+/// declaration sites (integral/target/max slice window + encoder memory cap)
+/// stay internally consistent while no fixed seconds value governs a run.
 ///
-/// One constant drives four declaration sites (integral/target/max slice
-/// window + the encoder memory cap) so the plumbing cannot drift
-/// internally. Split into target/max constants only when the
-/// measurement yields two different numbers.
-///
-/// Observations on gfx1030 16 GB / ad_q2_0_m (not a safety coefficient):
-/// the release CLI transcribe of jfk.wav peaks at ~15.4 GiB device VRAM
-/// (sysfs, including ~1 GB device baseline) with backend=gpu. The in-crate
-/// probe harness resolves `Auto` to CPU and measured ~17.6 GB RSS at 12 s
-/// and ~43.2 GB RSS at 62 s; those are host-lane numbers, not VRAM.
-/// The ggml graph buffer for one slice sums every activation tensor in the
-/// graph context; on a 16 GB card a ~94 s slice already needs ~33 GB, so the
-/// old 300 s value could never be admitted. Capped at 90 s to stay inside
-/// the measured graph-memory envelope. This is a device-specific bound, not
-/// a quality or safety claim; it is paired with the stable-envelope runtime
-/// key that makes all slices of a longform request share one actor.
-/// Re-tested at 1200 s after those fixes on a 997 s clip: still fail-closed,
-/// requesting 110.6 GB for the single graph buffer against 33.2 GB available.
-pub(crate) const NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS: u32 = 90;
+/// Measurements behind the VRAM derivation (ad_q2_0_m, gfx1030 16 GB): the PE
+/// encoder's flash-attention graph scratch is ~155 MiB/s of audio (1.7 GiB @
+/// 11 s, 13.6 GiB @ 88 s). A fixed 90 s slice both wasted larger cards and
+/// could not be admitted on this one; deriving from detected memory fixes
+/// both. The ignored `longform_slice_scaling_probe` test in
+/// `models::nemotron_transcribe::executor` remains the harness for per-slice
+/// activation evidence.
+pub(crate) const NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS: u32 =
+    crate::models::nemotron_transcribe::slice::NEMOTRON_SLICE_HARD_CEILING_SECONDS;
 
 /// Default chunk length long-form slicing aims for: how long a slice we
 /// *want*, as a transcription-quality choice.

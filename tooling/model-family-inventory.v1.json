@@ -1481,7 +1481,7 @@
         "prefer_cpu_decoder_for_multichunk_metal": false,
         "auto_gpu_policy": "all-backends",
         "encoder_attention_span": "global-quadratic",
-        "encoder_attention_max_safe_chunk_seconds": 90.0
+        "encoder_attention_max_safe_chunk_seconds": 3600.0
       },
       "quantization": {
         "tensor_classification": "semantic-roles-v1",

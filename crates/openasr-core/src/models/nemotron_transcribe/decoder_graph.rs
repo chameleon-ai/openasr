@@ -147,6 +147,33 @@ const SSM_STATE_FLOATS: usize = NEMOTRON_TRANSCRIBE_SSM_D_STATE
 const CONV_STATE_FLOATS: usize =
     (NEMOTRON_TRANSCRIBE_SSM_D_CONV - 1) * NEMOTRON_TRANSCRIBE_CONV_CHANNELS;
 
+/// Maximum prompt rows fed to one decoder graph computation during prefill.
+///
+/// The decoder's per-graph activation scratch scales with the number of rows
+/// in a single forward pass (attention scores are `(span, t, heads)`, and the
+/// 52-block MoE trunk allocates intermediates per row). With one-shot prefill
+/// `t == span == the whole segment`, so graph memory grows with segment length
+/// and a long segment cannot be admitted on a discrete GPU. Chunking keeps
+/// `t` bounded by this constant while `span` still covers the whole written
+/// prefix (the incremental KV writes and the `write_start`-aware causal mask
+/// already support that). The recurrent Mamba/conv state and KV rows persist
+/// in the arenas across chunks, so the result is equivalent to one-shot
+/// prefill, with graph memory independent of segment length.
+const PREFILL_CHUNK_ROWS: usize = 64;
+
+/// Yields `(write_start, rows)` for each chunk of a `total`-row prefill.
+/// Pure so the chunking math is unit-testable without a pack.
+fn prefill_chunk_spans(total: usize, chunk_rows: usize) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut write_start = 0usize;
+    while write_start < total {
+        let rows = (total - write_start).min(chunk_rows);
+        spans.push((write_start, rows));
+        write_start += rows;
+    }
+    spans
+}
+
 fn rms_weight<'a>(
     graph: &GgmlCpuGraphBuilder<'a>,
     input: GgmlCpuTensor<'a>,
@@ -987,9 +1014,22 @@ impl NemotronTranscribeDecoderRuntime {
             });
         }
         self.reset_state_arenas()?;
-        let write_start = 0usize;
-        let span = write_start + t;
-        self.run_forward(embeddings, t, write_start, span, /* prefill */ true)
+        // Feed the prompt in bounded chunks so per-graph activation memory is
+        // a function of PREFILL_CHUNK_ROWS, not of the segment length. The
+        // arenas are zeroed once above and persist across chunks; run_forward
+        // writes K/V at absolute rows and the mask builder handles a non-zero
+        // write_start, so each chunk attends to the full written prefix.
+        let mut last = None;
+        for (write_start, rows) in prefill_chunk_spans(t, PREFILL_CHUNK_ROWS) {
+            let chunk = &embeddings[write_start * NEMOTRON_TRANSCRIBE_HIDDEN
+                ..(write_start + rows) * NEMOTRON_TRANSCRIBE_HIDDEN];
+            let span = write_start + rows;
+            last =
+                Some(self.run_forward(chunk, rows, write_start, span, /* prefill */ true)?);
+        }
+        last.ok_or_else(|| NemotronTranscribeDecoderError::Shape {
+            reason: "prefill produced no chunks for a non-empty prompt".to_owned(),
+        })
     }
 
     /// Advance one token; `cached_positions` positions must already be written.
@@ -1148,5 +1188,63 @@ impl NemotronTranscribeDecoderRuntime {
 
     pub(crate) fn cached_positions(&self) -> usize {
         self.positions_filled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_chunks_cover_the_prompt_exactly_once() {
+        // One chunk, exact multiple, and a trailing partial chunk.
+        assert_eq!(prefill_chunk_spans(0, 64), Vec::<(usize, usize)>::new());
+        assert_eq!(prefill_chunk_spans(1, 64), vec![(0, 1)]);
+        assert_eq!(prefill_chunk_spans(64, 64), vec![(0, 64)]);
+        assert_eq!(prefill_chunk_spans(65, 64), vec![(0, 64), (64, 1)]);
+        assert_eq!(
+            prefill_chunk_spans(150, 64),
+            vec![(0, 64), (64, 64), (128, 22)]
+        );
+    }
+
+    #[test]
+    fn prefill_chunks_cumulative_span_equals_write_start_plus_rows() {
+        // The mask builder and KV span view both require span = write_start + t.
+        for total in [1usize, 7, 64, 65, 640, 5000] {
+            let mut cursor = 0usize;
+            for (write_start, rows) in prefill_chunk_spans(total, PREFILL_CHUNK_ROWS) {
+                assert_eq!(write_start, cursor, "chunks must be contiguous");
+                assert!(rows > 0 && rows <= PREFILL_CHUNK_ROWS);
+                cursor += rows;
+            }
+            assert_eq!(cursor, total);
+            let covered: usize = prefill_chunk_spans(total, PREFILL_CHUNK_ROWS)
+                .into_iter()
+                .map(|(_, rows)| rows)
+                .sum();
+            assert_eq!(covered, total);
+        }
+    }
+
+    #[test]
+    fn prefill_mask_is_causal_across_a_chunk_boundary() {
+        // A query in the second chunk (write_start=64) must attend to all 64
+        // prior rows plus earlier queries in the current chunk, and to no
+        // future rows. Verify the mask the graph actually uploads.
+        let write_start = 64usize;
+        let t = 4usize;
+        let span = write_start + t; // 68
+        let bits = build_prefill_mask_f16_bits(span, t, write_start);
+        assert_eq!(bits.len(), span * t);
+        let zero = f32_to_f16_bits(0.0);
+        let neg_inf = f32_to_f16_bits(f32::NEG_INFINITY);
+        for query in 0..t {
+            let kv_limit = write_start + query + 1;
+            for kv in 0..span {
+                let expected = if kv < kv_limit { zero } else { neg_inf };
+                assert_eq!(bits[query * span + kv], expected, "q={query} kv={kv}");
+            }
+        }
     }
 }

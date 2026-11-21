@@ -34,6 +34,7 @@ pub(crate) mod offload;
 pub(crate) mod package_import;
 pub(crate) mod prompt;
 pub(crate) mod runtime_contract;
+pub(crate) mod slice;
 pub(crate) mod tokenizer;
 
 pub(crate) use executor::NemotronTranscribeGgmlExecutor;

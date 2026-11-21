@@ -19,16 +19,15 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   the remainder on the GPU. The offload count is a function of measured VRAM
   (starting with the never-executed MTP block 52, then the earliest trunk
   layers), not a fixed knob; when the pack already fits the count is zero and
-  the lane behaves like an all-device run. On the 16 GB RX 6800 XT the decoder
-  graph is built for the family's full 90 s reserve span and its scheduler
-  scratch buffer (~7.5 GiB) dominates admission, so all expert bytes are
-  offloaded: JFK (11 s) stays on the GPU at ~9.6 GB peak VRAM (down from ~16.2
-  GB on the all-device path, which silently fell back to CPU) with a verbatim
-  transcript. Longform slices (>=30 s, e.g. `gilbert`, `rye`) still fall back
-  to CPU: their context/graph buffers alone exceed the remaining admission
-  budget, which offloading weights does not change. The CPU lane remains the
-  general fallback and transcribes the JFK fixture verbatim for all three
-  quants.
+  the lane behaves like an all-device run. Decoder prefill is chunked and the
+  longform slice length is derived from detected memory (capped at the family's
+  3600 s hard ceiling), so both short and long audio stay on GPU: on the 16 GB
+  RX 6800 XT all expert bytes are offloaded, JFK (11 s) runs at ~6.9 GB peak
+  VRAM and gilbert (94 s) runs in 3 x 40 s GPU slices at ~11.4 GB with no CPU
+  fallback (down from ~16.2 GB on the all-device path, which silently fell back
+  to CPU). The full-context, single-segment (whole-recording) path still cannot
+  fit on a discrete card. The CPU lane remains the general fallback and
+  transcribes the JFK fixture verbatim for all three quants.
 - `GET /v1/models` and other served-identity listings verify GGUF metadata
   and the CAS path digest of the bound pack. They do not re-hash a multi-GB
   object on every read. Full-file integrity is `openasr model-pack verify`.

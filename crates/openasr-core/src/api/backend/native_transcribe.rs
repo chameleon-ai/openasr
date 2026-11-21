@@ -5380,11 +5380,22 @@ fn resolve_native_longform_policy_for_backend(
         }
     };
     let mut provenance = Vec::new();
+    // For nemotron-transcribe the slice length is derived from detected memory
+    // at runtime, not from the descriptor's static hard ceiling. The descriptor
+    // facet remains the model's maximum; the derived value narrows it to what
+    // the actual device/host can admit, so 10/12/16 GB cards all stay on GPU.
+    let runtime_slice_cap =
+        if model_architecture == crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID {
+            crate::models::nemotron_transcribe::slice::runtime_slice_seconds(_backend)
+        } else {
+            None
+        };
     if !matches!(options.mode, LongFormMode::Off)
         && scoped_slice_recording_fits_one_decode(
             model_architecture,
             audio_duration_seconds,
             requested,
+            runtime_slice_cap,
         )
     {
         options.mode = LongFormMode::Off;
@@ -5399,6 +5410,14 @@ fn resolve_native_longform_policy_for_backend(
             &mut provenance,
         );
         apply_longform_safety_policy(model_architecture, &mut options, &mut provenance);
+        if let Some(cap_seconds) = runtime_slice_cap {
+            let cap = cap_seconds as f32;
+            if apply_vram_derived_slice_cap(&mut options, cap) {
+                provenance.push(format!(
+                    "core.native.longform.policy:runtime-vram-slice-cap={cap_seconds}"
+                ));
+            }
+        }
     }
     NativeLongformPolicyResolution {
         options,
@@ -5424,6 +5443,7 @@ fn scoped_slice_recording_fits_one_decode(
     model_architecture: &str,
     audio_duration_seconds: f32,
     requested: Option<&crate::LongFormOptions>,
+    runtime_slice_cap: Option<u64>,
 ) -> bool {
     if requested.is_some() {
         return false;
@@ -5434,7 +5454,9 @@ fn scoped_slice_recording_fits_one_decode(
     else {
         return false;
     };
-    audio_duration_seconds <= integral_seconds
+    // A VRAM-derived cap replaces the static integral window when present.
+    let integral = runtime_slice_cap.map_or(integral_seconds, |seconds| seconds as f32);
+    audio_duration_seconds <= integral
 }
 
 /// Installs the slice window an
@@ -5775,6 +5797,26 @@ fn apply_encoder_attention_span_longform_safety_policy(
             "core.native.longform.policy:encoder-attention-span-chunk-cap={max_safe_chunk_seconds}"
         ));
     }
+}
+
+/// Apply a runtime-derived slice cap, replacing (not just narrowing) the
+/// static windows installed by `apply_scoped_slice_longform_window_policy` and
+/// `apply_longform_safety_policy`. The derived value is authoritative for this
+/// backend: the descriptor's static facet is only the model's hard ceiling.
+/// Returns whether any field moved.
+fn apply_vram_derived_slice_cap(options: &mut crate::LongFormOptions, cap_seconds: f32) -> bool {
+    let mut changed = false;
+    for field in [
+        &mut options.chunk_seconds,
+        &mut options.max_chunk_seconds,
+        &mut options.min_chunk_seconds,
+    ] {
+        if *field != cap_seconds {
+            *field = cap_seconds;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The clamp itself, split out from the registry lookup so it can be exercised
@@ -10406,13 +10448,14 @@ mod tests {
         resolution.options.validate().expect("resolved options");
     }
 
-    /// nemotron-transcribe is the first family whose window is one named
-    /// constant rather than inline literals. Raising the constant in one
-    /// place must move every value asserted here with it; changing only one
-    /// of the four declaration sites fails this test.
+    /// nemotron-transcribe declares a single named hard ceiling rather than
+    /// inline literals. The descriptor's four static sites must all carry that
+    /// ceiling; the *operative* window is then derived from detected memory at
+    /// runtime and may only narrow it, never widen it past 3600 s.
     #[test]
-    fn nemotron_scoped_slices_resolve_the_single_named_window() {
-        let slice = crate::arch::NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32;
+    fn nemotron_scoped_slices_resolve_the_runtime_derived_window() {
+        let ceiling = crate::arch::NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32;
+        assert_eq!(ceiling, 3600.0, "model advertises a one-hour max segment");
         let crate::arch::OpenAsrLongformSliceShape::ScopedSlices {
             integral_seconds,
             target_seconds,
@@ -10425,28 +10468,38 @@ mod tests {
         };
         assert_eq!(
             (integral_seconds, target_seconds, max_seconds),
-            (slice, slice, slice)
+            (ceiling, ceiling, ceiling)
         );
 
-        // Just past the window: slicing takes over with exactly the declared
-        // window, and the encoder memory cap must not re-narrow it.
+        // The runtime cap is derived from the detected memory budget (host RAM
+        // for the CPU backend used by this test) and applied as the operative
+        // window. It is always within (0, ceiling].
+        let derived = crate::models::nemotron_transcribe::slice::runtime_slice_seconds(
+            GgmlCpuGraphBackend::Cpu,
+        )
+        .expect("CPU backend has a host-memory-derived slice cap");
+        assert!((1..=3600).contains(&derived), "derived cap {derived}");
+        let derived_f32 = derived as f32;
+
+        // Just past the derived integral: slicing takes over with exactly the
+        // derived window and the descriptor's static cap never re-narrows it.
         let resolution = resolve_native_longform_policy_for_backend(
             None,
-            slice + 1.0,
+            derived_f32 + 1.0,
             crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
         assert_eq!(resolution.options.mode, LongFormMode::Energy);
-        assert_eq!(resolution.options.chunk_seconds, slice);
-        assert_eq!(resolution.options.max_chunk_seconds, slice);
+        assert_eq!(resolution.options.chunk_seconds, derived_f32);
+        assert_eq!(resolution.options.max_chunk_seconds, derived_f32);
         assert_eq!(resolution.options.padding_seconds, 0.0);
         assert!(!resolution.options.carry_prompt_across_slices);
         resolution.options.validate().expect("resolved options");
 
-        // At the window itself the recording still decodes whole.
+        // At the derived integral itself the recording still decodes whole.
         let whole = resolve_native_longform_policy_for_backend(
             None,
-            slice,
+            derived_f32,
             crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID,
             GgmlCpuGraphBackend::Cpu,
         );
@@ -11108,13 +11161,11 @@ mod tests {
             match descriptor.longform_max_safe_chunk_seconds() {
                 Some(max_safe_chunk_seconds) => {
                     let expected = match descriptor.identity.model_architecture {
-                        // Cited override: onboarding-branch plumbing for the
-                        // first family that can slice past the conservative
-                        // default; see the constant's doc for the evidence
-                        // owed before it may move again.
-                        crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID => {
-                            crate::arch::NEMOTRON_TRANSCRIBE_LONGFORM_SLICE_SECONDS as f32
-                        }
+                        // The model-level hard ceiling is the one-hour
+                        // invocation span; the operative window is derived from
+                        // detected memory at runtime and may narrow it further
+                        // but never widen it.
+                        crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID => 3600.0,
                         _ => DEFAULT_ENCODER_SAFE_CHUNK_SECONDS,
                     };
                     assert_eq!(
@@ -11123,13 +11174,27 @@ mod tests {
                          upstream override",
                         descriptor.identity.model_architecture
                     );
-                    assert_eq!(
-                        resolution.options.max_chunk_seconds,
-                        max_safe_chunk_seconds,
-                        "'{}' must resolve max_chunk_seconds to exactly {max_safe_chunk_seconds}, got {}",
-                        descriptor.identity.model_architecture,
-                        resolution.options.max_chunk_seconds
-                    );
+                    if descriptor.identity.model_architecture
+                        == crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID
+                    {
+                        // Runtime-derived cap is authoritative; the static
+                        // descriptor ceiling only bounds it from above.
+                        let derived =
+                            crate::models::nemotron_transcribe::slice::runtime_slice_seconds(
+                                GgmlCpuGraphBackend::Cpu,
+                            )
+                            .expect("CPU derived cap") as f32;
+                        assert_eq!(resolution.options.max_chunk_seconds, derived);
+                        assert!(derived <= max_safe_chunk_seconds);
+                    } else {
+                        assert_eq!(
+                            resolution.options.max_chunk_seconds,
+                            max_safe_chunk_seconds,
+                            "'{}' must resolve max_chunk_seconds to exactly {max_safe_chunk_seconds}, got {}",
+                            descriptor.identity.model_architecture,
+                            resolution.options.max_chunk_seconds
+                        );
+                    }
                     assert!(
                         resolution.options.chunk_seconds <= max_safe_chunk_seconds,
                         "'{}' must cap chunk_seconds to <= {max_safe_chunk_seconds}, got {}",

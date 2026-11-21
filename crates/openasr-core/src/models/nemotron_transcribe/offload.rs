@@ -22,7 +22,7 @@
 //! Sizing constants: `nemotron-offloading.md` sections 2.3 and 3.1, plus the
 //! Hybrid lane's per-graph BACKEND_PRIVATE admission measured on the discrete
 //! card (the spec's 2 GiB context floor alone is not enough: the decoder graph
-//! is quoted at ~7.46 GiB for the full 90 s reserve span).
+//! is quoted at ~7.3 GiB for the full 90 s reserve span).
 
 use crate::device::execution_route::ExecutionProvider;
 use crate::ggml_runtime::{
@@ -54,7 +54,7 @@ const CONTEXT_AND_STATE_FOOTPRINT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Additional device footprint the Hybrid lane reserves for its per-graph
 /// BACKEND_PRIVATE scratch buffers, admitted against live free VRAM on top of
 /// the context/state arena. The decoder graph is built for the family's full
-/// 90 s reserve span (not the actual clip length) and quotes ~7.46 GiB on the
+/// 90 s reserve span (not the actual clip length) and quotes ~7.3 GiB on the
 /// discrete card; the encoder quotes ~1.58 GiB. The 10 GiB floor covers the
 /// decoder's high-water buffer plus the state arena that stays committed while
 /// it is admitted. Without this term the offload budget leaves too little live
@@ -76,7 +76,7 @@ const MOE_BLOCK_OFFLOAD_ORDER: [usize; 24] = [
 /// total. Both come from the same `ggml_backend_dev_memory` snapshot, so they
 /// are internally consistent; `free` is what the broker's observed-capacity
 /// check samples when it admits the Hybrid lane's scheduler buffers.
-fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
+pub(crate) fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
     let device = ggml_available_devices()
         .into_iter()
         .find(|device| match backend {
@@ -105,7 +105,7 @@ fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
 /// The Hybrid lane's scheduler-private graph buffers make (2) bind first on a
 /// discrete card whose desktop/driver baseline is not counted in (1), so the
 /// smaller of the two is the ceiling weights + context must fit under.
-fn binding_ceiling(total_vram_bytes: u64, free_vram_bytes: u64) -> Option<u64> {
+pub(crate) fn binding_ceiling(total_vram_bytes: u64, free_vram_bytes: u64) -> Option<u64> {
     let policy = u64::try_from(
         u128::from(total_vram_bytes) * u128::from(OWNED_FRACTION_BASIS_POINTS) / 10_000,
     )
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn recon_16gb_card_offloads_every_expert_layer() {
         // On the recon 16 GB card the binding ceiling leaves a budget larger
-        // than all expert bytes: the decoder graph's 7.46 GiB BACKEND_PRIVATE
+        // than all expert bytes: the decoder graph's 7.3 GiB BACKEND_PRIVATE
         // high-water buffer must fit alongside the remaining device weights.
         let total = 17_163_091_968u64;
         let ceiling = binding_ceiling(total, 0).expect("ceiling");
