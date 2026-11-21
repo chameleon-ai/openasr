@@ -73,6 +73,14 @@ pub(crate) const NEMOTRON_TRANSCRIBE_EOT_TOKEN_ID: u32 = 11;
 pub(crate) const NEMOTRON_TRANSCRIBE_SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.5;
 
 const NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS: usize = 640;
+
+/// Extra KV rows reserved at the family runtime beyond the planner's minimal
+/// `P + G - 1` span. When the shared greedy driver's degenerate-ngram guard
+/// drops tokens, its decode can advance one step past the nominal generation
+/// budget and write one more KV row; without margin that step fails closed
+/// (`decode position N exhausts the resident KV span N`). A small margin keeps
+/// the admission and the actor pool key tied to the planner's stable span.
+const NEMOTRON_TRANSCRIBE_KV_SPAN_MARGIN: usize = 16;
 /// Resident unified-runtime pool limits: a few idle (pack, lane, span)
 /// buckets; two actors per bucket. Native ownership is bound at build time,
 /// so the pool tracks no extra SystemMemory bytes.
@@ -441,7 +449,9 @@ impl NemotronTranscribeGgmlExecutor {
                 NemotronTranscribePreparedRuntime::build(
                     &preflight,
                     backend,
-                    required_span.max(NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS),
+                    required_span
+                        .max(NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS)
+                        .saturating_add(NEMOTRON_TRANSCRIBE_KV_SPAN_MARGIN),
                 )
                 .map(|prepared| {
                     SystemMemoryOwner::without_allocation(NemotronTranscribeUnifiedRuntime {

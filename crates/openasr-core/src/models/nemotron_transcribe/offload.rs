@@ -117,6 +117,16 @@ pub(crate) fn binding_ceiling(total_vram_bytes: u64, free_vram_bytes: u64) -> Op
     Some(observed.map_or(policy, |observed| policy.min(observed)))
 }
 
+/// Total payload bytes of every tensor in the pack. Used by the slice policy
+/// to reserve device/host memory for the resident weights before deriving the
+/// encoder graph budget.
+pub(crate) fn pack_weight_bytes(tensor_index: &GgufTensorIndex) -> u64 {
+    tensor_index
+        .tensors()
+        .iter()
+        .fold(0u64, |sum, tensor| sum.saturating_add(tensor.size_bytes))
+}
+
 /// Picks whole MoE layers, in `MOE_BLOCK_OFFLOAD_ORDER`, until their expert
 /// bytes cover `budget_bytes`. Pure over the per-layer byte lookup so the
 /// tiering logic is testable without a pack; a layer whose tensors are absent
@@ -155,10 +165,7 @@ pub(crate) fn compute_host_offload_spec(
     tensor_index: &GgufTensorIndex,
 ) -> Option<HostWeightOffloadSpec> {
     let (total_vram_bytes, free_vram_bytes) = device_vram_bytes(backend)?;
-    let pack_weight_bytes = tensor_index
-        .tensors()
-        .iter()
-        .fold(0u64, |sum, tensor| sum.saturating_add(tensor.size_bytes));
+    let pack_weight_bytes = pack_weight_bytes(tensor_index);
     let ceiling = binding_ceiling(total_vram_bytes, free_vram_bytes)?;
     let required = pack_weight_bytes
         .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)

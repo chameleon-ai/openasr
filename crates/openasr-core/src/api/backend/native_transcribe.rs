@@ -2770,6 +2770,7 @@ fn run_native_transcription_impl(
         request.longform.as_ref(),
         audio_duration_seconds,
         selected_family.model_architecture,
+        Some(verified_pack.preflight().tensor_index()),
     );
     let longform_options = longform_resolution.options.clone();
     let run_longform = !matches!(longform_options.mode, LongFormMode::Off);
@@ -5354,20 +5355,45 @@ fn resolve_native_longform_policy(
     requested: Option<&crate::LongFormOptions>,
     audio_duration_seconds: f32,
     model_architecture: &str,
+    tensor_index: Option<&crate::ggml_runtime::GgufTensorIndex>,
 ) -> NativeLongformPolicyResolution {
-    resolve_native_longform_policy_for_backend(
+    resolve_native_longform_policy_for_backend_with_pack(
         requested,
         audio_duration_seconds,
         model_architecture,
         GgmlCpuGraphConfig::runtime_default().backend,
+        tensor_index,
     )
 }
 
+/// Test-facing form without a pack: the runtime slice cap has no pack to
+/// reserve, so VRAM-derived sizing falls back to a conservative zero-weight
+/// budget. Production passes the tensor index via the 3-arg wrapper above.
+#[cfg(test)]
 fn resolve_native_longform_policy_for_backend(
     requested: Option<&crate::LongFormOptions>,
     audio_duration_seconds: f32,
     model_architecture: &str,
+    backend: GgmlCpuGraphBackend,
+) -> NativeLongformPolicyResolution {
+    // Use an empty index so the runtime cap is still derived (zero pack
+    // weight); tests that need a specific pack size call the _with_pack form.
+    let empty = crate::GgufTensorIndex::empty_for_test(std::path::PathBuf::from("/test"));
+    resolve_native_longform_policy_for_backend_with_pack(
+        requested,
+        audio_duration_seconds,
+        model_architecture,
+        backend,
+        Some(&empty),
+    )
+}
+
+fn resolve_native_longform_policy_for_backend_with_pack(
+    requested: Option<&crate::LongFormOptions>,
+    audio_duration_seconds: f32,
+    model_architecture: &str,
     _backend: GgmlCpuGraphBackend,
+    tensor_index: Option<&crate::ggml_runtime::GgufTensorIndex>,
 ) -> NativeLongformPolicyResolution {
     let mut options = if let Some(options) = requested {
         options.clone()
@@ -5386,7 +5412,9 @@ fn resolve_native_longform_policy_for_backend(
     // the actual device/host can admit, so 10/12/16 GB cards all stay on GPU.
     let runtime_slice_cap =
         if model_architecture == crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID {
-            crate::models::nemotron_transcribe::slice::runtime_slice_seconds(_backend)
+            tensor_index.and_then(|index| {
+                crate::models::nemotron_transcribe::slice::runtime_slice_seconds(_backend, index)
+            })
         } else {
             None
         };
@@ -10474,8 +10502,10 @@ mod tests {
         // The runtime cap is derived from the detected memory budget (host RAM
         // for the CPU backend used by this test) and applied as the operative
         // window. It is always within (0, ceiling].
+        let empty_index = crate::GgufTensorIndex::empty_for_test(std::path::PathBuf::from("/test"));
         let derived = crate::models::nemotron_transcribe::slice::runtime_slice_seconds(
             GgmlCpuGraphBackend::Cpu,
+            &empty_index,
         )
         .expect("CPU backend has a host-memory-derived slice cap");
         assert!((1..=3600).contains(&derived), "derived cap {derived}");
@@ -11179,9 +11209,13 @@ mod tests {
                     {
                         // Runtime-derived cap is authoritative; the static
                         // descriptor ceiling only bounds it from above.
+                        let empty_index = crate::GgufTensorIndex::empty_for_test(
+                            std::path::PathBuf::from("/test"),
+                        );
                         let derived =
                             crate::models::nemotron_transcribe::slice::runtime_slice_seconds(
                                 GgmlCpuGraphBackend::Cpu,
+                                &empty_index,
                             )
                             .expect("CPU derived cap") as f32;
                         assert_eq!(resolution.options.max_chunk_seconds, derived);
