@@ -391,6 +391,60 @@ fn pad_mel(features: &[f32], frames: usize, padded_frames: usize) -> Vec<f32> {
     out
 }
 
+/// Whether a `<...>` span is a diarization speaker tag. Those are turn markers
+/// the caller needs in diarize mode, unlike the SALM scaffolding below.
+fn is_speaker_markup(span: &str) -> bool {
+    let inner = span
+        .strip_prefix("</")
+        .or_else(|| span.strip_prefix('<'))
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or("");
+    let Some(digits) = inner.strip_prefix("spk:") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Remove SALM scaffolding markup from a decoded transcript.
+///
+/// The observed tags (`<ev:audio>`, `<ev:ev-step end="true" ...>`, `<voice>`,
+/// `</ev:segment>`, misspellings like `<ev:asistant>`, and tags split across
+/// word boundaries) are *free text* built from ordinary BPE pieces, not
+/// vocabulary specials, so they can only be recognised textually. A literal
+/// `<`/`>` pair in genuine speech is rare; anything that looks like a closed
+/// tag is treated as markup. Speaker tags can be preserved for diarize mode.
+fn strip_scaffolding_markup(text: &str, preserve_speaker_tags: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut removed = false;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        let Some(close) = tail.find('>') else {
+            // Unterminated '<': keep the remainder verbatim.
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let span = &tail[..=close];
+        let keep = preserve_speaker_tags && is_speaker_markup(span);
+        if !keep {
+            removed = true;
+        } else {
+            out.push_str(span);
+        }
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    if !removed {
+        return out;
+    }
+    // Tag removal leaves doubled/orphaned whitespace. The CTC alignment target
+    // is whitespace-normalised by `clean_sot_transcript`, so do the same here
+    // to keep `text` and the aligned words consistent.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl NemotronTranscribeGgmlExecutor {
     fn required_self_kv_positions(
         decoder_state: &crate::models::ggml_asr_executor::GgmlAsrDecoderState,
@@ -696,6 +750,11 @@ impl NemotronTranscribeGgmlExecutor {
                         text = fallback_text;
                     }
                 }
+                // Strip SALM scaffolding before it reaches either the final
+                // transcript (below) or the CTC alignment target (line below),
+                // so the timed words stay consistent with the cleaned text.
+                // Do it after the fallback so both prompts are covered.
+                text = strip_scaffolding_markup(&text, in_decoder_speakers);
 
                 // --- CTC word timestamps (transcript-independent head + host aligner) ---
                 // Alignment is a best-effort enhancement: the reference returns
@@ -930,6 +989,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn scaffolding_strip_removes_event_and_metadata_tags() {
+        let text = "<ev:audio> Hello, <ev:ev-step end=\"true\" start=\"true\" type=\"text\"> \
+                    world </ev:audio> <voice> again </ev:segment>";
+        assert_eq!(strip_scaffolding_markup(text, false), "Hello, world again");
+    }
+
+    #[test]
+    fn scaffolding_strip_handles_misspellings_and_split_tags() {
+        let text = "<ev:asistant> Hi <ev:window-message>Two minute</ev:window-message> \
+                    </ev:asistant> there";
+        assert_eq!(strip_scaffolding_markup(text, false), "Hi Two minute there");
+    }
+
+    #[test]
+    fn scaffolding_strip_preserves_speaker_tags_only_for_diarize() {
+        let text = "<spk:0> Hello <ev:voice> world </spk:0>";
+        assert_eq!(
+            strip_scaffolding_markup(text, true),
+            "<spk:0> Hello world </spk:0>"
+        );
+        assert_eq!(strip_scaffolding_markup(text, false), "Hello world");
+    }
+
+    #[test]
+    fn scaffolding_strip_leaves_clean_transcripts_untouched() {
+        let clean = "And so my fellow Americans, ask not what your country can do for you.";
+        assert_eq!(strip_scaffolding_markup(clean, false), clean);
+    }
 
     /// Real pack for the opt-in scaling probe; never committed (a 15-37 GB
     /// weight-bearing fixture). Same skip-if-absent convention as the other
