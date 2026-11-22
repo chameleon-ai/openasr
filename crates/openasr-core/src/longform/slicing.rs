@@ -798,6 +798,7 @@ fn plan_energy_auto_slices(
 ///    more windows is content only the skipped slice carries. Any such
 ///    slice vetoes the carrier wholesale, and the plan then decodes every
 ///    slice exactly as before.
+///
 /// Attach the request VAD's speech spans to a contiguous `Energy` layout for
 /// decode gating only. The layout keeps its identity/full-coverage timeline;
 /// the driver uses the spans to skip slices with no speech (the same
