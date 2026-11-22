@@ -10014,6 +10014,13 @@ impl<'a> GgmlCpuGraphBuilder<'a> {
         self.tensor_layout_prefix(tensor).type_
     }
 
+    /// Test-only view of a graph tensor's ggml element type, used by graph
+    /// construction tests that assert activation dtype placement.
+    #[cfg(test)]
+    pub(crate) fn tensor_dtype(&self, tensor: GgmlCpuTensor<'a>) -> i32 {
+        self.tensor_type(tensor)
+    }
+
     fn tensor_shape_4d(
         &self,
         tensor: GgmlCpuTensor<'a>,

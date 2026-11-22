@@ -259,14 +259,15 @@ pub(crate) fn rope_transformer_block<'a>(
     // q,k: (d_k, T, n_head, 1) for flash attention.
     let q_p = graph.permute(q, 0, 2, 1, 3).map_err(map)?;
     let q_p = graph.cont(q_p).map_err(map)?;
-    let k_p = graph.permute(k, 0, 2, 1, 3).map_err(map)?;
-    let k_f16 = graph
-        .cast_to_f16(graph.cont(k_p).map_err(map)?)
-        .map_err(map)?;
-    let v_p = graph.permute(v, 0, 2, 1, 3).map_err(map)?;
-    let v_f16 = graph
-        .cast_to_f16(graph.cont(v_p).map_err(map)?)
-        .map_err(map)?;
+    // Cast k/v to F16 *before* the permute/cont so the contiguous copy operates
+    // on half-width elements. flash_attn_ext already accepts F16 k/v; q stays
+    // F32 because flash_attn_ext requires an F32 q (nemotron-f16.md stage 1).
+    let k_f16 = graph.cast_to_f16(k).map_err(map)?;
+    let k_p = graph.permute(k_f16, 0, 2, 1, 3).map_err(map)?;
+    let k_f16 = graph.cont(k_p).map_err(map)?;
+    let v_f16 = graph.cast_to_f16(v).map_err(map)?;
+    let v_p = graph.permute(v_f16, 0, 2, 1, 3).map_err(map)?;
+    let v_f16 = graph.cont(v_p).map_err(map)?;
     let scale = 1.0f32 / (d_k as f32).sqrt();
     let attn = graph
         .flash_attn_ext_with_precision(
@@ -798,5 +799,34 @@ impl NemotronTranscribeEncoderRuntime {
         self.runner
             .release_transient_scheduler_working_set()
             .map_err(ggml_err("release_transient_scheduler_working_set"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ggml_runtime::GGML_TYPE_F16;
+
+    fn runner() -> GgmlCpuGraphRunner {
+        GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("graph runner")
+    }
+
+    /// The k/v path casts to F16 before the permute/cont so all three tensors
+    /// after the cast are F16 (the contiguous copy operates on half-width data).
+    #[test]
+    fn kv_cast_precedes_cont_and_stays_f16() {
+        let mut runner = runner();
+        let graph = &mut runner.start_graph();
+        // 4D (d_k, T, n_head, 1) as produced by rope_ext for k/v.
+        let k = graph
+            .new_tensor_4d_f32(4, 3, 2, 1, "kv_cast_test_k")
+            .expect("k tensor");
+        graph.set_input(k).expect("set k");
+        let k_f16 = graph.cast_to_f16(k).expect("cast k");
+        assert_eq!(graph.tensor_dtype(k_f16), GGML_TYPE_F16);
+        let k_p = graph.permute(k_f16, 0, 2, 1, 3).expect("permute k");
+        assert_eq!(graph.tensor_dtype(k_p), GGML_TYPE_F16);
+        let k_cont = graph.cont(k_p).expect("cont k");
+        assert_eq!(graph.tensor_dtype(k_cont), GGML_TYPE_F16);
     }
 }
