@@ -2558,12 +2558,6 @@ impl HostWeightOffloadSpec {
         }
     }
 
-    /// Bytes of the pack this spec moves to the host (0 when nothing is
-    /// offloaded). Used to size the resident-device weight footprint.
-    pub(crate) fn budget_bytes(&self) -> u64 {
-        self.budget_bytes
-    }
-
     /// Stable fingerprint for the coalescing key: two runtimes with the same
     /// budget and candidate ordering share one physical split, a different
     /// offload count must not alias a cached materialization.

@@ -10,7 +10,9 @@
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
 
-use super::offload::{binding_ceiling, device_vram_bytes};
+#[cfg(test)]
+use super::offload::binding_ceiling;
+use super::offload::device_vram_bytes;
 
 /// Encoder graph scratch per second of audio, with safety margin. Measurements
 /// on the discrete card (all experts offloaded to host): 1.70 GiB @ 11 s and
@@ -52,15 +54,33 @@ const NON_LEDGER_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 /// bound there; when unset, the policy bound alone applies as before.
 const APU_DEVICE_HEAP_BYTES_ENV: &str = "OPENASR_NEMOTRON_DEVICE_HEAP_BYTES";
 
+/// Discrete-GPU target slice length. Unlike the APU path (where the 40% rule
+/// was tuned on gfx1151 with the larger quants), a discrete card's budget is
+/// solved in the opposite direction: pick the slice first, then load as many
+/// experts as fit alongside it. The env override exists so the same binary can
+/// profile the throughput/seam trade-off at different targets.
+const DISCRETE_TARGET_SLICE_SECONDS_ENV: &str = "OPENASR_NEMOTRON_TARGET_SLICE_SECONDS";
+const DEFAULT_DISCRETE_TARGET_SLICE_SECONDS: u64 = 20;
+
+/// The explicit slice target used by the discrete-GPU policy. Clamped to the
+/// family's bounds so a malformed override cannot create an invalid window.
+pub(crate) fn discrete_target_slice_seconds() -> u64 {
+    std::env::var(DISCRETE_TARGET_SLICE_SECONDS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DISCRETE_TARGET_SLICE_SECONDS)
+        .clamp(MIN_SLICE_SECONDS, MAX_SLICE_SECONDS)
+}
+
 /// Floor so a tiny detected budget still yields a usable slice; the family's
 /// 640-position KV span covers it comfortably.
-const MIN_SLICE_SECONDS: u64 = 10;
+pub(crate) const MIN_SLICE_SECONDS: u64 = 10;
 
 /// Hard ceiling from the family's advertised invocation span (one hour,
 /// `OpenAsrInvocationSpan::Bounded { max_seconds: 3600 }`), independent of any
 /// device. Even a machine with unlimited memory never exceeds one hour per
 /// slice; memory only ever narrows it further.
-const MAX_SLICE_SECONDS: u64 = 3600;
+pub(crate) const MAX_SLICE_SECONDS: u64 = 3600;
 
 /// The model-level hard ceiling a slice may never exceed, regardless of the
 /// device. Replaces the old fixed 90 s as the descriptor's semantic bound.
@@ -73,7 +93,7 @@ pub(crate) const NEMOTRON_SLICE_HARD_CEILING_SECONDS: u32 = MAX_SLICE_SECONDS as
 /// admitted, so they must be subtracted first: a 36.7 GB q8 pack leaves far
 /// less headroom than a 15 GB q2 pack on the same host, and using the raw
 /// ceiling for both makes the larger quant fall back to CPU.
-fn slice_seconds_from_budget(available_bytes: u64, pack_weight_bytes: u64) -> u64 {
+pub(crate) fn slice_seconds_from_budget(available_bytes: u64, pack_weight_bytes: u64) -> u64 {
     let headroom = available_bytes.saturating_sub(pack_weight_bytes);
     let encoder_budget = u64::try_from(
         u128::from(headroom) * u128::from(ENCODER_GRAPH_MEMORY_FRACTION_BASIS_POINTS) / 10_000,
@@ -110,6 +130,7 @@ fn slice_seconds_from_budget_with_admission(
 
 /// GPU wrapper: apply the broker's binding device-memory ceiling to both the
 /// policy budget and the admission bound, then take the tighter slice.
+#[cfg(test)]
 pub(crate) fn slice_seconds_from_device_budget(
     total_vram_bytes: u64,
     free_vram_bytes: u64,
@@ -134,35 +155,23 @@ fn apu_device_heap_bytes() -> Option<u64> {
 
 /// Derive the runtime slice length for the given backend.
 ///
-/// Every backend is sized from detected memory:
-/// - discrete GPU: the broker's binding device-memory ceiling;
+/// - discrete GPU: an explicit target (`discrete_target_slice_seconds`), solved
+///   jointly with expert residency in `offload.rs` so the two agree. The slice
+///   is an input, not a fraction of leftover headroom.
 /// - APU with unified memory (device reports no discrete VRAM, e.g. gfx1151)
-///   and CPU: available host memory, where the encoder graph actually lives.
-///
-/// More memory yields longer slices, less memory yields shorter ones, and the
-/// result is always clamped to the model's hard context ceiling. No fixed
-/// seconds value is consulted at runtime.
+///   and CPU: available host memory and the 40% policy bound, which was tuned
+///   on gfx1151 with the larger quants and is deliberately left unchanged.
 pub(crate) fn runtime_slice_seconds(
     backend: GgmlCpuGraphBackend,
     tensor_index: &crate::ggml_runtime::GgufTensorIndex,
 ) -> Option<u64> {
     let pack_bytes = super::offload::pack_weight_bytes(tensor_index);
-    // On a discrete GPU the offload policy moves experts to host RAM, so only
-    // the residual device-resident bytes compete with the encoder graph. On an
-    // APU/CPU nothing is offloaded (or there is no discrete device), so the
-    // whole pack is resident in system memory and must be reserved in full.
-    let resident_bytes = match device_vram_bytes(backend) {
-        Some(_) => super::offload::compute_host_offload_spec(backend, tensor_index)
-            .map_or(pack_bytes, |spec| {
-                pack_bytes.saturating_sub(spec.budget_bytes())
-            }),
-        None => pack_bytes,
-    };
     match backend {
         GgmlCpuGraphBackend::Cpu => crate::host::host_available_memory_bytes()
-            .map(|available| slice_seconds_from_budget(available, resident_bytes)),
+            .map(|available| slice_seconds_from_budget(available, pack_bytes)),
         _ => match device_vram_bytes(backend) {
-            Some((total, free)) => slice_seconds_from_device_budget(total, free, resident_bytes),
+            Some(_) => super::offload::resolve_discrete_residency(backend, tensor_index)
+                .map(|plan| plan.slice_seconds),
             // Unified-memory APU: ggml reports an IntegratedGpu, not a discrete
             // GPU, so device_vram_bytes returns None. The encoder graph lives
             // in system memory there, so size from host RAM instead. Without
@@ -171,7 +180,7 @@ pub(crate) fn runtime_slice_seconds(
             None => crate::host::host_available_memory_bytes().map(|available| {
                 slice_seconds_from_budget_with_admission(
                     available,
-                    resident_bytes,
+                    pack_bytes,
                     apu_device_heap_bytes(),
                 )
             }),
