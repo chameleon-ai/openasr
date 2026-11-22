@@ -320,7 +320,19 @@ pub(crate) fn plan_longform_slices_with_materialization_gate<E>(
             layout_from_identity_slices(plan_fixed_slices(total_samples, sample_rate_hz, options))
         }
         LongFormMode::Energy => {
-            layout_from_identity_slices(plan_energy_slices(samples, sample_rate_hz, options))
+            let mut layout =
+                layout_from_identity_slices(plan_energy_slices(samples, sample_rate_hz, options));
+            if options.energy_vad_decode_gate {
+                attach_energy_vad_decode_gate(
+                    &mut layout,
+                    vad_provider,
+                    samples,
+                    sample_rate_hz,
+                    options,
+                    canceled,
+                )?;
+            }
+            layout
         }
         LongFormMode::EnergyAuto => {
             plan_energy_auto_slices(samples, sample_rate_hz, options, vad_provider, canceled)?
@@ -786,6 +798,44 @@ fn plan_energy_auto_slices(
 ///    more windows is content only the skipped slice carries. Any such
 ///    slice vetoes the carrier wholesale, and the plan then decodes every
 ///    slice exactly as before.
+/// Attach the request VAD's speech spans to a contiguous `Energy` layout for
+/// decode gating only. The layout keeps its identity/full-coverage timeline;
+/// the driver uses the spans to skip slices with no speech (the same
+/// `vad_speech_spans` gate `EnergyAuto` and `Auto` use). Only a speech-detecting
+/// provider qualifies -- the energy provider cannot arbitrate its own gate.
+/// Callers opt in via `LongFormOptions::energy_vad_decode_gate`.
+fn attach_energy_vad_decode_gate(
+    layout: &mut LongFormPlanningLayout,
+    vad_provider: Option<&dyn LongFormVadProvider>,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    options: &LongFormOptions,
+    canceled: &dyn Fn() -> bool,
+) -> Result<(), LongFormSliceError> {
+    let Some(provider) = vad_provider else {
+        return Ok(());
+    };
+    if provider.provider_kind() == LongFormVadProviderKind::EnergyLike {
+        return Ok(());
+    }
+    let vad_spans = provider
+        .compute_speech_slices_cancellable(samples, sample_rate_hz, options, canceled)
+        .map_err(map_vad_provider_error)?;
+    check_planning_canceled(canceled)?;
+    // An empty span list must not be carried: the driver would gate every
+    // slice. This mirrors `attach_energy_auto_decode_gate`'s guard.
+    if vad_spans
+        .iter()
+        .any(|span| span.end_sample > span.start_sample)
+    {
+        layout.selection_provenance.push(
+            "core.longform.energy.vad-decode-gate:spans-carried:provider=request-vad".to_string(),
+        );
+        layout.vad_speech_spans = Some(vad_spans);
+    }
+    Ok(())
+}
+
 fn attach_energy_auto_decode_gate(
     layout: &mut LongFormPlanningLayout,
     vad_provider: Option<&dyn LongFormVadProvider>,
@@ -5002,6 +5052,40 @@ mod tests {
             start_sample: 0,
             end_sample: samples.len(),
         }]
+    }
+
+    /// The opt-in `Energy` VAD gate carries spans for the decode skip without
+    /// changing the full-coverage timeline (unlike a packed/eliding plan).
+    #[test]
+    fn energy_vad_decode_gate_flag_attaches_spans_without_eliding_timeline() {
+        let samples = tone(16_000 * 60);
+        let provider = FixedVadProvider; // speech only in the first/last second
+        let mut options = options_with_mode(LongFormMode::Energy);
+        options.chunk_seconds = 20.0;
+        options.max_chunk_seconds = 20.0;
+
+        let plain = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(plain.vad_speech_spans.is_none());
+
+        options.energy_vad_decode_gate = true;
+        let gated = plan_longform_slices(&samples, 16_000, &options, Some(&provider)).unwrap();
+        assert!(gated.vad_speech_spans.is_some());
+        assert_eq!(
+            gated.slices, plain.slices,
+            "gating must not move slice bounds"
+        );
+        let suppressed = gated
+            .slices
+            .iter()
+            .filter(|slice| {
+                vad_speech_spans_overlap_samples(gated.vad_speech_spans.as_deref(), slice)
+                    .is_some_and(|overlap| overlap < VAD_SLICE_DECODE_MIN_SPEECH_SAMPLES)
+            })
+            .count();
+        assert!(
+            suppressed >= 1,
+            "the speech-free middle slice must be gated"
+        );
     }
 
     #[test]

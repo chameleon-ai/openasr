@@ -51,16 +51,25 @@ const BROKER_MINIMUM_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 /// driver allocation spikes and slightly longer slices.
 const CONTEXT_AND_STATE_FOOTPRINT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Additional device footprint the Hybrid lane reserves for its per-graph
-/// BACKEND_PRIVATE scratch buffers, admitted against live free VRAM on top of
-/// the context/state arena. The decoder graph is built for the family's full
-/// 90 s reserve span (not the actual clip length) and quotes ~7.3 GiB on the
-/// discrete card; the encoder quotes ~1.58 GiB. The 10 GiB floor covers the
-/// decoder's high-water buffer plus the state arena that stays committed while
-/// it is admitted. Without this term the offload budget leaves too little live
-/// free VRAM and the whole Hybrid candidate is rejected on `scheduler-candidate`
-/// (the device silently falls back to CPU inference).
-const SCHEDULER_GRAPH_PRIVATE_FOOTPRINT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Extra live-free VRAM kept beyond the estimated graph/state footprint. The
+/// scheduler admits the context buffer and graph scratch against the *live*
+/// free heap, which also pays driver workspaces and transient allocation
+/// spikes; the observed 16 GB card already produced `CapacityUnavailable` on
+/// `context-buffer` while device-wide peak was only ~9 GiB. This margin is the
+/// explicit allowance for that gap, so restoring experts never consumes the
+/// headroom graph admission actually needs.
+const ADMISSION_SAFETY_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Starting point for the fixed-point residency search. The old sizing (2 GiB
+/// context/state + 10 GiB graph scratch) is deliberately conservative; it is
+/// used only as the initial offload budget and is then relaxed until the
+/// slice-dependent footprint estimate agrees with the residency.
+const INITIAL_GRAPH_SCRATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// How many times to iterate residency -> slice length -> graph footprint.
+/// The map is monotonically contracting on this domain; four passes are plenty
+/// and keep the recomputation (two calls per request) cheap.
+const RESIDENCY_FIXED_POINT_PASSES: usize = 4;
 
 /// MoE block indices in offload-priority order: the MTP drafter first, then
 /// the Q2_0 trunk layers earliest-first, then the IQ4_NL trunk layers
@@ -153,32 +162,21 @@ fn plan_offload_layers(
     chosen
 }
 
-/// Computes the host offload spec for one prepared runtime: `None` when the
-/// whole pack and context footprint fit under the detected device's admission
-/// ceiling (or device memory is unknown), otherwise the exact ordered expert
-/// tensors to bind host-side. Call once per runtime build and apply the same
-/// spec to the encoder, decoder, and CTC runners: they coalesce onto one
-/// weight owner, and a different spec per runner would alias or double the
-/// pack.
-pub(crate) fn compute_host_offload_spec(
-    backend: GgmlCpuGraphBackend,
-    tensor_index: &GgufTensorIndex,
-) -> Option<HostWeightOffloadSpec> {
-    let (total_vram_bytes, free_vram_bytes) = device_vram_bytes(backend)?;
-    let pack_weight_bytes = pack_weight_bytes(tensor_index);
-    let ceiling = binding_ceiling(total_vram_bytes, free_vram_bytes)?;
-    let required = pack_weight_bytes
-        .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)
-        .saturating_add(SCHEDULER_GRAPH_PRIVATE_FOOTPRINT_BYTES);
-    let budget = required.saturating_sub(ceiling);
+/// Expert tensors of one MoE block, in bytes, or `None` when the pack does not
+/// carry that block.
+fn layer_bytes_of(tensor_index: &GgufTensorIndex, block: usize) -> Option<u64> {
+    let up = tensor_index.get(&format!("blk.{block}.ffn_up_exps.weight"))?;
+    let down = tensor_index.get(&format!("blk.{block}.ffn_down_exps.weight"))?;
+    Some(up.size_bytes.saturating_add(down.size_bytes))
+}
+
+/// Build the offload spec for a byte budget. The loader's in-order walk binds
+/// exactly the layers `plan_offload_layers` selects for that budget.
+fn spec_for_budget(budget: u64, tensor_index: &GgufTensorIndex) -> Option<HostWeightOffloadSpec> {
     if budget == 0 {
         return None;
     }
-    let layer_bytes = |block: usize| -> Option<u64> {
-        let up = tensor_index.get(&format!("blk.{block}.ffn_up_exps.weight"))?;
-        let down = tensor_index.get(&format!("blk.{block}.ffn_down_exps.weight"))?;
-        Some(up.size_bytes.saturating_add(down.size_bytes))
-    };
+    let layer_bytes = |block: usize| layer_bytes_of(tensor_index, block);
     let blocks = plan_offload_layers(budget, &layer_bytes);
     if blocks.is_empty() {
         return None;
@@ -188,10 +186,77 @@ pub(crate) fn compute_host_offload_spec(
         candidates.push(format!("blk.{block}.ffn_up_exps.weight"));
         candidates.push(format!("blk.{block}.ffn_down_exps.weight"));
     }
-    // The budget equals the chosen layers' bytes, so the loader's in-order
-    // walk binds exactly this set.
-    let budget_bytes = blocks.iter().filter_map(|block| layer_bytes(*block)).sum();
+    let budget_bytes: u64 = blocks.iter().filter_map(|block| layer_bytes(*block)).sum();
     Some(HostWeightOffloadSpec::new(budget_bytes, candidates))
+}
+
+/// Device footprint of the encoder graph for a slice of `seconds`, using the
+/// same budgeting rate the slice policy uses (measured 155 MiB/s plus a 24%
+/// margin). The decoder graph is prefix-chunked and the topology spans the
+/// derived slice, so the encoder is the component that actually scales with
+/// slice length; the context/state arena is accounted separately below.
+fn graph_footprint_bytes(seconds: u64) -> u64 {
+    super::slice::ENCODER_SCRATCH_BYTES_PER_SECOND.saturating_mul(seconds)
+}
+
+/// Resolve the offload byte budget by iterating residency -> derived slice ->
+/// graph footprint until the two agree. Pure over the pack's layer sizes so
+/// the policy is testable without a real pack.
+fn resolve_offload_budget(
+    total_vram_bytes: u64,
+    free_vram_bytes: u64,
+    pack_weight_bytes: u64,
+    layer_bytes: &dyn Fn(usize) -> Option<u64>,
+) -> Option<u64> {
+    let ceiling = binding_ceiling(total_vram_bytes, free_vram_bytes)?;
+    // Start from the conservative old sizing so every later pass is a
+    // relaxation, never an optimistic first guess.
+    let initial_required = pack_weight_bytes
+        .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)
+        .saturating_add(INITIAL_GRAPH_SCRATCH_BYTES);
+    let mut budget = initial_required.saturating_sub(ceiling);
+
+    for _ in 0..RESIDENCY_FIXED_POINT_PASSES {
+        let chosen = plan_offload_layers(budget, layer_bytes);
+        let offloaded: u64 = chosen.iter().filter_map(|block| layer_bytes(*block)).sum();
+        let resident = pack_weight_bytes.saturating_sub(offloaded);
+        let seconds = super::slice::slice_seconds_from_device_budget(
+            total_vram_bytes,
+            free_vram_bytes,
+            resident,
+        )?;
+        let required = pack_weight_bytes
+            .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)
+            .saturating_add(graph_footprint_bytes(seconds))
+            .saturating_add(ADMISSION_SAFETY_MARGIN_BYTES);
+        let next = required.saturating_sub(ceiling);
+        if next == budget {
+            break;
+        }
+        budget = next;
+    }
+    Some(budget)
+}
+
+/// Computes the host offload spec for one prepared runtime. The offload budget
+/// and the derived slice length are mutually dependent (more resident experts
+/// shrink the slice, which shrinks the graph that must fit alongside them), so
+/// resolve them with a short fixed-point iteration. The result is stable for
+/// both callers -- the slice policy and the executor -- which each call this
+/// pure function with the same pack index and backend.
+pub(crate) fn compute_host_offload_spec(
+    backend: GgmlCpuGraphBackend,
+    tensor_index: &GgufTensorIndex,
+) -> Option<HostWeightOffloadSpec> {
+    let (total_vram_bytes, free_vram_bytes) = device_vram_bytes(backend)?;
+    let pack_weight_bytes = pack_weight_bytes(tensor_index);
+    let budget = resolve_offload_budget(
+        total_vram_bytes,
+        free_vram_bytes,
+        pack_weight_bytes,
+        &|block| layer_bytes_of(tensor_index, block),
+    )?;
+    spec_for_budget(budget, tensor_index)
 }
 
 #[cfg(test)]
@@ -265,19 +330,53 @@ mod tests {
     }
 
     #[test]
-    fn recon_16gb_card_offloads_every_expert_layer() {
-        // On the recon 16 GB card the binding ceiling leaves a budget larger
-        // than all expert bytes: the decoder graph's 7.3 GiB BACKEND_PRIVATE
-        // high-water buffer must fit alongside the remaining device weights.
+    fn recon_16gb_card_offloads_every_expert_layer_with_the_old_footprint() {
+        // The initial (conservative) footprint still offloads everything; the
+        // slice-aware iteration below is what relaxes it. Keeping this test
+        // pins the starting point of the fixed-point search.
         let total = 17_163_091_968u64;
         let ceiling = binding_ceiling(total, 0).expect("ceiling");
-        let required = 15_233_819_708u64
-            + CONTEXT_AND_STATE_FOOTPRINT_BYTES
-            + SCHEDULER_GRAPH_PRIVATE_FOOTPRINT_BYTES;
+        let required =
+            15_233_819_708u64 + CONTEXT_AND_STATE_FOOTPRINT_BYTES + INITIAL_GRAPH_SCRATCH_BYTES;
         let budget = required.saturating_sub(ceiling);
         let chosen = plan_offload_layers(budget, &recon_layer_bytes);
         assert_eq!(chosen.len(), MOE_BLOCK_OFFLOAD_ORDER.len());
         assert_eq!(chosen[0], 52);
+    }
+
+    /// The slice-aware budget must restore some experts on a 16 GB card while
+    /// keeping the derived slice's graph, the context arena and the admission
+    /// margin under the binding ceiling.
+    #[test]
+    fn slice_aware_budget_restores_experts_without_exceeding_the_ceiling() {
+        let total = 17_163_091_968u64;
+        let free = total - 773_000_000; // ~0.72 GiB desktop baseline
+        let pack = 15_233_819_708u64;
+        let ceiling = binding_ceiling(total, free).expect("ceiling");
+        let budget = resolve_offload_budget(total, free, pack, &recon_layer_bytes).expect("budget");
+        let chosen = plan_offload_layers(budget, &recon_layer_bytes);
+        assert!(!chosen.is_empty(), "some experts must remain offloaded");
+        assert!(
+            chosen.len() < MOE_BLOCK_OFFLOAD_ORDER.len(),
+            "the stale fixed footprint must not force all experts off"
+        );
+        assert_eq!(chosen[0], 52, "MTP block stays first in priority order");
+
+        let offloaded: u64 = chosen.iter().filter_map(|b| recon_layer_bytes(*b)).sum();
+        let resident = pack.saturating_sub(offloaded);
+        let seconds = crate::models::nemotron_transcribe::slice::slice_seconds_from_device_budget(
+            total, free, resident,
+        )
+        .expect("slice");
+        let required = resident
+            .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)
+            .saturating_add(graph_footprint_bytes(seconds))
+            .saturating_add(ADMISSION_SAFETY_MARGIN_BYTES);
+        assert!(
+            required <= ceiling,
+            "resident {resident} + graph {} + context + margin must fit under {ceiling}",
+            graph_footprint_bytes(seconds)
+        );
     }
 
     #[test]

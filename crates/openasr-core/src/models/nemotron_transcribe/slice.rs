@@ -16,7 +16,7 @@ use super::offload::{binding_ceiling, device_vram_bytes};
 /// on the discrete card (all experts offloaded to host): 1.70 GiB @ 11 s and
 /// 13.6 GiB @ 88 s, i.e. ~155 MiB/s. Reserve 192 MiB/s (~24% margin) for
 /// driver allocation spikes and the CTC/encoder projection buffers.
-const ENCODER_SCRATCH_BYTES_PER_SECOND: u64 = 192 * 1024 * 1024;
+pub(crate) const ENCODER_SCRATCH_BYTES_PER_SECOND: u64 = 192 * 1024 * 1024;
 
 /// Fraction of the post-weight headroom reserved for the encoder graph.
 ///
@@ -110,7 +110,7 @@ fn slice_seconds_from_budget_with_admission(
 
 /// GPU wrapper: apply the broker's binding device-memory ceiling to both the
 /// policy budget and the admission bound, then take the tighter slice.
-fn slice_seconds_from_device_budget(
+pub(crate) fn slice_seconds_from_device_budget(
     total_vram_bytes: u64,
     free_vram_bytes: u64,
     resident_bytes: u64,

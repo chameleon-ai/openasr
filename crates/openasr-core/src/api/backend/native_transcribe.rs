@@ -5554,6 +5554,14 @@ fn apply_scoped_slice_longform_window_policy(
     options.min_chunk_seconds = options.min_chunk_seconds.min(target_seconds);
     options.padding_seconds = 0.0;
     options.carry_prompt_across_slices = false;
+    // Nemotron is a seq2seq decoder like whisper: a slice the VAD finds to
+    // hold no speech is a slice the model can fill with fluent scaffolding
+    // over a music bed. Gate those slices from decoding -- the timeline stays
+    // contiguous, so no audio is elided from the diarization context.
+    if model_architecture == crate::arch::NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID {
+        options.energy_vad_decode_gate = true;
+        provenance.push("core.native.longform.policy:scoped-slices-vad-decode-gate=on".to_string());
+    }
     provenance.push(format!(
         "core.native.longform.policy:scoped-slices,mode=energy,target_seconds={target_seconds},max_seconds={max_seconds}"
     ));

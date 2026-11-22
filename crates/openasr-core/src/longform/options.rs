@@ -88,6 +88,13 @@ pub struct LongFormOptions {
     pub fallback_to_energy_when_vad_unavailable: bool,
     pub fallback_to_energy_when_vad_empty: bool,
     pub vad: LongFormVadOptions,
+    /// Attach the request VAD's speech spans for the per-slice decode gate in
+    /// the contiguous `Energy` planner. Gating never changes the timeline --
+    /// slices still cover every sample -- it only skips decoding slices the
+    /// VAD found to hold no speech, the same gate `EnergyAuto`/`Auto` apply.
+    /// Off by default so families that pin `Energy` for coverage reasons opt
+    /// in explicitly.
+    pub energy_vad_decode_gate: bool,
 }
 
 impl Default for LongFormOptions {
@@ -113,6 +120,7 @@ impl Default for LongFormOptions {
             fallback_to_energy_when_vad_unavailable: true,
             fallback_to_energy_when_vad_empty: true,
             vad: LongFormVadOptions::default(),
+            energy_vad_decode_gate: false,
         }
     }
 }
