@@ -143,19 +143,20 @@ fn incremental_new_token(
     }
 }
 
-/// Expand the `[prefix][audio rows][suffix]` prompt into embedding rows:
-/// text rows gathered from the embedding table, audio rows taken from the
-/// PE encoder projection (frame-major, 2688 floats per 80 ms frame).
-pub(crate) fn materialize_audio_prompt_embeddings(
+/// Expand the `[prefix][audio rows][suffix]` prompt into embedding rows into
+/// a caller-owned buffer. The recovery ladder reuses
+/// one scratch across all sampled rounds, so the large prompt-embedding row
+/// is allocated once per slice instead of once per decode pass.
+pub(crate) fn materialize_audio_prompt_embeddings_into(
     embedding_table: &MappedTokenEmbeddingTable,
     prefix_ids: &[u32],
     audio_embeddings: &[f32],
     suffix_ids: &[u32],
     hidden: usize,
-) -> Result<Vec<f32>, Seq2SeqGreedyDecodeError> {
-    let mut out = Vec::with_capacity(
-        (prefix_ids.len() + audio_embeddings.len() / hidden + suffix_ids.len()) * hidden,
-    );
+    out: &mut Vec<f32>,
+) -> Result<(), Seq2SeqGreedyDecodeError> {
+    out.clear();
+    out.reserve((prefix_ids.len() + audio_embeddings.len() / hidden + suffix_ids.len()) * hidden);
     let prefix = embedding_table
         .gather_rows(prefix_ids)
         .map_err(map_embedding_error(0))?;
@@ -165,7 +166,14 @@ pub(crate) fn materialize_audio_prompt_embeddings(
         .gather_rows(suffix_ids)
         .map_err(map_embedding_error(0))?;
     out.extend_from_slice(&suffix);
-    Ok(out)
+    Ok(())
+}
+
+/// Reusable per-slice scratch for the decode ladder. Owned by the caller so
+/// every sampled round writes into the same allocation.
+#[derive(Debug, Default)]
+pub(crate) struct NemotronDecodeScratch {
+    prompt_embeddings: Vec<f32>,
 }
 
 /// Keep-quantized audio-prompt step executor. The session's runner, weight
@@ -174,9 +182,10 @@ pub(crate) fn materialize_audio_prompt_embeddings(
 pub(crate) struct NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
     session: &'s mut NemotronTranscribeDecodeSession,
     embedding_table: &'s MappedTokenEmbeddingTable,
-    prefix_ids: Vec<u32>,
-    suffix_ids: Vec<u32>,
-    initial_audio_embeddings: Vec<f32>,
+    prefix_ids: &'s [u32],
+    suffix_ids: &'s [u32],
+    initial_audio_embeddings: &'s [f32],
+    prompt_scratch: &'s mut NemotronDecodeScratch,
     hidden: usize,
     prompt_len: usize,
     prefilled: bool,
@@ -189,9 +198,10 @@ impl<'s> NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
     pub(crate) fn new(
         session: &'s mut NemotronTranscribeDecodeSession,
         embedding_table: &'s MappedTokenEmbeddingTable,
-        prefix_ids: Vec<u32>,
-        suffix_ids: Vec<u32>,
-        initial_audio_embeddings: Vec<f32>,
+        prefix_ids: &'s [u32],
+        suffix_ids: &'s [u32],
+        initial_audio_embeddings: &'s [f32],
+        prompt_scratch: &'s mut NemotronDecodeScratch,
         hidden: usize,
         prompt_len: usize,
         temperature: f32,
@@ -203,6 +213,7 @@ impl<'s> NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
             prefix_ids,
             suffix_ids,
             initial_audio_embeddings,
+            prompt_scratch,
             hidden,
             prompt_len,
             prefilled: false,
@@ -242,16 +253,20 @@ impl Seq2SeqGreedyDecodeStepExecutor for NemotronTranscribeResidentAudioDecodeSt
                 ),
             });
         }
-        let prompt_embeddings = materialize_audio_prompt_embeddings(
+        materialize_audio_prompt_embeddings_into(
             self.embedding_table,
-            &self.prefix_ids,
-            &self.initial_audio_embeddings,
-            &self.suffix_ids,
+            self.prefix_ids,
+            self.initial_audio_embeddings,
+            self.suffix_ids,
             self.hidden,
+            &mut self.prompt_scratch.prompt_embeddings,
         )?;
         let logits = self
             .session
-            .prefill(&prompt_embeddings, input.initial_prompt_tokens.len())
+            .prefill(
+                &self.prompt_scratch.prompt_embeddings,
+                input.initial_prompt_tokens.len(),
+            )
             .map_err(map_step_error(input.step_index, "prefill"))?;
         self.prefilled = true;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {

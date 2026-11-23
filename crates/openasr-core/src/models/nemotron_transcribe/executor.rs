@@ -30,6 +30,7 @@ use super::ctc_align::{
 };
 use super::ctc_head::{CTC_BLANK_ID, CTC_UPSAMPLING, CTC_VOCAB_SIZE, CtcHeadRuntime, bf16_round};
 use super::ctc_spm::CtcSpm;
+use super::decode_executor::NemotronDecodeScratch;
 use super::decode_executor::NemotronTranscribeDecodeSession;
 use super::decode_executor::NemotronTranscribeResidentAudioDecodeStepExecutor;
 use super::decoder_graph::NemotronTranscribeDecoderRuntime;
@@ -752,8 +753,14 @@ impl NemotronTranscribeGgmlExecutor {
                     Some((score, aligned.words.len(), failed))
                 };
 
+                // One scratch allocation for every decode pass in this slice
+                // (primary, ladder rounds and the fallback prompt). Reusing
+                // it avoids the repeated large prompt-embedding allocations
+                // that churn GPU-backed host memory across ladder rounds.
+                let mut decode_scratch = NemotronDecodeScratch::default();
                 let mut decode_pass = |plan: &prompt::NemotronTranscribePromptPlan,
                                        projections: &[f32],
+                                       scratch: &mut NemotronDecodeScratch,
                                        temperature: f32,
                                        sample_seed: u64|
                     -> Result<crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeResult,
@@ -777,9 +784,10 @@ impl NemotronTranscribeGgmlExecutor {
                     let mut step_executor = NemotronTranscribeResidentAudioDecodeStepExecutor::new(
                         session,
                         &prepared.embed_table,
-                        plan.prefix_ids.clone(),
-                        plan.suffix_ids.clone(),
-                        projections.to_vec(),
+                        plan.prefix_ids.as_slice(),
+                        plan.suffix_ids.as_slice(),
+                        projections,
+                        scratch,
                         2688,
                         prompt_len,
                         temperature,
@@ -829,7 +837,7 @@ impl NemotronTranscribeGgmlExecutor {
                         }),
                     }
                 };
-                let mut result = decode_pass(&plan, &projections, 0.0, 0)?;
+                let mut result = decode_pass(&plan, &projections, &mut decode_scratch, 0.0, 0)?;
                 // Strip SALM scaffolding before the emptiness check. A decode
                 // that emitted only event markup carries no transcript, so it
                 // must take the same recovery as a step-0 stop token; checking
@@ -868,7 +876,13 @@ impl NemotronTranscribeGgmlExecutor {
                         let seed = NEMOTRON_LADDER_BASE_SEED
                             .wrapping_add(i as u64)
                             .wrapping_mul(0x2545_F491_4F6C_DD1D);
-                        let round = match decode_pass(&plan, &projections, temperature, seed) {
+                        let round = match decode_pass(
+                            &plan,
+                            &projections,
+                            &mut decode_scratch,
+                            temperature,
+                            seed,
+                        ) {
                             Ok(round) if !round.stop_reason.is_truncated() => round,
                             Ok(round) => {
                                 eprintln!(
@@ -892,12 +906,23 @@ impl NemotronTranscribeGgmlExecutor {
                         if round_text.is_empty() {
                             continue;
                         }
+                        // Cheap textual gate first: a one-word filler
+                        // ("Yeah.", "electronic", "Um") cannot be a recovery
+                        // of a dropped phrase. Skipping it here avoids
+                        // building a CTC graph for a round we cannot adopt.
+                        if round_text.split_whitespace().count() < 3 {
+                            eprintln!(
+                                "openasr_nemotron_transcribe stage=temperature_ladder event=round_skipped round={} temperature={} reason=too_few_words text={:?}",
+                                i + 2,
+                                temperature,
+                                round_text
+                            );
+                            continue;
+                        }
                         let Some(evidence) = ctc_evidence(&round_text) else {
                             continue;
                         };
                         let (score, words, failed) = evidence;
-                        // A one-word filler ("Yeah.", "electronic", "Um")
-                        // is never a recovery of a multi-word dropped phrase.
                         let eligible = score >= NEMOTRON_MIN_ADOPT_CTC_SCORE
                             && words >= 3
                             && match &incumbent {
@@ -960,7 +985,8 @@ impl NemotronTranscribeGgmlExecutor {
                             prompt::NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT,
                             language.as_deref(),
                         )?;
-                        let fallback_result = decode_pass(&fallback_plan, &projections, 0.0, 0)?;
+                        let fallback_result =
+                            decode_pass(&fallback_plan, &projections, &mut decode_scratch, 0.0, 0)?;
                         let fallback_text =
                             strip_scaffolding_markup(fallback_result.text.trim(), in_decoder_speakers);
                         // Same acoustic-evidence test the ladder uses: a clean
