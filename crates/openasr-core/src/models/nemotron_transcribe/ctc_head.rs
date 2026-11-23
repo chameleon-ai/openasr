@@ -145,7 +145,16 @@ fn graph_config(backend: GgmlCpuGraphBackend) -> GgmlCpuGraphConfig {
 /// Resident CTC head runtime: a runner plus zero-copy bound pack weights.
 pub(crate) struct CtcHeadRuntime {
     runner: GgmlCpuGraphRunner,
+    // Kept alive for the cached `weights` handles; they point into its
+    // zero-copy tensor storage even though the handle lifetime is erased.
+    #[allow(dead_code)]
     loaded: GgmlLoadedWeightContext,
+    /// Bound once at construction: `build_weights` walks every layer and
+    /// formats weight names on each call, which is pure churn when the ladder
+    /// scores several candidate texts against the same slice.
+    weights: CtcHeadWeights<'static>,
+    /// Reused position column for the CTC graph upload.
+    positions: Vec<i32>,
 }
 
 impl CtcHeadRuntime {
@@ -162,7 +171,13 @@ impl CtcHeadRuntime {
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_weights"))?;
-        Ok(Self { runner, loaded })
+        let weights = build_weights(&loaded)?;
+        Ok(Self {
+            runner,
+            loaded,
+            weights,
+            positions: Vec::new(),
+        })
     }
 
     /// Project `columns` (CTC class ids, blank first) over every CTC frame.
@@ -196,7 +211,7 @@ impl CtcHeadRuntime {
             });
         }
 
-        let weights = build_weights(&self.loaded)?;
+        let weights = &self.weights;
         let config = head_config();
         config.validate("ctc").map_err(|e| CtcHeadError::Shape {
             reason: e.to_string(),
@@ -283,9 +298,14 @@ impl CtcHeadRuntime {
         graph
             .set_f32_slice(states_t, asr_states, "ctc_states")
             .map_err(ggml_err("upload_states"))?;
-        let positions: Vec<i32> = (0..frames as i32).collect();
+        if self.positions.len() < frames {
+            self.positions.resize(frames, 0);
+        }
+        for (index, value) in self.positions.iter_mut().enumerate() {
+            *value = index as i32;
+        }
         graph
-            .set_i32_slice(pos_t, &positions, "ctc_pos")
+            .set_i32_slice(pos_t, &self.positions[..frames], "ctc_pos")
             .map_err(ggml_err("upload_pos"))?;
         let ids: Vec<i32> = columns.iter().map(|&id| id as i32).collect();
         graph

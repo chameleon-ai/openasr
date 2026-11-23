@@ -719,6 +719,13 @@ pub(crate) struct NemotronTranscribeDecoderRuntime {
     kv_tensors: Vec<(usize, GgmlStaticTensor, GgmlStaticTensor)>,
     kv_max_positions: usize,
     cached_positions: usize,
+    /// Zero rows and mask bits are allocated once per resident runtime and
+    /// rewritten in place on every prefill. The ladder re-prefills the same
+    /// session many times, so rebuilding these per call was pure churn.
+    ssm_zero: Vec<f32>,
+    conv_zero: Vec<f32>,
+    kv_zero: Vec<f32>,
+    mask_bits: Vec<u16>,
 }
 
 impl NemotronTranscribeDecoderRuntime {
@@ -816,6 +823,15 @@ impl NemotronTranscribeDecoderRuntime {
             kv_tensors,
             kv_max_positions: max_positions,
             cached_positions: 0,
+            ssm_zero: vec![0.0f32; SSM_STATE_FLOATS],
+            conv_zero: vec![0.0f32; CONV_STATE_FLOATS],
+            kv_zero: vec![
+                0.0f32;
+                max_positions
+                    * NEMOTRON_TRANSCRIBE_ATTN_HEAD_DIM
+                    * NEMOTRON_TRANSCRIBE_ATTN_KV_HEADS
+            ],
+            mask_bits: vec![0u16; max_positions * PREFILL_CHUNK_ROWS],
         };
         runtime.reset_state_arenas()?;
         Ok(runtime)
@@ -825,32 +841,22 @@ impl NemotronTranscribeDecoderRuntime {
     /// `cached_positions` and its stale rows are never read (the span view
     /// shrinks to the written prefix).
     pub(crate) fn reset_state_arenas(&mut self) -> Result<(), NemotronTranscribeDecoderError> {
-        let ssm_len = SSM_STATE_FLOATS;
-        let conv_len = CONV_STATE_FLOATS;
-        let ssm_zero = vec![0.0f32; ssm_len];
-        let conv_zero = vec![0.0f32; conv_len];
         for &(_, tensor) in &self.ssm_tensors {
             self.state_arena
-                .set_f32_slice(tensor, &ssm_zero, "nemotron_ssm_state_reset")
+                .set_f32_slice(tensor, &self.ssm_zero, "nemotron_ssm_state_reset")
                 .map_err(ggml_err("ssm_state_reset"))?;
         }
         for &(_, tensor) in &self.conv_tensors {
             self.state_arena
-                .set_f32_slice(tensor, &conv_zero, "nemotron_conv_state_reset")
+                .set_f32_slice(tensor, &self.conv_zero, "nemotron_conv_state_reset")
                 .map_err(ggml_err("conv_state_reset"))?;
         }
-        let kv_zero = vec![
-            0.0f32;
-            self.kv_max_positions
-                * NEMOTRON_TRANSCRIBE_ATTN_HEAD_DIM
-                * NEMOTRON_TRANSCRIBE_ATTN_KV_HEADS
-        ];
         for &(_, k, v) in &self.kv_tensors {
             self.kv_arena
-                .set_f32_slice(k, &kv_zero, "nemotron_kv_k_reset")
+                .set_f32_slice(k, &self.kv_zero, "nemotron_kv_k_reset")
                 .map_err(ggml_err("kv_k_reset"))?;
             self.kv_arena
-                .set_f32_slice(v, &kv_zero, "nemotron_kv_v_reset")
+                .set_f32_slice(v, &self.kv_zero, "nemotron_kv_v_reset")
                 .map_err(ggml_err("kv_v_reset"))?;
         }
         self.cached_positions = 0;
@@ -969,17 +975,20 @@ impl NemotronTranscribeDecoderRuntime {
     }
 }
 
-fn build_prefill_mask_f16_bits(span: usize, t: usize, write_start: usize) -> Vec<u16> {
+/// Fill a caller-owned buffer with the causal prefill mask. The runtime keeps
+/// one scratch of this shape and reuses it for every chunk of every prefill.
+fn fill_prefill_mask_f16_bits(span: usize, t: usize, write_start: usize, bits: &mut [u16]) {
     debug_assert_eq!(span, t + write_start);
-    let mut bits = vec![f32_to_f16_bits(0.0); span * t];
+    debug_assert!(bits.len() >= span * t);
+    let zero = f32_to_f16_bits(0.0);
     let neg_inf = f32_to_f16_bits(f32::NEG_INFINITY);
     for query in 0..t {
         let kv_limit = write_start + query + 1;
-        for kv in kv_limit..span {
-            bits[query * span + kv] = neg_inf;
+        let start = query * span;
+        for (kv, slot) in bits[start..start + span].iter_mut().enumerate() {
+            *slot = if kv < kv_limit { zero } else { neg_inf };
         }
     }
-    bits
 }
 
 impl NemotronTranscribeDecoderRuntime {
@@ -1112,6 +1121,19 @@ impl NemotronTranscribeDecoderRuntime {
             })
             .collect();
 
+        // Reuse the mask scratch: rewrite the masked rows in place instead of
+        // allocating a span*t buffer for each prefill chunk.
+        let mask_bits = if prefill && t > 1 {
+            let needed = span * t;
+            if self.mask_bits.len() < needed {
+                self.mask_bits.resize(needed, 0);
+            }
+            fill_prefill_mask_f16_bits(span, t, write_start, &mut self.mask_bits);
+            Some(&self.mask_bits[..needed])
+        } else {
+            None
+        };
+
         let mut graph = self.runner.start_graph();
         let embeddings_t = graph
             .new_tensor_2d_f32(NEMOTRON_TRANSCRIBE_HIDDEN, t, "decoder_embeddings")
@@ -1169,10 +1191,9 @@ impl NemotronTranscribeDecoderRuntime {
         graph
             .set_i32_slice(ids_t, &ids, "decoder_ids")
             .map_err(ggml_err("upload_ids"))?;
-        if let Some(mask) = mask_t {
-            let bits = build_prefill_mask_f16_bits(span, t, write_start);
+        if let (Some(mask), Some(bits)) = (mask_t, mask_bits) {
             graph
-                .set_f16_bits_slice(mask, &bits, "decoder_mask")
+                .set_f16_bits_slice(mask, bits, "decoder_mask")
                 .map_err(ggml_err("upload_mask"))?;
         }
 
@@ -1235,7 +1256,8 @@ mod tests {
         let write_start = 64usize;
         let t = 4usize;
         let span = write_start + t; // 68
-        let bits = build_prefill_mask_f16_bits(span, t, write_start);
+        let mut bits = vec![0u16; span * t];
+        fill_prefill_mask_f16_bits(span, t, write_start, &mut bits);
         assert_eq!(bits.len(), span * t);
         let zero = f32_to_f16_bits(0.0);
         let neg_inf = f32_to_f16_bits(f32::NEG_INFINITY);
