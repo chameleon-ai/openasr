@@ -19,6 +19,39 @@ use crate::models::seq2seq_greedy_decode::{
     Seq2SeqGreedyDecodeStepLogitsOutput,
 };
 
+/// Deterministic splitmix64 stream for the temperature ladder's sampled rounds.
+struct NemotronLadderRng {
+    state: u64,
+}
+
+impl NemotronLadderRng {
+    fn next_unit_f32(&mut self) -> f32 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^= value >> 31;
+        let unit = (value >> 11) as f64 * (1.0f64 / (1u64 << 53) as f64);
+        (unit as f32 + 1.0e-6).min(1.0f32 - 1.0e-7)
+    }
+    fn gumbel(&mut self) -> f32 {
+        -(-self.next_unit_f32().ln()).ln()
+    }
+}
+
+/// Gumbel-max sampling reduces to argmax over `logit / T + Gumbel(0,1)`, so the
+/// shared driver's argmax samples from softmax(logits/T) with no driver change.
+fn temper_logits(rng: &mut NemotronLadderRng, temperature: f32, logits: Vec<f32>) -> Vec<f32> {
+    if temperature <= 0.0 {
+        return logits;
+    }
+    let inv_temperature = 1.0f32 / temperature;
+    logits
+        .into_iter()
+        .map(|logit| logit * inv_temperature + rng.gumbel())
+        .collect()
+}
+
 use super::decoder_graph::{NemotronTranscribeDecoderError, NemotronTranscribeDecoderRuntime};
 
 fn map_step_error(
@@ -147,9 +180,12 @@ pub(crate) struct NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
     hidden: usize,
     prompt_len: usize,
     prefilled: bool,
+    temperature: f32,
+    rng: NemotronLadderRng,
 }
 
 impl<'s> NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: &'s mut NemotronTranscribeDecodeSession,
         embedding_table: &'s MappedTokenEmbeddingTable,
@@ -158,6 +194,8 @@ impl<'s> NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
         initial_audio_embeddings: Vec<f32>,
         hidden: usize,
         prompt_len: usize,
+        temperature: f32,
+        sample_seed: u64,
     ) -> Self {
         Self {
             session,
@@ -168,6 +206,8 @@ impl<'s> NemotronTranscribeResidentAudioDecodeStepExecutor<'s> {
             hidden,
             prompt_len,
             prefilled: false,
+            temperature,
+            rng: NemotronLadderRng { state: sample_seed },
         }
     }
 }
@@ -188,7 +228,7 @@ impl Seq2SeqGreedyDecodeStepExecutor for NemotronTranscribeResidentAudioDecodeSt
                 .decode_step(&embedding)
                 .map_err(map_step_error(input.step_index, "audio"))?;
             return Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-                logits,
+                logits: temper_logits(&mut self.rng, self.temperature, logits),
                 greedy_token_hint: None,
             });
         }
@@ -215,12 +255,49 @@ impl Seq2SeqGreedyDecodeStepExecutor for NemotronTranscribeResidentAudioDecodeSt
             .map_err(map_step_error(input.step_index, "prefill"))?;
         self.prefilled = true;
         Ok(Seq2SeqGreedyDecodeStepLogitsOutput {
-            logits,
+            logits: temper_logits(&mut self.rng, self.temperature, logits),
             greedy_token_hint: None,
         })
     }
 
     fn take_compute_evidence(&mut self) -> Option<GgmlSelectionEvidenceRef> {
         self.session.take_compute_evidence()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_temperature_leaves_logits_untouched() {
+        let mut rng = NemotronLadderRng { state: 7 };
+        let logits = vec![1.0, 3.0, -2.0];
+        assert_eq!(temper_logits(&mut rng, 0.0, logits.clone()), logits);
+    }
+
+    #[test]
+    fn tempering_is_deterministic_for_a_seed() {
+        let row = vec![1.0, 1.05, 0.4];
+        let mut a = NemotronLadderRng { state: 42 };
+        let mut b = NemotronLadderRng { state: 42 };
+        assert_eq!(
+            temper_logits(&mut a, 0.7, row.clone()),
+            temper_logits(&mut b, 0.7, row)
+        );
+    }
+
+    #[test]
+    fn a_ladder_seed_can_break_an_argmax_tie() {
+        let row = vec![1.0, 1.01];
+        let mut moved = false;
+        for seed in 0..64u64 {
+            let mut rng = NemotronLadderRng { state: seed };
+            let tempered = temper_logits(&mut rng, 1.0, row.clone());
+            if tempered[0] > tempered[1] {
+                moved = true;
+            }
+        }
+        assert!(moved, "no sampled round moved off the greedy token");
     }
 }

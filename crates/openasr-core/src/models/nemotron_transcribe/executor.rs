@@ -74,6 +74,43 @@ pub(crate) const NEMOTRON_TRANSCRIBE_SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.5;
 
 const NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS: usize = 640;
 
+/// Recovery ladder for a temperature-0 decode cut short by the repeat guard
+/// or stripped to empty. One rung at 0.4 is the default: it is the only
+/// configuration that recovered real speech on both bonnie and mikan without
+/// the GPU faults seen with wider ladders. Override with a comma-separated
+/// list in `OPENASR_NEMOTRON_TEMPERATURE_LADDER`, or set it to `0`/`off` to
+/// disable. Nemotron decoder rounds cost far more than whisper's.
+const NEMOTRON_DEFAULT_TEMPERATURE_LADDER: [f32; 1] = [0.4];
+const NEMOTRON_LADDER_BASE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Any recovery round (ladder or fallback prompt) must clear this mean
+/// per-frame CTC score before its text is trusted. Scores below it are
+/// force-alignments of hallucinated words onto music / noise: the bad
+/// adoptions measured on lobster-uvr (1.86, "It's gonna be over there" x4)
+/// and tequila-uvr (0.74, "Heeft die ja!") sit below it, while mikan's genuine
+/// recoveries (3.34 and 4.66) clear it.
+const NEMOTRON_MIN_ADOPT_CTC_SCORE: f32 = 3.0;
+/// A sampled round must beat the incumbent's mean per-label CTC score by this
+/// much to be adopted (scores are log-probs; the elided full-vocab term is a
+/// per-frame constant, so comparisons across rounds on the same audio hold).
+const NEMOTRON_LADDER_SCORE_MARGIN: f32 = 0.05;
+
+fn nemotron_temperature_ladder() -> Vec<f32> {
+    match std::env::var("OPENASR_NEMOTRON_TEMPERATURE_LADDER") {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "0" | "off" | "false" | "no") {
+                Vec::new()
+            } else {
+                raw.split(',')
+                    .filter_map(|part| part.trim().parse::<f32>().ok())
+                    .filter(|temperature| *temperature > 0.0 && *temperature <= 1.0)
+                    .collect()
+            }
+        }
+        Err(_) => NEMOTRON_DEFAULT_TEMPERATURE_LADDER.to_vec(),
+    }
+}
+
 /// Extra KV rows reserved at the family runtime beyond the planner's minimal
 /// `P + G - 1` span. When the shared greedy driver's degenerate-ngram guard
 /// drops tokens, its decode can advance one step past the nominal generation
@@ -650,8 +687,75 @@ impl NemotronTranscribeGgmlExecutor {
                 // encoder output under a different prompt: the reference's
                 // one-shot empty-transcript fallback.
                 let projections = encoder_output.projections;
+
+                // Forced-alignment evidence for ladder round selection. The
+                // CTC head projects only the round's target columns, so this
+                // must re-run per candidate; it is still much cheaper than an
+                // extra decoder pass. Returns (mean per-label path score,
+                // aligned word count, failed-stream/unmatched count).
+                let ev_frames = encoder_output.frames;
+                let ev_speakers = super::encoder_graph::NEMOTRON_TRANSCRIBE_NUM_SPEAKERS;
+                let mut ev_speaker_probs = vec![0.0f32; ev_frames * ev_speakers];
+                for t in 0..ev_frames {
+                    for spk in 0..ev_speakers {
+                        ev_speaker_probs[t * ev_speakers + spk] =
+                            encoder_output.speaker_probs[spk * ev_frames + t];
+                    }
+                }
+                let ev_ctc_frames = ev_frames * CTC_UPSAMPLING;
+                let ev_config = AlignmentConfig {
+                    max_word_frames: 12 * CTC_UPSAMPLING,
+                    ..Default::default()
+                };
+                let mut ctc_evidence = |text: &str| -> Option<(f32, usize, usize)> {
+                    if !word_timestamps {
+                        return None;
+                    }
+                    let transcript = clean_sot_transcript(text, &[]);
+                    if transcript.is_empty() {
+                        return None;
+                    }
+                    let targets = alignment_targets(
+                        &prepared.ctc_spm,
+                        &transcript,
+                        CTC_BLANK_ID,
+                        ev_ctc_frames,
+                    )
+                    .ok()?;
+                    let logits = prepared
+                        .ctc_head
+                        .logits(&encoder_output.asr_states, ev_frames, &targets.columns)
+                        .ok()?;
+                    let _ = prepared.ctc_head.release_transient_compute_memory();
+                    let emissions: Vec<f32> = logits.iter().map(|&v| bf16_round(v)).collect();
+                    let inputs = AlignmentInputs {
+                        log_probs: &emissions,
+                        frames: ev_ctc_frames,
+                        speaker_probs: Some(&ev_speaker_probs),
+                        speaker_frames: ev_frames,
+                        speakers: ev_speakers,
+                        activity10: Some(&encoder_output.speaker_probs10),
+                        label_frames: frames.min(8 * ev_frames),
+                        label_speakers: ev_speakers,
+                        label_seconds: 0.01,
+                        duration: f64::from(audio_duration_seconds),
+                        time_offset: 0.0,
+                    };
+                    let aligned = align_record(&targets, &inputs, &ev_config).ok()?;
+                    // The Viterbi score accumulates a term on EVERY frame
+                    // (mostly blank), so normalising by label count rewards
+                    // short hallucinated texts. Per-frame normalisation keeps
+                    // the denominator fixed across candidate texts.
+                    let score = aligned.scores.iter().sum::<f32>() / ev_ctc_frames as f32;
+                    let failed = aligned.failed_streams.len()
+                        + aligned.refinement.unmatched_words.max(0) as usize;
+                    Some((score, aligned.words.len(), failed))
+                };
+
                 let mut decode_pass = |plan: &prompt::NemotronTranscribePromptPlan,
-                                       projections: &[f32]|
+                                       projections: &[f32],
+                                       temperature: f32,
+                                       sample_seed: u64|
                     -> Result<crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeResult,
                               NemotronTranscribeGgmlExecutorError> {
                     let decode_config = BuiltinSeq2SeqDecodePolicyConfigInput {
@@ -678,6 +782,8 @@ impl NemotronTranscribeGgmlExecutor {
                         projections.to_vec(),
                         2688,
                         prompt_len,
+                        temperature,
+                        sample_seed,
                     );
                     let decoded = run_builtin_seq2seq_decode_policy(
                         crate::arch::NEMOTRON_TRANSCRIBE_DECODE_POLICY_ID,
@@ -723,38 +829,164 @@ impl NemotronTranscribeGgmlExecutor {
                         }),
                     }
                 };
-                let mut result = decode_pass(&plan, &projections)?;
-                let mut text = result.text.trim().to_string();
-                if text.is_empty() && !in_decoder_speakers {
-                    // The reference's one-shot empty-transcript fallback: the
-                    // served transcription prompt decoded to nothing (the
-                    // model took its stop token at step zero), so re-decode
-                    // the same encoder output once under the
-                    // music/noise-tolerant prompt. Served transcription
-                    // prompts only - the diarize prompt is a different task
-                    // contract - and at most once: if this also comes back
-                    // empty the result stands, now reported as a
-                    // stop-token-before-content truncation by the driver.
+                let mut result = decode_pass(&plan, &projections, 0.0, 0)?;
+                // Strip SALM scaffolding before the emptiness check. A decode
+                // that emitted only event markup carries no transcript, so it
+                // must take the same recovery as a step-0 stop token; checking
+                // before the strip left those slices empty with no fallback.
+                let raw_text = result.text.trim();
+                let mut text = strip_scaffolding_markup(raw_text, in_decoder_speakers);
+                // A clean stop with no output is the model saying "nothing
+                // here" (music, room tone): the fallback prompt would invent
+                // a transcript. Recover only when the decode was cut short or
+                // its entire output was scaffolding that stripped to empty.
+                let needs_recovery = result.stop_reason.is_truncated()
+                    || (!raw_text.is_empty() && text.is_empty());
+
+                // Short CTC-scored recovery ladder. A sampled round replaces
+                // the incumbent only if forced alignment says it fits the
+                // SAME audio better (higher mean per-label path score) without
+                // losing placed words or adding failed streams: unlike text
+                // length, that signal cannot be gamed by fluent hallucination.
+                let rungs = nemotron_temperature_ladder();
+                if needs_recovery && !rungs.is_empty() && !in_decoder_speakers {
+                    let incumbent = ctc_evidence(&text);
                     eprintln!(
-                        "openasr_nemotron_transcribe stage=decode event=empty_transcript_fallback status=fired"
+                        "openasr_nemotron_transcribe stage=temperature_ladder event=ladder_start stop_reason={:?} incumbent={:?}",
+                        result.stop_reason,
+                        incumbent
                     );
-                    let fallback_plan = prompt::build_served_prompt(
-                        &prepared.tokenizer,
-                        prompt::NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT,
-                        language.as_deref(),
-                    )?;
-                    let fallback_result = decode_pass(&fallback_plan, &projections)?;
-                    let fallback_text = fallback_result.text.trim().to_string();
-                    if !fallback_text.is_empty() {
-                        result = fallback_result;
-                        text = fallback_text;
+                    // Evaluate every rung before choosing: single-word
+                    // fillers can win an early race on a noisy score, and a
+                    // later rung may carry the real recovery.
+                    let mut best_round: Option<(
+                        crate::models::seq2seq_greedy_decode::Seq2SeqGreedyDecodeResult,
+                        String,
+                        (f32, usize, usize),
+                    )> = None;
+                    for (i, &temperature) in rungs.iter().enumerate() {
+                        let seed = NEMOTRON_LADDER_BASE_SEED
+                            .wrapping_add(i as u64)
+                            .wrapping_mul(0x2545_F491_4F6C_DD1D);
+                        let round = match decode_pass(&plan, &projections, temperature, seed) {
+                            Ok(round) if !round.stop_reason.is_truncated() => round,
+                            Ok(round) => {
+                                eprintln!(
+                                    "openasr_nemotron_transcribe stage=temperature_ladder event=round_skipped round={} temperature={} reason=truncated stop_reason={:?}",
+                                    i + 2,
+                                    temperature,
+                                    round.stop_reason
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "openasr_nemotron_transcribe stage=temperature_ladder event=round_skipped round={} temperature={} reason=error error={error}",
+                                    i + 2,
+                                    temperature
+                                );
+                                continue;
+                            }
+                        };
+                        let round_text = strip_scaffolding_markup(round.text.trim(), false);
+                        if round_text.is_empty() {
+                            continue;
+                        }
+                        let Some(evidence) = ctc_evidence(&round_text) else {
+                            continue;
+                        };
+                        let (score, words, failed) = evidence;
+                        // A one-word filler ("Yeah.", "electronic", "Um")
+                        // is never a recovery of a multi-word dropped phrase.
+                        let eligible = score >= NEMOTRON_MIN_ADOPT_CTC_SCORE
+                            && words >= 3
+                            && match &incumbent {
+                                Some((inc_score, inc_words, inc_failed)) => {
+                                    score > *inc_score + NEMOTRON_LADDER_SCORE_MARGIN
+                                        && words >= *inc_words
+                                        && failed <= *inc_failed
+                                }
+                                None => true,
+                            };
+                        let better = eligible
+                            && best_round
+                                .as_ref()
+                                .is_none_or(|(_, _, (best_score, _, _))| score > *best_score);
+                        eprintln!(
+                            "openasr_nemotron_transcribe stage=temperature_ladder event=round_evidence round={} temperature={} score={:.3} words={} failed={} eligible={} text={:?}",
+                            i + 2,
+                            temperature,
+                            score,
+                            words,
+                            failed,
+                            eligible,
+                            round_text
+                        );
+                        if better {
+                            best_round = Some((round, round_text, evidence));
+                        }
+                    }
+                    if let Some((round, round_text, evidence)) = best_round {
+                        eprintln!(
+                            "openasr_nemotron_transcribe stage=temperature_ladder event=round_adopted score={:.3} words={} text={:?}",
+                            evidence.0,
+                            evidence.1,
+                            round_text
+                        );
+                        result = round;
+                        text = round_text;
                     }
                 }
-                // Strip SALM scaffolding before it reaches either the final
-                // transcript (below) or the CTC alignment target (line below),
-                // so the timed words stay consistent with the cleaned text.
-                // Do it after the fallback so both prompts are covered.
-                text = strip_scaffolding_markup(&text, in_decoder_speakers);
+
+                if text.is_empty() && !in_decoder_speakers {
+                    if !needs_recovery {
+                        // Clean stop token with no output: respect the model's
+                        // "nothing here" rather than inventing music/noise text.
+                        eprintln!(
+                            "openasr_nemotron_transcribe stage=decode event=empty_transcript_fallback status=skipped_clean_stop"
+                        );
+                    } else {
+                        // The reference's one-shot empty-transcript fallback:
+                        // the decode was cut short or emitted only scaffolding,
+                        // so re-decode the same encoder output once under the
+                        // music/noise-tolerant prompt. At most once: if this
+                        // also comes back empty the result stands, now reported
+                        // as a stop-token-before-content truncation.
+                        eprintln!(
+                            "openasr_nemotron_transcribe stage=decode event=empty_transcript_fallback status=fired"
+                        );
+                        let fallback_plan = prompt::build_served_prompt(
+                            &prepared.tokenizer,
+                            prompt::NEMOTRON_TRANSCRIBE_FALLBACK_PROMPT,
+                            language.as_deref(),
+                        )?;
+                        let fallback_result = decode_pass(&fallback_plan, &projections, 0.0, 0)?;
+                        let fallback_text =
+                            strip_scaffolding_markup(fallback_result.text.trim(), in_decoder_speakers);
+                        // Same acoustic-evidence test the ladder uses: a clean
+                        // decode of music/noise can be fluent but its words do
+                        // not sit on voiced frames. Without evidence (no word
+                        // timestamps requested) keep the historical behavior.
+                        let accept = match ctc_evidence(&fallback_text) {
+                            Some((score, words, failed)) => {
+                                let ok = score >= NEMOTRON_MIN_ADOPT_CTC_SCORE
+                                    && words >= 3
+                                    && failed <= 3;
+                                if !ok {
+                                    eprintln!(
+                                        "openasr_nemotron_transcribe stage=decode event=empty_transcript_fallback status=rejected_evidence score={score:.3} words={words} failed={failed} text={fallback_text:?}"
+                                    );
+                                }
+                                ok
+                            }
+                            None => !fallback_text.is_empty(),
+                        };
+                        if accept && !fallback_text.is_empty() {
+                            result = fallback_result;
+                            text = fallback_text;
+                        }
+                    }
+                }
 
                 // --- CTC word timestamps (transcript-independent head + host aligner) ---
                 // Alignment is a best-effort enhancement: the reference returns
@@ -1018,6 +1250,15 @@ mod tests {
     fn scaffolding_strip_leaves_clean_transcripts_untouched() {
         let clean = "And so my fellow Americans, ask not what your country can do for you.";
         assert_eq!(strip_scaffolding_markup(clean, false), clean);
+    }
+
+    #[test]
+    fn scaffolding_only_decode_is_an_empty_transcript() {
+        // A decode that emitted nothing but event markup is empty content. The
+        // executor decides the empty-transcript fallback on the stripped text,
+        // so this shape takes the same recovery as a step-zero stop token.
+        let raw = "<ev:audio> <ev:ev-step end=\"true\" type=\"text\"> </ev:ev-step> </ev:audio>";
+        assert_eq!(strip_scaffolding_markup(raw, false), "");
     }
 
     /// Real pack for the opt-in scaling probe; never committed (a 15-37 GB
