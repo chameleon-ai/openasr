@@ -211,8 +211,8 @@ pub use ggml_runtime::{
 };
 pub use metrics::{
     ProcessMemorySnapshot, VramPeakSampler, WerCounts, cer_counts, current_rss_bytes,
-    hip_vram_used_bytes, normalize_text, peak_rss_bytes, process_memory_snapshot, wer, wer_counts,
-    word_prefix_error_rate,
+    gtt_memory_bytes, hip_vram_used_bytes, normalize_text, peak_rss_bytes, process_memory_snapshot,
+    wer, wer_counts, word_prefix_error_rate,
 };
 pub use models::pack_verifier::{PackCandidate, PackVerificationError, PackVerifier, VerifiedPack};
 pub use qualification_manifest::{

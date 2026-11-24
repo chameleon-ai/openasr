@@ -70,12 +70,12 @@ const MOE_BLOCK_OFFLOAD_ORDER: [usize; 24] = [
     52, 1, 3, 6, 8, 10, 13, 15, 17, 20, 22, 24, 27, 29, 31, 34, 36, 38, 40, 43, 45, 47, 49, 51,
 ];
 
-/// Live `(total, free)` VRAM of the device the runner's backend class binds,
-/// `None` when the class is not a discrete GPU device or the device reports no
-/// total. Both come from the same `ggml_backend_dev_memory` snapshot, so they
-/// are internally consistent; `free` is what the broker's observed-capacity
-/// check samples when it admits the Hybrid lane's scheduler buffers.
-pub(crate) fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
+/// Live `(total, free)` VRAM from the ggml backend the runner binds, `None`
+/// when the class is not a discrete GPU device or the device reports no total.
+/// Both come from the same `ggml_backend_dev_memory` snapshot, so they are
+/// internally consistent; `free` is what the broker's observed-capacity check
+/// samples when it admits the Hybrid lane's scheduler buffers.
+fn ggml_device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
     let device = ggml_available_devices()
         .into_iter()
         .find(|device| match backend {
@@ -93,6 +93,22 @@ pub(crate) fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u6
         })?;
     let memory = device.memory.filter(|memory| memory.total_bytes > 0)?;
     Some((memory.total_bytes as u64, memory.free_bytes as u64))
+}
+
+/// Live `(total, free)` bytes of the memory domain the GPU actually allocates
+/// from. On a discrete GPU that is the ggml VRAM snapshot. On a unified-memory
+/// APU ggml reports an `IntegratedGpu` with no discrete device, so the GTT sysfs
+/// counters are used instead: GTT (not the 512 MiB VRAM carveout, and not total
+/// system RAM) is the pool graph buffers are charged against. Feeding both
+/// device classes through this one function lets `resolve_discrete_residency`
+/// size residency and slice identically on either architecture.
+pub(crate) fn device_vram_bytes(backend: GgmlCpuGraphBackend) -> Option<(u64, u64)> {
+    ggml_device_vram_bytes(backend).or_else(|| {
+        if backend == GgmlCpuGraphBackend::Cpu {
+            return None;
+        }
+        crate::metrics::gtt_memory_bytes().map(|(total, used)| (total, total.saturating_sub(used)))
+    })
 }
 
 /// The binding device-memory ceiling for offload sizing. The broker enforces
@@ -211,6 +227,34 @@ fn resolve_offload_budget(
     Some(required.saturating_sub(ceiling))
 }
 
+/// Slice length the post-residency headroom can fund: half of it, budgeted at
+/// the encoder scratch rate. The other half stays reserved for context/state,
+/// the admission margin and driver transients. This is the ceiling that binds
+/// on small cards and the grown slice on large cards or a big APU.
+fn headroom_slice_cap(ceiling: u64, resident: u64) -> u64 {
+    const DISCRETE_CAP_BASIS_POINTS: u128 = 5_000; // 50%
+    let headroom = ceiling.saturating_sub(resident);
+    u64::try_from(
+        u128::from(headroom) * DISCRETE_CAP_BASIS_POINTS
+            / 10_000
+            / u128::from(super::slice::ENCODER_SCRATCH_BYTES_PER_SECOND),
+    )
+    .unwrap_or(u64::MAX)
+    .clamp(
+        super::slice::MIN_SLICE_SECONDS,
+        super::slice::MAX_SLICE_SECONDS,
+    )
+}
+
+/// Pick the final slice from the headroom-derived cap and an optional explicit
+/// target. With no override the cap is the slice: on small cards it is exactly
+/// the value that already bound (13/15/14 s), while larger cards grow instead
+/// of being pinned at the old fixed 20 s. An explicit override is still capped
+/// so a profiling target can never exceed the safety ceiling.
+fn resolve_slice_seconds(explicit_target: Option<u64>, cap: u64) -> u64 {
+    explicit_target.map_or(cap, |target| target.min(cap))
+}
+
 /// The resolved discrete plan: offload budget and the slice length that fits
 /// alongside it. Both the longform slice policy and the weight loader call
 /// this once so they cannot disagree about residency vs. graph size.
@@ -220,14 +264,17 @@ pub(crate) struct DiscreteResidencyPlan {
 }
 
 /// Resolve the discrete plan in one pass:
-/// 1. price the graph at the requested target and see which layers that would
-///    offload (the provisional residency);
-/// 2. cap the slice to 40% of the headroom that residency actually leaves;
-/// 3. re-price the graph at the capped slice for the final budget.
+/// 1. price the graph at the explicit target (or the 20 s default when deriving
+///    it) and see which layers that would offload (provisional residency);
+/// 2. cap the slice to 50% of the headroom that residency actually leaves;
+/// 3. re-price the graph at the chosen slice for the final budget.
 ///
-/// The cap is a safety ceiling, not a feedback term: the final budget uses the
-/// capped slice, so a smaller card loads more experts instead of requesting an
-/// over-sized graph. No fixed-point loop and no 1.67x margin amplification.
+/// With no explicit target the cap itself is the slice: on 10/12/16 GiB cards
+/// it is already the binding value (13/15/14 s), while larger cards grow with
+/// headroom instead of being pinned at 20 s. The cap is a safety ceiling, not
+/// a feedback term: the final budget uses the chosen slice, so a smaller card
+/// loads more experts instead of requesting an over-sized graph. No fixed-point
+/// loop and no 1.67x margin amplification.
 pub(crate) fn resolve_discrete_residency(
     backend: GgmlCpuGraphBackend,
     tensor_index: &GgufTensorIndex,
@@ -235,33 +282,27 @@ pub(crate) fn resolve_discrete_residency(
     let (total, free) = device_vram_bytes(backend)?;
     let ceiling = binding_ceiling(total, free)?;
     let pack = pack_weight_bytes(tensor_index);
-    let target = super::slice::discrete_target_slice_seconds();
+    let explicit_target = super::slice::discrete_target_slice_override();
+    // The provisional budget is priced at the explicit target, or at the old
+    // 20 s default when deriving the slice. It only decides the starting
+    // residency; the final budget is re-priced at the chosen slice below.
+    let pricing_slice = explicit_target.unwrap_or(super::slice::PROVISIONAL_PRICING_SLICE_SECONDS);
 
-    let provisional =
-        resolve_offload_budget(total, free, pack, ADMISSION_SAFETY_MARGIN_BYTES, target)?;
+    let provisional = resolve_offload_budget(
+        total,
+        free,
+        pack,
+        ADMISSION_SAFETY_MARGIN_BYTES,
+        pricing_slice,
+    )?;
     let chosen = plan_offload_layers(provisional, &|block| layer_bytes_of(tensor_index, block));
     let offloaded: u64 = chosen
         .iter()
         .filter_map(|block| layer_bytes_of(tensor_index, *block))
         .sum();
     let resident = pack.saturating_sub(offloaded);
-    // Discrete cards can devote a larger share of post-weight headroom to the
-    // graph than the APU-tuned 40% rule: 50% caps the target at ~14 s here and
-    // leaves ~11 s on a 10 GB card, while still reserving half the headroom for
-    // context/state and admission margin.
-    const DISCRETE_CAP_BASIS_POINTS: u128 = 5_000;
-    let headroom = ceiling.saturating_sub(resident);
-    let cap = u64::try_from(
-        u128::from(headroom) * DISCRETE_CAP_BASIS_POINTS
-            / 10_000
-            / u128::from(super::slice::ENCODER_SCRATCH_BYTES_PER_SECOND),
-    )
-    .unwrap_or(u64::MAX)
-    .clamp(
-        super::slice::MIN_SLICE_SECONDS,
-        super::slice::MAX_SLICE_SECONDS,
-    );
-    let slice_seconds = target.min(cap);
+    let cap = headroom_slice_cap(ceiling, resident);
+    let slice_seconds = resolve_slice_seconds(explicit_target, cap);
     let budget = resolve_offload_budget(
         total,
         free,
@@ -294,6 +335,10 @@ mod tests {
     /// 718,405,632 B each.
     const Q2_0_LAYER_BYTES: u64 = 359_202_816;
     const IQ4_NL_LAYER_BYTES: u64 = 718_405_632;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const Q2_PACK: u64 = 15_242_619_392;
+    const IQ4_PACK: u64 = 21_349_067_264;
+    const Q8_PACK: u64 = 36_675_053_792;
 
     fn recon_layer_bytes(block: usize) -> Option<u64> {
         const Q2_0_BLOCKS: [usize; 17] = [
@@ -339,6 +384,51 @@ mod tests {
     #[test]
     fn zero_budget_offloads_nothing() {
         assert!(plan_offload_layers(0, &recon_layer_bytes).is_empty());
+    }
+
+    #[test]
+    fn auto_slice_uses_the_headroom_cap() {
+        // No override: the cap is the slice. On a 16 GiB card it is 14 s; a
+        // 32 GiB card grows to 43 s instead of being pinned at 20 s.
+        assert_eq!(resolve_slice_seconds(None, 14), 14);
+        assert_eq!(resolve_slice_seconds(None, 43), 43);
+    }
+
+    #[test]
+    fn explicit_target_is_still_capped_for_safety() {
+        assert_eq!(resolve_slice_seconds(Some(20), 14), 14);
+        assert_eq!(resolve_slice_seconds(Some(10), 14), 10);
+        assert_eq!(resolve_slice_seconds(Some(60), 43), 43);
+    }
+
+    /// gfx1151 has 112 GiB of GTT. Routing it through the shared resolver with
+    /// no override gives 245/230/192 s caps for q2/iq4/q8 (whole pack resident,
+    /// no expert offload), replacing the old 40%-policy 208/196/166 s slices.
+    #[test]
+    fn unified_apu_cap_grows_with_gtt_headroom() {
+        let gtt_total = 112 * GIB;
+        let ceiling = binding_ceiling(gtt_total, gtt_total).expect("ceiling");
+        for (pack, expected) in [(Q2_PACK, 245), (IQ4_PACK, 230), (Q8_PACK, 192)] {
+            assert_eq!(headroom_slice_cap(ceiling, pack), expected, "pack {pack}");
+        }
+    }
+
+    /// At those longer APU slices the whole pack still fits under the 95%-of-GTT
+    /// ceiling, so the shared resolver offloads nothing on gfx1151.
+    #[test]
+    fn unified_apu_keeps_the_whole_pack_resident() {
+        let gtt_total = 112 * GIB;
+        for (pack, slice) in [(Q2_PACK, 245), (IQ4_PACK, 230), (Q8_PACK, 192)] {
+            let budget = resolve_offload_budget(
+                gtt_total,
+                gtt_total,
+                pack,
+                ADMISSION_SAFETY_MARGIN_BYTES,
+                slice,
+            )
+            .expect("budget");
+            assert_eq!(budget, 0, "pack {pack} at {slice} s");
+        }
     }
 
     #[test]

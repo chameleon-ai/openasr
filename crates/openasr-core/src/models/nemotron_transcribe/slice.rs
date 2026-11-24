@@ -9,10 +9,10 @@
 //! on a 10 GB, 12 GB, or 16 GB card (and a larger card gets longer slices).
 
 use crate::ggml_runtime::GgmlCpuGraphBackend;
+use crate::metrics::gtt_memory_bytes;
 
 #[cfg(test)]
 use super::offload::binding_ceiling;
-use super::offload::device_vram_bytes;
 
 /// Encoder graph scratch per second of audio, with safety margin. Measurements
 /// on the discrete card (all experts offloaded to host): 1.70 GiB @ 11 s and
@@ -46,30 +46,33 @@ const ADMISSION_GRAPH_BYTES_PER_SECOND: u64 = 155 * 1024 * 1024;
 /// pack 36.7 GiB, ~1 GiB reserve -> (67 - 36.7 - 1) GiB / 155 MiB/s = 189 s.
 const NON_LEDGER_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Env override for the device-heap size on unified-memory hosts where ggml
-/// reports no discrete VRAM (gfx1151). The broker admits the graph against the
-/// live-free device heap, which is NOT derivable from system `MemAvailable`
-/// (the system-memory policy ceiling is ~114 GiB while the device heap is
-/// ~67 GiB). Set this to the observed heap size to enable the admission-side
-/// bound there; when unset, the policy bound alone applies as before.
+/// Env override for the device-heap size on unified-memory hosts (gfx1151).
+/// The automatic source is the amdgpu GTT total from sysfs; this knob wins
+/// when present and remains useful for profiling or for hosts where the GTT
+/// counter is unavailable. Invalid or non-positive values are ignored.
 const APU_DEVICE_HEAP_BYTES_ENV: &str = "OPENASR_NEMOTRON_DEVICE_HEAP_BYTES";
 
-/// Discrete-GPU target slice length. Unlike the APU path (where the 40% rule
-/// was tuned on gfx1151 with the larger quants), a discrete card's budget is
-/// solved in the opposite direction: pick the slice first, then load as many
-/// experts as fit alongside it. The env override exists so the same binary can
-/// profile the throughput/seam trade-off at different targets.
+/// Env override for the discrete-GPU slice target. When unset, the slice is
+/// derived from detected headroom instead of a fixed 20 s default, so larger
+/// cards get longer slices. The override still lets the same binary profile
+/// the throughput/seam trade-off at specific targets.
 const DISCRETE_TARGET_SLICE_SECONDS_ENV: &str = "OPENASR_NEMOTRON_TARGET_SLICE_SECONDS";
-const DEFAULT_DISCRETE_TARGET_SLICE_SECONDS: u64 = 20;
 
-/// The explicit slice target used by the discrete-GPU policy. Clamped to the
-/// family's bounds so a malformed override cannot create an invalid window.
-pub(crate) fn discrete_target_slice_seconds() -> u64 {
-    std::env::var(DISCRETE_TARGET_SLICE_SECONDS_ENV)
+/// Slice length used only to price the provisional offload budget before the
+/// headroom-derived cap is known. It is not a slice ceiling: on cards where
+/// the cap is smaller (10/12/16 GiB) the final slice is re-priced at the cap,
+/// and on larger cards the cap is what governs.
+pub(crate) const PROVISIONAL_PRICING_SLICE_SECONDS: u64 = 20;
+
+/// Explicit discrete-GPU slice target, when the env override is set. Clamped
+/// to the family's bounds so a malformed override cannot create an invalid
+/// window. `None` means "derive the slice from headroom".
+pub(crate) fn discrete_target_slice_override() -> Option<u64> {
+    let raw = std::env::var(DISCRETE_TARGET_SLICE_SECONDS_ENV).ok()?;
+    raw.trim()
+        .parse::<u64>()
         .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DISCRETE_TARGET_SLICE_SECONDS)
-        .clamp(MIN_SLICE_SECONDS, MAX_SLICE_SECONDS)
+        .map(|seconds| seconds.clamp(MIN_SLICE_SECONDS, MAX_SLICE_SECONDS))
 }
 
 /// Floor so a tiny detected budget still yields a usable slice; the family's
@@ -144,23 +147,49 @@ pub(crate) fn slice_seconds_from_device_budget(
     ))
 }
 
-/// Optional device-heap size for unified-memory hosts (see
+/// Optional device-heap override for unified-memory hosts (see
 /// `APU_DEVICE_HEAP_BYTES_ENV`). Invalid or non-positive values are ignored so
 /// a malformed override cannot produce a pathological slice.
-fn apu_device_heap_bytes() -> Option<u64> {
+fn apu_device_heap_override_bytes() -> Option<u64> {
     let raw = std::env::var(APU_DEVICE_HEAP_BYTES_ENV).ok()?;
     let bytes = raw.trim().parse::<u64>().ok()?;
     (bytes > 0).then_some(bytes)
 }
 
+/// Combine the GTT reading with host availability into the budget the unified
+/// slice policy prices against.
+///
+/// GTT is the GPU's mapping ceiling; host `MemAvailable` is the physical-RAM
+/// pressure signal. The tighter live-free figure binds, and the GTT total
+/// becomes the admission ceiling (the env override wins when present). This
+/// keeps the policy pack-aware in the GPU's real memory domain instead of
+/// charging it against total system RAM. With no GTT reading this reproduces
+/// the historical host-RAM behavior exactly.
+fn unified_memory_budget(
+    gtt: Option<(u64, u64)>,
+    host_available: Option<u64>,
+    heap_override: Option<u64>,
+) -> Option<(u64, Option<u64>)> {
+    let ceiling = heap_override.or_else(|| gtt.map(|(total, _)| total));
+    let available = match (gtt, host_available) {
+        (Some((total, used)), Some(available)) => Some((total.saturating_sub(used)).min(available)),
+        (Some((total, used)), None) => Some(total.saturating_sub(used)),
+        (None, available) => available,
+    }?;
+    Some((available, ceiling))
+}
+
 /// Derive the runtime slice length for the given backend.
 ///
-/// - discrete GPU: an explicit target (`discrete_target_slice_seconds`), solved
-///   jointly with expert residency in `offload.rs` so the two agree. The slice
-///   is an input, not a fraction of leftover headroom.
-/// - APU with unified memory (device reports no discrete VRAM, e.g. gfx1151)
-///   and CPU: available host memory and the 40% policy bound, which was tuned
-///   on gfx1151 with the larger quants and is deliberately left unchanged.
+/// - GPU and APU: one shared resolver in `offload.rs`, priced against the
+///   device's real memory domain (VRAM on a discrete card, GTT on a unified
+///   APU). Residency and slice are solved together, and with no explicit
+///   `discrete_target_slice_override()` the headroom-derived cap is the slice.
+/// - CPU: host RAM with the 40% policy bound.
+///
+/// The host-RAM/GTT budget remains only as a fallback for a GPU backend with
+/// no device-memory reading at all; without any cap a long clip would request
+/// one enormous graph that fails admission.
 pub(crate) fn runtime_slice_seconds(
     backend: GgmlCpuGraphBackend,
     tensor_index: &crate::ggml_runtime::GgufTensorIndex,
@@ -169,21 +198,17 @@ pub(crate) fn runtime_slice_seconds(
     match backend {
         GgmlCpuGraphBackend::Cpu => crate::host::host_available_memory_bytes()
             .map(|available| slice_seconds_from_budget(available, pack_bytes)),
-        _ => match device_vram_bytes(backend) {
-            Some(_) => super::offload::resolve_discrete_residency(backend, tensor_index)
-                .map(|plan| plan.slice_seconds),
-            // Unified-memory APU: ggml reports an IntegratedGpu, not a discrete
-            // GPU, so device_vram_bytes returns None. The encoder graph lives
-            // in system memory there, so size from host RAM instead. Without
-            // this fallback the cap is absent and a long clip requests one
-            // enormous graph that fails admission.
-            None => crate::host::host_available_memory_bytes().map(|available| {
-                slice_seconds_from_budget_with_admission(
-                    available,
-                    pack_bytes,
-                    apu_device_heap_bytes(),
+        _ => match super::offload::resolve_discrete_residency(backend, tensor_index) {
+            Some(plan) => Some(plan.slice_seconds),
+            None => {
+                let gtt = gtt_memory_bytes();
+                let host_available = crate::host::host_available_memory_bytes();
+                unified_memory_budget(gtt, host_available, apu_device_heap_override_bytes()).map(
+                    |(available, ceiling)| {
+                        slice_seconds_from_budget_with_admission(available, pack_bytes, ceiling)
+                    },
                 )
-            }),
+            }
         },
     }
 }
@@ -207,6 +232,7 @@ mod tests {
     // 232/220/189 s slices through the policy bound.
     const APU_MEM_AVAILABLE: u64 = 123 * 1024u64 * 1024 * 1024 + 50 * 1024 * 1024;
     const APU_DEVICE_HEAP: u64 = 67 * 1024u64 * 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
 
     #[test]
     fn small_card_gets_a_short_slice() {
@@ -312,6 +338,48 @@ mod tests {
                 slice_seconds_from_budget(APU_MEM_AVAILABLE, pack),
             );
         }
+    }
+
+    #[test]
+    fn unified_budget_prefers_the_tighter_of_gtt_and_host_free() {
+        let (available, ceiling) =
+            unified_memory_budget(Some((112 * GIB, 4 * GIB)), Some(123 * GIB), None)
+                .expect("budget");
+        assert_eq!(available, 108 * GIB);
+        assert_eq!(ceiling, Some(112 * GIB));
+    }
+
+    #[test]
+    fn unified_budget_override_wins_for_the_admission_ceiling() {
+        let (available, ceiling) =
+            unified_memory_budget(Some((112 * GIB, 0)), Some(123 * GIB), Some(67 * GIB))
+                .expect("budget");
+        assert_eq!(available, 112 * GIB);
+        assert_eq!(ceiling, Some(67 * GIB));
+    }
+
+    #[test]
+    fn unified_budget_without_gtt_preserves_host_only_behavior() {
+        let (available, ceiling) = unified_memory_budget(None, Some(123 * GIB), None).unwrap();
+        assert_eq!(available, 123 * GIB);
+        assert_eq!(ceiling, None);
+    }
+
+    /// On gfx1151 the GTT ceiling (112 GiB) is tighter than MemAvailable (123
+    /// GiB), so it must be the binding capacity: every quant is pack-aware and
+    /// the q8 slice is shorter than the old host-RAM-derived one.
+    #[test]
+    fn apu_gtt_budget_is_pack_aware_and_tighter_than_host_ram() {
+        let (available, ceiling) =
+            unified_memory_budget(Some((112 * GIB, 0)), Some(123 * GIB), None).expect("budget");
+        let q2 = slice_seconds_from_budget_with_admission(available, Q2_PACK, ceiling);
+        let q8 = slice_seconds_from_budget_with_admission(available, Q8_PACK, ceiling);
+        let old_q8 = slice_seconds_from_budget(123 * GIB, Q8_PACK);
+        assert!(q8 < q2, "q8 {q8} should be shorter than q2 {q2}");
+        assert!(
+            q8 < old_q8,
+            "GTT q8 {q8} should be shorter than host-RAM {old_q8}"
+        );
     }
 
     /// The extra admission bound must not change the discrete-GPU path: its

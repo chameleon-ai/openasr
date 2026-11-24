@@ -10,5 +10,5 @@ pub mod wer;
 pub use peak_rss::{
     ProcessMemorySnapshot, current_rss_bytes, peak_rss_bytes, process_memory_snapshot,
 };
-pub use vram::{VramPeakSampler, hip_vram_used_bytes};
+pub use vram::{VramPeakSampler, gtt_memory_bytes, hip_vram_used_bytes};
 pub use wer::{WerCounts, cer_counts, normalize_text, wer, wer_counts, word_prefix_error_rate};

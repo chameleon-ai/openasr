@@ -9,6 +9,10 @@
 //! the executor's context reports a meaningless near-zero occupancy even
 //! while the executor holds gigabytes of VRAM.
 //!
+//! [`gtt_memory_bytes`] reads the companion GTT counters. On unified-memory
+//! APUs the VRAM carveout is tiny (often 512 MiB) and the GPU allocates from
+//! GTT instead, so GTT is the capacity admission must be sized against.
+//!
 //! On non-Linux HIP builds `hipMemGetInfo` is the best available fallback.
 //! This module compiles everywhere; the probe returns `None` and the sampler
 //! is inert unless the `hip` feature is enabled, so harness code can call it
@@ -66,6 +70,68 @@ pub fn hip_vram_used_bytes() -> Option<u64> {
         }
     }
     any.then_some(total)
+}
+
+/// Total and in-use GTT (Graphics Translation Table) bytes reported by the
+/// Linux amdgpu driver, or `None` when the counters are unavailable.
+///
+/// On a unified-memory APU the small VRAM carveout is not the pool the GPU
+/// allocates from. GTT is the system-memory range the GPU can map, sized by
+/// `ttm.pages_limit` / `amdgpu.gttsize`; it is the capacity that bounds GPU
+/// admission there, not total system RAM. Values from all `cardN` devices are
+/// summed, matching [`hip_vram_used_bytes`]. On a machine with no amdgpu
+/// sysfs (non-Linux, or another vendor) this returns `None` and callers keep
+/// their previous behavior.
+pub fn gtt_memory_bytes() -> Option<(u64, u64)> {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    // Discover the sysfs counter paths once; card numbering is host-specific.
+    static COUNTERS: OnceLock<Vec<(PathBuf, PathBuf)>> = OnceLock::new();
+    let counters = COUNTERS.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let digits = name.strip_prefix("card")?;
+                if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                let device = entry.path().join("device");
+                let total = device.join("mem_info_gtt_total");
+                let used = device.join("mem_info_gtt_used");
+                (total.exists() && used.exists()).then_some((total, used))
+            })
+            .collect()
+    });
+    if counters.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut used = 0u64;
+    let mut any = false;
+    for (total_path, used_path) in counters {
+        let Ok(total_text) = std::fs::read_to_string(total_path) else {
+            continue;
+        };
+        let Ok(used_text) = std::fs::read_to_string(used_path) else {
+            continue;
+        };
+        let (Ok(total_bytes), Ok(used_bytes)) = (
+            total_text.trim().parse::<u64>(),
+            used_text.trim().parse::<u64>(),
+        ) else {
+            continue;
+        };
+        total = total.saturating_add(total_bytes);
+        used = used.saturating_add(used_bytes);
+        any = true;
+    }
+    any.then_some((total, used))
 }
 
 /// Non-Linux HIP builds fall back to the runtime query.
