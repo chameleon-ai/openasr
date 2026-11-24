@@ -813,6 +813,8 @@ impl DeviceMemoryBrokerSet {
                 policy_ceiling,
                 observed_ceiling,
                 available_bytes: policy_remaining,
+                binding_check: BudgetBindingCheck::Policy,
+                committed_scopes: committed_scope_summary(account),
             });
         }
         let generation = self
@@ -1292,6 +1294,12 @@ impl DeviceMemoryBrokerSet {
                     policy_ceiling,
                     observed_ceiling,
                     available_bytes,
+                    binding_check: if policy_ok {
+                        BudgetBindingCheck::Observed
+                    } else {
+                        BudgetBindingCheck::Policy
+                    },
+                    committed_scopes: committed_scope_summary(account),
                 });
             }
             account
@@ -2756,6 +2764,38 @@ impl Drop for MappingEnvelopeHandle {
     }
 }
 
+/// Which live ceiling rejected a candidate budget request. Kept small so the
+/// error type stays within the `result_large_err` budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBindingCheck {
+    Policy,
+    Observed,
+}
+
+impl std::fmt::Display for BudgetBindingCheck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy => "policy",
+            Self::Observed => "observed",
+        })
+    }
+}
+
+/// Compact, diagnostic-only attribution of a domain's committed ledger. Built
+/// only when formatting a budget error; it never feeds an admission decision.
+fn committed_scope_summary(account: &DomainAccount) -> Box<str> {
+    if account.by_scope.is_empty() {
+        return "none".into();
+    }
+    let mut parts: Vec<String> = account
+        .by_scope
+        .iter()
+        .map(|(scope, scoped)| format!("{scope:?}={}", scoped.committed_bytes))
+        .collect();
+    parts.sort();
+    parts.join(",").into_boxed_str()
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MemoryPlanningError {
     #[error("physical device key must not be empty")]
@@ -2811,7 +2851,7 @@ pub enum MemoryPlanningError {
         exclusive_pending_children: u32,
     },
     #[error(
-        "device memory budget exceeded for {domain} while reserving '{resource_id}': requested={requested_bytes}, available={available_bytes}, pending={pending_bytes}, committed={committed_bytes}, unreclaimable={unreclaimable_bytes}, policy_ceiling={policy_ceiling}, observed_ceiling={observed_ceiling}"
+        "device memory budget exceeded for {domain} while reserving '{resource_id}': requested={requested_bytes}, available={available_bytes}, pending={pending_bytes}, committed={committed_bytes}, unreclaimable={unreclaimable_bytes}, policy_ceiling={policy_ceiling}, observed_ceiling={observed_ceiling}, binding_check={binding_check}, committed_scopes={committed_scopes}"
     )]
     DeviceBudgetExceeded {
         domain: MemoryDomainKey,
@@ -2823,6 +2863,12 @@ pub enum MemoryPlanningError {
         policy_ceiling: u64,
         observed_ceiling: u64,
         available_bytes: u64,
+        /// Which live check actually rejected the candidate. The observed
+        /// ceiling is only diagnostic for file-backed residency.
+        binding_check: BudgetBindingCheck,
+        /// Per-scope committed bytes, so a Windows repro can attribute a
+        /// large committed total instead of seeing only the aggregate.
+        committed_scopes: Box<str>,
     },
     #[error(
         "provisional memory quote for {domain} ('{resource_id}') requires post-allocation reconciliation"
@@ -2909,6 +2955,29 @@ mod tests {
             total_bytes: 8 * GIB,
             confidence: MemoryObservationConfidence::DeviceSnapshot,
         }
+    }
+
+    #[test]
+    fn budget_error_names_binding_check_and_committed_scopes() {
+        let error = MemoryPlanningError::DeviceBudgetExceeded {
+            domain: domain(),
+            resource_id: "probe".to_owned(),
+            requested_bytes: 10,
+            pending_bytes: 0,
+            committed_bytes: 5,
+            unreclaimable_bytes: 0,
+            policy_ceiling: 8,
+            observed_ceiling: 7,
+            available_bytes: 3,
+            binding_check: BudgetBindingCheck::Policy,
+            committed_scopes: "NativeExecutionScopeId(1)=5".into(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("binding_check=policy"), "{text}");
+        assert!(
+            text.contains("committed_scopes=NativeExecutionScopeId(1)=5"),
+            "{text}"
+        );
     }
 
     fn request(

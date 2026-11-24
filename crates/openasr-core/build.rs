@@ -762,6 +762,9 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cuda");
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=cublas");
+        // ggml-cuda's FP8 kernels call cublasLt* directly (its CMake links
+        // CUDA::cublasLt), so a static CUDA link must supply it here too.
+        println!("cargo:rustc-link-lib=dylib=cublasLt");
         if let Some(cuda_path) = cuda_path.as_deref() {
             println!(
                 "cargo:rustc-link-search=native={}",

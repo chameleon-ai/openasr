@@ -2813,6 +2813,96 @@ mod tests {
     }
 
     #[test]
+    fn volatile_free_bytes_do_not_make_a_quote_stale() {
+        let device = std::ptr::dangling_mut::<std::ffi::c_void>();
+        let total = 16 * GIB;
+        let quote_free = 2 * GIB;
+        let generation =
+            crate::ggml_runtime::backend_memory::stats_generation(device, quote_free, total);
+        let identity = identity("cpu:volatile-free");
+        let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);
+        let quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: generation,
+            ..Default::default()
+        };
+        let claims = [claim(
+            1,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            GIB,
+            0,
+            GIB,
+            GIB,
+        )];
+        // Simulate a Windows live-RAM read between quote() and stats(): the
+        // regime is identical, only the free-byte count moved.
+        let fresh = stats(native_domain, generation, quote_free - 1, total);
+        let metadata = BTreeMap::from([(1, semantics("volatile", PhaseSet::ALL))]);
+        let shared = semantics("shared", PhaseSet::ALL);
+        let built = build_from_views(&[view(
+            "volatile-free",
+            &identity,
+            &quote,
+            &claims,
+            &[fresh],
+            &metadata,
+            &shared,
+        )])
+        .expect("a free-byte change must not invalidate the quote");
+        // Capacity still comes from the fresh stats, not the quote.
+        assert_eq!(built.requests[0].snapshot.free_bytes, quote_free - 1);
+    }
+
+    #[test]
+    fn changed_capacity_still_fails_closed_with_a_regime_generation() {
+        let device = std::ptr::dangling_mut::<std::ffi::c_void>();
+        let total = 16 * GIB;
+        let identity = identity("cpu:changed-capacity");
+        let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);
+        let quote = ffi::GgmlBackendMemoryQuoteV1 {
+            struct_size: mem::size_of::<ffi::GgmlBackendMemoryQuoteV1>() as u32,
+            stats_generation: crate::ggml_runtime::backend_memory::stats_generation(
+                device, 0, total,
+            ),
+            ..Default::default()
+        };
+        let claims = [claim(
+            1,
+            native_domain,
+            ffi::GGML_BACKEND_MEMORY_CLAIM_EXACT,
+            GIB,
+            0,
+            GIB,
+            GIB,
+        )];
+        let fresh = stats(
+            native_domain,
+            crate::ggml_runtime::backend_memory::stats_generation(device, 0, total - 1),
+            2 * GIB,
+            total - 1,
+        );
+        let metadata = BTreeMap::from([(1, semantics("capacity", PhaseSet::ALL))]);
+        let shared = semantics("shared", PhaseSet::ALL);
+        let result = build_from_views(&[view(
+            "changed-capacity",
+            &identity,
+            &quote,
+            &claims,
+            &[fresh],
+            &metadata,
+            &shared,
+        )]);
+        assert!(
+            matches!(
+                result,
+                Err(NativeMemoryAdmissionError::StaleStatsGeneration { .. })
+            ),
+            "a changed device capacity must remain stale"
+        );
+    }
+
+    #[test]
     fn same_group_repeated_domain_observations_use_max_high_water() {
         let identity = identity("cpu:repeat");
         let native_domain = domain(ffi::GGML_BACKEND_MEMORY_DOMAIN_HOST_PAGEABLE, 0, [0; 16]);

@@ -228,21 +228,41 @@ impl BackendMemoryAbiError {
 //   see Unknown, i.e. fail-closed admission, rather than a silent total.
 static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Stats generation derived from the device's reported accounting tuple.
-/// Identical snapshots yield identical generations; any device-side movement
-/// (or a move between measured and unmeasurable) changes it. Deterministic
-/// reads (e.g. Linux CPU, which always reports free == total) keep one
-/// stable generation, which the admission layer requires between a quote and
-/// the stats sampled from it.
-fn stats_generation(free: u64, total: u64) -> u64 {
+/// Generation reported when no device memory observation is available. Kept
+/// distinct from every measured regime so a measured/unmeasurable transition
+/// between quote and stats fails closed.
+const UNMEASURABLE_STATS_GENERATION: u64 = 1;
+
+/// Generation identifying the *measurement regime* of a native stats snapshot:
+/// the concrete device, its reported total capacity, and whether the device was
+/// measurable at all. It deliberately excludes `free`: Windows CPU ggml reports
+/// live `ullAvailPhys` and CUDA reports live free VRAM, both of which move
+/// between a quote and the stats sampled immediately afterwards. Hashing those
+/// bytes made every quote stale under ordinary background activity.
+///
+/// Capacity still comes from the separately fetched fresh statistics and is
+/// enforced by the broker; the epoch only binds the two observations to the
+/// same device and regime. This is the contract in
+/// docs/design/decoder-state-memory-planning.md: the quote generation is an
+/// epoch for provider state that can invalidate layout/cost derivation, not a
+/// hash of live used/free bytes.
+pub(crate) fn stats_generation(device: ffi::GgmlBackendDevRaw, _free: u64, total: u64) -> u64 {
+    let measurable = u64::from(total != 0);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for value in [free, total, 1] {
+    for value in [device as u64, total, measurable] {
         for byte in value.to_le_bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-    hash | 1
+    let generation = hash | 1;
+    // `0` is the "unknown" sentinel in receipts; `1` is reserved for the
+    // unmeasurable regime above. Never emit either from a measured snapshot.
+    if generation == UNMEASURABLE_STATS_GENERATION {
+        UNMEASURABLE_STATS_GENERATION + 2
+    } else {
+        generation
+    }
 }
 
 fn next_request_id() -> u64 {
@@ -443,7 +463,7 @@ impl BackendMemoryAbi {
         }
         let device_kind = self.device_kind();
         let domain = domain_id_for_device(device_kind, self.device);
-        let generation = stats_generation(free, total);
+        let generation = stats_generation(self.device, free, total);
         let claims = requests
             .iter()
             .map(|request| ffi::GgmlBackendMemoryClaimV1 {
@@ -499,7 +519,7 @@ impl BackendMemoryAbi {
             struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryStatsV1>() as u32,
             flags: 0,
             domain,
-            generation: 1,
+            generation: UNMEASURABLE_STATS_GENERATION,
             timestamp_monotonic_ns: monotonic_ns(),
             total_bytes: 0,
             budget_bytes: 0,
@@ -531,7 +551,7 @@ impl BackendMemoryAbi {
                 budget_bytes: 0,
                 device_used_bytes: total.saturating_sub(free),
                 device_free_bytes: free,
-                generation: stats_generation(free, total),
+                generation: stats_generation(self.device, free, total),
                 ..base
             },
             Err(_) => ffi::GgmlBackendMemoryStatsV1 {
@@ -1304,6 +1324,31 @@ mod tests {
             backend_owned_high_water_bytes: 45,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stats_generation_ignores_volatile_free_bytes() {
+        let device = std::ptr::dangling_mut::<std::ffi::c_void>();
+        let total = 32 * 1024 * 1024 * 1024u64;
+        let free = 2 * 1024 * 1024 * 1024u64;
+        // Two live reads one byte apart, plus the deterministic Linux CPU case
+        // where ggml reports free == total. All three must share one epoch.
+        let quoted = stats_generation(device, free, total);
+        assert_eq!(quoted, stats_generation(device, free + 1, total));
+        assert_eq!(quoted, stats_generation(device, total, total));
+        assert_ne!(quoted, UNMEASURABLE_STATS_GENERATION);
+        assert_eq!(quoted & 1, 1);
+    }
+
+    #[test]
+    fn stats_generation_changes_only_with_the_measurement_regime() {
+        let device = std::ptr::dangling_mut::<std::ffi::c_void>();
+        let other_device = (device as usize + 8) as *mut std::ffi::c_void;
+        let total = 32 * 1024 * 1024 * 1024u64;
+        let base = stats_generation(device, 0, total);
+        assert_ne!(base, stats_generation(device, 0, total - 1));
+        assert_ne!(base, stats_generation(device, 0, 0));
+        assert_ne!(base, stats_generation(other_device, 0, total));
     }
 
     #[test]
