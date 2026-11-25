@@ -12217,6 +12217,56 @@ fn measure_context_buffer_chunks(
     pack_context_buffer_chunks(alignment, max_size, sizes)
 }
 
+/// Tensor groups matching `measure_context_buffer_chunks`, for buffer types
+/// whose `get_max_size` bounds one native allocation (Vulkan). ggml's own
+/// `ggml_backend_alloc_ctx_tensors_from_buft` splits on those boundaries, but
+/// the skip-aware path binds by name and has to reproduce the grouping here.
+fn group_context_tensors_for_chunks(
+    context: NonNull<c_void>,
+    buft: NonNull<c_void>,
+    skip: Option<&LoadedWeightSkipSpec>,
+) -> Result<Vec<Vec<NonNull<c_void>>>, GgmlCpuGraphError> {
+    let alignment = unsafe { ffi::ggml_backend_buft_get_alignment(buft.as_ptr()) }.max(1);
+    let max_size = unsafe { openasr_ggml_backend_buft_get_max_size(buft.as_ptr()) }.max(1);
+    let mut groups: Vec<Vec<NonNull<c_void>>> = Vec::new();
+    let mut current: Vec<NonNull<c_void>> = Vec::new();
+    let mut current_bytes = 0usize;
+    let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.as_ptr()) };
+    while let Some(tensor) = NonNull::new(tensor_raw) {
+        let name = unsafe { cstr_lossy(ffi::ggml_get_name(tensor.as_ptr())) };
+        let skipped = skip.is_some_and(|spec| spec.contains(name.as_str()));
+        let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
+        if !skipped && layout.data.is_null() && layout.view_src.is_null() {
+            let alloc_size =
+                unsafe { openasr_ggml_backend_buft_get_alloc_size(buft.as_ptr(), tensor.as_ptr()) };
+            let padded = alloc_size
+                .checked_add(alignment - 1)
+                .and_then(|bytes| bytes.checked_div(alignment))
+                .and_then(|blocks| blocks.checked_mul(alignment))
+                .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/group",
+                    reason: "tensor allocation size overflowed".to_owned(),
+                })?;
+            if !current.is_empty() && current_bytes.saturating_add(padded) > max_size {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes = current_bytes.checked_add(padded).ok_or_else(|| {
+                GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/group",
+                    reason: "chunk byte sum overflowed".to_owned(),
+                }
+            })?;
+            current.push(tensor);
+        }
+        tensor_raw = unsafe { ffi::ggml_get_next_tensor(context.as_ptr(), tensor.as_ptr()) };
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
+
 /// Walks every tensor in `context` in declaration order and binds the ones
 /// ggml has not already allocated (fresh leaves) or view-initialized (fresh
 /// views) into `buffer`. Mirrors the four-way dispatch
@@ -13093,6 +13143,10 @@ enum GgmlBackendBufferOwnership {
 
 struct GgmlBackendBufferGuard {
     ownership: GgmlBackendBufferOwnership,
+    /// Additional chunks of one logical buffer for buffer types with a bounded
+    /// max size (notably Vulkan). The first chunk is `ownership`; these owners
+    /// keep the remaining native buffers and their reservations alive.
+    extra: Vec<GgmlBackendBufferGuard>,
 }
 
 impl GgmlBackendBufferGuard {
@@ -13205,6 +13259,9 @@ impl GgmlBackendBufferGuard {
             GgmlBackendBufferOwnership::Direct(_) => {}
             GgmlBackendBufferOwnership::Admitted(allocation) => allocation.record_receipt_reuse(),
         }
+        for extra in &self.extra {
+            extra.record_receipt_reuse();
+        }
     }
 
     fn raw(&self) -> NonNull<c_void> {
@@ -13235,39 +13292,6 @@ impl GgmlBackendBufferGuard {
             reason: format!("negative or out-of-range buffer usage {usage}"),
         })?;
         let chunks = measure_context_buffer_chunks(context, buft, skip)?;
-        let skip_total = chunks
-            .iter()
-            .try_fold(0usize, |sum, chunk| sum.checked_add(chunk.requested_bytes))
-            .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
-                operation: "context-buffer/measure",
-                reason: "context buffer chunk bytes overflowed usize".to_owned(),
-            })?;
-        let native_allocate = || {
-            if let Some(skip) = skip {
-                // Skipped tensors are left unbound; allocate only the
-                // non-skipped bytes and bind exactly those tensors.
-                let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), skip_total) };
-                let raw = NonNull::new(raw)
-                    .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
-                unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
-                bind_unallocated_context_tensors(context, raw, Some(skip))?;
-                Ok(GgmlRawBackendBufferGuard {
-                    raw,
-                    released: false,
-                })
-            } else {
-                let raw = unsafe {
-                    ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr())
-                };
-                let raw = NonNull::new(raw)
-                    .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
-                unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
-                Ok(GgmlRawBackendBufferGuard {
-                    raw,
-                    released: false,
-                })
-            }
-        };
         let mut request_semantics = BTreeMap::new();
         let mut requests = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.into_iter().enumerate() {
@@ -13304,15 +13328,96 @@ impl GgmlBackendBufferGuard {
                 },
             );
         }
-        allocate_native_buffers_with_admission(
-            "context-buffer",
-            backend,
-            requests,
-            request_semantics,
-            semantics,
-            true,
-            native_allocate,
-        )
+        if let Some(skip) = skip {
+            // Skipped tensors are left unbound. Bind the remaining ones in
+            // chunks that respect the buffer type's max size (1 GiB on RADV);
+            // a single skipped-weight buffer would exceed Vulkan's per-buffer
+            // limit even though the card has free VRAM.
+            let groups = group_context_tensors_for_chunks(context, buft, Some(skip))?;
+            if groups.len() != requests.len() {
+                return Err(GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/group",
+                    reason: format!(
+                        "measured {} chunks but grouped {} tensor ranges",
+                        requests.len(),
+                        groups.len()
+                    ),
+                });
+            }
+            let mut guards = Vec::with_capacity(groups.len());
+            for (request, tensors) in requests.iter().zip(groups) {
+                let chunk_semantics = request_semantics.get(&request.request_id).cloned().ok_or(
+                    GgmlCpuGraphError::MemoryAdmission {
+                        operation: "context-buffer/group",
+                        reason: format!("missing semantics for chunk {}", request.request_id),
+                    },
+                )?;
+                let guard = allocate_native_buffer_with_admission(
+                    "context-buffer",
+                    backend,
+                    *request,
+                    chunk_semantics,
+                    true,
+                    || {
+                        let mut tensor_array: Vec<ffi::GgmlTensorRaw> =
+                            tensors.iter().map(|tensor| tensor.as_ptr()).collect();
+                        let tensor_count = c_int::try_from(tensor_array.len()).map_err(|_| {
+                            GgmlCpuGraphError::MemoryAdmission {
+                                operation: "context-buffer/group",
+                                reason: "chunk tensor count exceeds c_int".to_owned(),
+                            }
+                        })?;
+                        let raw = unsafe {
+                            ffi::ggml_backend_buft_alloc_buffer_n(
+                                buft.as_ptr(),
+                                tensor_array.as_mut_ptr(),
+                                tensor_count,
+                            )
+                        };
+                        let raw = NonNull::new(raw).ok_or_else(|| {
+                            backend_buffer_allocation_failure(backend_name(backend))
+                        })?;
+                        unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
+                        Ok(GgmlRawBackendBufferGuard {
+                            raw,
+                            released: false,
+                        })
+                    },
+                )?;
+                guards.push(guard);
+            }
+            let mut guards = guards.into_iter();
+            let mut guard = guards
+                .next()
+                .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "context-buffer/group",
+                    reason: "no context buffer chunks were allocated".to_owned(),
+                })?;
+            guard.extra.extend(guards);
+            Ok(guard)
+        } else {
+            let native_allocate = || {
+                let raw = unsafe {
+                    ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr())
+                };
+                let raw = NonNull::new(raw)
+                    .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
+                unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
+                Ok(GgmlRawBackendBufferGuard {
+                    raw,
+                    released: false,
+                })
+            };
+            allocate_native_buffers_with_admission(
+                "context-buffer",
+                backend,
+                requests,
+                request_semantics,
+                semantics,
+                true,
+                native_allocate,
+            )
+        }
     }
 
     /// Admits and allocates a host-resident (CPU buffer type) WEIGHTS buffer that
@@ -13537,6 +13642,7 @@ fn allocate_native_buffers_with_admission(
         {
             return native_allocate().map(|owner| GgmlBackendBufferGuard {
                 ownership: GgmlBackendBufferOwnership::Direct(owner),
+                extra: Vec::new(),
             });
         }
         #[cfg(not(test))]
@@ -13583,6 +13689,7 @@ fn allocate_native_buffers_with_admission(
         })?;
     Ok(GgmlBackendBufferGuard {
         ownership: GgmlBackendBufferOwnership::Admitted(allocation),
+        extra: Vec::new(),
     })
 }
 
