@@ -75,6 +75,24 @@ pub(crate) const NEMOTRON_TRANSCRIBE_SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.5;
 
 const NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS: usize = 640;
 
+/// Quantisation bucket for the resident KV span. The decoder-state planner
+/// sizes its reserve span from the request's envelope, so an 11 s and a 13 s
+/// clip differ by a few positions. Without bucketing, two files in one process
+/// get different actor keys and build a second pack-wide runtime while the
+/// first is still resident -- on a 10 GB card that second context buffer cannot
+/// be admitted. One bucket adds at most 255 KV positions (a few MB) and keeps
+/// ordinary short clips on one runtime.
+const NEMOTRON_TRANSCRIBE_KV_SPAN_BUCKET: usize = 256;
+
+fn stable_kv_span(required_span: usize) -> usize {
+    required_span
+        .max(NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS)
+        .saturating_add(NEMOTRON_TRANSCRIBE_KV_SPAN_MARGIN)
+        .saturating_add(NEMOTRON_TRANSCRIBE_KV_SPAN_BUCKET - 1)
+        / NEMOTRON_TRANSCRIBE_KV_SPAN_BUCKET
+        * NEMOTRON_TRANSCRIBE_KV_SPAN_BUCKET
+}
+
 /// Recovery ladder for a temperature-0 decode cut short by the repeat guard
 /// or stripped to empty. One rung at 0.4 is the default: it is the only
 /// configuration that recovered real speech on both bonnie and mikan without
@@ -528,28 +546,24 @@ impl NemotronTranscribeGgmlExecutor {
         backend: GgmlCpuGraphBackend,
         required_span: usize,
     ) -> Result<NemotronTranscribeUnifiedRuntimeActor, NemotronTranscribeGgmlExecutorError> {
+        let stable_span = stable_kv_span(required_span);
         let key = NemotronTranscribeUnifiedRuntimeCacheKey {
             content: PackContentKey::for_runtime_source(&preflight.runtime_source),
             lane: current_execution_lane_key(backend),
-            required_span,
+            required_span: stable_span,
         };
         let quote_preflight = preflight.clone();
         self.unified_runtimes.checkout_or_try_build_with(
             key,
-            move || Ok((0, (quote_preflight, required_span, backend))),
-            move |(preflight, required_span, backend)| {
-                NemotronTranscribePreparedRuntime::build(
-                    &preflight,
-                    backend,
-                    required_span
-                        .max(NEMOTRON_TRANSCRIBE_MIN_KV_POSITIONS)
-                        .saturating_add(NEMOTRON_TRANSCRIBE_KV_SPAN_MARGIN),
+            move || Ok((0, (quote_preflight, stable_span, backend))),
+            move |(preflight, decoder_span, backend)| {
+                NemotronTranscribePreparedRuntime::build(&preflight, backend, decoder_span).map(
+                    |prepared| {
+                        SystemMemoryOwner::without_allocation(NemotronTranscribeUnifiedRuntime {
+                            prepared,
+                        })
+                    },
                 )
-                .map(|prepared| {
-                    SystemMemoryOwner::without_allocation(NemotronTranscribeUnifiedRuntime {
-                        prepared,
-                    })
-                })
             },
             Self::map_unified_actor_error,
         )
@@ -1247,6 +1261,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn short_clip_spans_share_one_resident_runtime_bucket() {
+        // 11 s and 13 s clips differ by a few KV rows. They must map to one
+        // bucket so a second file in one process reuses the first runtime
+        // instead of building a second pack-wide runtime on the same GPU.
+        let short = stable_kv_span(700);
+        let longer = stable_kv_span(725);
+        assert_eq!(short, longer);
+        assert!(short >= 700 + NEMOTRON_TRANSCRIBE_KV_SPAN_MARGIN);
+        assert_eq!(short % NEMOTRON_TRANSCRIBE_KV_SPAN_BUCKET, 0);
+        assert_eq!(stable_kv_span(1), 768);
+    }
 
     #[test]
     fn scaffolding_strip_removes_event_and_metadata_tags() {
