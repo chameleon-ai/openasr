@@ -69,6 +69,44 @@ pass it today.
 | Resident pool reuse across requests (weights stay resident) | Supported | `NemotronTranscribeGgmlExecutor` owns an `AdmittedPinnedRuntimeActorCheckoutPool` keyed by `(pack content, ExecutionLaneKey, required_span)` with limits 4 idle entries / 2 instances per key; the unified runtime (tokenizer, mmap'd embedding table, encoder+decoder sessions, KV/SSM/conv arenas) is leased per request and returned to the pool; the actor worker thread keeps every native context. `evict_prepared_runtime_content_id` evicts idle actors per pack; `unload_idle_state` drops them all. K2/K3 audit gates pass; `resident_runtime_audit` green. KV/SSM/conv arena reuse within a request AND across requests both exercised. |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Graphs are built with explicit `cont` calls at layout boundaries (e.g. SSM `zxBCdt` slicing, KV row writes, debug-free tap-free outputs); no audit pass has recorded the reasons per node. Unlock: graph review enumerating every `cont` and why the input could not be consumed strided. |
 | Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Supported (CPU); not applicable (HIP) | Measured on the Strix Halo bench host (2026-11-18, quiet, sha-bound to the published packs): ad_q2_0_m peak RSS 18.3 GB / HIP 15.1 GB; ad_iq4_nl 24.0 / 20.4; q8_0 38.2 / 34.7. Weights alone match (card: 15.2 / 21.3 / 36.7 GB); no excess observed. Catalog RAM requirement should cite these peaks at flip time. HIP VRAM not separately attributed (unified GTT). |
+| Dead-weight skip (unused pack tensors excluded from the loaded weight context) | Supported by wiring + Linux unit tests; CUDA/HIP hardware placement not measured | `token_embd.weight` and the dense `blk.52.*` tensors are never looked up by a ggml graph; see the detailed note below. |
+
+### Dead-weight skip: rationale and the MTP dependency
+
+The runtime now omits two tensor groups from the loaded ggml weight context even
+though they remain in the `.oasr` pack and index:
+
+- `token_embd.weight` (374,341,632 B in the AD tiers). The decoder does not
+  bind this weight into a graph. `MappedTokenEmbeddingTable` gathers the needed
+  rows directly from the mapped GGUF, and `upload_embeddings` supplies the
+  resulting vectors as a graph input. The data is used; the ggml binding was
+  redundant.
+- Dense `blk.52.*` tensors (~52 MB: attention projections, norms, shared-expert
+  projections, `nextn.eh_proj`). The decoder topology has exactly 52 blocks
+  (`BLOCK_TYPES`, indices 0..=51); block 52 is the MTP/NextN speculative drafter
+  and is outside the trunk. Its two *expert* tensors
+  (`ffn_up_exps.weight` / `ffn_down_exps.weight`) are deliberately **not**
+  skipped: the VRAM-derived offload policy already moves them to host memory
+  first, where they cost nothing at runtime.
+
+The pack is unchanged. `validate_runtime_pack_contract` checks the tensor index
+(count, dims and pinned names) and never inspects the loaded context, so skipping
+a binding at load time remains contract-valid. The skip set participates in the
+loaded-weight owner-cache fingerprint, so a cached full load cannot be reused for
+a skipped load; skipped names are also excluded from buffer sizing and binding,
+and their bytes are subtracted in `offload::pack_weight_bytes` so the slice and
+offload planner budgets the bytes the runtime actually has to place. Any future
+graph lookup of a skipped name fails closed with a typed missing-weight error
+rather than reading dead memory.
+
+**MTP warning (must be addressed explicitly):** if speculative / NextN decoding
+is implemented for this family, block 52 stops being dead. The MTP drafter will
+need its dense `blk.52.*` weights and likely the embedding table, so the skip
+list in `offload::skipped_weight_names` must be reduced accordingly and the
+cache-fingerprint, planner-footprint and missing-weight tests updated in the same
+change. Do not treat the skip list as a permanent property of the pack; it is a
+statement about today's greedy-only decoder. The audit verdict for speculative
+decode stays **Deferred**.
 
 ## 4. Decode algorithms
 
