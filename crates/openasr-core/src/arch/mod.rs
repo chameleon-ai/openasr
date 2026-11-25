@@ -113,8 +113,12 @@ const DOLPHIN_EXECUTION_CAPABILITIES: ExecutionCapabilities = ExecutionCapabilit
 /// (W < policy ceiling) and would always win the candidate walk, leaving the
 /// context buffer with no headroom exactly when it is needed; with 0
 /// offloaded tensors the Hybrid lane behaves the same as FullDevice anyway.
-/// Other providers keep the all-device placement because the offload path is
-/// validated on HIP only.
+/// CUDA declares the same Hybrid lane, so both 16 GB-class providers keep
+/// headroom for the context buffer. The mechanism is provider-generic (VRAM
+/// query, expert selection, host buffer and scheduler CPU fallback); Metal and
+/// Vulkan keep the all-device placement. Hardware evidence exists on HIP only
+/// so far, so the CUDA route still needs qualification on real hardware before
+/// any capability claim is made.
 const NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES: ExecutionCapabilities =
     ExecutionCapabilities::new(true)
         .with_provider(
@@ -123,7 +127,7 @@ const NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES: ExecutionCapabilities =
         )
         .with_provider(
             ExecutionProvider::Cuda,
-            AcceleratedPlacementCapabilities::FULL_DEVICE,
+            AcceleratedPlacementCapabilities::HYBRID,
         )
         .with_provider(
             ExecutionProvider::Hip,
@@ -3491,8 +3495,9 @@ const BUILTIN_ARCHITECTURE_DESCRIPTORS: &[OpenAsrArchitectureDescriptor] = &[
                 >,
             execution_capability: GgmlExecutionCapability::DedicatedRuntimeExecutorV1,
             // The 30B MoE trunk sits at the edge of 16 GB-class VRAM, so HIP
-            // runs the VRAM-derived Hybrid split; other providers keep the
-            // all-device placement. See the constant's doc for the reasoning.
+            // runs the VRAM-derived Hybrid split; CUDA declares the same lane,
+            // while Metal and Vulkan keep the all-device placement. See the
+            // constant's doc for the reasoning.
             execution_capabilities: NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES,
             phrase_bias: OpenAsrPhraseBiasStrategy::Unsupported,
             // The upstream model CAN translate speech ("Translate the audio into
@@ -3640,12 +3645,13 @@ mod tests {
                 ExecutionProvider::Hip,
                 ExecutionProvider::Vulkan,
             ] {
+                let nemotron_hybrid = descriptor.identity.model_architecture
+                    == NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID
+                    && matches!(provider, ExecutionProvider::Hip | ExecutionProvider::Cuda);
                 let hybrid_only = (descriptor.identity.model_architecture
                     == MOONSHINE_GGML_ARCHITECTURE_ID
                     && provider == ExecutionProvider::Vulkan)
-                    || (descriptor.identity.model_architecture
-                        == NEMOTRON_TRANSCRIBE_GGML_ARCHITECTURE_ID
-                        && provider == ExecutionProvider::Hip);
+                    || nemotron_hybrid;
                 let qualified_fallback = descriptor.identity.model_architecture
                     == DOLPHIN_GGML_ARCHITECTURE_ID
                     && provider == ExecutionProvider::Vulkan;
@@ -3676,6 +3682,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nemotron_declares_cuda_hybrid_by_default() {
+        use crate::device::execution_policy::ExecutionPlacement;
+
+        assert!(
+            NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES
+                .supports(ExecutionProvider::Cuda, ExecutionPlacement::Hybrid,),
+            "CUDA must use the VRAM-derived Hybrid lane"
+        );
+        assert!(
+            !NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES
+                .supports(ExecutionProvider::Cuda, ExecutionPlacement::FullDevice,),
+            "FullDevice would win the candidate walk and leave no context headroom"
+        );
+        // HIP stays Hybrid-only; Metal and Vulkan keep the all-device lane.
+        assert!(
+            NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES
+                .supports(ExecutionProvider::Hip, ExecutionPlacement::Hybrid,)
+        );
+        assert!(
+            NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES
+                .supports(ExecutionProvider::Metal, ExecutionPlacement::FullDevice,)
+        );
+        assert!(
+            NEMOTRON_TRANSCRIBE_EXECUTION_CAPABILITIES
+                .supports(ExecutionProvider::Vulkan, ExecutionPlacement::FullDevice,)
+        );
     }
 
     #[test]

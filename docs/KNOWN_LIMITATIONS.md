@@ -27,7 +27,10 @@ for the code map and [Roadmap](ROADMAP.md) for development priorities.
   fallback (down from ~16.2 GB on the all-device path, which silently fell back
   to CPU). The full-context, single-segment (whole-recording) path still cannot
   fit on a discrete card. The CPU lane remains the general fallback and
-  transcribes the JFK fixture verbatim for all three quants.
+  transcribes the JFK fixture verbatim for all three quants. CUDA declares the
+  same Hybrid lane by default, but has no CUDA hardware receipt yet. The planner
+  predicts both AD tiers fit a 10 GB card with 23 of 24 expert blocks offloaded
+  at a 10-11 s slice; this is arithmetic, not a hardware measurement.
 - `GET /v1/models` and other served-identity listings verify GGUF metadata
   and the CAS path digest of the bound pack. They do not re-hash a multi-GB
   object on every read. Full-file integrity is `openasr model-pack verify`.

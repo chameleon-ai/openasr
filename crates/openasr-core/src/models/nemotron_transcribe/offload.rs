@@ -560,6 +560,69 @@ mod tests {
         );
     }
 
+    /// Helper for the discrete-card sizing cases: after all selected experts
+    /// are offloaded, what must still be resident on the device?
+    fn post_offload_footprint(
+        pack: u64,
+        total: u64,
+        desktop: u64,
+        seconds: u64,
+        layer_bytes: &dyn Fn(usize) -> Option<u64>,
+    ) -> (u64, u64, usize) {
+        let free = total.saturating_sub(desktop);
+        let ceiling = binding_ceiling(total, free).expect("ceiling");
+        let budget =
+            resolve_offload_budget(total, free, pack, ADMISSION_SAFETY_MARGIN_BYTES, seconds)
+                .expect("budget");
+        let chosen = plan_offload_layers(budget, layer_bytes);
+        let offloaded: u64 = chosen.iter().filter_map(|b| layer_bytes(*b)).sum();
+        assert!(offloaded > 0);
+        let resident = pack.saturating_sub(offloaded);
+        let required = resident
+            .saturating_add(CONTEXT_AND_STATE_FOOTPRINT_BYTES)
+            .saturating_add(graph_footprint_bytes(seconds))
+            .saturating_add(ADMISSION_SAFETY_MARGIN_BYTES);
+        (required, ceiling, chosen.len())
+    }
+
+    /// In the IQ4 tier every expert block uses IQ4-sized tensors.
+    /// `recon_layer_bytes` models the Q2 tier (17 Q2 blocks + 7 IQ4 blocks);
+    /// using it for IQ4_PACK undercounts offloadable experts by 6.1 GB.
+    fn iq4_layer_bytes(block: usize) -> Option<u64> {
+        MOE_BLOCK_OFFLOAD_ORDER
+            .contains(&block)
+            .then_some(IQ4_NL_LAYER_BYTES)
+    }
+
+    /// The Windows report's 10 GB card: both published AD tiers fit at a 10 s
+    /// slice with 23 of 24 expert blocks offloaded. Their dense payload is the
+    /// same 4,107,332,096 B; only the expert tensor sizes differ.
+    #[test]
+    fn ten_gib_card_fits_both_ad_quants_after_experts_are_offloaded() {
+        let total = 10_239u64 * 1024 * 1024;
+        let desktop = 1_476u64 * 1024 * 1024;
+        for (name, pack, layers) in [
+            (
+                "ad_q2_0_m",
+                Q2_PACK,
+                &recon_layer_bytes as &dyn Fn(usize) -> Option<u64>,
+            ),
+            (
+                "ad_iq4_nl",
+                IQ4_PACK,
+                &iq4_layer_bytes as &dyn Fn(usize) -> Option<u64>,
+            ),
+        ] {
+            let (required, ceiling, count) =
+                post_offload_footprint(pack, total, desktop, 10, layers);
+            assert_eq!(count, MOE_BLOCK_OFFLOAD_ORDER.len() - 1, "{name}");
+            assert!(
+                required <= ceiling,
+                "{name}: resident + graph + context + margin {required} exceeded {ceiling}"
+            );
+        }
+    }
+
     #[test]
     fn iq4_nl_layers_only_after_every_q2_0_layer() {
         // blk.52 + all 17 Q2_0 layers = 6,824,853,504 B; one byte more takes
