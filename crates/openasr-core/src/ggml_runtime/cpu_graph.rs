@@ -2638,11 +2638,19 @@ enum GgmlWeightMaterialization {
     },
     /// Device-copy with a host-resident split: the non-offloaded tensors live in
     /// `_device_buffer` (WEIGHTS, on the selected GPU backend) and the offloaded
-    /// tensors live in `_host_buffer` (WEIGHTS, CPU buffer type).
+    /// tensors live in `_host_buffer` (WEIGHTS, CPU buffer type). When the host
+    /// half could be imported from the already-open pack mapping, `_mmap`,
+    /// `_pack_weight_residency` and `offload_names` let the per-tensor binding
+    /// point at the mapping instead of an anonymous host copy.
     DeviceCopiedSplit {
         lane: crate::models::native_execution_services::ExecutionLaneKey,
         _device_buffer: GgmlBackendBufferGuard,
-        _host_buffer: GgmlBackendBufferGuard,
+        // Boxed so the three-buffer split variant does not dominate the enum
+        // layout for every materialization kind.
+        _host_buffer: Box<GgmlBackendBufferGuard>,
+        _mmap: Option<std::sync::Arc<Mmap>>,
+        _pack_weight_residency: Option<PackWeightResidencyHandle>,
+        offload_names: std::collections::HashSet<String>,
     },
 }
 
@@ -2707,6 +2715,27 @@ impl GgmlWeightMaterialization {
         match self {
             Self::HostImported { _mmap, .. } => Some(_mmap),
             Self::DeviceCopied { .. } | Self::DeviceCopiedSplit { .. } => None,
+        }
+    }
+
+    /// Host half of a split that was bound from the pack mapping: the buffer,
+    /// mapping base and exact tensor names that belong to it. Other tensors in
+    /// the same pack still take the device-copy path in the loader.
+    fn host_offload_mmap_binding(
+        &self,
+    ) -> Option<(
+        NonNull<c_void>,
+        *const u8,
+        &std::collections::HashSet<String>,
+    )> {
+        match self {
+            Self::DeviceCopiedSplit {
+                _host_buffer,
+                _mmap: Some(mmap),
+                offload_names,
+                ..
+            } => Some((_host_buffer.raw(), mmap.as_ptr(), offload_names)),
+            _ => None,
         }
     }
 }
@@ -4170,10 +4199,14 @@ impl GgmlLoadedWeightContext {
             GgmlWeightMaterialization::DeviceCopiedSplit {
                 _device_buffer,
                 _host_buffer,
+                _pack_weight_residency,
                 ..
             } => {
                 _device_buffer.record_receipt_reuse();
                 _host_buffer.record_receipt_reuse();
+                if let Some(residency) = _pack_weight_residency.as_ref() {
+                    residency.record_receipt_reuse();
+                }
             }
         }
     }
@@ -4302,11 +4335,73 @@ impl GgmlLoadedWeightContext {
                 operation: "host-offload-buffer/describe",
                 reason: "CPU fallback backend returned no buffer type".to_owned(),
             })?;
-            let host_buffer = GgmlBackendBufferGuard::allocate_host_offload_buffer(
-                host_buft,
-                host_backend,
-                &offload_raw,
-            )?;
+            let mapped = reader.backing_mmap();
+            // Prefer binding the host half from the mapping we already own. A
+            // failed import is only a lost optimization: fall back to the
+            // ordinary anonymous host buffer, which stays fail-closed on
+            // admission. The mapping's SystemMemory charge is released when
+            // the residency handle from the failed attempt drops.
+            let (host_buffer, host_mmap_import) =
+                match GgmlBackendBufferGuard::import_host_offload_buffer_from_mmap(
+                    host_backend,
+                    std::sync::Arc::clone(&mapped),
+                ) {
+                    Ok((buffer, residency)) => (buffer, Some((mapped, residency))),
+                    Err(_) => (
+                        GgmlBackendBufferGuard::allocate_host_offload_buffer(
+                            host_buft,
+                            host_backend,
+                            &offload_raw,
+                        )?,
+                        None,
+                    ),
+                };
+            if let Some((host_mmap, _)) = host_mmap_import.as_ref() {
+                // Bind before the device allocation so `allocate_weights` sees
+                // these tensors as already bound and leaves them out of the
+                // device buffer.
+                let mut cursor = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
+                while let Some(raw) = NonNull::new(cursor) {
+                    let name = unsafe { cstr_lossy(ffi::ggml_get_name(raw.as_ptr())) };
+                    if offload_set.contains(name.as_str()) {
+                        let payload = reader.host_tensor_bytes_by_name(&name).map_err(|error| {
+                            GgmlCpuGraphError::LoadedWeightContextFailed {
+                                reason: format!(
+                                    "could not read tensor '{name}' from {}: {error}",
+                                    path.display()
+                                ),
+                            }
+                        })?;
+                        let addr = unsafe {
+                            host_mmap
+                                .as_ptr()
+                                .add(payload.start)
+                                .cast_mut()
+                                .cast::<c_void>()
+                        };
+                        let status = unsafe {
+                            ffi::ggml_backend_tensor_alloc(
+                                host_buffer.raw().as_ptr(),
+                                raw.as_ptr(),
+                                addr,
+                            )
+                        };
+                        if status != ffi::GGML_STATUS_SUCCESS {
+                            return Err(GgmlCpuGraphError::LoadedWeightContextFailed {
+                                reason: format!(
+                                    "host offload tensor alloc failed for '{name}' with status={status}"
+                                ),
+                            });
+                        }
+                    }
+                    cursor =
+                        unsafe { ffi::ggml_get_next_tensor(context.raw.as_ptr(), raw.as_ptr()) };
+                }
+            }
+            let (host_mmap, host_residency) = match host_mmap_import {
+                Some((mmap, residency)) => (Some(mmap), Some(residency)),
+                None => (None, None),
+            };
             let device_buffer =
                 GgmlBackendBufferGuard::allocate_weights(context.raw, backend, skip)?;
             GgmlWeightMaterialization::DeviceCopiedSplit {
@@ -4314,7 +4409,10 @@ impl GgmlLoadedWeightContext {
                     backend_kind,
                 ),
                 _device_buffer: device_buffer,
-                _host_buffer: host_buffer,
+                _host_buffer: Box::new(host_buffer),
+                _mmap: host_mmap,
+                _pack_weight_residency: host_residency,
+                offload_names: offload_names.into_iter().collect(),
             }
         } else {
             match maybe_allocate_weight_buffer_from_host_ptr(backend, reader)? {
@@ -4333,6 +4431,7 @@ impl GgmlLoadedWeightContext {
             }
         };
         let mut tensors = HashMap::new();
+        let host_offload_binding = materialization.host_offload_mmap_binding();
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
         while let Some(raw) = NonNull::new(tensor_raw) {
             let name = unsafe { cstr_lossy(ffi::ggml_get_name(raw.as_ptr())) };
@@ -4365,6 +4464,11 @@ impl GgmlLoadedWeightContext {
                         ),
                     });
                 }
+            } else if host_offload_binding
+                .is_some_and(|(_, _, names)| names.contains(name.as_str()))
+            {
+                // Already bound into the mmap-backed host buffer during
+                // materialization; copying again would duplicate 10-17 GB.
             } else {
                 // Stock ggml's ggml_backend_tensor_set returns void; the
                 // upload cannot fail synchronously.
@@ -13290,6 +13394,111 @@ impl GgmlBackendBufferGuard {
             native_allocate,
         )
     }
+
+    /// Host half of a Hybrid split bound from the already-open pack mapping.
+    ///
+    /// Pack-weight residency charges one open mapping to SystemMemory as
+    /// FILE_BACKED (policy peak = mapping size, observed peak = 0). Importing
+    /// those same bytes with `currently_allocated_bytes = requested_bytes`
+    /// therefore adds no anonymous host copy, unlike the ordinary
+    /// `pack-host-offload-buffer` path. Fails closed if residency or the native
+    /// import cannot be proven; the caller may then fall back to a copy.
+    fn import_host_offload_buffer_from_mmap(
+        host_backend: NonNull<c_void>,
+        mmap: std::sync::Arc<Mmap>,
+    ) -> Result<(Self, PackWeightResidencyHandle), GgmlCpuGraphError> {
+        let device = NonNull::new(unsafe { ffi::ggml_backend_get_device(host_backend.as_ptr()) })
+            .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+            operation: "host-offload-import/describe",
+            reason: "CPU fallback backend has no device for buffer-from-host-ptr".to_owned(),
+        })?;
+        let requested_bytes =
+            u64::try_from(mmap.len()).map_err(|_| GgmlCpuGraphError::MemoryAdmission {
+                operation: "host-offload-import/describe",
+                reason: "mapped weight bytes exceed u64".to_owned(),
+            })?;
+        let broker =
+            crate::models::native_execution_services::current_native_execution_memory_broker()
+                .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                    operation: "host-offload-import/describe",
+                    reason: "process-wide native execution memory broker is not installed"
+                        .to_owned(),
+                })?;
+        let total = crate::host::host_total_memory_bytes()
+            .or_else(crate::host::host_available_memory_bytes)
+            .unwrap_or(requested_bytes)
+            .max(1);
+        let free = crate::host::host_available_memory_bytes()
+            .unwrap_or(total)
+            .min(total);
+        let snapshot = DeviceMemorySnapshot {
+            free_bytes: free,
+            total_bytes: total,
+            confidence: MemoryObservationConfidence::DeviceSnapshot,
+        }
+        .normalized()
+        .map_err(|source| GgmlCpuGraphError::MemoryAdmission {
+            operation: "host-offload-import/residency",
+            reason: source.to_string(),
+        })?;
+        let (residency, _) = broker
+            .acquire_open_pack_weight_residency(
+                MemoryDomainKey::SystemMemory,
+                std::sync::Arc::clone(&mmap),
+                snapshot,
+                crate::models::native_execution_services::current_memory_reservation_cohort_id(),
+            )
+            .map_err(|source| GgmlCpuGraphError::MemoryAdmission {
+                operation: "host-offload-import/residency",
+                reason: source.to_string(),
+            })?;
+        let host_ptr = mmap.as_ptr().cast_mut().cast::<c_void>();
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+            request_id: 1,
+            backend: host_backend.as_ptr(),
+            host_ptr,
+            requested_bytes,
+            currently_allocated_bytes: requested_bytes,
+            ..Default::default()
+        };
+        let semantics = NativeMemoryClaimSemantics {
+            resource_id: "pack-host-offload-import".to_owned(),
+            lifetime: AllocationLifetime::PackShared,
+            phases: PhaseSet::ALL,
+        };
+        let native_allocate = || {
+            let raw = unsafe {
+                ffi::ggml_backend_dev_buffer_from_host_ptr(device.as_ptr(), host_ptr, mmap.len(), 0)
+            };
+            let raw = NonNull::new(raw).ok_or_else(|| {
+                GgmlCpuGraphError::BackendBufferAllocationFailed {
+                    backend: backend_name(host_backend),
+                }
+            })?;
+            unsafe {
+                ffi::ggml_backend_buffer_set_usage(
+                    raw.as_ptr(),
+                    ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+                )
+            };
+            Ok(GgmlRawBackendBufferGuard {
+                raw,
+                released: false,
+            })
+        };
+        let buffer = allocate_native_buffer_with_admission(
+            "host-offload-import",
+            host_backend,
+            request,
+            semantics,
+            false,
+            native_allocate,
+        )?;
+        residency.attach_receipt();
+        Ok((buffer, residency))
+    }
 }
 
 fn allocate_native_buffer_with_admission(
@@ -13658,15 +13867,15 @@ mod tests {
     use crate::nn::half::f32_to_f16_bits as f32_to_f16_bits_for_test;
 
     use super::{
-        AbortCallbackInstall, AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendCapabilities,
-        GgmlContextGuard, GgmlCpuBinaryOp, GgmlCpuGraphBackend, GgmlCpuGraphConfig,
-        GgmlCpuGraphCpuAcceleratorPolicy, GgmlCpuGraphError, GgmlCpuGraphOutputSpec,
-        GgmlCpuGraphOutputValue, GgmlCpuGraphRunner, GgmlCpuGraphThreadingWorkload, GgmlCpuTensor,
-        GgmlGraphLifecycleState, GgmlLstmGateOrder, GgmlMatmulPrecision,
-        GgmlNativeGraphObservationPhase, GgmlPersistentGraphSession, GgmlRopeExtParams,
-        GgmlRunnerExecutionIdentity, GgmlStaticTensor, GgmlWeightMaterialization,
-        GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
-        LoadedWeightSkipSpec, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        AbortCallbackInstall, AutoGpuPolicy, GPU_PROBE_NEGATIVE_TTL, GgmlBackendBufferGuard,
+        GgmlBackendCapabilities, GgmlBackendGuard, GgmlContextGuard, GgmlCpuBinaryOp,
+        GgmlCpuGraphBackend, GgmlCpuGraphConfig, GgmlCpuGraphCpuAcceleratorPolicy,
+        GgmlCpuGraphError, GgmlCpuGraphOutputSpec, GgmlCpuGraphOutputValue, GgmlCpuGraphRunner,
+        GgmlCpuGraphThreadingWorkload, GgmlCpuTensor, GgmlGraphLifecycleState, GgmlLstmGateOrder,
+        GgmlMatmulPrecision, GgmlNativeGraphObservationPhase, GgmlPersistentGraphSession,
+        GgmlRopeExtParams, GgmlRunnerExecutionIdentity, GgmlStaticTensor,
+        GgmlWeightMaterialization, GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome,
+        GpuProbeState, LoadedWeightSkipSpec, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
         backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
         force_copied_weight_binding, gpu_probe_failed_log_message, gpu_probe_log_message,
         install_abort_callback, install_test_graph_compute_status_override,
@@ -17956,6 +18165,54 @@ mod tests {
             .memory_broker()
             .usage(&crate::device::execution_memory::MemoryDomainKey::SystemMemory)
             .committed_bytes
+    }
+
+    #[test]
+    fn host_offload_mmap_import_is_file_backed_and_shares_one_owner() {
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let (_dir, source) = tiny_loaded_weight_pack();
+        let mmap = source.backing_mmap();
+        let cpu = GgmlBackendGuard::cpu().expect("cpu backend");
+        let before = system_memory_committed(&services);
+
+        let (buffer, residency) =
+            GgmlBackendBufferGuard::import_host_offload_buffer_from_mmap(cpu.raw, mmap.clone())
+                .expect("mmap-backed host import");
+        assert_eq!(
+            unsafe { ffi::ggml_backend_buffer_get_size(buffer.raw().as_ptr()) },
+            mmap.len()
+        );
+        let after_first = system_memory_committed(&services);
+        assert!(
+            after_first > before,
+            "the open mapping must be charged once to SystemMemory"
+        );
+
+        let (second_buffer, second_residency) =
+            GgmlBackendBufferGuard::import_host_offload_buffer_from_mmap(cpu.raw, mmap.clone())
+                .expect("second mmap-backed host import");
+        assert_eq!(
+            system_memory_committed(&services),
+            after_first,
+            "the same mapping must not be charged twice"
+        );
+
+        drop(buffer);
+        drop(residency);
+        assert_eq!(
+            system_memory_committed(&services),
+            after_first,
+            "one live owner still holds the charge"
+        );
+        drop(second_buffer);
+        drop(second_residency);
+        assert_eq!(
+            system_memory_committed(&services),
+            before,
+            "last owner drop refunds the mapping charge"
+        );
     }
 
     #[test]
