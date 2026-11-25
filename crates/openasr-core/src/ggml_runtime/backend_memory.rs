@@ -388,6 +388,15 @@ fn fingerprint_requests(requests: &[ffi::GgmlBackendMemoryRequestV1]) -> u64 {
     hash
 }
 
+/// New physical commitment a request may add. `currently_allocated_bytes`
+/// reports bytes the backend already owns for this request (file-backed pack
+/// reuse), which are charged by their existing owner lease instead.
+fn quote_incremental_bytes(request: &ffi::GgmlBackendMemoryRequestV1) -> u64 {
+    request
+        .requested_bytes
+        .saturating_sub(request.currently_allocated_bytes)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct BackendMemoryAbi {
     backend: ffi::GgmlBackendRaw,
@@ -455,10 +464,16 @@ impl BackendMemoryAbi {
         self.validate_primary_backends(requests)?;
         let (free, total) = self.device_memory()?;
         let used = total.saturating_sub(free);
-        let mut requested_upper: u64 = 0;
+        // A request may name bytes the backend already owns (the HOST_IMPORT
+        // reuse contract in `device::pack_weight_residency`): the mapping's
+        // SystemMemory charge is already live, so quoting the full size again
+        // double-counts it and rejects reuse on memory-tight hosts. Only the
+        // incremental bytes are an upper bound on new physical commitment.
+        let mut incremental_upper: u64 = 0;
         for request in requests {
-            requested_upper = requested_upper
-                .checked_add(request.requested_bytes)
+            let incremental = quote_incremental_bytes(request);
+            incremental_upper = incremental_upper
+                .checked_add(incremental)
                 .ok_or(BackendMemoryAbiError::UnstableCount { operation: "quote" })?;
         }
         let device_kind = self.device_kind();
@@ -466,21 +481,30 @@ impl BackendMemoryAbi {
         let generation = stats_generation(self.device, free, total);
         let claims = requests
             .iter()
-            .map(|request| ffi::GgmlBackendMemoryClaimV1 {
-                struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryClaimV1>() as u32,
-                // A committed upper bound: admission charges it, the
-                // post-allocation reconciliation refunds whatever the fresh
-                // device stats show was not used.
-                flags: ffi::GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER,
-                request_id: request.request_id,
-                domain,
-                payload_requested_bytes: request.requested_bytes,
-                committed_before_bytes: used,
-                committed_after_upper_bytes: used.saturating_add(requested_upper),
-                commit_peak_extra_upper_bytes: requested_upper,
-                resident_after_upper_bytes: request.requested_bytes,
-                retained_after_use_upper_bytes: request.requested_bytes,
-                releasable_after_use_upper_bytes: 0,
+            .map(|request| {
+                let incremental = quote_incremental_bytes(request);
+                ffi::GgmlBackendMemoryClaimV1 {
+                    struct_size: std::mem::size_of::<ffi::GgmlBackendMemoryClaimV1>() as u32,
+                    // A committed upper bound: admission charges it, the
+                    // post-allocation reconciliation refunds whatever the fresh
+                    // device stats show was not used.
+                    flags: ffi::GGML_BACKEND_MEMORY_CLAIM_CONSERVATIVE_UPPER,
+                    request_id: request.request_id,
+                    domain,
+                    payload_requested_bytes: request.requested_bytes,
+                    committed_before_bytes: used,
+                    committed_after_upper_bytes: used.saturating_add(incremental_upper),
+                    commit_peak_extra_upper_bytes: incremental,
+                    resident_after_upper_bytes: incremental,
+                    // Reuse retains exactly the pre-existing commitment; an
+                    // ordinary allocation retains its own requested bytes.
+                    retained_after_use_upper_bytes: if incremental == 0 {
+                        used
+                    } else {
+                        request.requested_bytes
+                    },
+                    releasable_after_use_upper_bytes: 0,
+                }
             })
             .collect();
         let raw = ffi::GgmlBackendMemoryQuoteV1 {
@@ -488,7 +512,7 @@ impl BackendMemoryAbi {
             flags: 0,
             residual_flags: 0,
             residual_request_count: 0,
-            provisional_requested_upper_bytes: requested_upper,
+            provisional_requested_upper_bytes: incremental_upper,
             stats_generation: generation,
             quote_token: next_request_id(),
             request_fingerprint: fingerprint_requests(requests),
@@ -1580,6 +1604,90 @@ mod tests {
         assert_eq!(abi.provider(), ExecutionProvider::Cpu);
         abi.domains()
             .expect("cpu registry device must expose memory domains");
+    }
+
+    fn cpu_device_abi() -> BackendMemoryAbi {
+        crate::ggml_runtime::ensure_backends_loaded();
+        let cpu = crate::ggml_available_devices()
+            .into_iter()
+            .find(|device| device.kind == crate::GgmlBackendKind::Cpu)
+            .expect("cpu device");
+        unsafe { BackendMemoryAbi::from_device(cpu.as_ptr()) }.expect("device-only memory ABI")
+    }
+
+    /// `pack_weight_residency` already charged the open mapping to SystemMemory;
+    /// the HOST_IMPORT stage must not charge it a second time against live free.
+    #[test]
+    fn host_import_reuse_quote_has_zero_incremental_commitment() {
+        let abi = cpu_device_abi();
+        let pack = 21 * 1024 * 1024 * 1024u64;
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+            request_id: 1,
+            requested_bytes: pack,
+            currently_allocated_bytes: pack,
+            ..Default::default()
+        };
+        let quote = abi.quote(&[request]).expect("reuse quote");
+        assert_eq!(quote.raw().provisional_requested_upper_bytes, 0);
+        let claim = &quote.claims()[0];
+        assert_eq!(claim.payload_requested_bytes, pack);
+        assert_eq!(claim.commit_peak_extra_upper_bytes, 0);
+        assert_eq!(
+            claim.committed_after_upper_bytes,
+            claim.committed_before_bytes
+        );
+        assert_eq!(
+            claim.retained_after_use_upper_bytes,
+            claim.committed_before_bytes
+        );
+    }
+
+    #[test]
+    fn ordinary_buffer_quote_still_charges_the_full_request() {
+        let abi = cpu_device_abi();
+        let bytes = 64 * 1024;
+        let request = ffi::GgmlBackendMemoryRequestV1 {
+            kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+            usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+            request_id: 1,
+            requested_bytes: bytes,
+            ..Default::default()
+        };
+        let quote = abi.quote(&[request]).expect("ordinary quote");
+        assert_eq!(quote.raw().provisional_requested_upper_bytes, bytes);
+        let claim = &quote.claims()[0];
+        assert_eq!(claim.commit_peak_extra_upper_bytes, bytes);
+        assert_eq!(claim.retained_after_use_upper_bytes, bytes);
+    }
+
+    #[test]
+    fn mixed_reuse_and_new_bytes_only_charge_the_new_bytes() {
+        let abi = cpu_device_abi();
+        let pack = 15 * 1024 * 1024 * 1024u64;
+        let new = 64 * 1024u64;
+        let requests = [
+            ffi::GgmlBackendMemoryRequestV1 {
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_HOST_IMPORT,
+                usage: ffi::GGML_BACKEND_BUFFER_USAGE_WEIGHTS as u32,
+                request_id: 1,
+                requested_bytes: pack,
+                currently_allocated_bytes: pack,
+                ..Default::default()
+            },
+            ffi::GgmlBackendMemoryRequestV1 {
+                kind: ffi::GGML_BACKEND_MEMORY_REQUEST_BUFFER,
+                usage: ffi::GGML_BACKEND_BUFFER_USAGE_COMPUTE as u32,
+                request_id: 2,
+                requested_bytes: new,
+                ..Default::default()
+            },
+        ];
+        let quote = abi.quote(&requests).expect("mixed quote");
+        assert_eq!(quote.raw().provisional_requested_upper_bytes, new);
+        assert_eq!(quote.claims()[0].commit_peak_extra_upper_bytes, 0);
+        assert_eq!(quote.claims()[1].commit_peak_extra_upper_bytes, new);
     }
 
     #[cfg(target_os = "macos")]
