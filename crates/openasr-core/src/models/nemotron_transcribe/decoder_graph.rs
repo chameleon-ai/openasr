@@ -743,6 +743,10 @@ impl NemotronTranscribeDecoderRuntime {
         if let Some(spec) = host_offload {
             runner.set_host_weight_offload(spec);
         }
+        let skipped = super::offload::skipped_weight_names(&preflight.tensor_index);
+        if !skipped.is_empty() {
+            runner.set_loaded_weight_skip(crate::ggml_runtime::LoadedWeightSkipSpec::new(skipped));
+        }
         let loaded = runner
             .load_gguf_weight_context_from_preflight(preflight)
             .map_err(ggml_err("load_gguf_weight_context"))?;

@@ -2034,6 +2034,10 @@ pub struct GgmlCpuGraphRunner {
     /// into a host-resident WEIGHTS buffer. Only effective on a scheduler-backed
     /// (hybrid) GPU lane, which supplies the CPU fallback buffer.
     host_offload: Option<HostWeightOffloadSpec>,
+    /// Family-declared weights that must never be bound into the loaded weight
+    /// context (dead weights the family consumes through another path). Kept in
+    /// the owner-cache key so a cached full load cannot alias a skipped one.
+    weight_skip: Option<LoadedWeightSkipSpec>,
     scheduler: Option<GgmlBackendSchedulerGuard>,
     /// Grow-to-fit backend buffer reused across `start_graph()` calls for the
     /// CPU, no-scheduler per-token decode path (see `GgmlCpuStepBufferPool`).
@@ -2592,6 +2596,35 @@ impl HostWeightOffloadSpec {
     }
 }
 
+/// Family-declared set of pack tensors that must not be bound into the loaded
+/// weight context. The tensor stays in the `.oasr` index (and its bytes are
+/// still readable through the mapping); only the ggml binding and its buffer
+/// allocation are omitted. Any future graph lookup of a skipped name fails
+/// closed instead of silently reading dead memory.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct LoadedWeightSkipSpec {
+    names: Vec<String>,
+}
+
+impl LoadedWeightSkipSpec {
+    pub(crate) fn new(mut names: Vec<String>) -> Self {
+        names.sort();
+        names.dedup();
+        Self { names }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|candidate| candidate == name)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.names.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 enum GgmlWeightMaterialization {
     HostImported {
         source_identity: super::StrongFileIdentity,
@@ -2782,6 +2815,9 @@ struct LoadedWeightOwnerKey {
     /// different offload count is a second physical owner and must not alias a
     /// cached one, so the count is part of identity.
     offload_fingerprint: u64,
+    /// Fingerprint of the family's skipped-tensor set (0 when none). A load
+    /// that bound the dead weights is a different physical owner.
+    skip_fingerprint: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2825,6 +2861,7 @@ impl LoadedWeightOwnerCache {
         kind: GgmlWeightMaterializationKind,
         backend_kind: GgmlCpuGraphBackend,
         offload_fingerprint: u64,
+        skip_fingerprint: u64,
     ) -> LoadedWeightOwnerKey {
         let lane =
             crate::models::native_execution_services::current_execution_lane_key(backend_kind);
@@ -2848,6 +2885,7 @@ impl LoadedWeightOwnerCache {
             kind,
             lane,
             offload_fingerprint,
+            skip_fingerprint,
         }
     }
 
@@ -3412,6 +3450,7 @@ impl GgmlCpuGraphRunner {
             _scheduler_accel_backends: scheduler_accel_backends,
             _scheduler_cpu_fallback: scheduler_cpu_fallback,
             host_offload: None,
+            weight_skip: None,
             scheduler,
             cpu_step_buffer_pool: GgmlCpuStepBufferPool::new(),
             last_transient_graph_generation: None,
@@ -3505,6 +3544,14 @@ impl GgmlCpuGraphRunner {
         self.host_offload = Some(spec);
     }
 
+    /// Declare pack tensors that are never consumed by a graph for this family.
+    /// They are omitted from the loaded weight context and from its buffer
+    /// allocation. Must be called before the first `load_gguf_weight_context*`
+    /// on this runner; the skip set participates in the owner-cache key.
+    pub(crate) fn set_loaded_weight_skip(&mut self, spec: LoadedWeightSkipSpec) {
+        self.weight_skip = Some(spec);
+    }
+
     pub(crate) fn loaded_weight_binding_identity(
         &self,
         loaded: &GgmlLoadedWeightContext,
@@ -3588,6 +3635,10 @@ impl GgmlCpuGraphRunner {
             ),
             _ => unreachable!("offload and host backend are set together"),
         };
+        let skip_fingerprint = self
+            .weight_skip
+            .as_ref()
+            .map_or(0, LoadedWeightSkipSpec::fingerprint);
         let owners = crate::models::native_execution_services::current_loaded_weight_owners();
         if let Some(owners) = owners.as_ref() {
             let key = LoadedWeightOwnerCache::key(
@@ -3595,6 +3646,7 @@ impl GgmlCpuGraphRunner {
                 preferred_kind,
                 self.backend_kind,
                 offload_fingerprint,
+                skip_fingerprint,
             );
             if let Some(inner) = owners.lookup(&key) {
                 if require_direct_backend_matmul_support {
@@ -3619,6 +3671,7 @@ impl GgmlCpuGraphRunner {
             require_direct_backend_matmul_support,
             offload,
             host_backend,
+            self.weight_skip.as_ref(),
         )?;
         if let Some(owners) = owners {
             let key = LoadedWeightOwnerCache::key(
@@ -3626,6 +3679,7 @@ impl GgmlCpuGraphRunner {
                 loaded.inner.materialization.kind(),
                 self.backend_kind,
                 offload_fingerprint,
+                skip_fingerprint,
             );
             owners.publish(key, &loaded.inner);
         }
@@ -4142,13 +4196,24 @@ impl GgmlLoadedWeightContext {
         require_direct_backend_matmul_support: bool,
         offload: Option<&HostWeightOffloadSpec>,
         host_backend: Option<NonNull<c_void>>,
+        skip: Option<&LoadedWeightSkipSpec>,
     ) -> Result<Self, GgmlCpuGraphError> {
         let path = source.path();
         let mmap = source.backing_mmap();
-        let context_bytes = reader
+        let skipped = skip.map_or(0, |spec| {
+            reader
+                .tensor_index()
+                .tensors()
+                .iter()
+                .filter(|tensor| spec.contains(&tensor.name))
+                .count()
+        });
+        let context_tensors = reader
             .tensor_index()
             .tensors()
             .len()
+            .saturating_sub(skipped);
+        let context_bytes = context_tensors
             .checked_mul(unsafe { ffi::ggml_tensor_overhead() })
             .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
                 operation: "ggml-loaded-weight-context",
@@ -4242,7 +4307,8 @@ impl GgmlLoadedWeightContext {
                 host_backend,
                 &offload_raw,
             )?;
-            let device_buffer = GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?;
+            let device_buffer =
+                GgmlBackendBufferGuard::allocate_weights(context.raw, backend, skip)?;
             GgmlWeightMaterialization::DeviceCopiedSplit {
                 lane: crate::models::native_execution_services::current_execution_lane_key(
                     backend_kind,
@@ -4262,7 +4328,7 @@ impl GgmlLoadedWeightContext {
                     lane: crate::models::native_execution_services::current_execution_lane_key(
                         backend_kind,
                     ),
-                    _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend)?,
+                    _buffer: GgmlBackendBufferGuard::allocate_weights(context.raw, backend, skip)?,
                 },
             }
         };
@@ -4270,6 +4336,11 @@ impl GgmlLoadedWeightContext {
         let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.raw.as_ptr()) };
         while let Some(raw) = NonNull::new(tensor_raw) {
             let name = unsafe { cstr_lossy(ffi::ggml_get_name(raw.as_ptr())) };
+            if skip.is_some_and(|spec| spec.contains(name.as_str())) {
+                tensor_raw =
+                    unsafe { ffi::ggml_get_next_tensor(context.raw.as_ptr(), raw.as_ptr()) };
+                continue;
+            }
             let payload = reader.host_tensor_bytes_by_name(&name).map_err(|error| {
                 GgmlCpuGraphError::LoadedWeightContextFailed {
                     reason: format!(
@@ -11947,7 +12018,7 @@ fn bind_ctx_tensors_grow_to_fit(
         .buffer
         .as_ref()
         .expect("capacity_bytes > 0 implies buffer is populated");
-    bind_unallocated_context_tensors(context, buffer.raw())
+    bind_unallocated_context_tensors(context, buffer.raw(), None)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12014,6 +12085,7 @@ fn pack_context_buffer_chunks(
 fn measure_context_buffer_chunks(
     context: NonNull<c_void>,
     buft: NonNull<c_void>,
+    skip: Option<&LoadedWeightSkipSpec>,
 ) -> Result<Vec<ContextBufferChunk>, GgmlCpuGraphError> {
     let alignment = unsafe { ffi::ggml_backend_buft_get_alignment(buft.as_ptr()) };
     let max_size = unsafe { openasr_ggml_backend_buft_get_max_size(buft.as_ptr()) };
@@ -12021,7 +12093,13 @@ fn measure_context_buffer_chunks(
     let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.as_ptr()) };
     while let Some(tensor) = NonNull::new(tensor_raw) {
         let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
-        if layout.data.is_null() && layout.view_src.is_null() {
+        let skipped = skip.is_some_and(|spec| {
+            let name = unsafe { cstr_lossy(ffi::ggml_get_name(tensor.as_ptr())) };
+            spec.contains(name.as_str())
+        });
+        if skipped {
+            sizes.push(0);
+        } else if layout.data.is_null() && layout.view_src.is_null() {
             sizes.push(unsafe {
                 openasr_ggml_backend_buft_get_alloc_size(buft.as_ptr(), tensor.as_ptr())
             });
@@ -12046,10 +12124,19 @@ fn measure_context_buffer_chunks(
 fn bind_unallocated_context_tensors(
     context: NonNull<c_void>,
     buffer: NonNull<c_void>,
+    skip: Option<&LoadedWeightSkipSpec>,
 ) -> Result<(), GgmlCpuGraphError> {
     let mut tallocr = unsafe { ffi::ggml_tallocr_new(buffer.as_ptr()) };
     let mut tensor_raw = unsafe { ffi::ggml_get_first_tensor(context.as_ptr()) };
     while let Some(tensor) = NonNull::new(tensor_raw) {
+        let skipped = skip.is_some_and(|spec| {
+            let name = unsafe { cstr_lossy(ffi::ggml_get_name(tensor.as_ptr())) };
+            spec.contains(name.as_str())
+        });
+        if skipped {
+            tensor_raw = unsafe { ffi::ggml_get_next_tensor(context.as_ptr(), tensor.as_ptr()) };
+            continue;
+        }
         let layout = unsafe { *(tensor.as_ptr() as *const ffi::GgmlTensorAllocPrefix) };
         let status = if layout.data.is_null() {
             if layout.view_src.is_null() {
@@ -12918,12 +13005,14 @@ impl GgmlBackendBufferGuard {
                 lifetime: AllocationLifetime::StepTransient,
                 phases: PhaseSet::ALL,
             },
+            None,
         )
     }
 
     fn allocate_weights(
         context: NonNull<c_void>,
         backend: NonNull<c_void>,
+        skip: Option<&LoadedWeightSkipSpec>,
     ) -> Result<Self, GgmlCpuGraphError> {
         Self::allocate_context_buffer(
             context,
@@ -12934,6 +13023,7 @@ impl GgmlBackendBufferGuard {
                 lifetime: AllocationLifetime::PackShared,
                 phases: PhaseSet::ALL,
             },
+            skip,
         )
     }
 
@@ -12951,6 +13041,7 @@ impl GgmlBackendBufferGuard {
                 lifetime: AllocationLifetime::SessionResident,
                 phases: PhaseSet::ALL,
             },
+            None,
         )
     }
 
@@ -13025,20 +13116,10 @@ impl GgmlBackendBufferGuard {
         backend: NonNull<c_void>,
         usage: c_int,
         semantics: NativeMemoryClaimSemantics,
+        skip: Option<&LoadedWeightSkipSpec>,
     ) -> Result<Self, GgmlCpuGraphError> {
         ensure_backend_device_present(backend)?;
-        let native_allocate = || {
-            let raw =
-                unsafe { ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr()) };
-            let raw = NonNull::new(raw)
-                .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
-            unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage) };
-            Ok(GgmlRawBackendBufferGuard {
-                raw,
-                released: false,
-            })
-        };
-
+        let usage_raw = usage;
         let buft =
             NonNull::new(unsafe { ffi::ggml_backend_get_default_buffer_type(backend.as_ptr()) })
                 .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
@@ -13049,7 +13130,40 @@ impl GgmlBackendBufferGuard {
             operation: "context-buffer/describe",
             reason: format!("negative or out-of-range buffer usage {usage}"),
         })?;
-        let chunks = measure_context_buffer_chunks(context, buft)?;
+        let chunks = measure_context_buffer_chunks(context, buft, skip)?;
+        let skip_total = chunks
+            .iter()
+            .try_fold(0usize, |sum, chunk| sum.checked_add(chunk.requested_bytes))
+            .ok_or_else(|| GgmlCpuGraphError::MemoryAdmission {
+                operation: "context-buffer/measure",
+                reason: "context buffer chunk bytes overflowed usize".to_owned(),
+            })?;
+        let native_allocate = || {
+            if let Some(skip) = skip {
+                // Skipped tensors are left unbound; allocate only the
+                // non-skipped bytes and bind exactly those tensors.
+                let raw = unsafe { ffi::ggml_backend_buft_alloc_buffer(buft.as_ptr(), skip_total) };
+                let raw = NonNull::new(raw)
+                    .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
+                unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
+                bind_unallocated_context_tensors(context, raw, Some(skip))?;
+                Ok(GgmlRawBackendBufferGuard {
+                    raw,
+                    released: false,
+                })
+            } else {
+                let raw = unsafe {
+                    ffi::ggml_backend_alloc_ctx_tensors(context.as_ptr(), backend.as_ptr())
+                };
+                let raw = NonNull::new(raw)
+                    .ok_or_else(|| backend_buffer_allocation_failure(backend_name(backend)))?;
+                unsafe { ffi::ggml_backend_buffer_set_usage(raw.as_ptr(), usage_raw) };
+                Ok(GgmlRawBackendBufferGuard {
+                    raw,
+                    released: false,
+                })
+            }
+        };
         let mut request_semantics = BTreeMap::new();
         let mut requests = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.into_iter().enumerate() {
@@ -13552,9 +13666,10 @@ mod tests {
         GgmlNativeGraphObservationPhase, GgmlPersistentGraphSession, GgmlRopeExtParams,
         GgmlRunnerExecutionIdentity, GgmlStaticTensor, GgmlWeightMaterialization,
         GgmlWeightMaterializationKind, GpuProbeCache, GpuProbeOutcome, GpuProbeState,
-        METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS, backend_satisfies_execution_placement,
-        flash_attn_ext_head_dim_supported_on_backend, gpu_probe_failed_log_message,
-        gpu_probe_log_message, install_abort_callback, install_test_graph_compute_status_override,
+        LoadedWeightSkipSpec, METAL_FLASH_ATTN_EXT_SUPPORTED_HEAD_DIMS,
+        backend_satisfies_execution_placement, flash_attn_ext_head_dim_supported_on_backend,
+        force_copied_weight_binding, gpu_probe_failed_log_message, gpu_probe_log_message,
+        install_abort_callback, install_test_graph_compute_status_override,
         install_test_tensor_readback_status_override, memory_admission_failure,
         mul_mat_requires_f32_precision_to_preserve_rhs_range,
         reset_test_compute_gate_attempt_count, reset_test_native_graph_submission_count,
@@ -17784,6 +17899,54 @@ mod tests {
         let runtime_source =
             crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
         (dir, runtime_source)
+    }
+
+    #[test]
+    fn skipped_dead_weights_are_absent_from_the_loaded_context() {
+        use crate::ggml_runtime::gguf_write::{
+            GgufWriteTensor, GgufWriteTensorType, write_gguf_file_v0,
+        };
+        use std::collections::BTreeMap;
+
+        let services = crate::models::native_execution_services::test_native_execution_services();
+        let _nes =
+            crate::models::native_execution_services::install_native_execution_services(&services);
+        let _force = force_copied_weight_binding();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pack = dir.path().join("skipped_owner.gguf");
+        let live: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let dead: [f32; 4] = [7.0, 8.0, 9.0, 10.0];
+        write_gguf_file_v0(
+            &pack,
+            &BTreeMap::new(),
+            &[
+                GgufWriteTensor {
+                    name: "loaded.weight".to_string(),
+                    dims: vec![3, 2],
+                    tensor_type: GgufWriteTensorType::F32,
+                    data: live.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                },
+                GgufWriteTensor {
+                    name: "dead.weight".to_string(),
+                    dims: vec![2, 2],
+                    tensor_type: GgufWriteTensorType::F32,
+                    data: dead.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                },
+            ],
+        )
+        .expect("write tiny gguf");
+        let source = crate::validate_ggml_runtime_source_path(&pack).expect("runtime source");
+        let preflight =
+            crate::ggml_runtime::GgufRuntimeSourcePreflight::from_runtime_source(&source)
+                .expect("preflight");
+
+        let mut runner = GgmlCpuGraphRunner::new(GgmlCpuGraphConfig::default()).expect("runner");
+        runner.set_loaded_weight_skip(LoadedWeightSkipSpec::new(vec!["dead.weight".to_owned()]));
+        let loaded = runner
+            .load_gguf_weight_context_from_preflight(&preflight)
+            .expect("load with skipped weight");
+        assert!(loaded.tensor("dead.weight").is_none());
+        assert!(loaded.tensor("loaded.weight").is_some());
     }
 
     fn system_memory_committed(

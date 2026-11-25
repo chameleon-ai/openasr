@@ -141,6 +141,13 @@ impl GgufTensorIndex {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&mut self, tensor: GgufTensorMetadata) {
+        let index = self.tensors.len();
+        self.tensor_index_by_name.insert(tensor.name.clone(), index);
+        self.tensors.push(tensor);
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

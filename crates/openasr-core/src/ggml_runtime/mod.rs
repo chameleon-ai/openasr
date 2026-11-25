@@ -82,9 +82,9 @@ pub(crate) use cpu_graph::{
     GgmlLoadedWeightBindingIdentity, GgmlLoadedWeightContext, GgmlMatmulPrecision,
     GgmlNativeGqaCapability, GgmlPersistentGraphSession, GgmlRopeExtParams,
     GgmlSameShapePersistentGraph, GgmlStaticTensor, GgmlStaticTensorArena, HostWeightOffloadSpec,
-    LoadedWeightOwnerCache, ResidentDeviceCopyCapability, ResidentHostImportCapability,
-    encoder_same_shape_reuse_is_enabled, exact_discrete_gpu_unified_owner_is_proven,
-    proven_discrete_gpu_provider,
+    LoadedWeightOwnerCache, LoadedWeightSkipSpec, ResidentDeviceCopyCapability,
+    ResidentHostImportCapability, encoder_same_shape_reuse_is_enabled,
+    exact_discrete_gpu_unified_owner_is_proven, proven_discrete_gpu_provider,
 };
 pub use decode_conformance::{
     DecodeFirstDivergenceClass, DiagnosticDecodeConformanceSuite, DiagnosticDecodeSelection,

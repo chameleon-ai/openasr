@@ -132,14 +132,50 @@ pub(crate) fn binding_ceiling(total_vram_bytes: u64, free_vram_bytes: u64) -> Op
     Some(observed.map_or(policy, |observed| policy.min(observed)))
 }
 
-/// Total payload bytes of every tensor in the pack. Used by the slice policy
-/// to reserve device/host memory for the resident weights before deriving the
-/// encoder graph budget.
-pub(crate) fn pack_weight_bytes(tensor_index: &GgufTensorIndex) -> u64 {
+/// Tensors the family packs but never binds into a ggml weight context.
+///
+/// `token_embd.weight` is consumed by `MappedTokenEmbeddingTable`, which gathers
+/// rows straight from the mapped GGUF and uploads the resulting vectors as a
+/// graph input; the graph never looks the weight up. `blk.52.*` is the
+/// MTP/NextN speculative drafter, outside the 52-block trunk. Its expert
+/// tensors stay in the offload candidate list because offloading them is free,
+/// but its dense tensors are never executed.
+pub(crate) fn skipped_weight_names(tensor_index: &GgufTensorIndex) -> Vec<String> {
     tensor_index
         .tensors()
         .iter()
+        .filter(|tensor| {
+            tensor.name == "token_embd.weight"
+                || (tensor.name.starts_with("blk.52.")
+                    && !tensor.name.ends_with("ffn_up_exps.weight")
+                    && !tensor.name.ends_with("ffn_down_exps.weight"))
+        })
+        .map(|tensor| tensor.name.clone())
+        .collect()
+}
+
+fn skipped_weight_bytes(tensor_index: &GgufTensorIndex) -> u64 {
+    tensor_index
+        .tensors()
+        .iter()
+        .filter(|tensor| {
+            tensor.name == "token_embd.weight"
+                || (tensor.name.starts_with("blk.52.")
+                    && !tensor.name.ends_with("ffn_up_exps.weight")
+                    && !tensor.name.ends_with("ffn_down_exps.weight"))
+        })
         .fold(0u64, |sum, tensor| sum.saturating_add(tensor.size_bytes))
+}
+
+/// Payload bytes the runtime actually has to find room for: every pack tensor
+/// except the family's dead weights. Used by the slice policy to reserve
+/// device/host memory before deriving the encoder graph budget.
+pub(crate) fn pack_weight_bytes(tensor_index: &GgufTensorIndex) -> u64 {
+    let total = tensor_index
+        .tensors()
+        .iter()
+        .fold(0u64, |sum, tensor| sum.saturating_add(tensor.size_bytes));
+    total.saturating_sub(skipped_weight_bytes(tensor_index))
 }
 
 /// Picks whole MoE layers, in `MOE_BLOCK_OFFLOAD_ORDER`, until their expert
@@ -352,6 +388,33 @@ mod tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn dead_weights_are_excluded_from_the_planner_footprint() {
+        let mut index =
+            crate::GgufTensorIndex::empty_for_test(std::path::PathBuf::from("probe.gguf"));
+        let tensor = |name: &str, bytes: u64| crate::GgufTensorMetadata {
+            name: name.to_owned(),
+            dims: vec![bytes, 1],
+            ggml_type: 0,
+            type_name: "f32".to_owned(),
+            size_bytes: bytes,
+            offset_bytes: 0,
+        };
+        index.push_for_test(tensor("loaded.weight", 100));
+        index.push_for_test(tensor("token_embd.weight", 374));
+        index.push_for_test(tensor("blk.52.attn_q.weight", 52));
+        index.push_for_test(tensor("blk.52.ffn_up_exps.weight", 718));
+        assert_eq!(
+            skipped_weight_names(&index),
+            vec![
+                "token_embd.weight".to_owned(),
+                "blk.52.attn_q.weight".to_owned()
+            ]
+        );
+        // Expert tensors stay in the offload budget; dead weights do not.
+        assert_eq!(pack_weight_bytes(&index), 818);
     }
 
     #[test]
