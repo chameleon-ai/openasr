@@ -13,18 +13,18 @@ implemented and verified verbatim against the NeMo-Speech.cpp oracle golden
 (`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`) on three
 lanes: **CPU** (best-of-3 per quant, all three quants, sha-bound to the
 published packs), **HIP** (full-residency runs on a gfx1151 Strix Halo,
-112 GiB unified GTT; all three quants verbatim), and now **CUDA** (short-clip
-Hybrid receipt on a 10 GB RTX 3080; both AD quants verbatim). Peak RSS per
-quant measured on CPU/HIP; peak VRAM and Windows process RAM measured on CUDA.
+112 GiB unified GTT; all three quants verbatim), and **CUDA** (Hybrid receipt
+at `7944b7f7` on a 10 GB RTX 3080: all four short-clip runs pass on the first
+candidate, both fixtures x both AD quants verbatim). Peak RSS per quant measured
+on CPU/HIP; peak VRAM, GPU utilisation and Windows process RAM measured on CUDA.
 **Remaining release blockers:** min_core_version / min_cli_version must name
-the first release shipping this family; the CUDA receipt covers only the 11 s
-JFK clip -- `en_zh_mixed.wav` (13 s) fails system-memory admission on both AD
-quants (see "CUDA hybrid receipt" below) -- and the wider <=16 GB discrete-card
-GPU verdict is still unsupported outside the listed receipts; the AMI
-diarization fixtures are unverified through this runtime; streaming is the
-shared snapshot driver. **Do not flip `release_public = true`, run
-`publish_catalog.sh`, or treat any cell as evidence beyond the listed lanes
-until those are closed.**
+the first release shipping this family; CUDA has one card and no >10 min
+fixture or automated parity test, and the second file of a multi-file run still
+loses Hybrid and completes via CPU fallback; the wider discrete-card GPU verdict
+is unsupported outside the listed receipts; the AMI diarization fixtures are
+unverified through this runtime; streaming is the shared snapshot driver.
+**Do not flip `release_public = true`, run `publish_catalog.sh`, or treat any
+cell as evidence beyond the listed lanes until those are closed.**
 
 | Field | Value |
 | --- | --- |
@@ -32,37 +32,52 @@ until those are closed.**
 | Models covered | nemotron-3.5-transcribe-30b-a4b (q8_0, ad_iq4_nl, ad_q2_0_m; packs published at chameleon-ai/nemotron-3.5-transcribe-30b-a4b, hf_revision 4aefd4391c57bb5cf18ffcabac635f526c636142) |
 | Auditor / date | OpenASR onboarding, 2026-11-18 |
 | Core version + commit audited | workspace 0.2.1, `nemotron` branch (uncommitted working tree at audit time) |
-| Bench hardware | AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, 112 GiB unified GTT), Arch 2026-11-18 (CPU + HIP best-of-3); AMD RX 6800 XT (gfx1030, 16 GB) HIP bring-up, AMD ROCm/HIP; Windows 11 Pro (build 26300.10075), i7-12700F, 32 GB RAM, RTX 3080 (10239 MiB, sm_86, driver 621.24, CUDA 13.0), 2026-11-25 (CUDA Hybrid receipt, both AD quants); no Mac/Metal host benched |
+| Bench hardware | AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, 112 GiB unified GTT), Arch 2026-11-18 (CPU + HIP best-of-3); AMD RX 6800 XT (gfx1030, 16 GB) HIP bring-up, AMD ROCm/HIP; Windows 11 Pro (build 26300.10075), i7-12700F, 32 GB RAM (`31.85 GiB`), RTX 3080 (10239 MiB, `sm_86`, driver 621.40, CUDA 13.0), 2026-11-25 (CUDA Hybrid verification at `7944b7f7`, both fixtures x both AD quants); no Mac/Metal host benched |
 
-### CUDA hybrid receipt (2026-11-25, external tester)
+### CUDA hybrid receipts (2026-11-25, external tester)
 
-Recorded in `bug-report.md` for branch `cuda-hybrid` at `c54ec7f5` (the HEAD
-commit that declared CUDA `HYBRID`). This is a manual hardware receipt, not a
-CI gate; it is the first OpenASR CUDA execution evidence for this family.
+Recorded in `bug-report.md`, `bug-report-followup.md` and
+`verification-report.md` for branch `cuda-hybrid`. These are manual hardware
+receipts, not CI gates.
 
-- Build: `cargo build --release -p openasr-cli --features "cuda,legacy-windows-static-sidecar"`
+- Build at both `c54ec7f5` and `7944b7f7`:
+  `cargo build --release -p openasr-cli --features "cuda,legacy-windows-static-sidecar"`
   with `OPENASR_CUDA_GPU_TARGETS=86`, no `RUSTFLAGS` workaround. The missing
   `cublasLt` link (`077f5f5a`) is confirmed fixed.
-- `StaleStatsGeneration` ("quote is stale") did not recur in any run (`1.1`
-  from the earlier report is confirmed fixed).
-- GPU residency: device-wide VRAM rose from ~1207-1274 MiB idle to 7284 MiB
-  (`ad_q2_0_m`) / 7296 MiB (`ad_iq4_nl`) with 61% max GPU util; both quants
-  transcribed `fixtures/jfk.wav` (11 s) verbatim. Wall 41.59 s / RTF 3.78 and
-  74.48 s / RTF 6.77; peak Windows process RAM (WS / private bytes) 24,463.5 /
-  17,205.8 MiB and 26,254.8 / 23,047.3 MiB.
-- **Not passing:** `fixtures/en_zh_mixed.wav` (13 s) failed on both quants
-  during encoder `load_gguf_weight_context` with a `system-memory` budget error
-  on `pack-weight-buffer-chunk-0` (iq4 requested 20,903,768,128 B with
-  11,437,273,088 B available; exit 6). The requested size is the whole IQ4
-  pack minus the dead-weight skip set, i.e. a host weight buffer with no expert
-  offload split. `available` is a broker budget remainder from one of two
-  gates: the policy ledger (`95% of ullTotalPhys - occupied`) or the observed
-  live snapshot (`ullAvailPhys - 256 MiB`); `11,437,273,088 + 256 MiB` is
-  page-aligned and equals ~10.90 GiB, consistent with a live Windows free
-  reading. The elided `binding_check` / `committed_scopes` fields distinguish
-  live host pressure from a stale/duplicate pack-sized owner before a root
-  cause is asserted. The placement verdict for that clip is therefore still
-  `No`; see section 7.
+- `StaleStatsGeneration` ("quote is stale") did not recur in any run.
+- **Initial receipt at `c54ec7f5`:** JFK (11 s) passed on both AD quants with
+  VRAM 7284 / 7296 MiB at 61% util, but `en_zh_mixed.wav` (13 s) failed on both
+  quants during encoder `load_gguf_weight_context` with a `system-memory`
+  `observed` budget error on `pack-weight-buffer-chunk-0` (iq4 requested
+  20,903,768,128 B, available 11,437,273,088 B; `binding_check=observed`,
+  committed only 473,984 B). The requested size was the whole IQ4 pack minus
+  the dead-weight skip set, i.e. a copied host buffer with no expert split.
+  Root cause: the HOST_IMPORT quote charged an already-open mapping a second
+  time, and the Hybrid host half used an anonymous buffer sized 11-17 GB
+  against a live `ullAvailPhys` floor near zero. Fixed by `561a4685` and
+  `7944b7f7` respectively.
+- **Verified at `7944b7f7`:** all four 11/13 s runs exit 0 with **zero candidate
+  retries** (Hybrid committed on the first candidate):
+
+  | Quant / fixture | Wall / inference | RTF | VRAM peak / GPU util |
+  | --- | ---: | ---: | ---: |
+  | `ad_q2_0_m` / jfk | 29.14 s / 27.57 s | 2.51x | 7451 MiB / 77% |
+  | `ad_q2_0_m` / en_zh_mixed | 42.22 s / 40.43 s | 3.11x | 7460 MiB / 73% |
+  | `ad_iq4_nl` / jfk | 52.79 s / 50.43 s | 4.58x | 7469 MiB / 94% |
+  | `ad_iq4_nl` / en_zh_mixed | 67.88 s / 65.61 s | 5.05x | 7465 MiB / 67% |
+
+- Memory mechanism: peak `PrivateMemorySize64` fell from 15-23 GiB to ~7.25 GiB
+  on all four runs; lowest `FreePhysicalMemory` improved from 0.00-0.59 GiB to
+  0.85-5.88 GiB. The mmap import path is active on Windows.
+- Transcripts: JFK matches the oracle golden on both quants. `en_zh_mixed.wav`
+  produces the expected mixed-language text on both quants; iq4 ends
+  `...去伊家新开。` where q2 reads `...去一家新开...` (no OpenASR golden exists
+  for this fixture, so this is recorded, not scored).
+- Two-file `--continue-on-error` runs (`ad_q2_0_m`, both orders) also pass 2/2,
+  but the second file takes one `context-buffer` capacity retry and completes
+  via CPU fallback (~9.5-11.6 s inference, peak VRAM ~9.57-9.58 GiB with both
+  runtimes resident). Hybrid does not stay available across requests in one
+  process; see section 7.
 
 **How to fill.** Status is exactly one of:
 
@@ -103,7 +118,7 @@ pass it today.
 | mmap weight loading | Supported | Weights are bound from the verified pack through the shared preflight reader (`load_gguf_weight_context_from_preflight`): Q2_0/IQ4_NL/Q8_0 tensors are bound in place (no host-side dequantization pass), activations flow F32. Evidence: executor weight binding + `audit-quant` clean on all three packs. |
 | Resident pool reuse across requests (weights stay resident) | Supported | `NemotronTranscribeGgmlExecutor` owns an `AdmittedPinnedRuntimeActorCheckoutPool` keyed by `(pack content, ExecutionLaneKey, required_span)` with limits 4 idle entries / 2 instances per key; the unified runtime (tokenizer, mmap'd embedding table, encoder+decoder sessions, KV/SSM/conv arenas) is leased per request and returned to the pool; the actor worker thread keeps every native context. `evict_prepared_runtime_content_id` evicts idle actors per pack; `unload_idle_state` drops them all. K2/K3 audit gates pass; `resident_runtime_audit` green. KV/SSM/conv arena reuse within a request AND across requests both exercised. |
 | View contiguity tradeoffs audited (`cont`/copy nodes justified) | Deferred | Graphs are built with explicit `cont` calls at layout boundaries (e.g. SSM `zxBCdt` slicing, KV row writes, debug-free tap-free outputs); no audit pass has recorded the reasons per node. Unlock: graph review enumerating every `cont` and why the input could not be consumed strided. |
-| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Supported (CPU, HIP); partial (CUDA) | Measured on the Strix Halo bench host (2026-11-18, quiet, sha-bound to the published packs): ad_q2_0_m peak RSS 18.3 GB / HIP 15.1 GB; ad_iq4_nl 24.0 / 20.4; q8_0 38.2 / 34.7. Weights alone match (card: 15.2 / 21.3 / 36.7 GB); no excess observed. Catalog RAM requirement should cite these peaks at flip time. HIP VRAM not separately attributed (unified GTT). CUDA (2026-11-25, Windows, not a quiet host): JFK peak VRAM 7284 / 7296 MiB and WS / private bytes 24,463.5 / 17,205.8 and 26,254.8 / 23,047.3 MiB for ad_q2_0_m / ad_iq4_nl; the 13 s clip has no successful peak because admission failed. |
+| Peak RSS/VRAM per shipped quant measured (quiet host) and reconciled against the weights+KV+activations budget; unexplained excess blocks release; catalog RAM requirement matches the measured peak | Supported (CPU, HIP, CUDA) | Measured on the Strix Halo bench host (2026-11-18, quiet, sha-bound to the published packs): ad_q2_0_m peak RSS 18.3 GB / HIP 15.1 GB; ad_iq4_nl 24.0 / 20.4; q8_0 38.2 / 34.7. Weights alone match (card: 15.2 / 21.3 / 36.7 GB); no excess observed. Catalog RAM requirement should cite these peaks at flip time. HIP VRAM not separately attributed (unified GTT). CUDA (2026-11-25, Windows, not a quiet host): all four 11/13 s AD runs peak at 7451-7469 MiB VRAM with 67-94% GPU util and ~7.25 GiB `PrivateMemorySize64` after the mmap-import fix (before: 15-23 GiB private, free RAM floor 0.00-0.59 GiB). Multi-file runs peak at ~9.57 GiB VRAM and ~9.81 GiB private with both runtimes resident. |
 | Dead-weight skip (unused pack tensors excluded from the loaded weight context) | Supported by wiring + Linux unit tests + CUDA/HIP hardware runs | `token_embd.weight` and the dense `blk.52.*` tensors are never looked up by a ggml graph; both AD quants load and run on CUDA with the skip installed; see the detailed note below. |
 
 ### Dead-weight skip: rationale and the MTP dependency
@@ -164,7 +179,7 @@ decode stays **Deferred**.
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
-| Metal command batching + wired memory budget respected | Deferred | No OpenASR Metal lane (this family has only been run on HIP and CPU-build); Vulkan-class smoke on the upstream SALM server (see `tooling/nemotron-reference-dumper/README.md`, validated ad_q2_0_m on gfx1031/RADV 16 GB on 2026-11-16) is NOT evidence about OpenASR Metal. Unlock: OpenASR Metal smoke on reference quants. |
+| Metal command batching + wired memory budget respected | Deferred | No OpenASR Metal lane (this family has only been run on HIP, CUDA and CPU-build); Vulkan-class smoke on the upstream SALM server (see `tooling/nemotron-reference-dumper/README.md`, validated ad_q2_0_m on gfx1031/RADV 16 GB on 2026-11-16) is NOT evidence about OpenASR Metal. Unlock: OpenASR Metal smoke on reference quants. |
 | CPU thread pool sized for P/E cores | Deferred | The CPU lane is correctness-verified and benched: JFK fixture transcribes verbatim on ad_q2_0_m (best-of-3, RTF 0.627, peak RSS ~19.5 GB on a 62 GB x86-64 host; load 96.3 s / compute 6.9 s, 2026-11-18); threadpool still not audited. Unlock: CPU threadpool audit + full per-quant CPU bench on the release host (ad_iq4_nl / q8_0 do not fit a 62 GB host under the residency regime). |
 | Accelerate/BLAS used where it wins | Deferred | CPU lane not profiled. Unlock: CPU bring-up + BLAS comparison. |
 
@@ -174,14 +189,15 @@ Every cell must be answered. `Supported? = Yes` means the OpenASR backend
 loads and runs the pack; `Golden-verified? = Yes` means byte/parity fixtures
 pass ON that backend; `Utilization measured? = Yes` means the weight
 placement gate (or equivalent) proved the compute actually runs there.
-CPU and HIP are green on the listed lanes; CUDA is green for the 11 s JFK clip
-only. Metal and Vulkan remain unanswered.
+CPU and HIP are green on the listed lanes; CUDA is green for both short
+fixtures (11 s and 13 s) on both AD quants at `7944b7f7`. Metal and Vulkan
+remain unanswered.
 
 | Backend | Supported? | Golden-verified? | Utilization measured? | Justification + unlock plan if unsupported |
 | --- | --- | --- | --- | --- |
 | CPU | Yes | Yes | N/A | All three quants bench on CPU (best-of-3, Ryzen AI MAX+ 395, 2026-11-18, sha-bound to the published packs, JFK verbatim): ad_q2_0_m RTF 0.234 / peak RSS 18.3 GB; ad_iq4_nl RTF 0.242 / 24.0 GB; q8_0 RTF 0.251 / 38.2 GB. Utilization: N/A on CPU. |
 | Metal | No | No | No | See CPU. Unlock: same gate, on the Apple-Silicon bench host with the Metal backend. |
-| CUDA | Yes (11 s JFK only) | Yes (JFK, manual) | Yes (11 s JFK) | VRAM-derived Hybrid lane with MoE expert offload, declared by default at `c54ec7f5`, now has a hardware receipt: Windows 11 / RTX 3080 (10 GB, sm_86, CUDA 13.0), both AD quants, JFK verbatim, VRAM 1207-1274 -> 7284 / 7296 MiB at 61% util (2026-11-25). `en_zh_mixed.wav` (13 s) still fails system-memory admission on both quants, so this is not a general discrete-card verdict. Unlock for full green: short-clip result on a second CUDA card + a `GGML_SCHED_DEBUG=2` weight-placement capture; unlock for the backend as a whole: close the 13 s failure below and add a >10 min golden. |
+| CUDA | Yes | Yes (JFK oracle; both fixtures manual) | Yes | VRAM-derived Hybrid lane with MoE expert offload, declared by default at `c54ec7f5` and verified at `7944b7f7`: Windows 11 / RTX 3080 (10 GB, sm_86, CUDA 13.0), all four 11/13 s runs (both AD quants) exit 0 with zero retries and Hybrid committed on the first candidate; JFK matches the oracle golden, `en_zh_mixed.wav` produces expected text on both quants; VRAM 7451-7469 MiB at 67-94% util and ~7.25 GiB private bytes after the mmap-import fixes. `GGML_SCHED_DEBUG=2` confirms experts on CPU and trunk on CUDA. Not a general discrete-card verdict: one card, no >10 min fixture, no automated parity test, and the second file of a two-file run takes a `context-buffer` capacity retry and completes via CPU fallback. Unlock for full green: second CUDA card + >10 min golden + fix the cross-request Hybrid reuse loss. |
 | Vulkan | No | No | No | See CPU; note upstream `nemo-speech vulkan-server` smoke (ad_q2_0_m, gfx1031/RADV, validated 2026-11-16) is oracle evidence, not OpenASR evidence. Unlock: same gate on the Vulkan bench host. |
 | HIP | Yes | Yes | No | All three quants run and transcribe verbatim on ROCm/HIP (best-of-3, Radeon 8060S / gfx1151 / 112 GiB unified GTT, 2026-11-18, sha-bound packs): ad_q2_0_m RTF 0.090 / peak 15.1 GB; ad_iq4_nl RTF 0.092 / 20.4 GB; q8_0 RTF 0.105 / 34.7 GB. Utilization not measured. Discrete-card verdict (RX 6800 XT, gfx1030, 16 GB, ad_q2_0_m): the all-device lane silently fell back to CPU on every clip (the earlier "no retry" note was wrong -- candidate retries are gated on `OPENASR_TIMING`, not `RUST_LOG`); the VRAM-derived Hybrid split offloads all MoE experts to system RAM, decoder prefill is chunked (64 rows/call), and the longform slice length is derived from detected memory (capped at the family's 3600 s hard ceiling). JFK (11 s) now runs on the GPU with a verbatim transcript at ~6.9 GB peak VRAM; gilbert (94 s) runs in 3 x 40 s GPU slices at ~11.4 GB with no CPU fallback. The full-context single-segment path still needs chunked attention / a unified-memory GPU (see KNOWN_LIMITATIONS). |
 
@@ -189,11 +205,11 @@ only. Metal and Vulkan remain unanswered.
 
 | Item | Status | Justification / evidence (+ unlock condition if not Supported) |
 | --- | --- | --- |
-| WER vs fp16 measured for every shipped quant tier | Deferred | Measured upstream, not by OpenASR: the source repo reports <= +/-0.18 WER decoder-vs-BF16 for every tier from 15.55 GB up, and ad_q2_0_m +1.53 CER on FLEURS Chinese (model card). OpenASR's only quality evidence is the verbatim JFK fixture on ad_q2_0_m (CPU/HIP, all three quants; CUDA, both AD quants). Unlock: OpenASR-side WER sweep per tier on the frozen en eval set before any public flip. |
+| WER vs fp16 measured for every shipped quant tier | Deferred | Measured upstream, not by OpenASR: the source repo reports <= +/-0.18 WER decoder-vs-BF16 for every tier from 15.55 GB up, and ad_q2_0_m +1.53 CER on FLEURS Chinese (model card). OpenASR's quality evidence is the verbatim JFK fixture (CPU/HIP, all three quants; CUDA, both AD quants) plus manually reviewed `en_zh_mixed.wav` transcripts on CUDA, neither scored against a frozen OpenASR golden. Unlock: OpenASR-side WER sweep per tier on the frozen en eval set before any public flip. |
 | Model ref alias forms resolve identically everywhere (bare family / `family:canonical` / every `quant_tag_cases.json` alias accepted by CLI and server match logic; covered by the catalog-wide alias matrix test) | Deferred | The catalog row does not exist yet (staged); alias behavior is exercised by the catalog-wide matrix only after the entry is public. Unlock: catalog entry lands publicly; matrix test covers `nemotron-3.5-transcribe-30b-a4b` and its `:ad_q2_0_m`/`:ad_iq4_nl`/`:q8_0` suffix forms (note: the `ad_*` tags are exact, not aliased). |
-| Golden coverage includes long audio AND a cross-backend parity fixture | Deferred | JFK verbatim transcript reproduces byte-identically through the OpenASR HIP runtime and, on the 2026-11-25 CUDA receipt, through the CUDA Hybrid runtime on both AD quants, matching the oracle golden (`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`); the mel path is pinned by an ignored golden unit test. The two GPU receipts are manual comparisons, not automated parity tests. AMI 2-speaker fixtures are not validated by OpenASR; no long-audio golden, no cross-backend parity fixture. Unlock: pin `GOLDEN_JFK_TEXT` in a pack-backed test; add AMI validation + a >10 min fixture + a CPU/GPU parity fixture. |
+| Golden coverage includes long audio AND a cross-backend parity fixture | Deferred | JFK verbatim transcript reproduces byte-identically through the OpenASR HIP runtime and, on the 2026-11-25 CUDA receipts, through the CUDA Hybrid runtime on both AD quants, matching the oracle golden (`tooling/nemotron-reference-dumper/work/goldens/jfk.transcript.json`); the mel path is pinned by an ignored golden unit test. The GPU receipts are manual comparisons, not automated parity tests. CUDA also produced `en_zh_mixed.wav` transcripts on both AD quants, with a q2/iq4 character difference (`一家` vs `伊家`) that has no OpenASR golden to score against. AMI 2-speaker fixtures are not validated by OpenASR; no long-audio golden, no cross-backend parity fixture. Unlock: pin `GOLDEN_JFK_TEXT` in a pack-backed test; add AMI validation + a >10 min fixture + a CPU/GPU parity fixture. |
 | Official decode parameters honored (suppression, stop tokens, upstream reference settings) | Deferred | The served prompt renders the SALM chat template with an empty `<think></think>` block (thinking disabled), byte-identical prefix/suffix to the SALM reference (`<|im_start|>system\n<|im_end|>\n<|im_start|>user\n` + instruction + `<|audio|>` locator + `<|im_end|>\n<|im_start|>assistant\n<think></think>`); the greedy shared driver enforces the EOT stop token and the serve budget. Not covered by an automated render-parity test. Unlock: prompt-render parity test + suppression table audit against the pack's embedded template. |
-| Long-audio degradation checked (repetition, drift, truncation) | Deferred | Not checked by OpenASR; only an 11 s fixture has been run. Upstream validates up to 1 h; the AMI 2-speaker 60 s fixture decodes verbatim on the oracle. Unlock: long-audio golden + degenerate-loop guard exercise on >10 min fixtures. |
+| Long-audio degradation checked (repetition, drift, truncation) | Deferred | Not checked by OpenASR; only 11 s and 13 s fixtures have been run on CUDA, with no >10 min receipt on any lane. Upstream validates up to 1 h; the AMI 2-speaker 60 s fixture decodes verbatim on the oracle. Unlock: long-audio golden + degenerate-loop guard exercise on >10 min fixtures. |
 
 ## 9. Resource limits & fail-closed
 
