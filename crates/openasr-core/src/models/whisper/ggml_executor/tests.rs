@@ -27,9 +27,9 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-// Pinned to the stock ggml v1.0.0 Linux x86_64 build. The previous hash
-// tracked the vendored fork (v0.17.0) CPU kernels, which are not bit-identical
-// to stock's. ggml CPU kernels need not be bit-identical across targets, so
+// Pinned to the stock ggml v1.1.0 Linux x86_64 build (unchanged from v1.0.0).
+// The previous hash tracked the vendored fork (v0.17.0) CPU kernels, which are
+// not bit-identical to stock's. ggml CPU kernels need not be bit-identical across targets, so
 // this check runs on the Linux CI runner only; the macOS reference could not
 // be re-verified in the stock-ggml migration environment and must be
 // regenerated on the macOS runner.

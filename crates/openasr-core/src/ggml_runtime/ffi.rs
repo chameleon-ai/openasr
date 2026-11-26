@@ -427,6 +427,8 @@ pub(crate) struct GgmlTypeTraits {
     pub from_float_ref: *const c_void,
 }
 
+/// Mirrors `struct ggml_backend_dev_caps` (ggml-backend.h). Keep in lockstep
+/// with the vendored pin: v1.1.0 appends `fast_async_host_input`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GgmlBackendDevCaps {
@@ -435,6 +437,7 @@ pub(crate) struct GgmlBackendDevCaps {
     pub buffer_from_host_ptr: bool,
     pub events: bool,
     pub mmap_support: bool,
+    pub fast_async_host_input: bool,
 }
 
 #[repr(C)]
@@ -1176,5 +1179,18 @@ mod ggml_type_tests {
             !upper.contains("REMOVED") && !upper.contains("DEPRECATED"),
             "ggml_type_name(COUNT-1) was {name:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod backend_dev_caps_tests {
+    use super::GgmlBackendDevCaps;
+
+    #[test]
+    fn dev_caps_mirror_matches_vendored_v1_1_0_layout() {
+        // `ggml_backend_dev_get_props` writes this struct on the C side; a short
+        // mirror silently drops capability flags (and was an out-of-bounds write
+        // when `mmap_support` was first appended).
+        assert_eq!(std::mem::size_of::<GgmlBackendDevCaps>(), 6);
     }
 }

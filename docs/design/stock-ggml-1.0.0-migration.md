@@ -7,6 +7,10 @@ fork commits) to stock upstream **v1.0.0** (`ggml-org/ggml`, tag `v1.0.0` =
 `ggml-migration-report.md` (repo root) for the pre-migration analysis this
 change implements.
 
+Update: the vendored pin has since moved to stock **v1.1.0** (`2ca32666`).
+Everything below describes the initial v1.0.0 migration and remains the
+baseline for the Rust-side reimplementations of the fork's removed APIs.
+
 ## What changed
 
 ### Submodule and build
